@@ -47,7 +47,7 @@ async-runtime, TLS, SDK, or memory-management infrastructure.
 
 ## Required authoring work
 
-- canonical formatter
+- canonical formatter (implemented in the 0.2 bootstrap)
 - parser, name, type, effect, and capability diagnostics
 - `krit check`
 - `krit explain`

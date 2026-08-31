@@ -39,6 +39,7 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - sorted `io.stdout` effect inference with function and call propagation
 - recursive function declarations
 - exhaustive empty/cons list matching
+- deterministic comment-preserving canonical source formatting
 - deterministic human and JSON diagnostics
 - implementation-neutral conformance cases
 - strict package manifest validation
@@ -85,6 +86,18 @@ executing:
 ```sh
 krit check examples/factorial.krit
 ```
+
+Format one or more files after validating the complete batch:
+
+```sh
+krit fmt examples/factorial.krit examples/lists.krit
+krit fmt --check examples/factorial.krit examples/lists.krit
+```
+
+`krit fmt` preserves every `//` comment, emits four-space indentation and LF
+line endings, and leaves all requested files untouched if any file cannot be
+read or parsed. `--check` writes nothing and returns status `1` when a file is
+not canonical.
 
 Validate a package manifest:
 
@@ -244,7 +257,7 @@ semantic reference, CI requirement, or contributor tool.
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 cargo build --workspace --release --locked
 ```
@@ -259,10 +272,11 @@ The accepted implementation path is:
 1. Rust source, parser, diagnostics, and direct evaluator
 2. readable records, built-in `Option` and `Result`, parsed annotations, and
    dynamic JSON conversion
-3. name resolution plus static type/effect checking (complete)
+3. name resolution, static type/effect checking, and canonical formatting
+   (complete)
 4. typed Core IR and a validated WebAssembly component backend
 5. one bounded HTTP/webhook host with outbound HTTP, secrets, and AI calls
-6. deterministic formatting, explanation, and permission commands
+6. deterministic explanation and effective permission commands
 7. optional provider-neutral inline prediction with visible checked edits
 8. broader connectors and packaging only after the reference agent succeeds
 

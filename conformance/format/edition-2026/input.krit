@@ -1,0 +1,5 @@
+let payload:Record{message:String,values:List<Int>,result:Result<Int,String>}=record{message:"line\n\"quoted\"",values:[1,2,3,],result:Ok((1+2)*3),};
+fn select(value:Option<Int>,fallback:Int)->Int{match value{None=>fallback,Some(found)=>found,}}
+let transform=fn(item:Record{value:Int})->Int{if item.value>0{item.value}else if item.value==0{0}else{-item.value}};
+println(select(Some(transform(record{value:-3})),0));
+match payload.result{Ok(value)=>println(value),Err(message)=>println(message),};

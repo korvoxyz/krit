@@ -1,0 +1,10 @@
+// leading
+fn sum( // parameters
+items:List<Int>// list input
+){ // body
+match items{// match subject
+[]=>0,// empty
+[head,..tail]=>head+sum(tail)// recurse
+}
+}// function
+println(sum([1,2,3]));// output

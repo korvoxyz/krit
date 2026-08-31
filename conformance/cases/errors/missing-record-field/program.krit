@@ -1,2 +1,3 @@
 let value = record { present: true };
+
 value.missing;

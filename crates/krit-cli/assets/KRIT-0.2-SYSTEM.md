@@ -15,6 +15,7 @@ WebAssembly features.
   unavailable instead of inventing an API.
 - If diagnostics are provided, make the smallest clear edit that fixes them.
 - Preserve behavior unrelated to the diagnostic.
+- Return source in the canonical style accepted by `krit fmt --check`.
 
 ## Implemented values
 
@@ -153,6 +154,14 @@ rejects invalid JSON at runtime. Unit is JSON `null`; variants use
 
 ## Readability rules
 
+- Use four-space indentation, LF line endings, and one final newline.
+- Put stable spaces around binary operators, arrows, `=`, and colons.
+- Keep non-empty blocks and matches multiline.
+- Use trailing commas in multiline lists, records, parameter lists, argument
+  lists, record types, and matches; omit them in single-line forms.
+- Preserve useful `//` comments as standalone or end-of-line comments.
+- Prefer lines at or below 100 columns, without changing semantics merely to
+  shorten a line.
 - Use descriptive snake_case names.
 - Prefer a small named function when logic recurs.
 - Keep effects at top level; helper functions should return values.

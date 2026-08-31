@@ -34,6 +34,12 @@ krit check --diagnostic-format json program.krit
 It compares status and diagnostic codes and requires that checking never
 execute program effects or emit program output.
 
+`conformance/format` contains formatter input/output pairs. Each
+`input.krit` must parse, and formatting must exactly equal
+`formatted.krit`. Formatting the expected output again must produce identical
+bytes. These fixtures exercise the normative canonical style without making
+non-canonical inputs runtime conformance programs.
+
 No case depends on a host path, locale, time zone, environment variable,
 network service, or nondeterministic value.
 
@@ -69,6 +75,8 @@ network service, or nondeterministic value.
 | `check/valid/inference` | recursion, closures, empty lists, None, and effects infer together |
 | `check/name/*` | lexical undefined and duplicate name diagnostics |
 | `check/type/*` | stable static operator, condition, field, call, annotation, and match errors |
+| `format/comments` | exact standalone and end-of-line comment preservation |
+| `format/edition-2026` | canonical layout for all currently implemented syntax families |
 
 ## Adding a case
 

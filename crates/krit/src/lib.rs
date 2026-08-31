@@ -2,6 +2,7 @@ mod analysis;
 mod ast;
 mod diagnostic;
 mod evaluator;
+mod formatter;
 mod lexer;
 mod parser;
 mod source;
@@ -17,6 +18,7 @@ pub use ast::{
 };
 pub use diagnostic::Diagnostic;
 pub use evaluator::{BuiltinFunction, FunctionValue, Value, execute};
+pub use formatter::{FORMAT_LINE_WIDTH, format_source};
 pub use parser::parse;
 pub use source::{Position, Source, Span};
 

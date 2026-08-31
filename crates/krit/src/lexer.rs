@@ -4,13 +4,30 @@ use crate::{
 };
 
 pub fn lex(source: &Source) -> Result<Vec<Token>, Diagnostic> {
+    Ok(lex_with_comments(source)?.tokens)
+}
+
+pub(crate) fn lex_with_comments(source: &Source) -> Result<LexedSource, Diagnostic> {
     Lexer::new(source.text()).scan()
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Comment {
+    pub(crate) text: String,
+    pub(crate) span: Span,
+    pub(crate) inline: bool,
+}
+
+pub(crate) struct LexedSource {
+    pub(crate) tokens: Vec<Token>,
+    pub(crate) comments: Vec<Comment>,
 }
 
 struct Lexer<'a> {
     text: &'a str,
     cursor: usize,
     tokens: Vec<Token>,
+    comments: Vec<Comment>,
 }
 
 impl<'a> Lexer<'a> {
@@ -19,10 +36,11 @@ impl<'a> Lexer<'a> {
             text,
             cursor: 0,
             tokens: Vec::new(),
+            comments: Vec::new(),
         }
     }
 
-    fn scan(mut self) -> Result<Vec<Token>, Diagnostic> {
+    fn scan(mut self) -> Result<LexedSource, Diagnostic> {
         while self.cursor < self.text.len() {
             self.skip_trivia();
             if self.cursor >= self.text.len() {
@@ -77,7 +95,10 @@ impl<'a> Lexer<'a> {
             TokenKind::Eof,
             Span::new(self.text.len(), self.text.len()),
         ));
-        Ok(self.tokens)
+        Ok(LexedSource {
+            tokens: self.tokens,
+            comments: self.comments,
+        })
     }
 
     fn skip_trivia(&mut self) {
@@ -87,9 +108,24 @@ impl<'a> Lexer<'a> {
             }
 
             if self.peek() == Some('/') && self.peek_next() == Some('/') {
-                while self.peek().is_some_and(|character| character != '\n') {
+                let start = self.cursor;
+                let line_start = self.text[..start]
+                    .rfind(['\n', '\r'])
+                    .map_or(0, |index| index + 1);
+                let inline = self.text[line_start..start]
+                    .chars()
+                    .any(|character| !character.is_whitespace());
+                while self
+                    .peek()
+                    .is_some_and(|character| character != '\n' && character != '\r')
+                {
                     self.advance();
                 }
+                self.comments.push(Comment {
+                    text: self.text[start..self.cursor].to_owned(),
+                    span: Span::new(start, self.cursor),
+                    inline,
+                });
             } else {
                 break;
             }

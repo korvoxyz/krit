@@ -11,10 +11,11 @@ not part of the compiler or runtime.
 - Language authority: [`../spec/LANGUAGE.md`](../spec/LANGUAGE.md)
 
 The prompt contains only implemented Krit 0.2 syntax, including records,
-built-in Option and Result values, checked annotations, JSON conversion, and
-the static rules enforced by `krit check`. Draft HTTP, WebAssembly, formatter,
-and capability designs are intentionally excluded so a model does not
-generate code the current compiler cannot accept.
+built-in Option and Result values, checked annotations, JSON conversion,
+canonical formatting, and the static rules enforced by `krit check`. Draft
+HTTP, WebAssembly, explanation, and capability designs are intentionally
+excluded so a model does not generate code the current compiler cannot
+accept.
 
 ## Use
 
@@ -35,6 +36,8 @@ result for [10, 20, 12].
 Save the returned Krit block and check it:
 
 ```sh
+krit fmt generated.krit
+krit fmt --check generated.krit
 krit check generated.krit
 ```
 
@@ -76,8 +79,10 @@ Every prompt pack is tied to a compiler/language version. A change must:
 2. include canonical readable examples
 3. add or update generation evaluation tasks
 4. pass parsing tests for every embedded Krit block
-5. record compatibility in `prompt-pack.json`
-6. update the changelog
+5. pass canonical formatting and idempotence tests for every embedded Krit
+   block
+6. record compatibility in `prompt-pack.json`
+7. update the changelog
 
 Old packs remain available for projects pinned to an older language version.
 

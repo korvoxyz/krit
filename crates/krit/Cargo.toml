@@ -1,6 +1,6 @@
 [package]
 name = "krit"
-description = "Parser, semantic analyzer, and runtime for the Krit programming language"
+description = "Parser, formatter, semantic analyzer, and runtime for the Krit programming language"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

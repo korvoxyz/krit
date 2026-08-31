@@ -1,10 +1,12 @@
 use std::{
-    env, fs, io,
+    env, fs,
+    fs::OpenOptions,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
 
-use krit::{Diagnostic, Source, analyze, parse_source, run_source};
+use krit::{Diagnostic, Source, Span, analyze, format_source, parse_source, run_source};
 use krit_package::Manifest;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -37,6 +39,7 @@ fn run(arguments: Vec<String>) -> u8 {
         }
         "run" => source_command(&arguments[1..], SourceAction::Run),
         "check" => source_command(&arguments[1..], SourceAction::Check),
+        "fmt" => fmt_command(&arguments[1..]),
         "prompt" => prompt_command(&arguments[1..]),
         "permissions" => permissions_command(&arguments[1..]),
         "package" => package_command(&arguments[1..]),
@@ -46,6 +49,183 @@ fn run(arguments: Vec<String>) -> u8 {
             2
         }
     }
+}
+
+struct FormattedFile {
+    path: PathBuf,
+    source: Source,
+    formatted: String,
+}
+
+struct StagedFile {
+    path: PathBuf,
+    temporary: PathBuf,
+}
+
+fn fmt_command(arguments: &[String]) -> u8 {
+    let (check, paths) = match parse_fmt_options(arguments) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("krit: {message}");
+            return 2;
+        }
+    };
+
+    if paths.is_empty() {
+        eprintln!("krit: expected at least one source file");
+        return 2;
+    }
+
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("krit: could not read {}: {error}", path.display());
+                return 1;
+            }
+        };
+        let source = Source::new(path.to_string_lossy().into_owned(), text);
+        let formatted = match format_source(&source) {
+            Ok(formatted) => formatted,
+            Err(diagnostic) => return report(&diagnostic, &source, DiagnosticFormat::Human),
+        };
+        files.push(FormattedFile {
+            path,
+            source,
+            formatted,
+        });
+    }
+
+    let changed = files
+        .iter()
+        .filter(|file| file.source.text() != file.formatted)
+        .collect::<Vec<_>>();
+    if check {
+        for file in &changed {
+            let diagnostic = Diagnostic::new(
+                "K8001",
+                "source is not canonically formatted",
+                Span::new(0, 0),
+            );
+            eprintln!("{}", diagnostic.render_human(&file.source));
+        }
+        return u8::from(!changed.is_empty());
+    }
+
+    let staged = match stage_formatted_files(&changed) {
+        Ok(staged) => staged,
+        Err(message) => {
+            eprintln!("krit: {message}");
+            return 1;
+        }
+    };
+    for (index, file) in staged.iter().enumerate() {
+        if let Err(error) = fs::rename(&file.temporary, &file.path) {
+            for remaining in &staged[index..] {
+                let _ = fs::remove_file(&remaining.temporary);
+            }
+            eprintln!("krit: could not replace {}: {error}", file.path.display());
+            return 1;
+        }
+        println!("formatted {}", file.path.display());
+    }
+    0
+}
+
+fn parse_fmt_options(arguments: &[String]) -> Result<(bool, Vec<PathBuf>), String> {
+    let mut check = false;
+    let mut paths = Vec::new();
+    let mut positional_only = false;
+
+    for argument in arguments {
+        if positional_only {
+            paths.push(PathBuf::from(argument));
+            continue;
+        }
+        match argument.as_str() {
+            "--check" => check = true,
+            "--" => positional_only = true,
+            argument if argument.starts_with('-') => {
+                return Err(format!("unknown option `{argument}`"));
+            }
+            argument => paths.push(PathBuf::from(argument)),
+        }
+    }
+
+    Ok((check, paths))
+}
+
+fn stage_formatted_files(files: &[&FormattedFile]) -> Result<Vec<StagedFile>, String> {
+    let mut staged = Vec::with_capacity(files.len());
+    for (index, file) in files.iter().enumerate() {
+        match stage_formatted_file(file, index) {
+            Ok(temporary) => staged.push(StagedFile {
+                path: file.path.clone(),
+                temporary,
+            }),
+            Err(message) => {
+                for file in staged {
+                    let _ = fs::remove_file(file.temporary);
+                }
+                return Err(message);
+            }
+        }
+    }
+    Ok(staged)
+}
+
+fn stage_formatted_file(file: &FormattedFile, sequence: usize) -> Result<PathBuf, String> {
+    let metadata = fs::metadata(&file.path)
+        .map_err(|error| format!("could not inspect {}: {error}", file.path.display()))?;
+    let parent = file.path.parent().unwrap_or_else(|| Path::new("."));
+    let name = file
+        .path
+        .file_name()
+        .ok_or_else(|| format!("invalid source path {}", file.path.display()))?;
+
+    for attempt in 0..100 {
+        let mut temporary_name = std::ffi::OsString::from(".");
+        temporary_name.push(name);
+        temporary_name.push(format!(
+            ".krit-fmt-{}-{sequence}-{attempt}",
+            std::process::id()
+        ));
+        let temporary = parent.join(temporary_name);
+        let mut output = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not create formatter output for {}: {error}",
+                    file.path.display()
+                ));
+            }
+        };
+
+        let result = output
+            .write_all(file.formatted.as_bytes())
+            .and_then(|()| output.set_permissions(metadata.permissions()))
+            .and_then(|()| output.sync_all());
+        if let Err(error) = result {
+            drop(output);
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "could not write formatter output for {}: {error}",
+                file.path.display()
+            ));
+        }
+        return Ok(temporary);
+    }
+
+    Err(format!(
+        "could not allocate formatter output for {}",
+        file.path.display()
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -230,6 +410,7 @@ An open, human-auditable language for the age of AI.
 USAGE:
     krit run [--diagnostic-format human|json] FILE
     krit check [--diagnostic-format human|json] FILE
+    krit fmt [--check] FILE...
     krit prompt
     krit permissions [--json] [MANIFEST]
     krit package check [MANIFEST]
@@ -261,6 +442,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_formatter_options() {
+        let (check, paths) = parse_fmt_options(&[
+            "--check".to_owned(),
+            "one.krit".to_owned(),
+            "--".to_owned(),
+            "-two.krit".to_owned(),
+        ])
+        .expect("options should parse");
+        assert!(check);
+        assert_eq!(
+            paths,
+            [PathBuf::from("one.krit"), PathBuf::from("-two.krit")]
+        );
+    }
+
+    #[test]
     fn checks_every_prompt_example() {
         let mut remaining = GENERATION_PROMPT;
         let mut count = 0;
@@ -270,6 +467,23 @@ mod tests {
             let source = Source::new(format!("<prompt-example-{count}>"), &code[..end]);
             let program = parse_source(&source).expect("prompt example should parse");
             analyze(&program).expect("prompt example should pass semantic analysis");
+            let formatted = format_source(&source).expect("prompt example should format");
+            assert_eq!(
+                formatted,
+                format!("{}\n", &code[..end]),
+                "prompt example should be canonical"
+            );
+            let formatted_source = Source::new(
+                format!("<formatted-prompt-example-{count}>"),
+                formatted.clone(),
+            );
+            let program =
+                parse_source(&formatted_source).expect("formatted prompt example should parse");
+            analyze(&program).expect("formatted prompt example should pass semantic analysis");
+            assert_eq!(
+                format_source(&formatted_source).expect("formatting should be idempotent"),
+                formatted
+            );
             count += 1;
             remaining = &code[end + "\n```".len()..];
         }

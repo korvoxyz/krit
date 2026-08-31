@@ -46,6 +46,10 @@ Always available and offline:
 
 This layer supplies facts to both people and models.
 
+The 0.2 bootstrap already provides the comment-preserving canonical formatter
+and `krit fmt --check`. Parser-aware completion, fixes, language-server edits,
+and broader compiler-facts APIs remain part of the 0.4 authoring milestone.
+
 ### 2. Predictive completion
 
 An optional LLM proposes the next expression, block, handler, schema, or

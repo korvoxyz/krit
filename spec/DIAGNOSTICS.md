@@ -95,6 +95,7 @@ Initial required codes:
 | `K5001` | Required capability not granted |
 | `K6001` | Invalid package manifest |
 | `K6002` | Lockfile is stale or invalid |
+| `K8001` | Source is not canonically formatted in formatter check mode |
 
 ## Exit statuses
 

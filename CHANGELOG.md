@@ -33,6 +33,12 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Public `krit::analyze` API with inferred binding types, source spans, and
   effects
 - Implementation-neutral static `check` conformance fixtures
+- Public `krit::format_source` API with deterministic edition-2026 formatting
+- Lossless standalone and end-of-line `//` comment preservation
+- `krit fmt [--check] FILE...` with batch validation, atomic same-directory
+  replacement, and stable `K8001` check diagnostics
+- Formatter fixtures and repository-wide parse, analysis, and idempotence
+  coverage
 
 ### Changed
 
@@ -41,9 +47,10 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Defined LLM assistance as optional visible edits gated by deterministic
   formatting, checks, and permission analysis
 - Updated the provider-neutral generation prompt to version 0.2.2 for readable
-  data and static checking
+  data and static checking, then to version 0.2.3 for canonical formatting
 - Made `krit check` perform semantic analysis without executing source while
   preserving its success output
+- Marked the readable-agent-data phase complete
 
 ## [0.2.0] - 2026-09-01
 

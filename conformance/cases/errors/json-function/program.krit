@@ -1,1 +1,3 @@
-json_encode(fn(value) { value });
+json_encode(fn(value) {
+    value
+});

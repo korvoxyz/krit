@@ -35,7 +35,7 @@ operations yet.
 
 ## Phase 2: readable agent data
 
-**Status:** In progress; data syntax and static checker milestones complete
+**Status:** Complete
 
 - records and built-in variants
 - `Option<T>` and `Result<T, E>` annotations
@@ -43,10 +43,10 @@ operations yet.
 - parsed let, parameter, and return annotations
 - dynamic deterministic JSON decoding and encoding
 - name, type, and effect checking (complete)
-- canonical formatter
+- canonical comment-preserving formatter (complete)
 
-Gate: webhook request, connector response, model output, and application errors
-can be represented without untyped maps or hidden exceptions.
+Gate met: webhook request, connector response, model output, and application
+errors can be represented without untyped maps or hidden exceptions.
 
 ## Phase 3: WebAssembly boundary
 

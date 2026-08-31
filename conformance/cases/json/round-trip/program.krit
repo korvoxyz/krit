@@ -1,4 +1,5 @@
 let value = record { name: "agent", outcome: Ok(Some([1, 2])) };
 let encoded = json_encode(value);
+
 println(encoded);
 println(json_decode(encoded) == value);

@@ -425,3 +425,38 @@ value, output bytes, and diagnostic code.
 
 Hash iteration, memory addresses, host paths, timestamps, and stack traces
 must not affect user-visible output.
+
+## 16. Canonical source format
+
+`krit fmt` defines the canonical textual layout for implemented edition-2026
+syntax. Formatting changes trivia, equivalent literal spellings, and
+grammar-permitted trailing commas, not expression order or program semantics.
+
+- Indentation is four ASCII spaces. Formatter-produced structural whitespace
+  contains no tabs or trailing spaces.
+- Output uses LF line endings and exactly one final line feed.
+- Binary operators, `=`, `=>`, `->`, and type/value colons use stable spacing.
+  Calls, field access, unary operators, and generic type brackets remain
+  compact.
+- Non-empty blocks and every match are multiline. Short lists, records,
+  parameter lists, argument lists, and record types remain on one line when
+  readable.
+- Multiline lists, records, parameter lists, argument lists, record types,
+  and matches have one item per line and a trailing comma. Single-line forms
+  omit a trailing comma.
+- Top-level declarations are separated from executable expression statements
+  by one blank line.
+- Integer separators are removed. Strings use direct printable Unicode plus
+  `\"`, `\\`, `\n`, `\r`, `\t`, `\0`, or lowercase `\u{...}` escapes for
+  required control characters.
+- Parentheses from the input are retained, including every pair needed to
+  preserve evaluation order.
+- Every `//` comment and its text is retained in source order. Standalone
+  comments remain standalone, and end-of-line comments remain after code so
+  they cannot comment out a following token. Whitespace inside comment text is
+  not rewritten.
+
+The formatter uses a soft 100-column target. It wraps delimiter-based
+collections and signatures deterministically; an indivisible string, comment,
+or operator chain may exceed the target. Correctness, comment preservation,
+and idempotence take priority over filling every line optimally.

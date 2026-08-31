@@ -92,13 +92,23 @@ Source files are immutable byte buffers validated as UTF-8. Spans are
 half-open byte ranges associated with a source identifier. Line/column
 conversion is lazy so lexing and parsing do not repeatedly scan text.
 
-Tokens retain spans but not copied lexeme strings. Identifier interning begins
-only when profiling shows a memory or comparison benefit.
+Parser tokens retain spans and normalized literal values. The lexer also
+exposes formatter-only line-comment trivia with exact comment text, source
+order, and standalone/end-of-line placement. Identifier interning begins only
+when profiling shows a memory or comparison benefit.
 
 The parser is handwritten recursive descent with Pratt/precedence parsing for
 expressions. Error recovery synchronizes at `;`, `}`, and declaration
 keywords. The first implementation may stop after one error, but its
 diagnostic code and primary span must match the specification.
+
+The canonical formatter validates with the normal parser, then renders the
+parsed token stream with AST-derived block, type, and statement boundaries.
+It retains grouping parentheses and comments rather than reconstructing them
+from the lossy semantic AST. It only inserts or removes grammar-permitted
+trailing commas. Delimiter groups provide deterministic wrapping with a soft
+100-column target. This hybrid keeps formatting semantic-safe while avoiding
+a second language parser.
 
 ## Semantic stages
 
@@ -221,6 +231,13 @@ Human output goes to standard output; diagnostics and progress go to standard
 error. `--json` or command-specific JSON options emit stable schemas with no
 decorative text.
 
+`krit fmt [--check] FILE...` validates and formats files in argument order.
+Normal mode reads and formats the complete batch before creating
+same-directory staged files, preserves file permissions, and atomically
+renames each staged result. A read or parse failure therefore leaves every
+requested source untouched. Check mode never writes and reports `K8001` for
+each non-canonical source.
+
 Editor integration is separate from compilation. `krit-lsp` exposes
 deterministic syntax, type, effect, formatting, and permission facts.
 `krit-assist` may ask a configured model for small structured edits, but those
@@ -238,6 +255,8 @@ Required layers:
 - package resolver/store tests with local fixtures
 - malformed source and WebAssembly component fuzzing
 - deterministic output tests
+- formatter fixtures, comment preservation, idempotence, parse/analyze
+  round-trips, and atomic batch CLI tests
 - cache clean/hit equivalence tests
 - capability denial tests
 - differential direct-evaluator/component tests during backend development
