@@ -3,8 +3,8 @@ use std::{fmt, io::Write, rc::Rc};
 use crate::{
     Diagnostic, Span,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, Program, Statement, StatementKind,
-        UnaryOperator, ValueLiteral,
+        BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Program, Statement,
+        StatementKind, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
     },
 };
 
@@ -15,6 +15,11 @@ pub enum Value {
     String(Rc<str>),
     Unit,
     List(Rc<[Value]>),
+    Record(Rc<[(String, Value)]>),
+    Variant {
+        name: VariantName,
+        payload: Option<Rc<Value>>,
+    },
     Function(Rc<FunctionValue>),
     Builtin(BuiltinFunction),
 }
@@ -31,6 +36,11 @@ pub struct FunctionValue {
 pub enum BuiltinFunction {
     Print,
     Println,
+    Some,
+    Ok,
+    Err,
+    JsonEncode,
+    JsonDecode,
 }
 
 impl fmt::Debug for Value {
@@ -54,12 +64,32 @@ impl Value {
                     .join(", ");
                 format!("[{contents}]")
             }
+            Self::Record(fields) => {
+                if fields.is_empty() {
+                    return "record {}".to_owned();
+                }
+                let contents = fields
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {}", value.render_nested()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("record {{ {contents} }}")
+            }
+            Self::Variant { name, payload } => payload.as_ref().map_or_else(
+                || name.as_str().to_owned(),
+                |value| format!("{}({})", name.as_str(), value.render_nested()),
+            ),
             Self::Function(function) => function.name.as_deref().map_or_else(
                 || "<function>".to_owned(),
                 |name| format!("<function {name}>"),
             ),
             Self::Builtin(BuiltinFunction::Print) => "<function print>".to_owned(),
             Self::Builtin(BuiltinFunction::Println) => "<function println>".to_owned(),
+            Self::Builtin(BuiltinFunction::Some) => "<function Some>".to_owned(),
+            Self::Builtin(BuiltinFunction::Ok) => "<function Ok>".to_owned(),
+            Self::Builtin(BuiltinFunction::Err) => "<function Err>".to_owned(),
+            Self::Builtin(BuiltinFunction::JsonEncode) => "<function json_encode>".to_owned(),
+            Self::Builtin(BuiltinFunction::JsonDecode) => "<function json_decode>".to_owned(),
         }
     }
 
@@ -77,6 +107,11 @@ impl Value {
             Self::String(_) => "string",
             Self::Unit => "unit",
             Self::List(_) => "list",
+            Self::Record(_) => "record",
+            Self::Variant { name, .. } => match name {
+                VariantName::Some | VariantName::None => "option",
+                VariantName::Ok | VariantName::Err => "result",
+            },
             Self::Function(_) | Self::Builtin(_) => "function",
         }
     }
@@ -85,6 +120,10 @@ impl Value {
         match self {
             Self::Function(_) | Self::Builtin(_) => true,
             Self::List(values) => values.iter().any(Self::contains_function),
+            Self::Record(fields) => fields.iter().any(|(_, value)| value.contains_function()),
+            Self::Variant { payload, .. } => {
+                payload.as_deref().is_some_and(Self::contains_function)
+            }
             _ => false,
         }
     }
@@ -147,7 +186,7 @@ impl Evaluator<'_> {
         environment: &Environment,
     ) -> Result<Environment, Diagnostic> {
         match &statement.kind {
-            StatementKind::Let { name, value } => {
+            StatementKind::Let { name, value, .. } => {
                 let value = self.expression(value, environment)?;
                 Ok(environment.extend(name.clone(), value))
             }
@@ -155,10 +194,15 @@ impl Evaluator<'_> {
                 name,
                 parameters,
                 body,
+                ..
             } => {
                 let function = Value::Function(Rc::new(FunctionValue {
                     name: Some(Rc::from(name.as_str())),
-                    parameters: parameters.clone().into(),
+                    parameters: parameters
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect::<Vec<_>>()
+                        .into(),
                     body: body.clone(),
                     environment: environment.clone(),
                 }));
@@ -192,6 +236,15 @@ impl Evaluator<'_> {
             ExpressionKind::Variable(name) => match name.as_str() {
                 "print" => Ok(Value::Builtin(BuiltinFunction::Print)),
                 "println" => Ok(Value::Builtin(BuiltinFunction::Println)),
+                "Some" => Ok(Value::Builtin(BuiltinFunction::Some)),
+                "None" => Ok(Value::Variant {
+                    name: VariantName::None,
+                    payload: None,
+                }),
+                "Ok" => Ok(Value::Builtin(BuiltinFunction::Ok)),
+                "Err" => Ok(Value::Builtin(BuiltinFunction::Err)),
+                "json_encode" => Ok(Value::Builtin(BuiltinFunction::JsonEncode)),
+                "json_decode" => Ok(Value::Builtin(BuiltinFunction::JsonDecode)),
                 _ => environment.lookup(name).ok_or_else(|| {
                     Diagnostic::new("K2001", format!("undefined name `{name}`"), expression.span)
                 }),
@@ -202,6 +255,37 @@ impl Evaluator<'_> {
                     .map(|element| self.expression(element, environment))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::List(values.into()))
+            }
+            ExpressionKind::Record(fields) => {
+                let values = fields
+                    .iter()
+                    .map(|field| {
+                        self.expression(&field.value, environment)
+                            .map(|value| (field.name.clone(), value))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Record(values.into()))
+            }
+            ExpressionKind::FieldAccess { value, field } => {
+                let value = self.expression(value, environment)?;
+                let Value::Record(fields) = value else {
+                    return Err(Diagnostic::new(
+                        "K4001",
+                        format!("expected record for field access, found {}", value.kind()),
+                        expression.span,
+                    ));
+                };
+                fields
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, value)| value.clone())
+                    .ok_or_else(|| {
+                        Diagnostic::new(
+                            "K4001",
+                            format!("record has no field `{field}`"),
+                            expression.span,
+                        )
+                    })
             }
             ExpressionKind::Block(block) => self.block(block, environment),
             ExpressionKind::If {
@@ -216,33 +300,79 @@ impl Evaluator<'_> {
                     self.expression(alternative, environment)
                 }
             }
-            ExpressionKind::Function { parameters, body } => {
-                Ok(Value::Function(Rc::new(FunctionValue {
-                    name: None,
-                    parameters: parameters.clone().into(),
-                    body: body.clone(),
-                    environment: environment.clone(),
-                })))
-            }
+            ExpressionKind::Function {
+                parameters, body, ..
+            } => Ok(Value::Function(Rc::new(FunctionValue {
+                name: None,
+                parameters: parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .collect::<Vec<_>>()
+                    .into(),
+                body: body.clone(),
+                environment: environment.clone(),
+            }))),
             ExpressionKind::Call { callee, arguments } => {
                 self.call(callee, arguments, environment, expression.span)
             }
-            ExpressionKind::Match {
-                subject,
-                empty_case,
-                head_name,
-                tail_name,
-                cons_case,
-            } => {
+            ExpressionKind::Match { subject, kind } => {
                 let subject_value = self.expression(subject, environment)?;
-                let values = self.list(subject_value, subject.span)?;
-                if values.is_empty() {
-                    self.expression(empty_case, environment)
-                } else {
-                    let with_head = environment.extend(head_name.clone(), values[0].clone());
-                    let with_tail = with_head
-                        .extend(tail_name.clone(), Value::List(values[1..].to_vec().into()));
-                    self.expression(cons_case, &with_tail)
+                match kind {
+                    MatchKind::List {
+                        empty_case,
+                        head_name,
+                        tail_name,
+                        cons_case,
+                    } => {
+                        let values = self.list(subject_value, subject.span)?;
+                        if values.is_empty() {
+                            self.expression(empty_case, environment)
+                        } else {
+                            let with_head =
+                                environment.extend(head_name.clone(), values[0].clone());
+                            let with_tail = with_head.extend(
+                                tail_name.clone(),
+                                Value::List(values[1..].to_vec().into()),
+                            );
+                            self.expression(cons_case, &with_tail)
+                        }
+                    }
+                    MatchKind::Variants { family, arms } => {
+                        let Value::Variant { name, payload } = subject_value else {
+                            return Err(Diagnostic::new(
+                                "K4001",
+                                format!(
+                                    "expected {} for variant match, found {}",
+                                    variant_family_name(*family),
+                                    subject_value.kind()
+                                ),
+                                subject.span,
+                            ));
+                        };
+                        if variant_family(name) != *family {
+                            return Err(Diagnostic::new(
+                                "K4001",
+                                format!(
+                                    "expected {} for variant match, found {}",
+                                    variant_family_name(*family),
+                                    variant_family_name(variant_family(name))
+                                ),
+                                subject.span,
+                            ));
+                        }
+                        let arm = arms
+                            .iter()
+                            .find(|arm| arm.variant == name)
+                            .expect("parser guarantees exhaustive variant arms");
+                        let arm_environment = match (&arm.binding, payload) {
+                            (Some(binding), Some(value)) => {
+                                environment.extend(binding.clone(), value.as_ref().clone())
+                            }
+                            (None, None) => environment.clone(),
+                            _ => unreachable!("variant payload shape is fixed"),
+                        };
+                        self.expression(&arm.value, &arm_environment)
+                    }
                 }
             }
             ExpressionKind::Unary { operator, operand } => {
@@ -303,18 +433,36 @@ impl Evaluator<'_> {
                     return Err(arity_error(1, arguments.len(), span));
                 }
                 let value = self.expression(&arguments[0], environment)?;
-                let rendered = value.render();
-                self.output
-                    .write_all(rendered.as_bytes())
-                    .map_err(|error| {
-                        Diagnostic::new("K4007", format!("output failed: {error}"), span)
-                    })?;
-                if builtin == BuiltinFunction::Println {
-                    self.output.write_all(b"\n").map_err(|error| {
-                        Diagnostic::new("K4007", format!("output failed: {error}"), span)
-                    })?;
+                match builtin {
+                    BuiltinFunction::Print | BuiltinFunction::Println => {
+                        let rendered = value.render();
+                        self.output
+                            .write_all(rendered.as_bytes())
+                            .map_err(|error| {
+                                Diagnostic::new("K4007", format!("output failed: {error}"), span)
+                            })?;
+                        if builtin == BuiltinFunction::Println {
+                            self.output.write_all(b"\n").map_err(|error| {
+                                Diagnostic::new("K4007", format!("output failed: {error}"), span)
+                            })?;
+                        }
+                        Ok(Value::Unit)
+                    }
+                    BuiltinFunction::Some => Ok(Value::Variant {
+                        name: VariantName::Some,
+                        payload: Some(Rc::new(value)),
+                    }),
+                    BuiltinFunction::Ok => Ok(Value::Variant {
+                        name: VariantName::Ok,
+                        payload: Some(Rc::new(value)),
+                    }),
+                    BuiltinFunction::Err => Ok(Value::Variant {
+                        name: VariantName::Err,
+                        payload: Some(Rc::new(value)),
+                    }),
+                    BuiltinFunction::JsonEncode => json_encode(&value, span),
+                    BuiltinFunction::JsonDecode => json_decode(value, span),
                 }
-                Ok(Value::Unit)
             }
             value => Err(Diagnostic::new(
                 "K4002",
@@ -549,7 +697,166 @@ fn value_equal(left: &Value, right: &Value, span: Span) -> Result<bool, Diagnost
             }
             Ok(true)
         }
+        (Value::Record(left), Value::Record(right)) => {
+            if left.len() != right.len() {
+                return Ok(false);
+            }
+            for (name, left_value) in left.iter() {
+                let Some((_, right_value)) =
+                    right.iter().find(|(right_name, _)| right_name == name)
+                else {
+                    return Ok(false);
+                };
+                if !value_equal(left_value, right_value, span)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (
+            Value::Variant {
+                name: left_name,
+                payload: left_payload,
+            },
+            Value::Variant {
+                name: right_name,
+                payload: right_payload,
+            },
+        ) => {
+            if left_name != right_name {
+                return Ok(false);
+            }
+            match (left_payload, right_payload) {
+                (None, None) => Ok(true),
+                (Some(left), Some(right)) => value_equal(left, right, span),
+                _ => Ok(false),
+            }
+        }
         _ => Ok(false),
+    }
+}
+
+const fn variant_family(name: VariantName) -> VariantFamily {
+    match name {
+        VariantName::Some | VariantName::None => VariantFamily::Option,
+        VariantName::Ok | VariantName::Err => VariantFamily::Result,
+    }
+}
+
+const fn variant_family_name(family: VariantFamily) -> &'static str {
+    match family {
+        VariantFamily::Option => "option",
+        VariantFamily::Result => "result",
+    }
+}
+
+fn json_encode(value: &Value, span: Span) -> Result<Value, Diagnostic> {
+    let json = value_to_json(value, span)?;
+    serde_json::to_string(&json)
+        .map(|json| Value::String(Rc::from(json)))
+        .map_err(|error| Diagnostic::new("K4008", format!("JSON encoding failed: {error}"), span))
+}
+
+fn value_to_json(value: &Value, span: Span) -> Result<serde_json::Value, Diagnostic> {
+    match value {
+        Value::Integer(value) => Ok((*value).into()),
+        Value::Boolean(value) => Ok((*value).into()),
+        Value::String(value) => Ok(value.as_ref().into()),
+        Value::Unit => Ok(serde_json::Value::Null),
+        Value::List(values) => values
+            .iter()
+            .map(|value| value_to_json(value, span))
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        Value::Record(fields) => {
+            let mut object = serde_json::Map::new();
+            let mut fields = fields.iter().collect::<Vec<_>>();
+            fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (name, value) in fields {
+                object.insert(name.clone(), value_to_json(value, span)?);
+            }
+            Ok(serde_json::Value::Object(object))
+        }
+        Value::Variant { name, payload } => {
+            let mut object = serde_json::Map::new();
+            let payload = payload
+                .as_deref()
+                .map_or(Ok(serde_json::Value::Null), |value| {
+                    value_to_json(value, span)
+                })?;
+            object.insert(name.as_str().to_owned(), payload);
+            Ok(serde_json::Value::Object(object))
+        }
+        Value::Function(_) | Value::Builtin(_) => Err(Diagnostic::new(
+            "K4008",
+            "functions cannot be encoded as JSON",
+            span,
+        )),
+    }
+}
+
+fn json_decode(value: Value, span: Span) -> Result<Value, Diagnostic> {
+    let Value::String(text) = value else {
+        return Err(Diagnostic::new(
+            "K4001",
+            format!("expected string, found {}", value.kind()),
+            span,
+        ));
+    };
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| Diagnostic::new("K4009", format!("invalid JSON: {error}"), span))?;
+    json_to_value(json, span)
+}
+
+fn json_to_value(value: serde_json::Value, span: Span) -> Result<Value, Diagnostic> {
+    match value {
+        serde_json::Value::Null => Ok(Value::Unit),
+        serde_json::Value::Bool(value) => Ok(Value::Boolean(value)),
+        serde_json::Value::Number(value) => value.as_i64().map(Value::Integer).ok_or_else(|| {
+            Diagnostic::new("K4009", "JSON number is not a signed 64-bit integer", span)
+        }),
+        serde_json::Value::String(value) => Ok(Value::String(Rc::from(value))),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(|value| json_to_value(value, span))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| Value::List(values.into())),
+        serde_json::Value::Object(mut fields) => {
+            if fields.len() == 1 {
+                for (tag, name) in [
+                    ("Some", VariantName::Some),
+                    ("None", VariantName::None),
+                    ("Ok", VariantName::Ok),
+                    ("Err", VariantName::Err),
+                ] {
+                    if let Some(payload) = fields.remove(tag) {
+                        if name == VariantName::None {
+                            if !payload.is_null() {
+                                return Err(Diagnostic::new(
+                                    "K4009",
+                                    "the JSON `None` tag must contain null",
+                                    span,
+                                ));
+                            }
+                            return Ok(Value::Variant {
+                                name,
+                                payload: None,
+                            });
+                        }
+                        return Ok(Value::Variant {
+                            name,
+                            payload: Some(Rc::new(json_to_value(payload, span)?)),
+                        });
+                    }
+                }
+            }
+            let mut fields = fields
+                .into_iter()
+                .map(|(name, value)| json_to_value(value, span).map(|value| (name, value)))
+                .collect::<Result<Vec<_>, _>>()?;
+            fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+            Ok(Value::Record(fields.into()))
+        }
     }
 }
 
@@ -595,5 +902,90 @@ mod tests {
     fn renders_strings_unambiguously_inside_lists() {
         let (output, _) = run(r#"println(["human", "AI"]);"#).expect("program should run");
         assert_eq!(output, "[\"human\", \"AI\"]\n");
+    }
+
+    #[test]
+    fn evaluates_records_fields_and_structural_equality() {
+        let (output, _) = run(r#"
+            let first = record { name: "agent", ready: true };
+            let second = record { ready: true, name: "agent" };
+            println(first);
+            println(first.name);
+            println(first == second);
+            "#)
+        .expect("records should run");
+
+        assert_eq!(
+            output,
+            "record { name: \"agent\", ready: true }\nagent\ntrue\n"
+        );
+    }
+
+    #[test]
+    fn evaluates_option_and_result_matches() {
+        let (output, _) = run(r#"
+            let option = Some("ready");
+            println(match option { None => "missing", Some(value) => value });
+            let result = Err("failed");
+            println(match result { Ok(value) => value, Err(error) => error });
+            println(Some([1, 2]) == Some([1, 2]));
+            "#)
+        .expect("variants should run");
+
+        assert_eq!(output, "ready\nfailed\ntrue\n");
+    }
+
+    #[test]
+    fn functions_nested_in_data_remain_non_comparable() {
+        for source in [
+            "println(record { callback: fn(value) { value } } == record { callback: fn(value) { value } });",
+            "println(Some(fn(value) { value }) == Some(fn(value) { value }));",
+            "println(Err(fn(value) { value }) == Err(fn(value) { value }));",
+        ] {
+            let error = run(source).expect_err("nested functions should not compare");
+            assert_eq!(error.code(), "K4006");
+        }
+    }
+
+    #[test]
+    fn annotations_do_not_change_dynamic_evaluation() {
+        let (output, _) = run(r#"
+            let value: Int = "still dynamic";
+            fn identity(input: Bool) -> Unit { input }
+            println(identity(value));
+            "#)
+        .expect("annotations should not be checked yet");
+
+        assert_eq!(output, "still dynamic\n");
+    }
+
+    #[test]
+    fn encodes_and_decodes_json_deterministically() {
+        let (output, _) = run(r#"
+            let value = record { z: 2, option: Some([true, None]), a: 1 };
+            let encoded = json_encode(value);
+            println(encoded);
+            println(json_decode(encoded) == value);
+            println(json_decode("{\"Err\":\"failed\"}"));
+            let unit = {};
+            println(json_encode(unit));
+            println(json_decode("null") == unit);
+            "#)
+        .expect("JSON values should round trip");
+
+        assert_eq!(
+            output,
+            "{\"a\":1,\"option\":{\"Some\":[true,{\"None\":null}]},\"z\":2}\ntrue\nErr(\"failed\")\nnull\ntrue\n"
+        );
+    }
+
+    #[test]
+    fn reports_json_failures() {
+        let encode_error =
+            run("json_encode(fn(value) { value });").expect_err("functions should not encode");
+        assert_eq!(encode_error.code(), "K4008");
+
+        let decode_error = run(r#"json_decode("{");"#).expect_err("invalid JSON should not decode");
+        assert_eq!(decode_error.code(), "K4009");
     }
 }

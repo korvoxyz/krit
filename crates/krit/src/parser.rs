@@ -3,8 +3,9 @@ use std::collections::HashSet;
 use crate::{
     Diagnostic, Span,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, Program, Statement, StatementKind,
-        UnaryOperator, ValueLiteral,
+        BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
+        RecordField, RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind,
+        UnaryOperator, ValueLiteral, VariantArm, VariantFamily, VariantName,
     },
     token::{Token, TokenKind},
 };
@@ -55,11 +56,20 @@ impl Parser {
     fn let_declaration(&mut self) -> Result<Statement, Diagnostic> {
         let start = self.expect(TokenKind::Let)?.span;
         let (name, _) = self.binding_name()?;
+        let annotation = if self.consume(&TokenKind::Colon) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
         self.expect(TokenKind::Equal)?;
         let value = self.expression()?;
         let end = self.expect(TokenKind::Semicolon)?.span;
         Ok(Statement {
-            kind: StatementKind::Let { name, value },
+            kind: StatementKind::Let {
+                name,
+                annotation,
+                value,
+            },
             span: start.join(end),
         })
     }
@@ -68,19 +78,25 @@ impl Parser {
         let start = self.expect(TokenKind::Fn)?.span;
         let (name, _) = self.binding_name()?;
         let parameters = self.parameters()?;
+        let return_type = if self.consume(&TokenKind::ThinArrow) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
         let body = self.block()?;
         let span = start.join(body.span);
         Ok(Statement {
             kind: StatementKind::Function {
                 name,
                 parameters,
+                return_type,
                 body,
             },
             span,
         })
     }
 
-    fn parameters(&mut self) -> Result<Vec<String>, Diagnostic> {
+    fn parameters(&mut self) -> Result<Vec<Parameter>, Diagnostic> {
         self.expect(TokenKind::LeftParen)?;
         let mut parameters = Vec::new();
         let mut seen = HashSet::new();
@@ -95,7 +111,16 @@ impl Parser {
                         span,
                     ));
                 }
-                parameters.push(name);
+                let annotation = if self.consume(&TokenKind::Colon) {
+                    Some(self.type_annotation()?)
+                } else {
+                    None
+                };
+                parameters.push(Parameter {
+                    name,
+                    annotation,
+                    span,
+                });
 
                 if !self.consume(&TokenKind::Comma) {
                     break;
@@ -284,28 +309,42 @@ impl Parser {
 
     fn call(&mut self) -> Result<Expression, Diagnostic> {
         let mut expression = self.primary()?;
-        while self.consume(&TokenKind::LeftParen) {
-            let mut arguments = Vec::new();
-            if !self.check(&TokenKind::RightParen) {
-                loop {
-                    arguments.push(self.expression()?);
-                    if !self.consume(&TokenKind::Comma) {
-                        break;
-                    }
-                    if self.check(&TokenKind::RightParen) {
-                        break;
+        loop {
+            if self.consume(&TokenKind::LeftParen) {
+                let mut arguments = Vec::new();
+                if !self.check(&TokenKind::RightParen) {
+                    loop {
+                        arguments.push(self.expression()?);
+                        if !self.consume(&TokenKind::Comma) {
+                            break;
+                        }
+                        if self.check(&TokenKind::RightParen) {
+                            break;
+                        }
                     }
                 }
+                let end = self.expect(TokenKind::RightParen)?.span;
+                let span = expression.span.join(end);
+                expression = Expression {
+                    kind: ExpressionKind::Call {
+                        callee: Box::new(expression),
+                        arguments,
+                    },
+                    span,
+                };
+            } else if self.consume(&TokenKind::Dot) {
+                let (field, field_span) = self.identifier()?;
+                let span = expression.span.join(field_span);
+                expression = Expression {
+                    kind: ExpressionKind::FieldAccess {
+                        value: Box::new(expression),
+                        field,
+                    },
+                    span,
+                };
+            } else {
+                break;
             }
-            let end = self.expect(TokenKind::RightParen)?.span;
-            let span = expression.span.join(end);
-            expression = Expression {
-                kind: ExpressionKind::Call {
-                    callee: Box::new(expression),
-                    arguments,
-                },
-                span,
-            };
         }
         Ok(expression)
     }
@@ -347,6 +386,7 @@ impl Parser {
                 })
             }
             TokenKind::LeftBracket => self.list(token.span),
+            TokenKind::Record => self.record(token.span),
             TokenKind::LeftBrace => {
                 self.cursor -= 1;
                 let block = self.block()?;
@@ -386,6 +426,42 @@ impl Parser {
         })
     }
 
+    fn record(&mut self, start: Span) -> Result<Expression, Diagnostic> {
+        self.expect(TokenKind::LeftBrace)?;
+        let mut fields = Vec::new();
+        let mut seen = HashSet::new();
+        if !self.check(&TokenKind::RightBrace) {
+            loop {
+                let (name, name_span) = self.identifier()?;
+                if !seen.insert(name.clone()) {
+                    return Err(Diagnostic::new(
+                        "K2002",
+                        format!("duplicate record field `{name}`"),
+                        name_span,
+                    ));
+                }
+                self.expect(TokenKind::Colon)?;
+                let value = self.expression()?;
+                fields.push(RecordField {
+                    name,
+                    span: name_span.join(value.span),
+                    value,
+                });
+                if !self.consume(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightBrace) {
+                    break;
+                }
+            }
+        }
+        let end = self.expect(TokenKind::RightBrace)?.span;
+        Ok(Expression {
+            kind: ExpressionKind::Record(fields),
+            span: start.join(end),
+        })
+    }
+
     fn if_expression(&mut self, start: Span) -> Result<Expression, Diagnostic> {
         let condition = self.expression()?;
         let consequent = self.block()?;
@@ -418,10 +494,19 @@ impl Parser {
             return Err(self.expected("`(` after `fn`"));
         }
         let parameters = self.parameters()?;
+        let return_type = if self.consume(&TokenKind::ThinArrow) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
         let body = self.block()?;
         let span = start.join(body.span);
         Ok(Expression {
-            kind: ExpressionKind::Function { parameters, body },
+            kind: ExpressionKind::Function {
+                parameters,
+                return_type,
+                body,
+            },
             span,
         })
     }
@@ -429,7 +514,14 @@ impl Parser {
     fn match_expression(&mut self, start: Span) -> Result<Expression, Diagnostic> {
         let subject = self.expression()?;
         self.expect(TokenKind::LeftBrace)?;
+        if self.check(&TokenKind::LeftBracket) {
+            self.list_match(start, subject)
+        } else {
+            self.variant_match(start, subject)
+        }
+    }
 
+    fn list_match(&mut self, start: Span, subject: Expression) -> Result<Expression, Diagnostic> {
         let empty_pattern_start = self.current().span;
         if !self.consume(&TokenKind::LeftBracket) || !self.consume(&TokenKind::RightBracket) {
             return Err(Diagnostic::new(
@@ -476,16 +568,220 @@ impl Parser {
         Ok(Expression {
             kind: ExpressionKind::Match {
                 subject: Box::new(subject),
-                empty_case: Box::new(empty_case),
-                head_name,
-                tail_name,
-                cons_case: Box::new(cons_case),
+                kind: MatchKind::List {
+                    empty_case: Box::new(empty_case),
+                    head_name,
+                    tail_name,
+                    cons_case: Box::new(cons_case),
+                },
             },
             span: start.join(end),
         })
     }
 
+    fn variant_match(
+        &mut self,
+        start: Span,
+        subject: Expression,
+    ) -> Result<Expression, Diagnostic> {
+        let mut arms = Vec::new();
+        let mut seen = HashSet::new();
+
+        while !self.check(&TokenKind::RightBrace) {
+            if self.check(&TokenKind::Eof) {
+                return Err(self.expected("variant match arm or `}`"));
+            }
+            let pattern_start = self.current().span;
+            let token = self.advance().clone();
+            let TokenKind::Identifier(name) = token.kind else {
+                return Err(Diagnostic::new(
+                    "K1003",
+                    "expected `Some(name)`, `None`, `Ok(name)`, or `Err(name)`",
+                    token.span,
+                ));
+            };
+            let variant = match name.as_str() {
+                "Some" => VariantName::Some,
+                "None" => VariantName::None,
+                "Ok" => VariantName::Ok,
+                "Err" => VariantName::Err,
+                _ => {
+                    return Err(Diagnostic::new(
+                        "K1003",
+                        format!("unknown match variant `{name}`"),
+                        token.span,
+                    ));
+                }
+            };
+            if !seen.insert(variant) {
+                return Err(Diagnostic::new(
+                    "K1003",
+                    format!("duplicate `{}` match arm", variant.as_str()),
+                    token.span,
+                ));
+            }
+            let binding = if variant == VariantName::None {
+                if self.check(&TokenKind::LeftParen) {
+                    return Err(Diagnostic::new(
+                        "K1003",
+                        "`None` does not bind a value",
+                        self.current().span,
+                    ));
+                }
+                None
+            } else {
+                if !self.consume(&TokenKind::LeftParen) {
+                    return Err(Diagnostic::new(
+                        "K1003",
+                        format!("`{}` must bind one value", variant.as_str()),
+                        token.span.join(self.current().span),
+                    ));
+                }
+                let (binding, _) = self.binding_name()?;
+                self.expect(TokenKind::RightParen)?;
+                Some(binding)
+            };
+            self.expect(TokenKind::FatArrow)?;
+            let value = self.expression()?;
+            let arm_span = pattern_start.join(value.span);
+            arms.push(VariantArm {
+                variant,
+                binding,
+                value,
+                span: arm_span,
+            });
+            if !self.consume(&TokenKind::Comma) && !self.check(&TokenKind::RightBrace) {
+                return Err(self.expected("`,` or `}`"));
+            }
+        }
+        let end = self.expect(TokenKind::RightBrace)?.span;
+        let family = if seen.len() == 2
+            && seen.contains(&VariantName::Some)
+            && seen.contains(&VariantName::None)
+        {
+            VariantFamily::Option
+        } else if seen.len() == 2
+            && seen.contains(&VariantName::Ok)
+            && seen.contains(&VariantName::Err)
+        {
+            VariantFamily::Result
+        } else {
+            return Err(Diagnostic::new(
+                "K1003",
+                "variant match must contain exactly `Some(name)` and `None`, or exactly `Ok(name)` and `Err(name)`",
+                start.join(end),
+            ));
+        };
+
+        Ok(Expression {
+            kind: ExpressionKind::Match {
+                subject: Box::new(subject),
+                kind: MatchKind::Variants { family, arms },
+            },
+            span: start.join(end),
+        })
+    }
+
+    fn type_annotation(&mut self) -> Result<TypeAnnotation, Diagnostic> {
+        let start = self.current().span;
+        let token = self.advance().clone();
+        let TokenKind::Identifier(name) = token.kind else {
+            return Err(Diagnostic::new(
+                "K1002",
+                format!("expected built-in type, found {}", token.kind.description()),
+                token.span,
+            ));
+        };
+        let kind = match name.as_str() {
+            "Int" => TypeKind::Int,
+            "Bool" => TypeKind::Bool,
+            "String" => TypeKind::String,
+            "Unit" => TypeKind::Unit,
+            "List" => {
+                self.expect(TokenKind::Less)?;
+                let element = self.type_annotation()?;
+                self.expect(TokenKind::Greater)?;
+                TypeKind::List(Box::new(element))
+            }
+            "Option" => {
+                self.expect(TokenKind::Less)?;
+                let element = self.type_annotation()?;
+                self.expect(TokenKind::Greater)?;
+                TypeKind::Option(Box::new(element))
+            }
+            "Result" => {
+                self.expect(TokenKind::Less)?;
+                let value = self.type_annotation()?;
+                self.expect(TokenKind::Comma)?;
+                let error = self.type_annotation()?;
+                self.expect(TokenKind::Greater)?;
+                TypeKind::Result(Box::new(value), Box::new(error))
+            }
+            "Record" => TypeKind::Record(self.record_type_fields()?),
+            _ => {
+                return Err(Diagnostic::new(
+                    "K1002",
+                    format!("unknown built-in type `{name}`"),
+                    token.span,
+                ));
+            }
+        };
+        let end = self.previous().span;
+        Ok(TypeAnnotation {
+            kind,
+            span: start.join(end),
+        })
+    }
+
+    fn record_type_fields(&mut self) -> Result<Vec<RecordTypeField>, Diagnostic> {
+        self.expect(TokenKind::LeftBrace)?;
+        let mut fields = Vec::new();
+        let mut seen = HashSet::new();
+        if !self.check(&TokenKind::RightBrace) {
+            loop {
+                let (name, name_span) = self.identifier()?;
+                if !seen.insert(name.clone()) {
+                    return Err(Diagnostic::new(
+                        "K2002",
+                        format!("duplicate record type field `{name}`"),
+                        name_span,
+                    ));
+                }
+                self.expect(TokenKind::Colon)?;
+                let annotation = self.type_annotation()?;
+                fields.push(RecordTypeField {
+                    name,
+                    span: name_span.join(annotation.span),
+                    annotation,
+                });
+                if !self.consume(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightBrace) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RightBrace)?;
+        Ok(fields)
+    }
+
     fn binding_name(&mut self) -> Result<(String, Span), Diagnostic> {
+        let (name, span) = self.identifier()?;
+        if matches!(
+            name.as_str(),
+            "print" | "println" | "Some" | "None" | "Ok" | "Err" | "json_encode" | "json_decode"
+        ) {
+            return Err(Diagnostic::new(
+                "K2002",
+                format!("`{name}` is a reserved built-in name"),
+                span,
+            ));
+        }
+        Ok((name, span))
+    }
+
+    fn identifier(&mut self) -> Result<(String, Span), Diagnostic> {
         let token = self.advance().clone();
         let TokenKind::Identifier(name) = token.kind else {
             return Err(Diagnostic::new(
@@ -494,13 +790,6 @@ impl Parser {
                 token.span,
             ));
         };
-        if matches!(name.as_str(), "print" | "println") {
-            return Err(Diagnostic::new(
-                "K2002",
-                format!("`{name}` is a reserved built-in name"),
-                token.span,
-            ));
-        }
         Ok((name, token.span))
     }
 
@@ -610,5 +899,70 @@ mod tests {
         let error = parse_text("match items { [value] => value, [] => 0 };")
             .expect_err("invalid patterns should fail");
         assert_eq!(error.code(), "K1003");
+    }
+
+    #[test]
+    fn parses_records_variants_and_annotations() {
+        let program = parse_text(
+            r#"
+            let item: Record { name: String, values: List<Int> } =
+                record { name: "agent", values: [1, 2] };
+            fn unwrap(value: Option<String>) -> String {
+                match value {
+                    Some(name) => name,
+                    None => "missing",
+                }
+            }
+            item.name;
+            unwrap(Some("ready"));
+            "#,
+        )
+        .expect("data syntax should parse");
+
+        let StatementKind::Let {
+            annotation: Some(annotation),
+            ..
+        } = &program.statements[0].kind
+        else {
+            panic!("let annotation should be stored");
+        };
+        assert!(matches!(annotation.kind, TypeKind::Record(_)));
+        let StatementKind::Function {
+            parameters,
+            return_type: Some(_),
+            ..
+        } = &program.statements[1].kind
+        else {
+            panic!("function annotations should be stored");
+        };
+        assert!(parameters[0].annotation.is_some());
+    }
+
+    #[test]
+    fn rejects_duplicate_record_fields_and_variant_arms() {
+        let duplicate_field =
+            parse_text("record { value: 1, value: 2 };").expect_err("duplicate field should fail");
+        assert_eq!(duplicate_field.code(), "K2002");
+
+        let duplicate_type_field =
+            parse_text("let value: Record { item: Int, item: Bool } = record {};")
+                .expect_err("duplicate type field should fail");
+        assert_eq!(duplicate_type_field.code(), "K2002");
+
+        let duplicate_arm =
+            parse_text("match Some(1) { Some(value) => value, Some(other) => other, None => 0 };")
+                .expect_err("duplicate arm should fail");
+        assert_eq!(duplicate_arm.code(), "K1003");
+    }
+
+    #[test]
+    fn rejects_incomplete_or_mixed_variant_matches() {
+        let missing = parse_text("match None { None => 0 };")
+            .expect_err("non-exhaustive option match should fail");
+        assert_eq!(missing.code(), "K1003");
+
+        let mixed = parse_text("match Some(1) { Some(value) => value, Err(error) => error };")
+            .expect_err("mixed variant families should fail");
+        assert_eq!(mixed.code(), "K1003");
     }
 }

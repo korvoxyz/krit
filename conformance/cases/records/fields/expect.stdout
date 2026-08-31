@@ -1,0 +1,2 @@
+record { status: 200, body: "ready" }
+200

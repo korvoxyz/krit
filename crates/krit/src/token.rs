@@ -10,6 +10,7 @@ pub enum TokenKind {
     If,
     Else,
     Match,
+    Record,
     True,
     False,
     LeftParen,
@@ -19,7 +20,9 @@ pub enum TokenKind {
     LeftBracket,
     RightBracket,
     Comma,
+    Colon,
     Semicolon,
+    Dot,
     Equal,
     EqualEqual,
     Bang,
@@ -37,6 +40,7 @@ pub enum TokenKind {
     OrOr,
     DotDot,
     FatArrow,
+    ThinArrow,
     Eof,
 }
 
@@ -51,6 +55,7 @@ impl TokenKind {
             Self::If => "`if`",
             Self::Else => "`else`",
             Self::Match => "`match`",
+            Self::Record => "`record`",
             Self::True => "`true`",
             Self::False => "`false`",
             Self::LeftParen => "`(`",
@@ -60,7 +65,9 @@ impl TokenKind {
             Self::LeftBracket => "`[`",
             Self::RightBracket => "`]`",
             Self::Comma => "`,`",
+            Self::Colon => "`:`",
             Self::Semicolon => "`;`",
+            Self::Dot => "`.`",
             Self::Equal => "`=`",
             Self::EqualEqual => "`==`",
             Self::Bang => "`!`",
@@ -78,6 +85,7 @@ impl TokenKind {
             Self::OrOr => "`||`",
             Self::DotDot => "`..`",
             Self::FatArrow => "`=>`",
+            Self::ThinArrow => "`->`",
             Self::Eof => "end of file",
         }
     }

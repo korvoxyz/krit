@@ -37,6 +37,11 @@ network service, or nondeterministic value.
 | `scope/closures` | immutable lexical capture and shadowing |
 | `functions/recursion` | recursive declaration and calls |
 | `lists/match` | list construction and exhaustive decomposition |
+| `records/fields` | ordered record rendering and field access |
+| `variants/option-match` | exhaustive Option matching |
+| `variants/result-match` | exhaustive Result matching |
+| `json/round-trip` | deterministic JSON conversion |
+| `types/annotations` | parsed binding, parameter, return, and generic types |
 | `errors/syntax` | missing required syntax |
 | `errors/undefined-name` | lexical name resolution |
 | `errors/wrong-kind` | runtime kind checks |
@@ -44,6 +49,13 @@ network service, or nondeterministic value.
 | `errors/division-zero` | checked division |
 | `errors/overflow` | checked signed 64-bit arithmetic |
 | `errors/function-comparison` | non-comparable functions, including in lists |
+| `errors/duplicate-record-field` | unique record field names |
+| `errors/duplicate-variant-arm` | unique Option and Result arms |
+| `errors/incomplete-option-match` | exhaustive Option arms |
+| `errors/mixed-variant-match` | one variant family per match |
+| `errors/json-function` | functions cannot be JSON encoded |
+| `errors/json-invalid` | invalid JSON input |
+| `errors/missing-record-field` | field access requires an existing field |
 
 ## Adding a case
 

@@ -32,7 +32,9 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - familiar expressions, blocks, functions, calls, and operators
 - immutable lexical bindings and closures
 - checked 64-bit integer arithmetic
-- booleans, strings, unit, and immutable lists
+- booleans, strings, unit, immutable lists, and ordered records
+- built-in `Option` and `Result` values with exhaustive matching
+- parsed value annotations and deterministic JSON conversion
 - recursive function declarations
 - exhaustive empty/cons list matching
 - deterministic human and JSON diagnostics
@@ -252,7 +254,8 @@ The conformance suite runs through the Rust tests. See
 The accepted implementation path is:
 
 1. Rust source, parser, diagnostics, and direct evaluator
-2. readable records, variants, `Option`, `Result`, and typed JSON boundaries
+2. readable records, built-in `Option` and `Result`, parsed annotations, and
+   dynamic JSON conversion
 3. name resolution plus static type/effect checking
 4. typed Core IR and a validated WebAssembly component backend
 5. one bounded HTTP/webhook host with outbound HTTP, secrets, and AI calls

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "promptVersion": "0.2.0",
+  "promptVersion": "0.2.1",
   "languageVersion": "0.2.0",
   "edition": "2026",
   "status": "implemented",

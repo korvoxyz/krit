@@ -1,0 +1,3 @@
+match None {
+    None => 0,
+};

@@ -35,11 +35,13 @@ operations yet.
 
 ## Phase 2: readable agent data
 
-- records and variants
-- `Option<T>` and `Result<T, E>`
-- exhaustive matching
-- public function annotations
-- typed JSON decoding and encoding
+**Status:** In progress; data syntax milestone complete
+
+- records and built-in variants
+- `Option<T>` and `Result<T, E>` annotations
+- exhaustive list, Option, and Result matching
+- parsed let, parameter, and return annotations
+- dynamic deterministic JSON decoding and encoding
 - name, type, and effect checking
 - canonical formatter
 

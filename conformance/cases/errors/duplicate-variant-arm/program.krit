@@ -1,0 +1,5 @@
+match Some(1) {
+    Some(value) => value,
+    Some(other) => other,
+    None => 0,
+};

@@ -25,6 +25,9 @@ Bool
 String
 Unit
 List<T>
+Option<T>
+Result<T, E>
+Record { field: Type, ... }
 fn(A, B) -> C
 ```
 
@@ -45,17 +48,21 @@ fn double(value) {
 }
 ```
 
-Exported functions must state parameter, return, and effect contracts:
+The parser accepts value annotations on let bindings, function parameters,
+and function return values:
 
 ```krit
-pub fn total(items: List<Int>) -> Int {
+let fallback: Option<String> = None;
+
+fn total(items: List<Int>) -> Int {
     // ...
 }
 ```
 
-The exact annotation grammar becomes normative with this document. Until then,
-the 0.2 parser must not reserve speculative annotation syntax beyond keywords
-already listed in `LANGUAGE.md`.
+The exact implemented annotation grammar is normative in `LANGUAGE.md`.
+Annotations are stored in the AST but remain dynamically inert until the
+static checker lands. Public declarations and effect annotation syntax are
+still future work.
 
 ## Effects
 
@@ -127,9 +134,8 @@ type becomes unknown.
 
 ## Open decisions
 
-- Final annotation syntax
 - Generic exported functions
-- Record and result types
+- Generic user-defined record and variant declarations
 - Whether effect rows are written inline or in a `requires` clause
-- Exhaustiveness rules beyond lists
+- Exhaustiveness rules for future user-defined variants
 - Stable ABI representation of exported types

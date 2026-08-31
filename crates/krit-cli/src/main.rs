@@ -272,6 +272,6 @@ mod tests {
             count += 1;
             remaining = &code[end + "\n```".len()..];
         }
-        assert_eq!(count, 4, "prompt should contain four canonical examples");
+        assert_eq!(count, 6, "prompt should contain six canonical examples");
     }
 }

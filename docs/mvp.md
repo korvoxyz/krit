@@ -27,11 +27,9 @@ async-runtime, TLS, SDK, or memory-management infrastructure.
 
 ## Required language work
 
-- records and variants
-- `Option<T>` and `Result<T, E>`
-- exhaustive matching
-- typed function and public entry-point boundaries
-- JSON schema conversion
+- static checking for the implemented records, `Option<T>`, and `Result<T, E>`
+- typed public entry-point boundaries
+- schema-directed JSON conversion above the implemented dynamic conversion
 - static effect inference
 - explicit async host operations without exposed executor machinery
 

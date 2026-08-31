@@ -17,6 +17,12 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Strict configuration, secret, and outbound HTTP capability declarations
 - Human and JSON `krit permissions` output for pre-deployment authority review
 - Versioned provider-neutral Krit 0.2 generation prompt and usage contract
+- Readable records with deterministic rendering and field access
+- Built-in `Option` and `Result` values with exhaustive variant matching
+- Parsed type annotations for bindings, parameters, returns, lists, records,
+  options, and results
+- Deterministic `json_encode` and dynamic `json_decode` built-ins
+- Stable `K4008` and `K4009` JSON diagnostics
 
 ### Changed
 
@@ -24,6 +30,8 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   deployment target
 - Defined LLM assistance as optional visible edits gated by deterministic
   formatting, checks, and permission analysis
+- Updated the provider-neutral generation prompt to version 0.2.1 for the
+  readable data surface
 
 ## [0.2.0] - 2026-09-01
 

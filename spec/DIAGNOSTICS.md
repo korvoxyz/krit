@@ -84,6 +84,8 @@ Initial required codes:
 | `K4005` | Integer overflow |
 | `K4006` | Function comparison |
 | `K4007` | Output operation failed |
+| `K4008` | Value cannot be encoded as JSON |
+| `K4009` | Invalid or unsupported JSON input |
 | `K5001` | Required capability not granted |
 | `K6001` | Invalid package manifest |
 | `K6002` | Lockfile is stale or invalid |

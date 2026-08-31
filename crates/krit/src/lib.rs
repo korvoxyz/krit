@@ -6,9 +6,13 @@ mod parser;
 mod source;
 mod token;
 
-pub use ast::{Program, ValueLiteral};
+pub use ast::{
+    BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program, RecordField,
+    RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator,
+    ValueLiteral, VariantArm, VariantFamily, VariantName,
+};
 pub use diagnostic::Diagnostic;
-pub use evaluator::{Value, execute};
+pub use evaluator::{BuiltinFunction, FunctionValue, Value, execute};
 pub use parser::parse;
 pub use source::{Position, Source, Span};
 

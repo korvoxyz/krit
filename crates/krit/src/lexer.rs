@@ -42,8 +42,10 @@ impl<'a> Lexer<'a> {
                 '[' => self.push(TokenKind::LeftBracket, start),
                 ']' => self.push(TokenKind::RightBracket, start),
                 ',' => self.push(TokenKind::Comma, start),
+                ':' => self.push(TokenKind::Colon, start),
                 ';' => self.push(TokenKind::Semicolon, start),
                 '+' => self.push(TokenKind::Plus, start),
+                '-' if self.consume('>') => self.push(TokenKind::ThinArrow, start),
                 '-' => self.push(TokenKind::Minus, start),
                 '*' => self.push(TokenKind::Star, start),
                 '%' => self.push(TokenKind::Percent, start),
@@ -60,6 +62,7 @@ impl<'a> Lexer<'a> {
                 '&' if self.consume('&') => self.push(TokenKind::AndAnd, start),
                 '|' if self.consume('|') => self.push(TokenKind::OrOr, start),
                 '.' if self.consume('.') => self.push(TokenKind::DotDot, start),
+                '.' => self.push(TokenKind::Dot, start),
                 other => {
                     return Err(Diagnostic::new(
                         "K0001",
@@ -108,6 +111,7 @@ impl<'a> Lexer<'a> {
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "match" => TokenKind::Match,
+            "record" => TokenKind::Record,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             _ => TokenKind::Identifier(value.to_owned()),
@@ -330,5 +334,23 @@ mod tests {
         let source = Source::new("test.krit", "1__0;");
         let error = lex(&source).expect_err("source should fail");
         assert_eq!(error.code(), "K0001");
+    }
+
+    #[test]
+    fn lexes_data_and_annotation_punctuation() {
+        let source = Source::new(
+            "test.krit",
+            "let item: Record { value: Int } = record { value: 1 }; item.value; fn(x) -> Int { x };",
+        );
+        let tokens = lex(&source).expect("source should lex");
+
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Record));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Colon));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Dot));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::ThinArrow)
+        );
     }
 }

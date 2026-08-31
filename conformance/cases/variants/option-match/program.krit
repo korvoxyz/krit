@@ -1,0 +1,5 @@
+let value = Some("ready");
+println(match value {
+    None => "missing",
+    Some(name) => name,
+});

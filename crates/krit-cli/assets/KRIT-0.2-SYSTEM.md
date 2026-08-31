@@ -22,11 +22,14 @@ WebAssembly features.
 - booleans: `true`, `false`
 - UTF-8 strings
 - immutable lists: `[1, 2, 3]`
+- immutable records: `record { name: "agent", ready: true }`
+- `Option` values: `Some(value)`, `None`
+- `Result` values: `Ok(value)`, `Err(value)`
 - functions
 - unit, produced by statements and empty blocks
 
-There is no null, mutation, assignment, loop, record, map, module, exception,
-method, field access, indexing, interpolation, or implicit conversion.
+There is no source null literal, mutation, assignment, loop, map, module,
+exception, method, indexing, interpolation, or implicit conversion.
 
 ## Bindings and functions
 
@@ -34,6 +37,7 @@ Immutable binding:
 
 ```text
 let name = expression;
+let count: Int = expression;
 ```
 
 Named recursive function declaration:
@@ -41,6 +45,10 @@ Named recursive function declaration:
 ```text
 fn name(parameter, other_parameter) {
     final_expression
+}
+
+fn typed_name(parameter: Int) -> Result<Int, String> {
+    Ok(parameter)
 }
 ```
 
@@ -54,6 +62,10 @@ fn(parameter) {
 
 Functions use lexical scope. Calls use `function(argument)`. Argument counts
 must match parameter counts.
+
+Annotations are optional and do not enforce types yet. The available annotation
+types are `Int`, `Bool`, `String`, `Unit`, `List<T>`, `Option<T>`,
+`Result<T, E>`, and `Record { field: Type }`.
 
 ## Expressions
 
@@ -91,6 +103,40 @@ match items {
 ```
 
 Use recursive functions with list matching instead of loops or indexing.
+
+Option and Result matches contain exactly both variants, in either order:
+
+```text
+match possible {
+    Some(value) => value,
+    None => fallback,
+}
+
+match result {
+    Ok(value) => value,
+    Err(error) => error,
+}
+```
+
+Do not mix Option and Result arms or omit an arm.
+
+## Records and JSON
+
+Record construction and field access:
+
+```text
+let response = record { status: 200, body: "ready" };
+println(response.status);
+```
+
+Field names in one record must be unique. Records retain their written order
+when rendered.
+
+`json_encode(value)` supports integers, booleans, strings, unit, lists,
+records, Option, and Result. It rejects functions. `json_decode(string)`
+returns dynamic Krit values and rejects invalid JSON. Unit is JSON `null`;
+variants use `{"Some":value}`, `{"None":null}`, `{"Ok":value}`, and
+`{"Err":value}`.
 
 ## Statements and blocks
 
@@ -164,6 +210,36 @@ if should_print {
 } else {
     println("unexpected");
 };
+```
+
+Readable agent data:
+
+```krit
+let request: Record { path: String, retries: Option<Int> } = record {
+    path: "/events",
+    retries: Some(2),
+};
+
+fn retry_count(request: Record { path: String, retries: Option<Int> }) -> Int {
+    match request.retries {
+        Some(count) => count,
+        None => 0,
+    }
+}
+
+println(retry_count(request));
+```
+
+JSON result handling:
+
+```krit
+let decoded = json_decode("{\"Ok\":{\"message\":\"ready\"}}");
+let message = match decoded {
+    Ok(response) => response.message,
+    Err(error) => error,
+};
+
+println(json_encode(record { message: message, delivered: true }));
 ```
 
 Before responding, verify mentally that every identifier is bound, every call

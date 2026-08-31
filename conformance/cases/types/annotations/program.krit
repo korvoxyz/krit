@@ -1,0 +1,10 @@
+let value: Option<Int> = Some(42);
+
+fn unwrap(value: Option<Int>) -> Result<Int, String> {
+    match value {
+        Some(number) => Ok(number),
+        None => Err("missing"),
+    }
+}
+
+println(unwrap(value));
