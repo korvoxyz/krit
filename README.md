@@ -200,6 +200,7 @@ The specification is the semantic authority:
 - [Modules and packages](spec/PACKAGES.md) — draft
 - [Rust technical design](docs/technical-design.md)
 - [Performance methodology](docs/performance.md)
+- [Initial measured baseline](benchmarks/baseline.json)
 - [Conformance suite](conformance/README.md)
 
 The Racket prototype is preserved only in Git history at tag
