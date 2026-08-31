@@ -7,6 +7,19 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- Draft agent application, WebAssembly sandbox, and guided AI authoring
+  specifications
+- Narrow reference-agent MVP and explicit deferred scope
+
+### Changed
+
+- Selected WebAssembly components instead of custom bytecode as the first
+  deployment target
+- Defined LLM assistance as optional visible edits gated by deterministic
+  formatting, checks, and permission analysis
+
 ## [0.2.0] - 2026-09-01
 
 ### Added

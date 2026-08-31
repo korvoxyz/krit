@@ -2,9 +2,9 @@
 
 **Status:** Accepted baseline
 
-Krit performance claims require reproducible measurements. Rust, bytecode,
-native code, caching, and individual optimizations are hypotheses until they
-improve representative workloads.
+Krit performance claims require reproducible measurements. Rust, WebAssembly,
+component runtime selection, caching, and individual optimizations are
+hypotheses until they improve representative workloads.
 
 ## Priorities
 
@@ -15,7 +15,7 @@ For AI-authored automation, optimize in this order:
 3. incremental `check`
 4. clean package build
 5. predictable peak memory
-6. interpreter/VM throughput
+6. evaluator/component throughput
 7. dependency resolution and fetch
 
 Network or model latency is measured separately from language overhead.

@@ -38,6 +38,7 @@ version = "0.1.0"
 edition = "2026"
 entry = "src/main.krit"
 license = "Apache-2.0"
+target = "wasm-component"
 
 [dependencies]
 "krit/json" = "1.2.3"
@@ -53,7 +54,13 @@ globally identified by `(registry, namespace, name)`, not name alone.
 Versions follow Semantic Versioning 2.0.0. Published package contents are
 immutable for a version.
 
+`wasm-component` is the initial deployable target. Unknown targets are errors.
+The target selects an artifact contract, not additional ambient capabilities.
+
 ## Dependency sources
+
+Dependency resolution is deferred until the single-package WebAssembly MVP is
+working end to end. Its accepted design is:
 
 Supported source kinds:
 
@@ -191,6 +198,10 @@ krit publish
 
 All mutating package commands support `--dry-run`. Resolution and build plans
 have stable JSON output for agent use.
+
+The MVP implements only `check`, `build`, `run`, `explain`, and `permissions`
+for one local package. Registry, publishing, and workspace commands remain
+deferred rather than blocking the first sandboxed agent.
 
 ## Open decisions
 

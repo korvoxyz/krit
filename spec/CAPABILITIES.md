@@ -90,15 +90,20 @@ restricted programs whose outputs are content-addressed.
 ## Enforcement
 
 Language-level checks are not a security boundary by themselves. The runtime
-must pair capability handles with operating-system mechanisms where available:
+instantiates a validated WebAssembly component with only the typed imports
+required by its resolved capability plan. It must pair capability handles with
+operating-system mechanisms where available:
 
 - pre-opened file or directory handles
 - restricted child process APIs
 - network allow-list enforcement
 - environment construction rather than inheritance
-- Wasm component or process isolation for untrusted workloads
+- WebAssembly memory and control-flow isolation
+- fuel, memory, stack, host-call, output, and deadline limits
+- process or container isolation for untrusted multi-tenant workloads
 
 An unavailable host enforcement mechanism fails closed for untrusted mode.
+The complete boundary is defined in `WASM-SANDBOX.md`.
 
 ## Revocation and accounting
 

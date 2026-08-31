@@ -5,8 +5,8 @@
 
 ## Mission
 
-Krit is an open text programming language for software written with AI and
-trusted by humans.
+Krit is an open text programming language for small, sandboxed agent and
+integration applications written with AI and trusted by humans.
 
 AI systems should be free to compose useful programs, but generated programs
 must remain precise, reviewable, portable, and constrained by authority that a
@@ -52,6 +52,10 @@ Compiler decisions must be available as structured facts. Diagnostics,
 resolved dependencies, inferred types, effects, capabilities, and build plans
 must have stable machine-readable forms suitable for both people and agents.
 
+AI predictions are optional authoring suggestions, never semantic authority.
+Deterministic formatting, checking, permission analysis, and user-visible
+diffs remain the gate between generated text and executable code.
+
 ### 7. Fast feedback, measured performance
 
 Startup, checking, incremental compilation, cached execution, and predictable
@@ -77,6 +81,13 @@ Unknown syntax, types, effects, capabilities, editions, package fields, or
 lockfile formats fail closed. Krit does not silently continue with reduced
 checks or broader authority.
 
+### 11. Sandboxed deployment
+
+Deployable Krit applications are WebAssembly components with no ambient
+authority. External operations cross narrow typed host interfaces. Resource
+limits and operating-system isolation provide defense in depth around the
+WebAssembly boundary.
+
 ## Non-goals
 
 Krit does not initially aim to:
@@ -88,6 +99,8 @@ Krit does not initially aim to:
 - optimize scientific numerical workloads
 - preserve accidental behavior from the Racket prototype
 - guarantee sandboxing through language syntax alone
+- build or train a proprietary code-generation model
+- silently rewrite accepted source through an LLM
 
 ## Decision test
 

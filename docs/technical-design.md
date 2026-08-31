@@ -32,20 +32,20 @@ source database -> lexer -> parser -> AST
                   normalized Core IR (ANF)
                        /                \
                       v                  v
-              bytecode compiler     explanation data
+             Wasm component         explanation data
                       |
                       v
-             register bytecode VM
+            validator + component host
                       |
                       v
-             capability host boundary
+             capability interfaces
 ```
 
 The first Rust milestone implements source, lexer, parser, AST, diagnostics,
 name resolution, and a direct evaluator to establish semantics quickly. The
-direct evaluator is replaced as the default by bytecode only after
-differential tests prove equivalent behavior. It remains available for
-debugging, not as a second language implementation.
+first deployable backend is a WebAssembly component. It becomes the default
+only after differential tests prove equivalent behavior. The direct evaluator
+remains a development oracle, not a deployment runtime.
 
 ## Workspace
 
@@ -56,10 +56,12 @@ crates/
   krit-diagnostics/  codes, rendering, JSON schema
   krit-semantics/    names, types, effects, HIR
   krit-ir/           normalized Core IR
-  krit-bytecode/     instruction and artifact format
-  krit-runtime/      values, VM, GC, capability handles
+  krit-wasm/         Core IR to WebAssembly component lowering
+  krit-host/         component runtime, limits, and capability handles
   krit-package/      manifests, lockfiles, resolver, store
   krit-cli/          user command and orchestration
+  krit-lsp/          deterministic compiler facts and editor operations
+  krit-assist/       optional provider-neutral LLM edit suggestions
   krit-conformance/  implementation-neutral suite runner
 ```
 
@@ -134,49 +136,50 @@ Initial optimizations:
 - precise closure capture
 - tail-call marking
 
-## Bytecode
+## WebAssembly component target
 
-The primary runtime target is compact register bytecode. Registers reduce
-dispatch and stack traffic for expression-heavy generated programs.
+The primary deployable artifact is a small WebAssembly component. It exports
+typed HTTP, webhook, schedule, queue, or agent-tool entry points and imports
+only narrow host interfaces authorized for the package.
 
-An artifact header contains:
+Krit does not grant a general WASI environment. Files, sockets, processes,
+environment variables, clocks, randomness, secrets, state, and AI calls are
+host resources available only through explicit component imports and
+unforgeable handles.
 
-- magic and artifact schema
+An artifact records:
+
+- WebAssembly Component Model version
 - compiler build identifier
 - language edition
-- target-independent feature bits
-- source/interface hash
-- instruction, constant, function, and source-map sections
-- checksum
+- public interface and inferred effect hashes
+- source-map and explanation metadata selected by profile
+- artifact checksum
 
-Unknown schemas or feature bits fail closed. Bytecode is untrusted input and
-must be validated before execution.
+Unknown features or interfaces fail closed. Every component is validated
+before storage and instantiation.
 
-Native code generation is not a baseline requirement. Cranelift becomes an
-optional backend only when representative benchmarks show bytecode execution
-is the limiting cost. WebAssembly is a deployment boundary, not assumed to be
-the internal IR.
+Wasmtime is the initial reference host candidate. The host enforces fuel or
+epoch interruption, memory, stack, host-call, output, and wall-time limits.
+Untrusted multi-tenant execution adds a restricted OS process or container.
+`spec/WASM-SANDBOX.md` defines the security contract.
+
+A custom bytecode VM and native backend are deferred. They add a second
+security and artifact surface without helping prove the initial agent product.
 
 ## Runtime values and memory
 
 The bootstrap evaluator uses safe Rust enums and reference-counted immutable
-objects. Production VM representation is selected through benchmarks.
+objects. The component backend uses explicit canonical interface types for
+records, variants, strings, lists, options, and results. Host pointers and
+credentials never become guest values.
 
-Candidate production representation:
-
-```text
-Value (64 bits)
-  immediate integer / boolean / unit
-  traced heap reference for string, list, closure
-```
-
-A tracing generational collector is preferred over pervasive reference
-counting when closures and persistent structures become common. No custom
-unsafe representation will be introduced without:
+The component's internal value and memory layout is selected through
+measurements. No custom unsafe representation will be introduced without:
 
 - a safe reference implementation
 - Miri and sanitizer coverage
-- fuzzed bytecode validation
+- fuzzed component and canonical-ABI validation
 - representative memory and speed measurements
 - a documented invariant review
 
@@ -191,7 +194,7 @@ The CLI constructs a host from manifest declarations, user policy, and OS
 sandbox support.
 
 The runtime never inherits the entire process environment. Capability data is
-not serializable into bytecode or cache artifacts.
+not serializable into components or cache artifacts.
 
 ## Package and build system
 
@@ -216,6 +219,12 @@ Human output goes to standard output; diagnostics and progress go to standard
 error. `--json` or command-specific JSON options emit stable schemas with no
 decorative text.
 
+Editor integration is separate from compilation. `krit-lsp` exposes
+deterministic syntax, type, effect, formatting, and permission facts.
+`krit-assist` may ask a configured model for small structured edits, but those
+edits remain provisional until accepted and rechecked. Builds and deployments
+never require an LLM.
+
 ## Testing
 
 Required layers:
@@ -225,11 +234,13 @@ Required layers:
 - implementation-neutral conformance cases
 - CLI integration tests
 - package resolver/store tests with local fixtures
-- malformed source and bytecode fuzzing
+- malformed source and WebAssembly component fuzzing
 - deterministic output tests
 - cache clean/hit equivalence tests
 - capability denial tests
-- differential direct-evaluator/VM tests during VM development
+- differential direct-evaluator/component tests during backend development
+- capability import, resource exhaustion, and instance-reset tests
+- guided-authoring privacy and permission-bypass tests
 
 The conformance suite may be implemented in Rust, but case inputs and expected
 outputs must remain readable by independent implementations.
@@ -237,8 +248,9 @@ outputs must remain readable by independent implementations.
 ## Versioning
 
 Language edition, compiler version, package schema, lockfile schema,
-diagnostic schema, bytecode schema, and JSON command schemas are independent
-versions. A single compiler release records all supported versions.
+diagnostic schema, component interface version, authoring protocol, and JSON
+command schemas are independent versions. A single compiler release records
+all supported versions.
 
 Unknown future versions are errors. Compatibility adapters are explicit.
 
@@ -260,6 +272,17 @@ inspection is useful.
 
 Rejected because it increases compiler complexity and build latency before
 workloads justify native code generation.
+
+### Build a custom bytecode VM first
+
+Rejected because the product requires a portable sandbox boundary more than a
+second runtime. WebAssembly provides validation, mature isolation machinery,
+and typed component interfaces while Krit validates its domain.
+
+### Let an LLM automatically rewrite source
+
+Rejected because invisible semantic changes undermine review and trust. Models
+may propose visible edits; the formatter and checker remain deterministic.
 
 ### Execute natural language
 

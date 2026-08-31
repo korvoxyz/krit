@@ -1,7 +1,7 @@
 # Krit
 
-Krit is an open, human-auditable programming language for software written
-with AI and trusted by people.
+Krit is an open, human-auditable programming language for small sandboxed
+agents, bots, and integration APIs written with AI and trusted by people.
 
 ```krit
 fn sum(items) {
@@ -39,9 +39,10 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - implementation-neutral conformance cases
 - strict package manifest validation
 
-Static types and effects, capability enforcement, modules, dependency
-resolution, bytecode, and build caching are specified directions, not yet
-implemented features. Krit is not production-ready.
+Static types and effects, capability enforcement, WebAssembly components,
+agent APIs, guided authoring, modules, dependency resolution, and build
+caching are specified directions, not yet implemented features. Krit is not
+production-ready.
 
 ## Requirements
 
@@ -195,9 +196,13 @@ The specification is the semantic authority:
 - [Language charter](spec/CHARTER.md)
 - [Krit 0.2 language](spec/LANGUAGE.md)
 - [Diagnostic contract](spec/DIAGNOSTICS.md)
+- [Agent application model](spec/AGENT-APPLICATIONS.md) — draft
 - [Types and effects](spec/TYPES-AND-EFFECTS.md) — draft
 - [Capabilities](spec/CAPABILITIES.md) — draft
 - [Modules and packages](spec/PACKAGES.md) — draft
+- [WebAssembly sandbox](spec/WASM-SANDBOX.md) — draft
+- [Guided AI authoring](spec/GUIDED-AUTHORING.md) — draft
+- [Narrow product MVP](docs/mvp.md)
 - [Rust technical design](docs/technical-design.md)
 - [Performance methodology](docs/performance.md)
 - [Initial measured baseline](benchmarks/baseline.json)
@@ -224,13 +229,13 @@ The conformance suite runs through the Rust tests. See
 The accepted implementation path is:
 
 1. Rust source, parser, diagnostics, and direct evaluator
-2. name resolution plus static type/effect checking
-3. explicit capability host boundary
-4. typed Core IR with precise closure capture
-5. compact register bytecode and validated artifacts
-6. deterministic package resolution, lockfiles, content store, and cache
-7. optional Cranelift or WebAssembly backends only when measurements justify
-   them
+2. readable records, variants, `Option`, `Result`, and typed JSON boundaries
+3. name resolution plus static type/effect checking
+4. typed Core IR and a validated WebAssembly component backend
+5. one bounded HTTP/webhook host with outbound HTTP, secrets, and AI calls
+6. deterministic formatting, explanation, and permission commands
+7. optional provider-neutral inline prediction with visible checked edits
+8. broader connectors and packaging only after the reference agent succeeds
 
 Performance claims follow [docs/performance.md](docs/performance.md), not
 implementation-language assumptions.
