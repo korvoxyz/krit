@@ -1,6 +1,6 @@
 # WebAssembly sandbox
 
-**Status:** Draft  
+**Status:** Draft
 **Target:** Krit 0.4
 
 ## Decision

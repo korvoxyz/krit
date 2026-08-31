@@ -1,6 +1,6 @@
 # Guided AI authoring
 
-**Status:** Draft  
+**Status:** Draft
 **Target:** Krit 0.4
 
 ## Goal

@@ -1,6 +1,6 @@
 # Krit agent MVP
 
-**Status:** Accepted scope  
+**Status:** Accepted scope
 **Purpose:** Prove the product without building the entire platform
 
 ## Product test
