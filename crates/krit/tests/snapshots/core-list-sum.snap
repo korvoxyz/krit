@@ -1,0 +1,40 @@
+core module
+entry f0 module-init effects {io.stdout}
+bindings
+  b0 function sum: fn(List<Int>) -> Int effects {}
+  b1 parameter items: List<Int>
+  b2 match head: Int
+  b3 match tail: List<Int>
+  b4 let numbers: List<Int>
+function f0 $module_init () -> Unit effects {io.stdout}
+  block bb0 -> Unit effects {io.stdout}
+    v8: fn(List<Int>) -> Int effects {} = closure cl0 f1 []
+    v9: Unit = bind b0 = v8
+    v10: Int = int 10
+    v11: Int = int 20
+    v12: Int = int 12
+    v13: List<Int> = list [v10, v11, v12]
+    v14: Unit = bind b4 = v13
+    v15: fn(List<Int>) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v16: Unit = call v15(v13) effects {io.stdout}
+    v17: Unit = discard v16
+    v18: fn(Int) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v19: Int = call v8(v13)
+    v20: Unit = call v18(v19) effects {io.stdout}
+    v21: Unit = discard v20
+    v22: Unit = unit
+    return v22
+function f1 sum (p0 b1 v1: List<Int>) -> Int effects {}
+  self b0 v0: fn(List<Int>) -> Int effects {}
+  block bb1 -> Int effects {}
+    v7: Int = match-list v1 effects {}
+    empty
+      block bb2 -> Int effects {}
+        v2: Int = int 0
+        return v2
+    cons m0 m1
+      block bb3(m0 b2 v3 head: Int, m1 b3 v4 tail: List<Int>) -> Int effects {}
+        v5: Int = call v0(v4)
+        v6: Int = add v3 v5
+        return v6
+    return v7

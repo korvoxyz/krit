@@ -202,9 +202,10 @@ krit publish
 All mutating package commands support `--dry-run`. Resolution and build plans
 have stable JSON output for agent use.
 
-The MVP implements only `check`, `build`, `run`, `explain`, and `permissions`
-for one local package. Registry, publishing, and workspace commands remain
-deferred rather than blocking the first sandboxed agent.
+The planned MVP scope includes only `check`, `build`, `run`, `explain`, and
+`permissions` for one local package. The current bootstrap has no artifact
+`build` command or WebAssembly output yet. Registry, publishing, and workspace
+commands remain deferred rather than blocking the first sandboxed agent.
 
 ## Open decisions
 

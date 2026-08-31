@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Span {
     pub start: usize,
     pub end: usize,

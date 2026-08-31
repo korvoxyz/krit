@@ -1,6 +1,6 @@
 # Static types and effects
 
-**Status:** Implemented baseline with draft extensions
+**Status:** Implemented baseline with typed Core facts and draft extensions
 **Target:** Krit 0.2 bootstrap
 
 ## Goals
@@ -102,9 +102,21 @@ match effects are conservative unions. JSON conversion is pure.
 
 The Rust API returns effects in sorted deterministic order through
 `Analysis::effects`; function types expose their inferred latent effects.
-`krit check` intentionally preserves its existing success line and does not
-print the effect set yet. A future `krit explain` command will render compiler
-facts for users.
+`Analysis` also exposes normalized symbol, expression, and block type/effect
+facts plus resolved symbol or built-in identities. Core lowering consumes
+those facts and does not run an independent inference algorithm.
+
+Core name resolution and type inference do not imply that every type has a
+concrete backend layout. Valid generic Core may retain constrained
+`Type::Variable` values, and open structural record constraints may retain
+required-field information without defining a closed representation. A Wasm
+artifact stage must specialize or monomorphize those boundaries, or emit a
+stable source diagnostic, before layout selection and code emission.
+
+`krit check` preserves its existing success line while lowering and verifying
+typed Core IR. `krit explain FILE` renders module-init effects, top-level
+binding types, and stable Core facts; `krit explain --json FILE` emits
+versioned schema 1 JSON.
 
 ## Effects versus capabilities
 
@@ -158,4 +170,3 @@ type becomes unknown.
 - Exhaustiveness rules for future user-defined variants
 - Stable ABI representation of exported types
 - Let-generalization and effect polymorphism
-- User-facing `krit explain` rendering of inferred facts

@@ -190,7 +190,12 @@ counts. Teams can choose stricter profiles.
 
 ## Explainability
 
-`krit explain` produces human and JSON views of:
+The implemented bootstrap `krit explain` produces deterministic human and
+schema-1 JSON views of the synthetic module-init entrypoint, inferred effects,
+top-level binding/function types, and resolved typed Core IR.
+
+As the corresponding language and host features arrive, the command extends
+those compiler facts with:
 
 - exported routes, webhooks, schedules, queues, and tools
 - external services and model providers

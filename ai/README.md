@@ -13,9 +13,9 @@ not part of the compiler or runtime.
 The prompt contains only implemented Krit 0.2 syntax, including records,
 built-in Option and Result values, checked annotations, JSON conversion,
 canonical formatting, and the static rules enforced by `krit check`. Draft
-HTTP, WebAssembly, explanation, and capability designs are intentionally
-excluded so a model does not generate code the current compiler cannot
-accept.
+HTTP, WebAssembly, and capability designs are intentionally excluded so a
+model does not generate code the current compiler cannot accept. The compiler
+can explain checked source, but explanations do not add source-language APIs.
 
 ## Use
 
@@ -39,6 +39,7 @@ Save the returned Krit block and check it:
 krit fmt generated.krit
 krit fmt --check generated.krit
 krit check generated.krit
+krit explain --json generated.krit
 ```
 
 For a failed check, send the model:
@@ -49,9 +50,11 @@ For a failed check, send the model:
 4. the instruction: “Make the smallest edit that fixes these diagnostics.
    Do not add unsupported language features.”
 
-Run and review permissions only after checking:
+Inspect inferred types/effects, then run and review permissions only after
+checking:
 
 ```sh
+krit explain generated.krit
 krit run generated.krit
 krit permissions
 ```

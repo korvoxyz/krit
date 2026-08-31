@@ -258,3 +258,6 @@ has the correct argument count, every statement has the required semicolon,
 every block value omits its semicolon, annotations and branches agree, match
 subjects have the right family, and no unsupported feature appears. Generated
 source must pass `krit check` without being executed.
+The user can inspect its inferred types, effects, and resolved compiler form
+with `krit explain --json`; this explanation does not make unsupported syntax
+or APIs available.

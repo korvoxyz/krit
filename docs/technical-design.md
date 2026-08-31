@@ -1,6 +1,6 @@
 # Krit Rust technical design
 
-**Status:** Accepted baseline  
+**Status:** Accepted; typed Core IR implemented
 **Owner:** Akshay Bhardwaj
 
 ## Decision
@@ -41,11 +41,13 @@ source database -> lexer -> parser -> AST
              capability interfaces
 ```
 
-The first Rust milestone implements source, lexer, parser, AST, diagnostics,
-name resolution, and a direct evaluator to establish semantics quickly. The
-first deployable backend is a WebAssembly component. It becomes the default
-only after differential tests prove equivalent behavior. The direct evaluator
-remains a development oracle, not a deployment runtime.
+The Rust bootstrap implements source, lexer, parser, AST, diagnostics, name
+resolution, type/effect analysis, a verified typed Core IR, and a direct
+evaluator that establishes runtime semantics. The first deployable backend is
+a WebAssembly component, but no WebAssembly crate or artifact exists yet. The
+backend becomes the default only after differential tests prove equivalent
+behavior. The direct evaluator remains a development oracle, not a deployment
+runtime.
 
 ## Workspace
 
@@ -114,28 +116,73 @@ a second language parser.
 
 ### Name resolution
 
-The phase-2 bootstrap analyzer resolves lexical names directly over the
-spanned AST and reports duplicate declarations. Stable symbol IDs and a
-separate resolved HIR arrive with Core IR lowering. Built-ins currently occupy
-an analyzer prelude.
+The analyzer resolves lexical names over the spanned AST, reports duplicate
+declarations, and assigns deterministic symbol IDs to lets, named functions,
+parameters, and match bindings. Typed expression facts record either a symbol
+ID or an explicit built-in identity; executable Core references never perform
+source-name lookup. Original names survive only as optional debug metadata.
 
 ### Types and effects
 
-The phase-2 checker emits public analysis facts from the AST: inferred binding
-types, source spans, and sorted effects. Inference variables and diagnostic
-ordering are deterministic. Resolved typed HIR and public signature cache
-boundaries arrive in phase 3.
+The checker emits public analysis facts from the AST: inferred binding,
+symbol, expression, and block types; resolved name facts; source spans; and
+sorted effects. Core lowering consumes these normalized facts instead of
+re-running inference. Types retain shared `Arc` substructure so repeated Core
+boundaries do not expand the inference DAG. A normalized inference type can
+still contain a constrained parametric variable; name resolution does not
+imply a concrete backend layout. Public signature cache boundaries remain
+future module work.
 
 ### Core IR
 
-Core IR is typed, expression-oriented, and in administrative normal form:
+The bootstrap uses one resolved, typed Core IR rather than a second HIR whose
+boundary would duplicate the small current analyzer. Core IR is
+expression-oriented and in administrative normal form:
 
-- operands are variables or constants
-- evaluation order is explicit
-- closure capture sets are explicit
-- branches and list matching are explicit control flow
-- effectful operations are distinct instructions
-- source spans survive lowering
+- every executable operand is a `ValueId`, never a source variable name
+- bindings, functions, values, parameters, captures, closures, blocks, and
+  match inputs have deterministic typed IDs
+- calls evaluate the callee and arguments left to right; lists and records
+  evaluate elements and fields left to right
+- short-circuit operators, blocks, conditionals, list matches, and
+  Option/Result matches contain explicit nested blocks
+- recursive functions have an explicit self value and lexical closures have
+  explicit typed capture parameters and closure arguments
+- built-ins identify stdout host effects, pure variant constructors, and pure
+  JSON conversions separately
+- every operation, block, function boundary, and module-init entrypoint exposes
+  a normalized inferred type and sorted conservative effects
+- source spans survive lowering without becoming executable names
+
+Standalone source lowers to the stable synthetic `module-init` entrypoint.
+Future package exports can add entrypoint kinds without inventing agent APIs.
+
+Built-in identity defines intrinsic behavior. Constructing any built-in
+function value is pure; stdout built-ins require `io.stdout` when called, while
+constructors and JSON conversions have no intrinsic effect. Bidirectional
+inference may conservatively add effects to a built-in's function type, and a
+later Core call carries that inferred superset without making built-in value
+creation effectful.
+
+The Core verifier rejects duplicate or out-of-range IDs, unavailable uses,
+leaked branch values, inconsistent branch and match results, invalid call
+signatures or arity, mismatched operation types, malformed captures, and
+understated effect summaries. `krit check` and `krit explain` lower and verify
+successfully analyzed source; a failure after valid analysis is an internal
+compiler error.
+
+Residual `Type::Variable` values at Core boundaries are intentional
+parametric types, not malformed Core and not yet Wasm-ready layouts. The
+verifier accepts them where an operation records the relevant constraint, such
+as addition or equality. Before layout selection or emission, the Wasm
+artifact stage must monomorphize/specialize them or issue a stable diagnostic
+at source level. Open structural record requirements similarly state required
+fields without selecting a closed physical record layout.
+
+`CoreModule::render_text` is deterministic and is covered by checked golden
+files. `krit explain [--json] FILE` exposes module-init effects, top-level
+types, and the same Core facts. Its JSON schema is versioned independently and
+serialized through `serde_json`.
 
 Optimization never changes overflow, effect order, capability checks,
 diagnostic category, or deterministic rendering.

@@ -1,0 +1,32 @@
+core module
+entry f0 module-init effects {io.stdout}
+bindings
+  b0 let offset: Int
+  b1 parameter value: Int
+  b2 let add_offset: fn(Int) -> Int effects {}
+  b3 let offset: Int
+function f0 $module_init () -> Unit effects {io.stdout}
+  block bb0 -> Unit effects {io.stdout}
+    v0: Int = int 40
+    v1: Unit = bind b0 = v0
+    v5: fn(Int) -> Int effects {} = closure cl0 f1 [c0:b0=v0]
+    v6: Unit = bind b2 = v5
+    v15: Unit = block effects {io.stdout}
+      block bb2 -> Unit effects {io.stdout}
+        v7: Int = int 100
+        v8: Unit = bind b3 = v7
+        v9: fn(Int) -> Unit effects {io.stdout} = builtin println [host-effect]
+        v10: Int = int 2
+        v11: Int = call v5(v10)
+        v12: Unit = call v9(v11) effects {io.stdout}
+        v13: Unit = discard v12
+        v14: Unit = unit
+        return v14
+    v16: Unit = discard v15
+    v17: Unit = unit
+    return v17
+function f1 (p0 b1 v2: Int) -> Int effects {}
+  capture c0 b0 v3: Int
+  block bb1 -> Int effects {}
+    v4: Int = add v2 v3
+    return v4

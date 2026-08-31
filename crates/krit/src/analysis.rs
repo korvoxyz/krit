@@ -1,11 +1,12 @@
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     sync::Arc,
 };
 
 use crate::{
-    Diagnostic, Span,
+    Builtin, Diagnostic, Span,
     ast::{
         BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
         Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral,
@@ -17,6 +18,10 @@ use crate::{
 pub struct Analysis {
     bindings: Vec<BindingAnalysis>,
     effects: EffectSet,
+    symbols: Vec<SymbolAnalysis>,
+    symbol_index: Vec<u32>,
+    expressions: Vec<ExpressionAnalysis>,
+    blocks: Vec<BlockAnalysis>,
 }
 
 impl Analysis {
@@ -27,26 +32,198 @@ impl Analysis {
     pub const fn effects(&self) -> &EffectSet {
         &self.effects
     }
+
+    pub fn symbols(&self) -> &[SymbolAnalysis] {
+        &self.symbols
+    }
+
+    pub fn expressions(&self) -> &[ExpressionAnalysis] {
+        &self.expressions
+    }
+
+    pub fn blocks(&self) -> &[BlockAnalysis] {
+        &self.blocks
+    }
+
+    pub fn symbol(&self, span: Span, name: &str, kind: SymbolKind) -> Option<&SymbolAnalysis> {
+        let position = self
+            .symbol_index
+            .binary_search_by(|index| {
+                symbol_key_order(&self.symbols[*index as usize], span, name, kind)
+            })
+            .ok()?;
+        self.symbols.get(self.symbol_index[position] as usize)
+    }
+
+    pub fn expression(&self, span: Span) -> Option<&ExpressionAnalysis> {
+        self.expressions
+            .binary_search_by_key(&span, |expression| expression.span)
+            .ok()
+            .and_then(|index| self.expressions.get(index))
+    }
+
+    pub fn block(&self, span: Span) -> Option<&BlockAnalysis> {
+        self.blocks
+            .binary_search_by_key(&span, |block| block.span)
+            .ok()
+            .and_then(|index| self.blocks.get(index))
+    }
+}
+
+fn symbol_key_order(symbol: &SymbolAnalysis, span: Span, name: &str, kind: SymbolKind) -> Ordering {
+    symbol
+        .span
+        .cmp(&span)
+        .then_with(|| symbol.name.as_str().cmp(name))
+        .then_with(|| symbol.kind.cmp(&kind))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BindingAnalysis {
+    id: SymbolId,
     name: String,
-    ty: Type,
+    ty: Arc<Type>,
     span: Span,
+    top_level: bool,
 }
 
 impl BindingAnalysis {
+    pub const fn id(&self) -> SymbolId {
+        self.id
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub const fn ty(&self) -> &Type {
-        &self.ty
+    pub fn ty(&self) -> &Type {
+        self.ty.as_ref()
     }
 
     pub const fn span(&self) -> Span {
         self.span
+    }
+
+    pub const fn is_top_level(&self) -> bool {
+        self.top_level
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SymbolId(u32);
+
+impl SymbolId {
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SymbolKind {
+    Let,
+    Function,
+    Parameter,
+    Match,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymbolAnalysis {
+    id: SymbolId,
+    name: String,
+    kind: SymbolKind,
+    ty: Arc<Type>,
+    span: Span,
+    top_level: bool,
+}
+
+impl SymbolAnalysis {
+    pub const fn id(&self) -> SymbolId {
+        self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn kind(&self) -> SymbolKind {
+        self.kind
+    }
+
+    pub fn ty(&self) -> &Type {
+        self.ty.as_ref()
+    }
+
+    pub(crate) fn shared_type(&self) -> Arc<Type> {
+        Arc::clone(&self.ty)
+    }
+
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+
+    pub const fn is_top_level(&self) -> bool {
+        self.top_level
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolvedName {
+    Symbol(SymbolId),
+    Builtin(Builtin),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpressionAnalysis {
+    span: Span,
+    ty: Arc<Type>,
+    effects: EffectSet,
+    resolved_name: Option<ResolvedName>,
+}
+
+impl ExpressionAnalysis {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+
+    pub fn ty(&self) -> &Type {
+        self.ty.as_ref()
+    }
+
+    pub(crate) fn shared_type(&self) -> Arc<Type> {
+        Arc::clone(&self.ty)
+    }
+
+    pub const fn effects(&self) -> &EffectSet {
+        &self.effects
+    }
+
+    pub const fn resolved_name(&self) -> Option<ResolvedName> {
+        self.resolved_name
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockAnalysis {
+    span: Span,
+    ty: Arc<Type>,
+    effects: EffectSet,
+}
+
+impl BlockAnalysis {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+
+    pub fn ty(&self) -> &Type {
+        self.ty.as_ref()
+    }
+
+    pub(crate) fn shared_type(&self) -> Arc<Type> {
+        Arc::clone(&self.ty)
+    }
+
+    pub const fn effects(&self) -> &EffectSet {
+        &self.effects
     }
 }
 
@@ -114,12 +291,28 @@ pub struct FunctionType {
 }
 
 impl FunctionType {
+    pub(crate) fn new(
+        parameters: Vec<Arc<Type>>,
+        return_type: Arc<Type>,
+        effects: EffectSet,
+    ) -> Self {
+        Self {
+            parameters,
+            return_type,
+            effects,
+        }
+    }
+
     pub fn parameters(&self) -> &[Arc<Type>] {
         &self.parameters
     }
 
     pub fn return_type(&self) -> &Type {
         self.return_type.as_ref()
+    }
+
+    pub(crate) fn shared_return_type(&self) -> Arc<Type> {
+        Arc::clone(&self.return_type)
     }
 
     pub const fn effects(&self) -> &EffectSet {
@@ -177,6 +370,22 @@ impl EffectSet {
     pub fn is_empty(&self) -> bool {
         self.effects.is_empty()
     }
+
+    pub fn contains(&self, effect: &Effect) -> bool {
+        self.effects.binary_search(effect).is_ok()
+    }
+
+    pub fn is_superset(&self, other: &Self) -> bool {
+        other.effects.iter().all(|effect| self.contains(effect))
+    }
+
+    pub(crate) fn union<'a>(sets: impl IntoIterator<Item = &'a Self>) -> Self {
+        let mut effects = BTreeSet::new();
+        for set in sets {
+            effects.extend(set.effects.iter().cloned());
+        }
+        effect_set(effects)
+    }
 }
 
 impl fmt::Display for EffectSet {
@@ -233,15 +442,40 @@ impl InferEffects {
     }
 }
 
+#[derive(Clone)]
 struct ExpressionInfo {
     ty: InferType,
     effects: InferEffects,
 }
 
 struct PendingBinding {
+    id: SymbolId,
     name: String,
     ty: InferType,
     span: Span,
+    top_level: bool,
+}
+
+struct PendingSymbol {
+    id: SymbolId,
+    name: String,
+    kind: SymbolKind,
+    ty: InferType,
+    span: Span,
+    top_level: bool,
+}
+
+struct PendingExpression {
+    span: Span,
+    ty: InferType,
+    effects: InferEffects,
+    resolved_name: Option<ResolvedName>,
+}
+
+struct PendingBlock {
+    span: Span,
+    ty: InferType,
+    effects: InferEffects,
 }
 
 struct TypeConstraint {
@@ -257,13 +491,23 @@ enum ConstraintKind {
 }
 
 struct Analyzer {
-    scopes: Vec<BTreeMap<String, InferType>>,
+    scopes: Vec<BTreeMap<String, ScopeBinding>>,
     type_parents: Vec<TypeVariable>,
     substitutions: HashMap<TypeVariable, InferType>,
     next_type_variable: TypeVariable,
     effect_definitions: Vec<InferEffects>,
+    next_symbol: u32,
     bindings: Vec<PendingBinding>,
+    symbols: Vec<PendingSymbol>,
+    expressions: Vec<PendingExpression>,
+    blocks: Vec<PendingBlock>,
     constraints: Vec<TypeConstraint>,
+}
+
+#[derive(Clone)]
+struct ScopeBinding {
+    id: SymbolId,
+    ty: InferType,
 }
 
 impl Analyzer {
@@ -274,7 +518,11 @@ impl Analyzer {
             substitutions: HashMap::new(),
             next_type_variable: 0,
             effect_definitions: Vec::new(),
+            next_symbol: 0,
             bindings: Vec::new(),
+            symbols: Vec::new(),
+            expressions: Vec::new(),
+            blocks: Vec::new(),
             constraints: Vec::new(),
         }
     }
@@ -292,14 +540,82 @@ impl Analyzer {
             .bindings
             .iter()
             .map(|binding| BindingAnalysis {
+                id: binding.id,
                 name: binding.name.clone(),
-                ty: normalizer.normalize(&binding.ty).as_ref().clone(),
+                ty: normalizer.normalize(&binding.ty),
                 span: binding.span,
+                top_level: binding.top_level,
             })
             .collect();
         let effects = effect_set(self.resolve_effects(&effects, &expanded_effects));
+        let symbols = self
+            .symbols
+            .iter()
+            .map(|symbol| SymbolAnalysis {
+                id: symbol.id,
+                name: symbol.name.clone(),
+                kind: symbol.kind,
+                ty: normalizer.normalize(&symbol.ty),
+                span: symbol.span,
+                top_level: symbol.top_level,
+            })
+            .collect::<Vec<_>>();
+        let mut symbol_index = (0..symbols.len() as u32).collect::<Vec<_>>();
+        symbol_index.sort_unstable_by(|left, right| {
+            let left = &symbols[*left as usize];
+            let right = &symbols[*right as usize];
+            symbol_key_order(left, right.span, &right.name, right.kind)
+        });
+        assert!(
+            symbol_index.windows(2).all(|window| {
+                let left = &symbols[window[0] as usize];
+                let right = &symbols[window[1] as usize];
+                symbol_key_order(left, right.span, &right.name, right.kind) != Ordering::Equal
+            }),
+            "analysis symbol keys must be unique"
+        );
+        let mut expressions = self
+            .expressions
+            .iter()
+            .map(|expression| ExpressionAnalysis {
+                span: expression.span,
+                ty: normalizer.normalize(&expression.ty),
+                effects: effect_set(self.resolve_effects(&expression.effects, &expanded_effects)),
+                resolved_name: expression.resolved_name,
+            })
+            .collect::<Vec<_>>();
+        expressions.sort_by_key(|expression| expression.span);
+        assert!(
+            expressions
+                .windows(2)
+                .all(|window| window[0].span != window[1].span),
+            "analysis expression spans must be unique"
+        );
+        let mut blocks = self
+            .blocks
+            .iter()
+            .map(|block| BlockAnalysis {
+                span: block.span,
+                ty: normalizer.normalize(&block.ty),
+                effects: effect_set(self.resolve_effects(&block.effects, &expanded_effects)),
+            })
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|block| block.span);
+        assert!(
+            blocks
+                .windows(2)
+                .all(|window| window[0].span != window[1].span),
+            "analysis block spans must be unique"
+        );
 
-        Ok(Analysis { bindings, effects })
+        Ok(Analysis {
+            bindings,
+            effects,
+            symbols,
+            symbol_index,
+            expressions,
+            blocks,
+        })
     }
 
     fn statement(&mut self, statement: &Statement) -> Result<InferEffects, Diagnostic> {
@@ -325,11 +641,20 @@ impl Analyzer {
                 };
                 let binding_type = self.fresh_type();
                 self.unify(binding_type.clone(), ty, statement.span, "let binding")?;
-                self.define(name, binding_type.clone());
+                let top_level = self.scopes.len() == 1;
+                let id = self.define_symbol(
+                    name,
+                    binding_type.clone(),
+                    statement.span,
+                    SymbolKind::Let,
+                    top_level,
+                );
                 self.bindings.push(PendingBinding {
+                    id,
                     name: name.clone(),
                     ty: binding_type,
                     span: statement.span,
+                    top_level,
                 });
                 Ok(value.effects)
             }
@@ -357,7 +682,14 @@ impl Analyzer {
                     return_type: Box::new(declared_return.clone()),
                     effect,
                 };
-                self.define(name, function_type.clone());
+                let top_level = self.scopes.len() == 1;
+                let id = self.define_symbol(
+                    name,
+                    function_type.clone(),
+                    statement.span,
+                    SymbolKind::Function,
+                    top_level,
+                );
 
                 self.push_scope();
                 self.define_parameters(parameters, &parameter_types)?;
@@ -371,9 +703,11 @@ impl Analyzer {
                 )?;
                 self.effect_definitions[effect as usize].union(body_info.effects);
                 self.bindings.push(PendingBinding {
+                    id,
                     name: name.clone(),
                     ty: function_type,
                     span: statement.span,
+                    top_level,
                 });
                 Ok(InferEffects::default())
             }
@@ -395,11 +729,18 @@ impl Analyzer {
             InferType::Unit
         };
         self.pop_scope();
-        Ok(ExpressionInfo { ty, effects })
+        let info = ExpressionInfo { ty, effects };
+        self.blocks.push(PendingBlock {
+            span: block.span,
+            ty: info.ty.clone(),
+            effects: info.effects.clone(),
+        });
+        Ok(info)
     }
 
     fn expression(&mut self, expression: &Expression) -> Result<ExpressionInfo, Diagnostic> {
-        match &expression.kind {
+        let mut resolved_name = None;
+        let info = match &expression.kind {
             ExpressionKind::Literal(literal) => Ok(ExpressionInfo {
                 ty: match literal {
                     ValueLiteral::Integer(_) => InferType::Int,
@@ -408,10 +749,14 @@ impl Analyzer {
                 },
                 effects: InferEffects::default(),
             }),
-            ExpressionKind::Variable(name) => Ok(ExpressionInfo {
-                ty: self.lookup(name, expression.span)?,
-                effects: InferEffects::default(),
-            }),
+            ExpressionKind::Variable(name) => {
+                let (ty, resolution) = self.lookup(name, expression.span)?;
+                resolved_name = Some(resolution);
+                Ok(ExpressionInfo {
+                    ty,
+                    effects: InferEffects::default(),
+                })
+            }
             ExpressionKind::List(elements) => self.list(elements),
             ExpressionKind::Record(fields) => {
                 let mut types = BTreeMap::new();
@@ -498,7 +843,14 @@ impl Analyzer {
                 operator,
                 right,
             } => self.binary(left, *operator, right, expression.span),
-        }
+        }?;
+        self.expressions.push(PendingExpression {
+            span: expression.span,
+            ty: info.ty.clone(),
+            effects: info.effects.clone(),
+            resolved_name,
+        });
+        Ok(info)
     }
 
     fn list(&mut self, elements: &[Expression]) -> Result<ExpressionInfo, Diagnostic> {
@@ -656,8 +1008,14 @@ impl Analyzer {
                 )?;
                 let empty = self.expression(empty_case)?;
                 self.push_scope();
-                self.define(head_name, element.clone());
-                self.define(tail_name, InferType::List(Box::new(element)));
+                self.define_symbol(head_name, element.clone(), span, SymbolKind::Match, false);
+                self.define_symbol(
+                    tail_name,
+                    InferType::List(Box::new(element)),
+                    span,
+                    SymbolKind::Match,
+                    false,
+                );
                 let cons = self.expression(cons_case)?;
                 self.pop_scope();
                 let ty = self.unify(empty.ty, cons.ty, span, "list match arms")?;
@@ -715,7 +1073,7 @@ impl Analyzer {
                         ));
                     }
                 };
-                self.define(binding, payload);
+                self.define_symbol(binding, payload, arm.span, SymbolKind::Match, false);
             }
             let arm_info = self.expression(&arm.value)?;
             self.pop_scope();
@@ -817,7 +1175,13 @@ impl Analyzer {
     ) -> Result<(), Diagnostic> {
         for (parameter, ty) in parameters.iter().zip(types) {
             self.ensure_name_available(&parameter.name, parameter.span)?;
-            self.define(&parameter.name, ty.clone());
+            self.define_symbol(
+                &parameter.name,
+                ty.clone(),
+                parameter.span,
+                SymbolKind::Parameter,
+                false,
+            );
         }
         Ok(())
     }
@@ -1346,84 +1710,85 @@ impl Analyzer {
         }
     }
 
-    fn lookup(&mut self, name: &str, span: Span) -> Result<InferType, Diagnostic> {
+    fn lookup(&mut self, name: &str, span: Span) -> Result<(InferType, ResolvedName), Diagnostic> {
         for scope in self.scopes.iter().rev() {
-            if let Some(ty) = scope.get(name) {
-                return Ok(ty.clone());
+            if let Some(binding) = scope.get(name) {
+                return Ok((binding.ty.clone(), ResolvedName::Symbol(binding.id)));
             }
         }
         self.builtin(name, span)
             .ok_or_else(|| Diagnostic::new("K2001", format!("undefined name `{name}`"), span))
     }
 
-    fn builtin(&mut self, name: &str, span: Span) -> Option<InferType> {
-        match name {
-            "print" | "println" => {
+    fn builtin(&mut self, name: &str, span: Span) -> Option<(InferType, ResolvedName)> {
+        let builtin = Builtin::from_name(name)?;
+        let ty = match builtin {
+            Builtin::Print | Builtin::Println => {
                 let effect = self.fresh_effect();
                 self.effect_definitions[effect as usize]
                     .direct
                     .insert(Effect::IoStdout);
-                Some(InferType::Function {
+                InferType::Function {
                     parameters: vec![self.fresh_type()],
                     return_type: Box::new(InferType::Unit),
                     effect,
-                })
+                }
             }
-            "Some" => {
+            Builtin::Some => {
                 let value = self.fresh_type();
-                Some(InferType::Function {
+                InferType::Function {
                     parameters: vec![value.clone()],
                     return_type: Box::new(InferType::Option(Box::new(value))),
                     effect: self.fresh_effect(),
-                })
+                }
             }
-            "None" => Some(InferType::Option(Box::new(self.fresh_type()))),
-            "Ok" => {
+            Builtin::None => InferType::Option(Box::new(self.fresh_type())),
+            Builtin::Ok => {
                 let value = self.fresh_type();
-                Some(InferType::Function {
+                InferType::Function {
                     parameters: vec![value.clone()],
                     return_type: Box::new(InferType::Result(
                         Box::new(value),
                         Box::new(self.fresh_type()),
                     )),
                     effect: self.fresh_effect(),
-                })
+                }
             }
-            "Err" => {
+            Builtin::Err => {
                 let error = self.fresh_type();
-                Some(InferType::Function {
+                InferType::Function {
                     parameters: vec![error.clone()],
                     return_type: Box::new(InferType::Result(
                         Box::new(self.fresh_type()),
                         Box::new(error),
                     )),
                     effect: self.fresh_effect(),
-                })
+                }
             }
-            "json_encode" => {
+            Builtin::JsonEncode => {
                 let value = self.fresh_type();
                 self.constraints.push(TypeConstraint {
                     ty: value.clone(),
                     span,
                     kind: ConstraintKind::JsonValue,
                 });
-                Some(InferType::Function {
+                InferType::Function {
                     parameters: vec![value],
                     return_type: Box::new(InferType::String),
                     effect: self.fresh_effect(),
-                })
+                }
             }
-            "json_decode" => Some(InferType::Function {
+            Builtin::JsonDecode => InferType::Function {
                 parameters: vec![InferType::String],
                 return_type: Box::new(self.fresh_type()),
                 effect: self.fresh_effect(),
-            }),
-            _ => None,
-        }
+            },
+        };
+        Some((ty, ResolvedName::Builtin(builtin)))
     }
 
     fn ensure_name_available(&self, name: &str, span: Span) -> Result<(), Diagnostic> {
-        if is_builtin_name(name)
+        if Builtin::from_name(name).is_some()
             || self
                 .scopes
                 .last()
@@ -1439,11 +1804,29 @@ impl Analyzer {
         }
     }
 
-    fn define(&mut self, name: &str, ty: InferType) {
+    fn define_symbol(
+        &mut self,
+        name: &str,
+        ty: InferType,
+        span: Span,
+        kind: SymbolKind,
+        top_level: bool,
+    ) -> SymbolId {
+        let id = SymbolId(self.next_symbol);
+        self.next_symbol += 1;
+        self.symbols.push(PendingSymbol {
+            id,
+            name: name.to_owned(),
+            kind,
+            ty: ty.clone(),
+            span,
+            top_level,
+        });
         self.scopes
             .last_mut()
             .expect("analyzer always has a scope")
-            .insert(name.to_owned(), ty);
+            .insert(name.to_owned(), ScopeBinding { id, ty });
+        id
     }
 
     fn push_scope(&mut self) {
@@ -1588,13 +1971,6 @@ fn effect_set(effects: BTreeSet<Effect>) -> EffectSet {
     EffectSet {
         effects: effects.into_iter().collect(),
     }
-}
-
-fn is_builtin_name(name: &str) -> bool {
-    matches!(
-        name,
-        "print" | "println" | "Some" | "None" | "Ok" | "Err" | "json_encode" | "json_decode"
-    )
 }
 
 fn type_variable_name(id: u32) -> String {
@@ -1847,6 +2223,53 @@ mod tests {
         };
         assert_eq!(fields.len(), 2);
         assert!(Arc::ptr_eq(&fields[0].ty, &fields[1].ty));
+    }
+
+    #[test]
+    fn builds_sorted_unique_indexes_for_analysis_facts() {
+        let analysis = check(
+            r#"
+            let first = 1;
+            let second = {
+                let nested = first + 1;
+                nested
+            };
+            println(second);
+            "#,
+        )
+        .expect("program should analyze");
+
+        assert!(
+            analysis
+                .expressions
+                .windows(2)
+                .all(|window| window[0].span < window[1].span)
+        );
+        assert!(
+            analysis
+                .blocks
+                .windows(2)
+                .all(|window| window[0].span < window[1].span)
+        );
+        assert_eq!(analysis.symbol_index.len(), analysis.symbols.len());
+        assert!(analysis.symbol_index.windows(2).all(|window| {
+            let left = &analysis.symbols[window[0] as usize];
+            let right = &analysis.symbols[window[1] as usize];
+            symbol_key_order(left, right.span, &right.name, right.kind) == Ordering::Less
+        }));
+
+        for expression in &analysis.expressions {
+            assert_eq!(analysis.expression(expression.span), Some(expression));
+        }
+        for block in &analysis.blocks {
+            assert_eq!(analysis.block(block.span), Some(block));
+        }
+        for symbol in &analysis.symbols {
+            assert_eq!(
+                analysis.symbol(symbol.span, &symbol.name, symbol.kind),
+                Some(symbol)
+            );
+        }
     }
 
     #[test]

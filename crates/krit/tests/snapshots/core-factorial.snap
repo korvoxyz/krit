@@ -1,0 +1,36 @@
+core module
+entry f0 module-init effects {io.stdout}
+bindings
+  b0 function factorial: fn(Int) -> Int effects {}
+  b1 parameter number: Int
+function f0 $module_init () -> Unit effects {io.stdout}
+  block bb0 -> Unit effects {io.stdout}
+    v11: fn(Int) -> Int effects {} = closure cl0 f1 []
+    v12: Unit = bind b0 = v11
+    v13: fn(Int) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v14: Int = int 6
+    v15: Int = call v11(v14)
+    v16: Unit = call v13(v15) effects {io.stdout}
+    v17: Unit = discard v16
+    v18: Unit = unit
+    return v18
+function f1 factorial (p0 b1 v1: Int) -> Int effects {}
+  self b0 v0: fn(Int) -> Int effects {}
+  block bb1 -> Int effects {}
+    v2: Int = int 0
+    v3: Bool = eq v1 v2
+    v10: Int = if v3 effects {}
+      block bb2 -> Int effects {}
+        v4: Int = int 1
+        return v4
+    else
+      block bb3 -> Int effects {}
+        v9: Int = block effects {}
+          block bb4 -> Int effects {}
+            v5: Int = int 1
+            v6: Int = sub v1 v5
+            v7: Int = call v0(v6)
+            v8: Int = mul v1 v7
+            return v8
+        return v9
+    return v10

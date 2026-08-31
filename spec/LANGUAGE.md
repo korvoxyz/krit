@@ -7,8 +7,9 @@
 
 This document defines the syntax and runtime behavior required by the initial
 Rust implementation. The bootstrap static checker is specified in
-`TYPES-AND-EFFECTS.md`. Modules, package resolution, external capabilities,
-and typed Core IR remain draft.
+`TYPES-AND-EFFECTS.md`, and the evaluator-independent typed Core form is
+described in `docs/technical-design.md`. Modules, package resolution, external
+capabilities, WebAssembly generation, and sandbox execution remain draft.
 
 The historical Racket S-expression syntax is not accepted by Krit 0.2.
 

@@ -50,7 +50,8 @@ async-runtime, TLS, SDK, or memory-management infrastructure.
 - canonical formatter (implemented in the 0.2 bootstrap)
 - parser, name, type, effect, and capability diagnostics
 - `krit check`
-- `krit explain`
+- `krit explain` (typed Core/type/effect facts implemented; agent interfaces
+  and effective permissions remain future work)
 - `krit permissions`
 - language-server compiler facts
 - one optional inline prediction provider

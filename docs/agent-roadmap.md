@@ -50,12 +50,18 @@ errors can be represented without untyped maps or hidden exceptions.
 
 ## Phase 3: WebAssembly boundary
 
-- typed Core IR
+**Status:** In progress; typed Core IR milestone complete
+
+- typed Core IR (complete)
+- deterministic `krit explain` compiler facts (complete)
+- specialization/monomorphization of residual parametric Core types, or stable
+  source diagnostics before layout
+- closure of open structural record requirements before selecting Wasm layouts
 - WebAssembly component generation
 - artifact validation and hashing
 - one Rust component host
 - memory, fuel, stack, host-call, output, and deadline limits
-- `krit explain` and effective `krit permissions`
+- effective `krit permissions`
 
 Gate: a pure component behaves identically to the direct evaluator and cannot
 access ambient host resources.

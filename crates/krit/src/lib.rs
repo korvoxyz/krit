@@ -1,5 +1,7 @@
 mod analysis;
 mod ast;
+mod builtin;
+mod core;
 mod diagnostic;
 mod evaluator;
 mod formatter;
@@ -9,12 +11,20 @@ mod source;
 mod token;
 
 pub use analysis::{
-    Analysis, BindingAnalysis, Effect, EffectSet, FunctionType, RecordType, Type, analyze,
+    Analysis, BindingAnalysis, BlockAnalysis, Effect, EffectSet, ExpressionAnalysis, FunctionType,
+    RecordType, ResolvedName, SymbolAnalysis, SymbolId, SymbolKind, Type, analyze,
 };
 pub use ast::{
     BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program, RecordField,
     RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator,
     ValueLiteral, VariantArm, VariantFamily, VariantName,
+};
+pub use builtin::{Builtin, BuiltinCategory};
+pub use core::{
+    BindingId, BindingKind, BlockId, BlockParameter, CaptureArgument, CaptureId, ClosureId,
+    CoreBinding, CoreBlock, CoreCapture, CoreEntrypoint, CoreFunction, CoreModule, CoreOperation,
+    CoreParameter, EntrypointKind, FunctionId, FunctionSignature, IrError, MatchBindingId,
+    OperationKind, ParameterId, RecordOperand, RecursiveBinding, ValueId, VariantArmBlock, lower,
 };
 pub use diagnostic::Diagnostic;
 pub use evaluator::{BuiltinFunction, FunctionValue, Value, execute};

@@ -37,6 +37,10 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - value annotations enforced by `krit check` and deterministic JSON conversion
 - lexical name resolution and deterministic static type inference/checking
 - sorted `io.stdout` effect inference with function and call propagation
+- name-resolved, inferred typed Core IR with deterministic IDs and explicit
+  evaluation order
+- verified closures, recursive self bindings, captures, branches, and matches
+- stable human and schema-1 JSON compiler explanations
 - recursive function declarations
 - exhaustive empty/cons list matching
 - deterministic comment-preserving canonical source formatting
@@ -45,9 +49,9 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - strict package manifest validation
 
 Type/effect generalization beyond the bootstrap checker, capability
-enforcement, WebAssembly components, agent APIs, guided authoring, modules,
-dependency resolution, and build caching are specified directions, not yet
-implemented features. Krit is not production-ready.
+enforcement, WebAssembly generation or hosting, agent APIs, guided authoring,
+modules, dependency resolution, and build caching are specified directions,
+not yet implemented features. Krit is not production-ready.
 
 ## Requirements
 
@@ -81,11 +85,32 @@ krit run examples/lists.krit
 ```
 
 Check syntax, lexical names, types, matches, and inferred effects without
-executing:
+executing. A successful check also lowers and verifies typed Core IR:
 
 ```sh
 krit check examples/factorial.krit
 ```
+
+Inspect stable compiler facts and the resolved Core program:
+
+```sh
+krit explain examples/factorial.krit
+krit explain --json examples/factorial.krit
+```
+
+The explanation shows the synthetic `module-init` entrypoint, its inferred
+effects, top-level binding/function types, and deterministic typed Core IR.
+Core executable references use numeric IDs; source names appear only as debug
+metadata. Explanation JSON schema 1 is serialized with `serde_json` and does
+not include absolute compiler or cache paths.
+
+Core names are resolved and its types are normalized inference results, but
+not every Core type is a concrete storage layout. Constrained parametric type
+variables may remain in otherwise valid generic Core. The WebAssembly artifact
+stage must specialize such variables, or report a stable source diagnostic,
+before choosing layouts or emitting code. Open structural record requirements
+likewise describe required fields rather than a final closed Wasm record
+layout.
 
 Format one or more files after validating the complete batch:
 
@@ -274,9 +299,10 @@ The accepted implementation path is:
    dynamic JSON conversion
 3. name resolution, static type/effect checking, and canonical formatting
    (complete)
-4. typed Core IR and a validated WebAssembly component backend
-5. one bounded HTTP/webhook host with outbound HTTP, secrets, and AI calls
-6. deterministic explanation and effective permission commands
+4. typed verified Core IR and deterministic explanations (complete)
+5. Core specialization/layout diagnostics, a validated WebAssembly component
+   backend, and one bounded host
+6. HTTP/webhook interfaces with outbound HTTP, secrets, and AI calls
 7. optional provider-neutral inline prediction with visible checked edits
 8. broader connectors and packaging only after the reference agent succeeds
 

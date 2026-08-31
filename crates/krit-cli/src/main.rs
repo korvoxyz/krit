@@ -6,8 +6,12 @@ use std::{
     process::ExitCode,
 };
 
-use krit::{Diagnostic, Source, Span, analyze, format_source, parse_source, run_source};
+use krit::{
+    Analysis, CoreModule, Diagnostic, Source, Span, analyze, format_source, lower, parse_source,
+    run_source,
+};
 use krit_package::Manifest;
+use serde::Serialize;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GENERATION_PROMPT: &str = include_str!("../assets/KRIT-0.2-SYSTEM.md");
@@ -39,6 +43,7 @@ fn run(arguments: Vec<String>) -> u8 {
         }
         "run" => source_command(&arguments[1..], SourceAction::Run),
         "check" => source_command(&arguments[1..], SourceAction::Check),
+        "explain" => explain_command(&arguments[1..]),
         "fmt" => fmt_command(&arguments[1..]),
         "prompt" => prompt_command(&arguments[1..]),
         "permissions" => permissions_command(&arguments[1..]),
@@ -49,6 +54,175 @@ fn run(arguments: Vec<String>) -> u8 {
             2
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonExplanation {
+    schema: u8,
+    entrypoint: JsonEntrypoint,
+    bindings: Vec<JsonBinding>,
+    core: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonEntrypoint {
+    id: u32,
+    kind: &'static str,
+    result_type: String,
+    effects: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonBinding {
+    id: u32,
+    name: String,
+    kind: &'static str,
+    r#type: String,
+}
+
+fn explain_command(arguments: &[String]) -> u8 {
+    let mut json = false;
+    let mut path = None;
+    for argument in arguments {
+        match argument.as_str() {
+            "--json" => json = true,
+            argument if argument.starts_with('-') => {
+                eprintln!("krit: unknown option `{argument}`");
+                return 2;
+            }
+            argument if path.is_none() => path = Some(PathBuf::from(argument)),
+            _ => {
+                eprintln!("krit: expected exactly one source file");
+                return 2;
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("krit: expected exactly one source file");
+        return 2;
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("krit: could not read {}: {error}", path.display());
+            return 1;
+        }
+    };
+    let source = Source::new(path.to_string_lossy().into_owned(), text);
+    let program = match parse_source(&source) {
+        Ok(program) => program,
+        Err(diagnostic) => {
+            return report(
+                &diagnostic,
+                &source,
+                if json {
+                    DiagnosticFormat::Json
+                } else {
+                    DiagnosticFormat::Human
+                },
+            );
+        }
+    };
+    let analysis = match analyze(&program) {
+        Ok(analysis) => analysis,
+        Err(diagnostic) => {
+            return report(
+                &diagnostic,
+                &source,
+                if json {
+                    DiagnosticFormat::Json
+                } else {
+                    DiagnosticFormat::Human
+                },
+            );
+        }
+    };
+    let module = match lower(&program, &analysis) {
+        Ok(module) => module,
+        Err(error) => return internal_error("KICE0001", "lowering Core IR", &error),
+    };
+    if json {
+        render_explanation_json(&analysis, &module)
+    } else {
+        render_explanation_human(&analysis, &module);
+        0
+    }
+}
+
+fn render_explanation_human(analysis: &Analysis, module: &CoreModule) {
+    let entrypoint = module.entrypoint_function();
+    println!("Krit explanation (schema 1)");
+    println!(
+        "entrypoint: {} {}",
+        module.entrypoints()[0].kind.as_str(),
+        entrypoint.id
+    );
+    println!("result: {}", entrypoint.signature.result);
+    println!("effects: {}", entrypoint.signature.effects);
+    println!("top-level bindings:");
+    let mut found = false;
+    for binding in analysis
+        .bindings()
+        .iter()
+        .filter(|binding| binding.is_top_level())
+    {
+        found = true;
+        let core_binding = &module.bindings()[binding.id().as_u32() as usize];
+        println!("  {} {}: {}", core_binding.id, binding.name(), binding.ty());
+    }
+    if !found {
+        println!("  (none)");
+    }
+    println!("core:");
+    print!("{}", module.render_text());
+}
+
+fn render_explanation_json(analysis: &Analysis, module: &CoreModule) -> u8 {
+    let entrypoint = module.entrypoint_function();
+    let explanation = JsonExplanation {
+        schema: 1,
+        entrypoint: JsonEntrypoint {
+            id: entrypoint.id.as_u32(),
+            kind: module.entrypoints()[0].kind.as_str(),
+            result_type: entrypoint.signature.result.to_string(),
+            effects: entrypoint
+                .signature
+                .effects
+                .iter()
+                .map(|effect| effect.as_str())
+                .collect(),
+        },
+        bindings: analysis
+            .bindings()
+            .iter()
+            .filter(|binding| binding.is_top_level())
+            .map(|binding| {
+                let core_binding = &module.bindings()[binding.id().as_u32() as usize];
+                JsonBinding {
+                    id: core_binding.id.as_u32(),
+                    name: binding.name().to_owned(),
+                    kind: core_binding.kind.as_str(),
+                    r#type: binding.ty().to_string(),
+                }
+            })
+            .collect(),
+        core: module.render_text(),
+    };
+    match serde_json::to_string(&explanation) {
+        Ok(json) => {
+            println!("{json}");
+            0
+        }
+        Err(error) => internal_error("KICE0002", "rendering an explanation", &error),
+    }
+}
+
+fn internal_error(id: &str, operation: &str, error: &dyn std::fmt::Display) -> u8 {
+    eprintln!("krit: internal compiler error[{id}] while {operation}: {error}");
+    101
 }
 
 struct FormattedFile {
@@ -258,13 +432,19 @@ fn source_command(arguments: &[String], action: SourceAction) -> u8 {
     };
     let source = Source::new(path.to_string_lossy().into_owned(), text);
     if matches!(action, SourceAction::Check) {
-        match parse_source(&source).and_then(|program| analyze(&program)) {
-            Ok(_) => {
-                println!("checked {}", path.display());
-                0
-            }
-            Err(diagnostic) => report(&diagnostic, &source, format),
+        let program = match parse_source(&source) {
+            Ok(program) => program,
+            Err(diagnostic) => return report(&diagnostic, &source, format),
+        };
+        let analysis = match analyze(&program) {
+            Ok(analysis) => analysis,
+            Err(diagnostic) => return report(&diagnostic, &source, format),
+        };
+        if let Err(error) = lower(&program, &analysis) {
+            return internal_error("KICE0001", "lowering Core IR", &error);
         }
+        println!("checked {}", path.display());
+        0
     } else {
         execute_source(&source, format)
     }
@@ -410,6 +590,7 @@ An open, human-auditable language for the age of AI.
 USAGE:
     krit run [--diagnostic-format human|json] FILE
     krit check [--diagnostic-format human|json] FILE
+    krit explain [--json] FILE
     krit fmt [--check] FILE...
     krit prompt
     krit permissions [--json] [MANIFEST]

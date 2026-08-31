@@ -1,0 +1,31 @@
+core module
+entry f0 module-init effects {io.stdout}
+bindings
+  b0 let value: Record { name: String, outcome: Result<Option<List<Int>>, 'a> }
+  b1 let encoded: String
+function f0 $module_init () -> Unit effects {io.stdout}
+  block bb0 -> Unit effects {io.stdout}
+    v0: String = string "agent"
+    v1: fn(Option<List<Int>>) -> Result<Option<List<Int>>, 'a> effects {} = builtin Ok [constructor]
+    v2: fn(List<Int>) -> Option<List<Int>> effects {} = builtin Some [constructor]
+    v3: Int = int 1
+    v4: Int = int 2
+    v5: List<Int> = list [v3, v4]
+    v6: Option<List<Int>> = call v2(v5)
+    v7: Result<Option<List<Int>>, 'a> = call v1(v6)
+    v8: Record { name: String, outcome: Result<Option<List<Int>>, 'a> } = record {name: v0, outcome: v7}
+    v9: Unit = bind b0 = v8
+    v10: fn(Record { name: String, outcome: Result<Option<List<Int>>, 'a> }) -> String effects {} = builtin json_encode [conversion]
+    v11: String = call v10(v8)
+    v12: Unit = bind b1 = v11
+    v13: fn(String) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v14: Unit = call v13(v11) effects {io.stdout}
+    v15: Unit = discard v14
+    v16: fn(Bool) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v17: fn(String) -> Record { name: String, outcome: Result<Option<List<Int>>, 'a> } effects {} = builtin json_decode [conversion]
+    v18: Record { name: String, outcome: Result<Option<List<Int>>, 'a> } = call v17(v11)
+    v19: Bool = eq v18 v8
+    v20: Unit = call v16(v19) effects {io.stdout}
+    v21: Unit = discard v20
+    v22: Unit = unit
+    return v22

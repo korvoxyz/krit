@@ -39,6 +39,21 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   replacement, and stable `K8001` check diagnostics
 - Formatter fixtures and repository-wide parse, analysis, and idempotence
   coverage
+- Resolved typed Core IR with deterministic binding, value, function,
+  parameter, capture, closure, block, and match-binding IDs
+- Public normalized symbol, expression, block, and resolved-name analysis facts
+  used directly by Core lowering
+- Explicit left-to-right ANF evaluation order, nested control-flow blocks,
+  recursive self values, and lexical closure capture arguments
+- Explicit Core identities for stdout built-ins, pure Option/Result
+  constructors, and pure JSON conversion
+- Synthetic typed `module-init` entrypoint with inferred effects
+- Core verification for ID ranges, dominance, branch and call types, captures,
+  operation types, and conservative effects
+- Stable `CoreModule::render_text` output with golden and repository-corpus
+  lowering coverage
+- `krit explain [--json] FILE` with human compiler facts and deterministic
+  schema-1 JSON serialized through `serde_json`
 
 ### Changed
 
@@ -47,10 +62,13 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Defined LLM assistance as optional visible edits gated by deterministic
   formatting, checks, and permission analysis
 - Updated the provider-neutral generation prompt to version 0.2.2 for readable
-  data and static checking, then to version 0.2.3 for canonical formatting
+  data and static checking, to version 0.2.3 for canonical formatting, and to
+  version 0.2.4 for the checked explanation workflow
 - Made `krit check` perform semantic analysis without executing source while
-  preserving its success output
+  preserving its success output, then lower and verify typed Core IR
 - Marked the readable-agent-data phase complete
+- Started Phase 3 with the Core IR boundary only; WebAssembly generation and
+  sandbox hosting remain unimplemented
 
 ## [0.2.0] - 2026-09-01
 
