@@ -1,0 +1,4 @@
+match Some(1) {
+    Ok(value) => value,
+    Err(error) => error,
+};

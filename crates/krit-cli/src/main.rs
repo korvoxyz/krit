@@ -4,7 +4,7 @@ use std::{
     process::ExitCode,
 };
 
-use krit::{Diagnostic, Source, parse_source, run_source};
+use krit::{Diagnostic, Source, analyze, parse_source, run_source};
 use krit_package::Manifest;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -78,7 +78,7 @@ fn source_command(arguments: &[String], action: SourceAction) -> u8 {
     };
     let source = Source::new(path.to_string_lossy().into_owned(), text);
     if matches!(action, SourceAction::Check) {
-        match parse_source(&source) {
+        match parse_source(&source).and_then(|program| analyze(&program)) {
             Ok(_) => {
                 println!("checked {}", path.display());
                 0
@@ -261,14 +261,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_every_prompt_example() {
+    fn checks_every_prompt_example() {
         let mut remaining = GENERATION_PROMPT;
         let mut count = 0;
         while let Some(start) = remaining.find("```krit\n") {
             let code = &remaining[start + "```krit\n".len()..];
             let end = code.find("\n```").expect("Krit code fence should close");
             let source = Source::new(format!("<prompt-example-{count}>"), &code[..end]);
-            parse_source(&source).expect("prompt example should parse");
+            let program = parse_source(&source).expect("prompt example should parse");
+            analyze(&program).expect("prompt example should pass semantic analysis");
             count += 1;
             remaining = &code[end + "\n```".len()..];
         }

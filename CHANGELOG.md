@@ -23,6 +23,16 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   options, and results
 - Deterministic `json_encode` and dynamic `json_decode` built-ins
 - Stable `K4008` and `K4009` JSON diagnostics
+- Lexical name resolution with duplicate declaration checks
+- Deterministic static inference and checking for primitive, list, record,
+  Option, Result, and function types
+- Defensive exhaustive-family checking and stable `K3001` through `K3006`
+  diagnostics
+- Sorted `io.stdout` effect inference with recursive and higher-order call
+  propagation
+- Public `krit::analyze` API with inferred binding types, source spans, and
+  effects
+- Implementation-neutral static `check` conformance fixtures
 
 ### Changed
 
@@ -30,8 +40,10 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   deployment target
 - Defined LLM assistance as optional visible edits gated by deterministic
   formatting, checks, and permission analysis
-- Updated the provider-neutral generation prompt to version 0.2.1 for the
-  readable data surface
+- Updated the provider-neutral generation prompt to version 0.2.2 for readable
+  data and static checking
+- Made `krit check` perform semantic analysis without executing source while
+  preserving its success output
 
 ## [0.2.0] - 2026-09-01
 

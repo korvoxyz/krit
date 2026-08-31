@@ -1,0 +1,4 @@
+match 1 {
+    [] => 0,
+    [head, ..tail] => head,
+};

@@ -34,17 +34,19 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - checked 64-bit integer arithmetic
 - booleans, strings, unit, immutable lists, and ordered records
 - built-in `Option` and `Result` values with exhaustive matching
-- parsed value annotations and deterministic JSON conversion
+- value annotations enforced by `krit check` and deterministic JSON conversion
+- lexical name resolution and deterministic static type inference/checking
+- sorted `io.stdout` effect inference with function and call propagation
 - recursive function declarations
 - exhaustive empty/cons list matching
 - deterministic human and JSON diagnostics
 - implementation-neutral conformance cases
 - strict package manifest validation
 
-Static types and effects, capability enforcement, WebAssembly components,
-agent APIs, guided authoring, modules, dependency resolution, and build
-caching are specified directions, not yet implemented features. Krit is not
-production-ready.
+Type/effect generalization beyond the bootstrap checker, capability
+enforcement, WebAssembly components, agent APIs, guided authoring, modules,
+dependency resolution, and build caching are specified directions, not yet
+implemented features. Krit is not production-ready.
 
 ## Requirements
 
@@ -77,7 +79,8 @@ krit run examples/factorial.krit
 krit run examples/lists.krit
 ```
 
-Check syntax without executing:
+Check syntax, lexical names, types, matches, and inferred effects without
+executing:
 
 ```sh
 krit check examples/factorial.krit
@@ -221,7 +224,7 @@ The specification is the semantic authority:
 - [Krit 0.2 language](spec/LANGUAGE.md)
 - [Diagnostic contract](spec/DIAGNOSTICS.md)
 - [Agent application model](spec/AGENT-APPLICATIONS.md) — draft
-- [Types and effects](spec/TYPES-AND-EFFECTS.md) — draft
+- [Types and effects](spec/TYPES-AND-EFFECTS.md) — implemented baseline
 - [Capabilities](spec/CAPABILITIES.md) — draft
 - [Modules and packages](spec/PACKAGES.md) — draft
 - [WebAssembly sandbox](spec/WASM-SANDBOX.md) — draft
@@ -256,7 +259,7 @@ The accepted implementation path is:
 1. Rust source, parser, diagnostics, and direct evaluator
 2. readable records, built-in `Option` and `Result`, parsed annotations, and
    dynamic JSON conversion
-3. name resolution plus static type/effect checking
+3. name resolution plus static type/effect checking (complete)
 4. typed Core IR and a validated WebAssembly component backend
 5. one bounded HTTP/webhook host with outbound HTTP, secrets, and AI calls
 6. deterministic formatting, explanation, and permission commands

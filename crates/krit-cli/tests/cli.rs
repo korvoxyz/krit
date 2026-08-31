@@ -26,6 +26,71 @@ fn runs_an_example() {
 }
 
 #[test]
+fn checks_without_executing_effects() {
+    let output = krit()
+        .args(["check", "examples/factorial.krit"])
+        .output()
+        .expect("Krit should start");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"checked examples/factorial.krit\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn check_rejects_static_errors_without_partial_output() {
+    let output = krit()
+        .args([
+            "check",
+            "--diagnostic-format",
+            "json",
+            "conformance/check/type/mixed-addition/program.krit",
+        ])
+        .output()
+        .expect("Krit should start");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let diagnostic = String::from_utf8(output.stderr).expect("diagnostic should be UTF-8");
+    assert!(diagnostic.contains("\"code\":\"K3001\""));
+}
+
+#[test]
+fn check_preserves_fields_through_returned_records() {
+    for path in [
+        "conformance/check/type/returned-record-missing/program.krit",
+        "conformance/check/type/returned-record-field-type/program.krit",
+    ] {
+        let output = krit()
+            .args(["check", path])
+            .output()
+            .expect("Krit should start");
+
+        assert_eq!(output.status.code(), Some(1), "{path}");
+        assert!(output.stdout.is_empty(), "{path}");
+        assert!(
+            String::from_utf8(output.stderr)
+                .expect("diagnostic should be UTF-8")
+                .contains("error[K3001]"),
+            "{path}"
+        );
+    }
+
+    for path in [
+        "conformance/check/valid/returned-record-presence/program.krit",
+        "conformance/check/valid/returned-record-field-type/program.krit",
+    ] {
+        let output = krit()
+            .args(["check", path])
+            .output()
+            .expect("Krit should start");
+
+        assert!(output.status.success(), "{path}");
+        assert!(output.stderr.is_empty(), "{path}");
+    }
+}
+
+#[test]
 fn emits_machine_readable_diagnostics() {
     let output = krit()
         .args([

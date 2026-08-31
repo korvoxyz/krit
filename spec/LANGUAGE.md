@@ -6,9 +6,9 @@
 ## 1. Scope
 
 This document defines the syntax and runtime behavior required by the initial
-Rust implementation. Static type/effect checking, modules, packages, and
-external capabilities are specified separately and remain draft until their
-documents become normative.
+Rust implementation. The bootstrap static checker is specified in
+`TYPES-AND-EFFECTS.md`. Modules, package resolution, external capabilities,
+and typed Core IR remain draft.
 
 The historical Racket S-expression syntax is not accepted by Krit 0.2.
 
@@ -198,8 +198,11 @@ runtime values. Their payloads may contain any runtime value.
 The binding extends from the following item in the current scope to the end of
 that scope.
 
-An inner binding may shadow an outer binding. A binding cannot be read before
-its declaration.
+A lexical scope cannot declare the same name more than once. This applies
+across `let` and function declarations in that scope. A nested scope may
+shadow a name from an outer scope. A binding cannot be read before its
+declaration. `krit check` enforces these rules as a deliberate readability
+constraint for both human- and AI-authored code.
 
 Function declarations are visible from their declaration to the end of their
 containing scope and may call themselves recursively. Mutually recursive
@@ -240,8 +243,12 @@ fn attempt(value: Int) -> Result<Int, String> {
 }
 ```
 
-Annotations are parsed and retained by the compiler but do not change dynamic
-evaluation in this milestone. Static checking is specified separately.
+Annotations are parsed and retained by the compiler. `krit check` enforces
+them through static analysis without executing the program. `krit run`
+remains the transitional direct dynamic evaluator in this milestone: it does
+not yet enforce annotations or other static-checker rules, including
+same-scope duplicate declarations. Runtime conformance therefore remains
+separate. Static checking is specified in `TYPES-AND-EFFECTS.md`.
 
 ## 9. Operators
 

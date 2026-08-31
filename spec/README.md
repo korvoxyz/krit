@@ -18,7 +18,7 @@ infer semantics from historical interpreter behavior.
 | [LANGUAGE.md](LANGUAGE.md) | Normative | Krit 0.2 source syntax and runtime semantics |
 | [DIAGNOSTICS.md](DIAGNOSTICS.md) | Normative | Human and machine diagnostic contract |
 | [AGENT-APPLICATIONS.md](AGENT-APPLICATIONS.md) | Draft | Agent, bot, backend, and integration application model |
-| [TYPES-AND-EFFECTS.md](TYPES-AND-EFFECTS.md) | Draft | Static types and effect checking |
+| [TYPES-AND-EFFECTS.md](TYPES-AND-EFFECTS.md) | Implemented baseline | Static types and effect checking |
 | [CAPABILITIES.md](CAPABILITIES.md) | Draft | Runtime authority and sandbox boundaries |
 | [PACKAGES.md](PACKAGES.md) | Draft | Modules, manifests, lockfiles, and registries |
 | [WASM-SANDBOX.md](WASM-SANDBOX.md) | Draft | WebAssembly component and host security boundary |

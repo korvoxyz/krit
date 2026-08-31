@@ -77,6 +77,12 @@ Initial required codes:
 | `K1003` | Invalid match pattern |
 | `K2001` | Undefined name |
 | `K2002` | Duplicate binding or parameter |
+| `K3001` | Static type mismatch or invalid typed operator |
+| `K3002` | Statically known non-function call target |
+| `K3003` | Static function argument count mismatch |
+| `K3004` | Invalid record field access |
+| `K3005` | Invalid match subject, family, or exhaustiveness |
+| `K3006` | Type is not comparable or JSON-encodable |
 | `K4001` | Wrong runtime value kind |
 | `K4002` | Calling a non-function |
 | `K4003` | Function argument count mismatch |

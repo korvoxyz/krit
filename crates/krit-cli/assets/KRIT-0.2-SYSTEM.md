@@ -63,9 +63,11 @@ fn(parameter) {
 Functions use lexical scope. Calls use `function(argument)`. Argument counts
 must match parameter counts.
 
-Annotations are optional and do not enforce types yet. The available annotation
+Annotations are optional and are enforced by `krit check`. The checker also
+infers omitted local and private function types. The available annotation
 types are `Int`, `Bool`, `String`, `Unit`, `List<T>`, `Option<T>`,
-`Result<T, E>`, and `Record { field: Type }`.
+`Result<T, E>`, and `Record { field: Type }`. Do not mix list element types,
+return a value that contradicts an annotation, or access an absent field.
 
 ## Expressions
 
@@ -134,9 +136,9 @@ when rendered.
 
 `json_encode(value)` supports integers, booleans, strings, unit, lists,
 records, Option, and Result. It rejects functions. `json_decode(string)`
-returns dynamic Krit values and rejects invalid JSON. Unit is JSON `null`;
-variants use `{"Some":value}`, `{"None":null}`, `{"Ok":value}`, and
-`{"Err":value}`.
+returns an inferred value whose uses must impose a consistent type, and it
+rejects invalid JSON at runtime. Unit is JSON `null`; variants use
+`{"Some":value}`, `{"None":null}`, `{"Ok":value}`, and `{"Err":value}`.
 
 ## Statements and blocks
 
@@ -244,4 +246,6 @@ println(json_encode(record { message: message, delivered: true }));
 
 Before responding, verify mentally that every identifier is bound, every call
 has the correct argument count, every statement has the required semicolon,
-every block value omits its semicolon, and no unsupported feature appears.
+every block value omits its semicolon, annotations and branches agree, match
+subjects have the right family, and no unsupported feature appears. Generated
+source must pass `krit check` without being executed.

@@ -948,13 +948,13 @@ mod tests {
     }
 
     #[test]
-    fn annotations_do_not_change_dynamic_evaluation() {
+    fn run_source_keeps_annotations_dynamically_inert() {
         let (output, _) = run(r#"
             let value: Int = "still dynamic";
             fn identity(input: Bool) -> Unit { input }
             println(identity(value));
             "#)
-        .expect("annotations should not be checked yet");
+        .expect("run_source should remain dynamically compatible");
 
         assert_eq!(output, "still dynamic\n");
     }

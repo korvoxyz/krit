@@ -24,6 +24,16 @@ It compares status and standard output exactly. It decodes JSON Lines from
 standard error and compares the ordered `code` fields. Additional diagnostic
 prose and labels may vary within `spec/DIAGNOSTICS.md`.
 
+`conformance/check` contains implementation-neutral static-analysis cases.
+That harness invokes the equivalent of:
+
+```text
+krit check --diagnostic-format json program.krit
+```
+
+It compares status and diagnostic codes and requires that checking never
+execute program effects or emit program output.
+
 No case depends on a host path, locale, time zone, environment variable,
 network service, or nondeterministic value.
 
@@ -56,6 +66,9 @@ network service, or nondeterministic value.
 | `errors/json-function` | functions cannot be JSON encoded |
 | `errors/json-invalid` | invalid JSON input |
 | `errors/missing-record-field` | field access requires an existing field |
+| `check/valid/inference` | recursion, closures, empty lists, None, and effects infer together |
+| `check/name/*` | lexical undefined and duplicate name diagnostics |
+| `check/type/*` | stable static operator, condition, field, call, annotation, and match errors |
 
 ## Adding a case
 

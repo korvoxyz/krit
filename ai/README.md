@@ -11,10 +11,10 @@ not part of the compiler or runtime.
 - Language authority: [`../spec/LANGUAGE.md`](../spec/LANGUAGE.md)
 
 The prompt contains only implemented Krit 0.2 syntax, including records,
-built-in Option and Result values, parsed annotations, and JSON conversion.
-Draft HTTP, WebAssembly, static checking, and capability designs are
-intentionally excluded so a model does not generate code the current compiler
-cannot accept.
+built-in Option and Result values, checked annotations, JSON conversion, and
+the static rules enforced by `krit check`. Draft HTTP, WebAssembly, formatter,
+and capability designs are intentionally excluded so a model does not
+generate code the current compiler cannot accept.
 
 ## Use
 

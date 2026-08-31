@@ -1,7 +1,7 @@
 # Static types and effects
 
-**Status:** Draft  
-**Target:** Krit 0.3
+**Status:** Implemented baseline with draft extensions
+**Target:** Krit 0.2 bootstrap
 
 ## Goals
 
@@ -9,15 +9,15 @@ The type/effect system must make AI-generated code safer to review without
 requiring verbose annotations inside every function.
 
 - Infer local types.
-- Require explicit public package boundaries.
+- Require explicit public package boundaries (future module work).
 - Reject implicit `Any`.
 - Track side effects separately from value types.
 - Produce concise explanations and machine-readable facts.
-- Keep checking deterministic and incremental.
+- Keep checking deterministic; incremental module checking is future work.
 
 ## Value types
 
-Proposed built-in types:
+Implemented built-in and inferred types:
 
 ```text
 Int
@@ -31,7 +31,8 @@ Record { field: Type, ... }
 fn(A, B) -> C
 ```
 
-Type variables use lowercase identifiers in compiler output, such as `a`.
+The public Rust analysis API represents unresolved inference variables as
+`Type::Variable` and renders them as stable lowercase names such as `'a`.
 Source-level generic declaration syntax is not yet accepted.
 
 There are no implicit numeric, string, boolean, or collection conversions.
@@ -48,8 +49,8 @@ fn double(value) {
 }
 ```
 
-The parser accepts value annotations on let bindings, function parameters,
-and function return values:
+The parser and checker accept value annotations on let bindings, function
+parameters, and function return values:
 
 ```krit
 let fallback: Option<String> = None;
@@ -60,22 +61,31 @@ fn total(items: List<Int>) -> Int {
 ```
 
 The exact implemented annotation grammar is normative in `LANGUAGE.md`.
-Annotations are stored in the AST but remain dynamically inert until the
-static checker lands. Public declarations and effect annotation syntax are
-still future work.
+`krit check` enforces annotations without evaluating source. `krit run`
+continues to use the direct dynamic evaluator in this milestone, so runtime
+conformance diagnostics remain unchanged. Public declarations, source-level
+generic declarations, and effect annotation syntax are still future work.
+
+The bootstrap checker uses deterministic constraints and unification. It
+supports recursive functions, closures, empty lists, `None`, structural
+records, and Option/Result matches. An unresolved variable may remain generic;
+a known contradiction is always rejected. Full Hindley-Milner generalization
+across independently polymorphic uses is still draft.
 
 ## Effects
 
 A value type describes what an expression returns. An effect row describes
 what observable operations it may perform.
 
-Proposed effects:
+The representation is extensible to these effects:
 
 ```text
 io.stdout
 io.stdin
+config.read
 fs.read
 fs.write
+http.request
 net.connect
 process.spawn
 env.read
@@ -85,12 +95,16 @@ secret.read
 ai.invoke
 ```
 
-Pure functions have an empty effect row. Calling a function adds its effects
-to the caller. Branch effects are the union of effects reachable through
-either branch.
+The implemented effect is `io.stdout`, inferred for `print` and `println`.
+Pure functions have an empty effect set. Calling a function adds its effects
+to the caller, including recursive and higher-order propagation. Branch and
+match effects are conservative unions. JSON conversion is pure.
 
-Effect polymorphism may be added for higher-order functions, but the first
-checker can require a concrete effect row.
+The Rust API returns effects in sorted deterministic order through
+`Analysis::effects`; function types expose their inferred latent effects.
+`krit check` intentionally preserves its existing success line and does not
+print the effect set yet. A future `krit explain` command will render compiler
+facts for users.
 
 ## Effects versus capabilities
 
@@ -99,29 +113,33 @@ Effects and capabilities answer different questions:
 - **Effect:** what an expression may attempt.
 - **Capability:** what the host permits this execution to do.
 
-A program can type-check while lacking a runtime grant. `krit check` reports
-the effect set; `krit permissions` compares that set with package and host
-grants.
+A program can type-check while lacking a runtime grant. The analyzer reports
+the inferred effect set to compiler clients. `krit permissions` currently
+reports manifest requests; comparison with inferred effects and host grants is
+future work.
 
 A dependency may declare required effects but cannot grant capabilities.
 
 ## Inference algorithm
 
-The intended baseline is constraint-based Hindley-Milner inference extended
-with explicit effect rows and the value restriction if effectful bindings are
-generalized.
+The implemented baseline is deterministic constraint solving with
+monomorphic inference variables, structural record constraints, and effect
+dependency propagation. Hindley-Milner generalization and a value restriction
+remain future extensions.
 
 Implementation requirements:
 
 - unification must be deterministic
 - type variable numbering must be stable
 - errors should identify the originating constraints
-- checking one changed module should not require unrelated modules
-- exported signatures form module cache boundaries
+- checking one changed module should not require unrelated modules (draft)
+- exported signatures form module cache boundaries (draft)
 
 ## Error quality
 
-A type error should state:
+The bootstrap errors state the operation, expected type, inferred type, and a
+stable primary span where applicable. Multiple labels and full inference
+traces remain draft. The intended complete error should state:
 
 1. the operation being checked
 2. the expected type
@@ -139,3 +157,5 @@ type becomes unknown.
 - Whether effect rows are written inline or in a `requires` clause
 - Exhaustiveness rules for future user-defined variants
 - Stable ABI representation of exported types
+- Let-generalization and effect polymorphism
+- User-facing `krit explain` rendering of inferred facts

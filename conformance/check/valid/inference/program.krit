@@ -1,0 +1,23 @@
+fn factorial(number) {
+    if number == 0 {
+        1
+    } else {
+        number * factorial(number - 1)
+    }
+}
+
+fn sum(items) {
+    match items {
+        [] => 0,
+        [head, ..tail] => head + sum(tail),
+    }
+}
+
+let empty = [];
+let absent = None;
+let offset = 2;
+let add_offset = fn(value) {
+    value + offset
+};
+
+println(add_offset(factorial(sum([1, 2, 3]))));

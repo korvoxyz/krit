@@ -1,3 +1,4 @@
+mod analysis;
 mod ast;
 mod diagnostic;
 mod evaluator;
@@ -6,6 +7,9 @@ mod parser;
 mod source;
 mod token;
 
+pub use analysis::{
+    Analysis, BindingAnalysis, Effect, EffectSet, FunctionType, RecordType, Type, analyze,
+};
 pub use ast::{
     BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program, RecordField,
     RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator,

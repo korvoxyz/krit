@@ -1,0 +1,10 @@
+fn wrap(value) {
+    value.a;
+    value
+}
+
+fn use2(value) {
+    wrap(value).b
+}
+
+println(use2(record { a: 1 }));

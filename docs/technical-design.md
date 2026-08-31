@@ -104,15 +104,17 @@ diagnostic code and primary span must match the specification.
 
 ### Name resolution
 
-Names become stable symbol IDs before type checking. Resolution stores the
-definition span and lexical scope. Built-ins occupy an explicit prelude scope;
-they are not magic string comparisons after resolution.
+The phase-2 bootstrap analyzer resolves lexical names directly over the
+spanned AST and reports duplicate declarations. Stable symbol IDs and a
+separate resolved HIR arrive with Core IR lowering. Built-ins currently occupy
+an analyzer prelude.
 
 ### Types and effects
 
-The checker operates on resolved HIR and emits typed HIR. Public signatures are
-module cache boundaries. Inference variables and diagnostic ordering are
-deterministic.
+The phase-2 checker emits public analysis facts from the AST: inferred binding
+types, source spans, and sorted effects. Inference variables and diagnostic
+ordering are deterministic. Resolved typed HIR and public signature cache
+boundaries arrive in phase 3.
 
 ### Core IR
 

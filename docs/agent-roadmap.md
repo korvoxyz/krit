@@ -35,14 +35,14 @@ operations yet.
 
 ## Phase 2: readable agent data
 
-**Status:** In progress; data syntax milestone complete
+**Status:** In progress; data syntax and static checker milestones complete
 
 - records and built-in variants
 - `Option<T>` and `Result<T, E>` annotations
 - exhaustive list, Option, and Result matching
 - parsed let, parameter, and return annotations
 - dynamic deterministic JSON decoding and encoding
-- name, type, and effect checking
+- name, type, and effect checking (complete)
 - canonical formatter
 
 Gate: webhook request, connector response, model output, and application errors

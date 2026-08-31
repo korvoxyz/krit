@@ -1,0 +1,3 @@
+fn value() -> Bool {
+    1
+}
