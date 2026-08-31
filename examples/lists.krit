@@ -1,0 +1,11 @@
+; Pattern matching separates the empty and non-empty list cases.
+(define sum
+  (fn sum (items)
+    (match items
+      [empty 0]
+      [(cons head tail) (+ head (sum tail))])))
+
+(define numbers (list 10 20 12))
+
+(println (++ "Numbers: " "10, 20, 12"))
+(println (sum numbers))

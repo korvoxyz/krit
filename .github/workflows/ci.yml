@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Racket 9.3
+        uses: Bogdanp/setup-racket@v1.15
+        with:
+          version: "9.3"
+          architecture: x64
+
+      - name: Install Krit
+        run: raco pkg install --auto --batch --name krit
+
+      - name: Compile modules
+        run: raco make ast.rkt errors.rkt parser.rkt evaluator.rkt main.rkt cli.rkt
+
+      - name: Run tests
+        run: raco test tests/parser-tests.rkt tests/evaluator-tests.rkt tests/cli-tests.rkt
+
+      - name: Check installed executable and examples
+        run: |
+          raco krit --version
+          KRIT_BIN="$(racket -e '(require setup/dirs) (display (find-user-console-bin-dir))')/krit"
+          "$KRIT_BIN" --version
+          test "$(raco krit examples/factorial.krit)" = "720"
+          test "$(raco krit examples/lists.krit)" = $'Numbers: 10, 20, 12\n42'

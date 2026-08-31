@@ -1,0 +1,8 @@
+; Named functions can call themselves recursively.
+(define factorial
+  (fn factorial (n)
+    (if (= n 0)
+        1
+        (* n (factorial (- n 1))))))
+
+(println (factorial 6))
