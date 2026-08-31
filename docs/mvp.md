@@ -78,6 +78,10 @@ The MVP does not train or host its own model.
 These features require evidence from the reference agent rather than being
 prerequisites for it.
 
+The post-MVP service order is transactional state, queues and schedules,
+object storage, database access, then cache and search. See
+[agent-roadmap.md](agent-roadmap.md).
+
 ## Acceptance criteria
 
 - A new user can identify the webhook input, external calls, failures, and

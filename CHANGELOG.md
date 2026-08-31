@@ -12,6 +12,11 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Draft agent application, WebAssembly sandbox, and guided AI authoring
   specifications
 - Narrow reference-agent MVP and explicit deferred scope
+- Phased agent service roadmap from authority planning through durable state,
+  queues, databases, and optional caches
+- Strict configuration, secret, and outbound HTTP capability declarations
+- Human and JSON `krit permissions` output for pre-deployment authority review
+- Versioned provider-neutral Krit 0.2 generation prompt and usage contract
 
 ### Changed
 

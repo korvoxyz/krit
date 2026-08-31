@@ -87,6 +87,17 @@ Validate a package manifest:
 krit package check
 ```
 
+Inspect every capability requested by the package:
+
+```sh
+krit permissions
+krit permissions --json
+```
+
+Phase 1 validates configuration keys, opaque secret names, and exact
+outbound HTTP origins in `krit.pkg`. It reports requested authority only;
+deployment grants and sandbox enforcement arrive with the WebAssembly host.
+
 Request JSON Lines diagnostics for tools and AI agents:
 
 ```sh
@@ -102,6 +113,17 @@ Show all commands:
 ```sh
 krit --help
 ```
+
+Generate Krit with Claude, ChatGPT, Gemini, or a local model using the exact
+provider-neutral instruction shipped with this compiler:
+
+```sh
+krit prompt
+```
+
+See [ai/README.md](ai/README.md) for the generation and diagnostic-repair
+workflow. Prompt material contains only currently implemented syntax so models
+cannot confuse draft agent APIs with compilable Krit 0.2 code.
 
 ## Language tour
 
@@ -203,6 +225,7 @@ The specification is the semantic authority:
 - [WebAssembly sandbox](spec/WASM-SANDBOX.md) — draft
 - [Guided AI authoring](spec/GUIDED-AUTHORING.md) — draft
 - [Narrow product MVP](docs/mvp.md)
+- [Agent platform roadmap](docs/agent-roadmap.md)
 - [Rust technical design](docs/technical-design.md)
 - [Performance methodology](docs/performance.md)
 - [Initial measured baseline](benchmarks/baseline.json)

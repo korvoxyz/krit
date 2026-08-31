@@ -136,6 +136,28 @@ Providers return structured text edits, not executable tools. A local model,
 hosted model, or deterministic completion engine can implement the protocol.
 Core editor features must not depend on provider-specific prompt syntax.
 
+## Versioned generation prompt
+
+Every compiler release ships one provider-neutral generation prompt tied to a
+specific language version and edition. The pack contains:
+
+- implemented grammar and value kinds
+- compiler and standard-library constraints
+- canonical readable examples
+- unsupported-feature boundaries
+- diagnostic repair instructions
+- prompt schema and compatibility metadata
+
+Claude, ChatGPT, Gemini, and local models receive the same semantic material.
+Provider adapters change transport, not language rules.
+
+Every embedded Krit example is parsed in CI. Draft features are excluded until
+their compiler support ships. This prevents a model from generating future
+syntax against the current compiler.
+
+The exact current pack is printable with `krit prompt`. Generated text remains
+untrusted and enters the normal parse, check, permission, and review loop.
+
 ## Prompt-injection resistance
 
 Source comments, strings, package documentation, API responses, and generated

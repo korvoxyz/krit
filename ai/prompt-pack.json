@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "promptVersion": "0.2.0",
+  "languageVersion": "0.2.0",
+  "edition": "2026",
+  "status": "implemented",
+  "provider": "neutral",
+  "entrypoint": "../crates/krit-cli/assets/KRIT-0.2-SYSTEM.md",
+  "diagnosticSchema": 1
+}

@@ -18,6 +18,8 @@ Capability identifiers are hierarchical:
 ```text
 io.stdout
 io.stdin
+config.read
+http.request
 fs.read
 fs.write
 net.connect
@@ -39,12 +41,14 @@ Grants are narrow data:
 ```toml
 [capabilities]
 stdout = true
-fs_read = ["config/*.json", "data/**"]
-net_connect = ["api.example.com:443"]
-env_read = ["KRIT_PROFILE"]
-secret_read = ["model-api-key"]
-ai_invoke = ["openai/*", "local/*"]
+config = ["agent.model", "agent.timeout-ms"]
+http = ["https://api.github.com", "https://slack.com"]
+secrets = ["github-token", "slack-token"]
 ```
+
+The phase-1 manifest implements only `stdout`, `config`, `http`, and
+`secrets`. Files, generic sockets, processes, environment variables, clocks,
+randomness, state, queues, storage, and AI invocation remain unavailable.
 
 Paths are package-root-relative and resolved before execution. A lexical path
 that escapes the granted root is rejected. Symlink and platform-specific path
@@ -68,6 +72,16 @@ Dependencies contribute required effects but cannot add grants.
 
 `krit permissions` displays requested, granted, denied, and unused
 capabilities with the source package that introduced each requirement.
+
+Before a deployment host exists, `krit permissions` reports the requested
+plan and marks grants as `not-evaluated`. `krit permissions --json` emits:
+
+```json
+{"schema":1,"package":"akshay/agent","requested":[{"capability":"http.request","resource":"https://api.github.com"},{"capability":"secret.read","resource":"github-token"}],"grantStatus":"not-evaluated"}
+```
+
+Requests sort by capability and resource. Configuration keys, HTTP origins,
+and secret names are identifiers only; their values are never included.
 
 ## Development mode
 
@@ -127,6 +141,21 @@ implement a versioned neutral interface containing:
 
 Prompts and responses are private capability data. They are never uploaded for
 telemetry by default.
+
+## Service delivery order
+
+Capabilities are added in this order:
+
+1. configuration, secrets, HTTP, observability, and reliability controls
+2. transactional state, queues, schedules, and object storage
+3. database, cache, and search connectors
+
+Configuration is typed immutable startup data, not inherited environment.
+State provides durable correctness and replay before a general database is
+exposed. Caches are optional optimizations whose absence cannot change
+correctness.
+
+`docs/agent-roadmap.md` defines the implementation gates.
 
 ## Open decisions
 

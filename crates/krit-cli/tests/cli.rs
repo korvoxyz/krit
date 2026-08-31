@@ -56,3 +56,52 @@ fn validates_the_workspace_manifest() {
     assert_eq!(output.stdout, b"checked akshay/krit (krit.pkg)\n");
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn displays_requested_permissions() {
+    let output = krit()
+        .args(["permissions"])
+        .output()
+        .expect("Krit should start");
+
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout,
+        b"Requested capabilities for akshay/krit:\n  io.stdout\nDeployment grants: not evaluated\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn emits_permissions_as_json() {
+    let output = krit()
+        .args(["permissions", "--json"])
+        .output()
+        .expect("Krit should start");
+
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout,
+        b"{\"schema\":1,\"package\":\"akshay/krit\",\"requested\":[{\"capability\":\"io.stdout\"}],\"grantStatus\":\"not-evaluated\"}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn prints_the_versioned_generation_prompt() {
+    let output = krit().arg("prompt").output().expect("Krit should start");
+
+    assert!(output.status.success());
+    assert!(
+        output
+            .stdout
+            .starts_with(b"# Krit 0.2 code-generation instruction\n")
+    );
+    assert!(
+        output
+            .stdout
+            .windows(b"Never invent syntax".len())
+            .any(|window| window == b"Never invent syntax")
+    );
+    assert!(output.stderr.is_empty());
+}

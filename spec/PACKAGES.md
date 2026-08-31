@@ -45,6 +45,9 @@ target = "wasm-component"
 
 [capabilities]
 stdout = true
+config = ["agent.model", "agent.timeout-ms"]
+http = ["https://api.github.com", "https://slack.com"]
+secrets = ["github-token", "slack-token"]
 ```
 
 Package names contain a lowercase namespace and name separated by `/`.

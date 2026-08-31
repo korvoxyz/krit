@@ -8,6 +8,7 @@ use krit::{Diagnostic, Source, parse_source, run_source};
 use krit_package::Manifest;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GENERATION_PROMPT: &str = include_str!("../assets/KRIT-0.2-SYSTEM.md");
 
 #[derive(Clone, Copy, Debug)]
 enum DiagnosticFormat {
@@ -36,6 +37,8 @@ fn run(arguments: Vec<String>) -> u8 {
         }
         "run" => source_command(&arguments[1..], SourceAction::Run),
         "check" => source_command(&arguments[1..], SourceAction::Check),
+        "prompt" => prompt_command(&arguments[1..]),
+        "permissions" => permissions_command(&arguments[1..]),
         "package" => package_command(&arguments[1..]),
         unknown => {
             eprintln!("krit: unknown command `{unknown}`");
@@ -173,6 +176,51 @@ fn package_command(arguments: &[String]) -> u8 {
     }
 }
 
+fn prompt_command(arguments: &[String]) -> u8 {
+    if !arguments.is_empty() {
+        eprintln!("krit: `prompt` does not accept arguments");
+        return 2;
+    }
+    print!("{GENERATION_PROMPT}");
+    0
+}
+
+fn permissions_command(arguments: &[String]) -> u8 {
+    let mut json = false;
+    let mut manifest_path = None;
+    for argument in arguments {
+        match argument.as_str() {
+            "--json" => json = true,
+            argument if argument.starts_with('-') => {
+                eprintln!("krit: unknown option `{argument}`");
+                return 2;
+            }
+            argument if manifest_path.is_none() => manifest_path = Some(argument),
+            _ => {
+                eprintln!("krit: expected at most one manifest path");
+                return 2;
+            }
+        }
+    }
+
+    let path = manifest_path.map_or_else(|| PathBuf::from("krit.pkg"), PathBuf::from);
+    match Manifest::load(&path) {
+        Ok(manifest) => {
+            let plan = manifest.permission_plan();
+            if json {
+                println!("{}", plan.render_json());
+            } else {
+                print!("{}", plan.render_human());
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("{}:1:1: error[K6001]: {error}", path.to_string_lossy());
+            3
+        }
+    }
+}
+
 fn print_help() {
     println!(
         "\
@@ -182,6 +230,8 @@ An open, human-auditable language for the age of AI.
 USAGE:
     krit run [--diagnostic-format human|json] FILE
     krit check [--diagnostic-format human|json] FILE
+    krit prompt
+    krit permissions [--json] [MANIFEST]
     krit package check [MANIFEST]
     krit --version
     krit --help"
@@ -208,5 +258,20 @@ mod tests {
         let error =
             parse_source_options(&["--quiet".to_owned()]).expect_err("unknown option should fail");
         assert!(error.contains("unknown option"));
+    }
+
+    #[test]
+    fn parses_every_prompt_example() {
+        let mut remaining = GENERATION_PROMPT;
+        let mut count = 0;
+        while let Some(start) = remaining.find("```krit\n") {
+            let code = &remaining[start + "```krit\n".len()..];
+            let end = code.find("\n```").expect("Krit code fence should close");
+            let source = Source::new(format!("<prompt-example-{count}>"), &code[..end]);
+            parse_source(&source).expect("prompt example should parse");
+            count += 1;
+            remaining = &code[end + "\n```".len()..];
+        }
+        assert_eq!(count, 4, "prompt should contain four canonical examples");
     }
 }
