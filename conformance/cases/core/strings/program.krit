@@ -1,0 +1,2 @@
+println("Hello, " + "Krit!");
+println("open \u{1f916} text");

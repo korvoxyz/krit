@@ -1,0 +1,5 @@
+let identity = fn(value) {
+    value
+};
+
+println([identity] == [identity]);

@@ -1,0 +1,9 @@
+let offset = 40;
+let add_offset = fn(value) {
+    value + offset
+};
+
+{
+    let offset = 100;
+    println(add_offset(2));
+};

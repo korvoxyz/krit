@@ -1,107 +1,102 @@
 # Krit
 
-Krit is a small functional programming language for learning how interpreters
-work. It has lexical closures, recursive functions, immutable lists, pattern
-matching, and source-positioned errors, while keeping the implementation small
-enough to read.
+Krit is an open, human-auditable programming language for software written
+with AI and trusted by people.
 
 ```krit
-(define sum
-  (fn sum (items)
-    (match items
-      [empty 0]
-      [(cons head tail) (+ head (sum tail))])))
+fn sum(items) {
+    match items {
+        [] => 0,
+        [head, ..tail] => head + sum(tail),
+    }
+}
 
-(println (sum (list 10 20 12)))
+println(sum([10, 20, 12]));
 ```
 
 ```text
 42
 ```
 
-Krit uses S-expression syntax and is implemented in Racket. Version 0.1.0 is
-an educational interpreter, not a production application runtime.
+Krit favors readable source, deterministic behavior, immutable values,
+explicit authority, and machine-readable compiler facts. Natural language can
+help generate Krit, but natural language is never executable Krit.
+
+Krit and the Krit language are owned by Akshay Bhardwaj.
+
+## Status
+
+Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
+
+- UTF-8 source with precise byte and human positions
+- familiar expressions, blocks, functions, calls, and operators
+- immutable lexical bindings and closures
+- checked 64-bit integer arithmetic
+- booleans, strings, unit, and immutable lists
+- recursive function declarations
+- exhaustive empty/cons list matching
+- deterministic human and JSON diagnostics
+- implementation-neutral conformance cases
+- strict package manifest validation
+
+Static types and effects, capability enforcement, modules, dependency
+resolution, bytecode, and build caching are specified directions, not yet
+implemented features. Krit is not production-ready.
 
 ## Requirements
 
-- [Racket 9.3](https://download.racket-lang.org/) or newer
+- Rust 1.94 or newer
+- Cargo
 
-On macOS, Racket 9.3 is also available through Homebrew:
+Install Rust through [rustup](https://rustup.rs/) if it is not already
+available.
+
+## Build
 
 ```sh
-brew install --cask racket
+cargo build --release --locked
+./target/release/krit --version
 ```
 
-Confirm the installed version:
+Install the CLI from this checkout:
 
 ```sh
-racket --version
-# Welcome to Racket v9.3 [cs].
-```
-
-## Install
-
-From a clone of this repository:
-
-```sh
-raco pkg install --auto --name krit
-raco krit --version
-```
-
-The package also generates a `krit` executable in Racket's user executable
-directory. Add that directory to your shell path once:
-
-```sh
-RACKET_BIN="$(racket -e '(require setup/dirs) (display (find-user-console-bin-dir))')"
-export PATH="$RACKET_BIN:$PATH"
+cargo install --path crates/krit-cli --locked
 krit --version
 ```
 
-Add the `export` line, with the resolved directory, to your shell profile to
-make it permanent. `raco krit` works without this path setup.
+## Use
 
-You can run the interpreter without installing the package:
-
-```sh
-racket cli.rkt examples/factorial.krit
-```
-
-To update a linked development installation after changing package metadata:
+Run a source file:
 
 ```sh
-raco setup krit
+krit run examples/factorial.krit
+krit run examples/lists.krit
 ```
 
-## Use Krit
-
-Run a source file using either installed command:
+Check syntax without executing:
 
 ```sh
-krit examples/factorial.krit
-raco krit examples/factorial.krit
+krit check examples/factorial.krit
 ```
 
-Evaluate an expression:
+Validate a package manifest:
 
 ```sh
-krit --eval '(+ 20 22)'
+krit package check
 ```
 
-Start the REPL:
+Request JSON Lines diagnostics for tools and AI agents:
 
 ```sh
-krit
+krit run --diagnostic-format json broken.krit
 ```
 
-```text
-Krit 0.1.0 -- press Ctrl-D to exit
-krit> (define double (fn (x) (* x 2)))
-double defined
-krit> (double 21)
-42
+```json
+{"schema":1,"severity":"error","code":"K2001","message":"undefined name `total`","file":"broken.krit","span":{"start":{"line":1,"column":9,"byte":8},"end":{"line":1,"column":14,"byte":13}},"labels":[],"notes":[]}
 ```
 
-Show all command-line options:
+Show all commands:
 
 ```sh
 krit --help
@@ -109,132 +104,139 @@ krit --help
 
 ## Language tour
 
-Krit programs contain expressions and top-level definitions. A semicolon
-starts a line comment.
-
-### Values and operations
+### Values and checked operators
 
 ```krit
-42
-true
-false
-"hello"
+let answer = 20 + 22;
+let greeting = "Hello, " + "Krit!";
+let ready = answer == 42 && true;
 
-(+ 20 22)
-(>= 5 3)
-(++ "Hello, " "Krit!")
-(if true "yes" "no")
+println(answer);
+println(greeting);
+println(ready);
 ```
 
-Krit has integers, booleans, strings, functions, and immutable lists. Integer
-division truncates toward zero.
+Integers are signed 64-bit values. Overflow, division by zero, wrong value
+kinds, unresolved names, and incorrect function arguments are errors rather
+than silent conversions.
 
-### Bindings and functions
-
-`let` creates simultaneous lexical bindings:
+### Lexical functions
 
 ```krit
-(let ([x 20]
-      [y 22])
-  (+ x y))
+let offset = 40;
+let add_offset = fn(value) {
+    value + offset
+};
+
+println(add_offset(2));
 ```
 
-Functions can accept any number of parameters and close over their lexical
-environment:
+Bindings are immutable and functions use lexical scope.
+
+### Recursion
 
 ```krit
-(let ([x 10])
-  ((fn (y) (+ x y)) 5))
+fn factorial(number) {
+    if number == 0 {
+        1
+    } else {
+        number * factorial(number - 1)
+    }
+}
+
+println(factorial(6));
 ```
 
-Give a function a name when it needs to call itself:
+### Lists and exhaustive matching
 
 ```krit
-(fn factorial (n)
-  (if (= n 0)
-      1
-      (* n (factorial (- n 1)))))
+fn length(items) {
+    match items {
+        [] => 0,
+        [head, ..tail] => 1 + length(tail),
+    }
+}
+
+println(length(["human", "and", "AI"]));
 ```
 
-### Immutable lists and matching
+The two list shapes are visible and mandatory. Pattern names exist only in the
+non-empty branch.
 
-```krit
-(list 1 2 3)
-(cons 0 (list 1 2 3))
-(first (list 1 2 3))
-(rest (list 1 2 3))
-(empty? (list))
+See [spec/LANGUAGE.md](spec/LANGUAGE.md) for complete normative syntax and
+runtime semantics.
+
+## Package baseline
+
+`krit.pkg` is strict TOML:
+
+```toml
+schema = 1
+
+[package]
+name = "akshay/krit"
+version = "0.2.0"
+edition = "2026"
+entry = "examples/factorial.krit"
+license = "Apache-2.0"
+
+[capabilities]
+stdout = true
 ```
 
-`match` handles both possible list shapes:
+Unknown fields, malformed names, unsupported editions, invalid versions, and
+unsafe entry paths fail closed. Dependency resolution and lockfile generation
+will follow [spec/PACKAGES.md](spec/PACKAGES.md).
 
-```krit
-(match items
-  [empty 0]
-  [(cons head tail) (+ head (sum tail))])
-```
+## Architecture and specifications
 
-The bindings in the `cons` pattern are available only in that branch.
+The specification is the semantic authority:
 
-See [docs/language-reference.md](docs/language-reference.md) for the complete
-syntax and semantics.
+- [Language charter](spec/CHARTER.md)
+- [Krit 0.2 language](spec/LANGUAGE.md)
+- [Diagnostic contract](spec/DIAGNOSTICS.md)
+- [Types and effects](spec/TYPES-AND-EFFECTS.md) — draft
+- [Capabilities](spec/CAPABILITIES.md) — draft
+- [Modules and packages](spec/PACKAGES.md) — draft
+- [Rust technical design](docs/technical-design.md)
+- [Performance methodology](docs/performance.md)
+- [Conformance suite](conformance/README.md)
 
-## Errors
-
-Parser and runtime errors include the source file, line, and column:
-
-```text
-example.krit:3:7: expected an integer, received string
-```
-
-The parser reads data and builds Krit syntax directly; it never evaluates
-source as Racket code.
+The Racket prototype is preserved only in Git history at tag
+`racket-v0.1.0`. It is not an active implementation, runtime dependency,
+semantic reference, CI requirement, or contributor tool.
 
 ## Develop
 
-Compile the interpreter and run the test suite:
-
 ```sh
-raco make ast.rkt errors.rkt parser.rkt evaluator.rkt main.rkt cli.rkt
-raco test tests/parser-tests.rkt tests/evaluator-tests.rkt tests/cli-tests.rkt
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo build --workspace --release --locked
 ```
 
-Run the examples:
+The conformance suite runs through the Rust tests. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the language-change process.
 
-```sh
-racket cli.rkt examples/factorial.krit
-racket cli.rkt examples/lists.krit
-```
+## Direction
 
-The project is continuously tested with Racket 9.3. See
-[docs/architecture.md](docs/architecture.md) for the interpreter design and
-[CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes.
+The accepted implementation path is:
 
-## Project direction
+1. Rust source, parser, diagnostics, and direct evaluator
+2. name resolution plus static type/effect checking
+3. explicit capability host boundary
+4. typed Core IR with precise closure capture
+5. compact register bytecode and validated artifacts
+6. deterministic package resolution, lockfiles, content store, and cache
+7. optional Cranelift or WebAssembly backends only when measurements justify
+   them
 
-Krit is intentionally focused on teaching and experimentation:
-
-- **0.1:** parser, evaluator, lexical closures, recursion, immutable lists,
-  matching, REPL, CLI, errors, tests, and examples
-- **Next:** richer diagnostics, more match patterns, a small standard library,
-  and optional static type checking
-- **Later:** modules and a bytecode evaluator, if they improve the educational
-  value without obscuring the implementation
-
-Compatibility will be documented from version 1.0 onward. Before then, syntax
-may evolve between minor releases.
-
-## Origin
-
-Krit began in 2013 as a small interpreter exercise based on the MUPL
-educational language. The current implementation is a fresh language surface
-and interpreter foundation, while the Git history preserves that origin.
+Performance claims follow [docs/performance.md](docs/performance.md), not
+implementation-language assumptions.
 
 ## License
 
-**Ownership:** Krit and the Krit language are owned by Akshay Bhardwaj.
-
-Krit's implementation and documentation are licensed under the
-[Apache License 2.0](LICENSE). The license is permissive and includes an
-explicit patent grant. It does not place licensing requirements on programs
-written in Krit.
+Krit's specifications, implementation, and documentation are licensed under
+the [Apache License 2.0](LICENSE). It is permissive and includes an explicit
+patent grant. It does not place licensing requirements on programs written in
+Krit.

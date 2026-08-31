@@ -1,0 +1,53 @@
+# Krit conformance suite
+
+These cases are implementation-neutral examples of normative Krit behavior.
+An implementation is conforming only when it passes every case for the
+language edition it claims to support.
+
+## Case format
+
+Each directory contains:
+
+- `program.krit` — UTF-8 source
+- `expect.status` — required decimal process status plus line feed
+- `expect.stdout` — optional exact standard-output bytes; absent means empty
+- `expect.diagnostics` — optional ordered diagnostic codes, one per line;
+  absent means no diagnostics
+
+The harness invokes the equivalent of:
+
+```text
+krit run --diagnostic-format json program.krit
+```
+
+It compares status and standard output exactly. It decodes JSON Lines from
+standard error and compares the ordered `code` fields. Additional diagnostic
+prose and labels may vary within `spec/DIAGNOSTICS.md`.
+
+No case depends on a host path, locale, time zone, environment variable,
+network service, or nondeterministic value.
+
+## Current cases
+
+| Case | Contract |
+|---|---|
+| `core/arithmetic` | checked integer operators and precedence |
+| `core/booleans` | strict booleans and short-circuiting |
+| `core/strings` | UTF-8 strings and concatenation |
+| `scope/closures` | immutable lexical capture and shadowing |
+| `functions/recursion` | recursive declaration and calls |
+| `lists/match` | list construction and exhaustive decomposition |
+| `errors/syntax` | missing required syntax |
+| `errors/undefined-name` | lexical name resolution |
+| `errors/wrong-kind` | runtime kind checks |
+| `errors/arity` | exact function arity |
+| `errors/division-zero` | checked division |
+| `errors/overflow` | checked signed 64-bit arithmetic |
+| `errors/function-comparison` | non-comparable functions, including in lists |
+
+## Adding a case
+
+A conformance change must cite the normative specification section in its pull
+request. Keep each program minimal and test one semantic distinction. Unit and
+regression tests belong in Rust crates rather than this directory when they do
+not define portable behavior.

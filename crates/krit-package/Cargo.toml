@@ -1,0 +1,17 @@
+[package]
+name = "krit-package"
+description = "Manifest validation for Krit packages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+semver.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

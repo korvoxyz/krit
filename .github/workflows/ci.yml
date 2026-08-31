@@ -8,31 +8,46 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  quality:
+    name: Rust 1.94 quality
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install Racket 9.3
-        uses: Bogdanp/setup-racket@v1.15
+      - name: Install Rust 1.94.1
+        uses: dtolnay/rust-toolchain@1.94.1
         with:
-          version: "9.3"
-          architecture: x64
+          components: clippy, rustfmt
 
-      - name: Install Krit
-        run: raco pkg install --auto --batch --name krit
+      - name: Check formatting
+        run: cargo fmt --all --check
 
-      - name: Compile modules
-        run: raco make ast.rkt errors.rkt parser.rkt evaluator.rkt main.rkt cli.rkt
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests and conformance
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Build release binary
+        run: cargo build --workspace --release --locked
+
+      - name: Check CLI, package, and examples
+        run: |
+          target/release/krit --version
+          target/release/krit package check
+          test "$(target/release/krit run examples/factorial.krit)" = "720"
+          test "$(target/release/krit run examples/lists.krit)" = $'[10, 20, 12]\n42'
+
+  current-stable:
+    name: Current stable Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Run tests
-        run: raco test tests/parser-tests.rkt tests/evaluator-tests.rkt tests/cli-tests.rkt
-
-      - name: Check installed executable and examples
-        run: |
-          raco krit --version
-          KRIT_BIN="$(racket -e '(require setup/dirs) (display (find-user-console-bin-dir))')/krit"
-          "$KRIT_BIN" --version
-          test "$(raco krit examples/factorial.krit)" = "720"
-          test "$(raco krit examples/lists.krit)" = $'Numbers: 10, 20, 12\n42'
+        run: cargo test --workspace --all-targets --locked

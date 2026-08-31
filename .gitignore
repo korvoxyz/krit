@@ -1,3 +1,2 @@
-compiled/
-**/compiled/
+/target/
 .DS_Store
