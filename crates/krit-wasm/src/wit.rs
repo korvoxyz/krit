@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use wasm_encoder::ValType;
 use wit_parser::{
-    ManglingAndAbi, Resolve, WasmExport, WasmExportKind, WasmImport, WorldId, WorldItem,
+    ManglingAndAbi, Resolve, WasmExport, WasmExportKind, WasmImport, WorldId, WorldItem, WorldKey,
     abi::{WasmSignature, WasmType},
 };
 
@@ -11,13 +11,26 @@ use crate::BuildError;
 pub(crate) const WIT_SOURCE: &str = include_str!("../../../wit/runtime.wit");
 const WIT_PACKAGE: &str = "krit:runtime@0.2.0";
 pub(crate) const STDOUT_EFFECT: &str = "io.stdout";
+pub(crate) const CONFIG_EFFECT: &str = "config.read";
+pub(crate) const HTTP_EFFECT: &str = "http.request";
+pub(crate) const SECRETS_EFFECT: &str = "secret.read";
 pub const STDOUT_INTERFACE: &str = "krit:runtime/stdout@0.2.0";
 pub const CONFIG_INTERFACE: &str = "krit:runtime/config@0.2.0";
+pub const HTTP_INTERFACE: &str = "krit:runtime/http@0.2.0";
+pub const HTTP_ANONYMOUS_INTERFACE: &str = "krit:runtime/http-anonymous@0.2.0";
 pub const SECRETS_INTERFACE: &str = "krit:runtime/secrets@0.2.0";
 pub const WEBHOOK_INTERFACE: &str = "krit:runtime/webhook@0.2.0";
 pub const PROGRAM_WORLD: &str = "krit:runtime/program@0.2.0";
 pub const PURE_PROGRAM_WORLD: &str = "krit:runtime/pure-program@0.2.0";
 pub const WEBHOOK_PROGRAM_WORLD: &str = "krit:runtime/webhook-program@0.2.0";
+pub const WEBHOOK_ALL_PROGRAM_WORLD: &str =
+    "krit:runtime/webhook-stdout-config-secrets-http-program@0.2.0";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProgramKind {
+    Module,
+    Webhook,
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct WitFunction {
@@ -30,11 +43,17 @@ pub(crate) struct WitFunction {
 pub(crate) struct WitContract {
     pub world: String,
     pub component_imports: Vec<String>,
+    pub component_export: String,
     pub imports: Vec<WitFunction>,
     pub import_indices: BTreeMap<String, u32>,
-    pub run_export: String,
-    pub post_run_export: String,
-    pub run_signature: Signature,
+    pub entry_export: String,
+    pub post_entry_export: String,
+    pub entry_signature: Signature,
+    pub post_entry_signature: Signature,
+    pub kind: ProgramKind,
+    pub requires_memory: bool,
+    pub memory_export: String,
+    pub realloc_export: String,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -66,9 +85,10 @@ struct WorldSelection {
 }
 
 pub(crate) fn load_contract(
+    kind: ProgramKind,
     effects: &[String],
 ) -> Result<(Resolve, WorldId, WitContract), BuildError> {
-    let selection = select_world(effects)?;
+    let selection = select_world(kind, effects)?;
     let mut resolve = Resolve::default();
     let package = resolve
         .push_str("krit-runtime.wit", WIT_SOURCE)
@@ -86,11 +106,12 @@ pub(crate) fn load_contract(
     }
 
     let contract = contract_from_world(&resolve, world)?;
-    let expected_component_imports = selection
+    let mut expected_component_imports = selection
         .component_imports
         .iter()
         .map(|import| (*import).to_owned())
         .collect::<Vec<_>>();
+    expected_component_imports.sort();
     if contract.world != selection.id || contract.component_imports != expected_component_imports {
         return Err(BuildError::artifact(
             "built-in WIT world imports do not match policy 1",
@@ -98,7 +119,7 @@ pub(crate) fn load_contract(
     }
     if selection.id == PROGRAM_WORLD {
         verify_stdout_signatures(&contract.imports)?;
-    } else if !contract.imports.is_empty() {
+    } else if kind == ProgramKind::Module && !contract.imports.is_empty() {
         return Err(BuildError::artifact(
             "built-in pure WIT world unexpectedly has core imports",
         ));
@@ -168,78 +189,241 @@ pub(crate) fn contract_from_world(
     }
     component_imports.sort();
 
-    let run = world_definition
-        .exports
-        .iter()
-        .next()
-        .and_then(|(key, item)| match item {
-            WorldItem::Function(function) => Some((key, function)),
-            _ => None,
-        })
-        .ok_or_else(|| BuildError::artifact("built-in WIT run export is not a function"))?;
-    if run.1.name != "run" {
-        return Err(BuildError::artifact("built-in WIT world must export `run`"));
-    }
-    let mangling = ManglingAndAbi::Standard32.for_func(run.1);
-    let run_signature =
-        convert_signature(resolve.wasm_signature(mangling.export_variant(), run.1))?;
-    if !run_signature.params.is_empty() || !run_signature.results.is_empty() {
+    let (_export_key, export_interface, export_function, component_export, kind) =
+        export_function(resolve, world)?;
+    let mangling = ManglingAndAbi::Standard32.for_func(export_function);
+    let entry_signature =
+        convert_signature(resolve.wasm_signature(mangling.export_variant(), export_function))?;
+    if kind == ProgramKind::Module
+        && (!entry_signature.params.is_empty() || !entry_signature.results.is_empty())
+    {
         return Err(BuildError::artifact(
             "built-in WIT `run` canonical ABI must be `() -> ()`",
         ));
     }
-    let run_export = resolve.wasm_export_name(
+    let entry_export = resolve.wasm_export_name(
         mangling,
         WasmExport::Func {
-            interface: None,
-            func: run.1,
+            interface: export_interface,
+            func: export_function,
             kind: WasmExportKind::Normal,
         },
     );
-    let post_run_export = resolve.wasm_export_name(
+    let post_entry_export = resolve.wasm_export_name(
         mangling,
         WasmExport::Func {
-            interface: None,
-            func: run.1,
+            interface: export_interface,
+            func: export_function,
             kind: WasmExportKind::PostReturn,
         },
     );
+    let post_entry_signature = Signature {
+        params: entry_signature.results.clone(),
+        results: Vec::new(),
+    };
 
     Ok(WitContract {
         world: world_id,
         component_imports,
+        component_export,
         imports,
         import_indices,
-        run_export,
-        post_run_export,
-        run_signature,
+        entry_export,
+        post_entry_export,
+        entry_signature,
+        post_entry_signature,
+        kind,
+        requires_memory: kind == ProgramKind::Webhook,
+        memory_export: resolve.wasm_export_name(ManglingAndAbi::Standard32, WasmExport::Memory),
+        realloc_export: resolve.wasm_export_name(ManglingAndAbi::Standard32, WasmExport::Realloc),
     })
 }
 
-fn select_world(effects: &[String]) -> Result<WorldSelection, BuildError> {
-    match effects {
-        [] => Ok(WorldSelection {
-            name: "pure-program",
-            id: PURE_PROGRAM_WORLD,
-            component_imports: &[],
-        }),
-        [effect] if effect == STDOUT_EFFECT => Ok(WorldSelection {
-            name: "program",
-            id: PROGRAM_WORLD,
-            component_imports: &[STDOUT_INTERFACE],
-        }),
+fn export_function(
+    resolve: &Resolve,
+    world: WorldId,
+) -> Result<
+    (
+        &WorldKey,
+        Option<&WorldKey>,
+        &wit_parser::Function,
+        String,
+        ProgramKind,
+    ),
+    BuildError,
+> {
+    let (key, item) = resolve.worlds[world]
+        .exports
+        .iter()
+        .next()
+        .ok_or_else(|| BuildError::artifact("built-in WIT world has no export"))?;
+    match item {
+        WorldItem::Function(function) if function.name == "run" => {
+            Ok((key, None, function, "run".to_owned(), ProgramKind::Module))
+        }
+        WorldItem::Interface { id, .. } => {
+            let identity = resolve
+                .id_of(*id)
+                .ok_or_else(|| BuildError::artifact("WIT export interface has no identity"))?;
+            if identity != WEBHOOK_INTERFACE {
+                return Err(BuildError::artifact(
+                    "built-in WIT exports an unknown interface",
+                ));
+            }
+            let interface = &resolve.interfaces[*id];
+            if interface.functions.len() != 1 {
+                return Err(BuildError::artifact(
+                    "webhook WIT interface must export exactly one function",
+                ));
+            }
+            let function = interface
+                .functions
+                .get("handle")
+                .ok_or_else(|| BuildError::artifact("webhook WIT interface is missing `handle`"))?;
+            Ok((
+                key,
+                Some(key),
+                function,
+                WEBHOOK_INTERFACE.to_owned(),
+                ProgramKind::Webhook,
+            ))
+        }
         _ => Err(BuildError::artifact(
-            "checked effects do not map to a WebAssembly policy 1 WIT world",
+            "built-in WIT export is not an approved function or interface",
         )),
     }
 }
 
-fn convert_signature(signature: WasmSignature) -> Result<Signature, BuildError> {
-    if signature.indirect_params || signature.retptr {
+fn select_world(kind: ProgramKind, effects: &[String]) -> Result<WorldSelection, BuildError> {
+    if effects.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(BuildError::artifact(
-            "built-in WIT unexpectedly requires guest memory",
+            "checked effects must be sorted and unique",
         ));
     }
+    if kind == ProgramKind::Module {
+        return match effects {
+            [] => Ok(WorldSelection {
+                name: "pure-program",
+                id: PURE_PROGRAM_WORLD,
+                component_imports: &[],
+            }),
+            [effect] if effect == STDOUT_EFFECT => Ok(WorldSelection {
+                name: "program",
+                id: PROGRAM_WORLD,
+                component_imports: &[STDOUT_INTERFACE],
+            }),
+            _ => Err(BuildError::artifact(
+                "checked module effects do not map to a WebAssembly policy 1 WIT world",
+            )),
+        };
+    }
+
+    let mut mask = 0u8;
+    for effect in effects {
+        mask |= match effect.as_str() {
+            STDOUT_EFFECT => 1,
+            CONFIG_EFFECT => 2,
+            SECRETS_EFFECT => 4,
+            HTTP_EFFECT => 8,
+            _ => {
+                return Err(BuildError::artifact(
+                    "checked webhook effects contain an unknown host surface",
+                ));
+            }
+        };
+    }
+    let selection = match mask {
+        0 => WorldSelection {
+            name: "webhook-program",
+            id: WEBHOOK_PROGRAM_WORLD,
+            component_imports: &[],
+        },
+        1 => WorldSelection {
+            name: "webhook-stdout-program",
+            id: "krit:runtime/webhook-stdout-program@0.2.0",
+            component_imports: &[STDOUT_INTERFACE],
+        },
+        2 => WorldSelection {
+            name: "webhook-config-program",
+            id: "krit:runtime/webhook-config-program@0.2.0",
+            component_imports: &[CONFIG_INTERFACE],
+        },
+        4 => WorldSelection {
+            name: "webhook-secrets-program",
+            id: "krit:runtime/webhook-secrets-program@0.2.0",
+            component_imports: &[SECRETS_INTERFACE],
+        },
+        8 => WorldSelection {
+            name: "webhook-http-program",
+            id: "krit:runtime/webhook-http-program@0.2.0",
+            component_imports: &[HTTP_ANONYMOUS_INTERFACE],
+        },
+        3 => WorldSelection {
+            name: "webhook-stdout-config-program",
+            id: "krit:runtime/webhook-stdout-config-program@0.2.0",
+            component_imports: &[STDOUT_INTERFACE, CONFIG_INTERFACE],
+        },
+        5 => WorldSelection {
+            name: "webhook-stdout-secrets-program",
+            id: "krit:runtime/webhook-stdout-secrets-program@0.2.0",
+            component_imports: &[STDOUT_INTERFACE, SECRETS_INTERFACE],
+        },
+        9 => WorldSelection {
+            name: "webhook-stdout-http-program",
+            id: "krit:runtime/webhook-stdout-http-program@0.2.0",
+            component_imports: &[STDOUT_INTERFACE, HTTP_ANONYMOUS_INTERFACE],
+        },
+        6 => WorldSelection {
+            name: "webhook-config-secrets-program",
+            id: "krit:runtime/webhook-config-secrets-program@0.2.0",
+            component_imports: &[CONFIG_INTERFACE, SECRETS_INTERFACE],
+        },
+        10 => WorldSelection {
+            name: "webhook-config-http-program",
+            id: "krit:runtime/webhook-config-http-program@0.2.0",
+            component_imports: &[CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE],
+        },
+        12 => WorldSelection {
+            name: "webhook-secrets-http-program",
+            id: "krit:runtime/webhook-secrets-http-program@0.2.0",
+            component_imports: &[SECRETS_INTERFACE, HTTP_INTERFACE],
+        },
+        7 => WorldSelection {
+            name: "webhook-stdout-config-secrets-program",
+            id: "krit:runtime/webhook-stdout-config-secrets-program@0.2.0",
+            component_imports: &[STDOUT_INTERFACE, CONFIG_INTERFACE, SECRETS_INTERFACE],
+        },
+        11 => WorldSelection {
+            name: "webhook-stdout-config-http-program",
+            id: "krit:runtime/webhook-stdout-config-http-program@0.2.0",
+            component_imports: &[STDOUT_INTERFACE, CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE],
+        },
+        13 => WorldSelection {
+            name: "webhook-stdout-secrets-http-program",
+            id: "krit:runtime/webhook-stdout-secrets-http-program@0.2.0",
+            component_imports: &[STDOUT_INTERFACE, SECRETS_INTERFACE, HTTP_INTERFACE],
+        },
+        14 => WorldSelection {
+            name: "webhook-config-secrets-http-program",
+            id: "krit:runtime/webhook-config-secrets-http-program@0.2.0",
+            component_imports: &[CONFIG_INTERFACE, SECRETS_INTERFACE, HTTP_INTERFACE],
+        },
+        15 => WorldSelection {
+            name: "webhook-stdout-config-secrets-http-program",
+            id: WEBHOOK_ALL_PROGRAM_WORLD,
+            component_imports: &[
+                STDOUT_INTERFACE,
+                CONFIG_INTERFACE,
+                SECRETS_INTERFACE,
+                HTTP_INTERFACE,
+            ],
+        },
+        _ => unreachable!("four effects produce a four-bit mask"),
+    };
+    Ok(selection)
+}
+
+fn convert_signature(signature: WasmSignature) -> Result<Signature, BuildError> {
     Ok(Signature {
         params: signature
             .params
@@ -258,12 +442,10 @@ fn convert_wasm_type(ty: WasmType) -> Result<Scalar, BuildError> {
     match ty {
         WasmType::I32 => Ok(Scalar::I32),
         WasmType::I64 => Ok(Scalar::I64),
-        WasmType::F32
-        | WasmType::F64
-        | WasmType::Pointer
-        | WasmType::PointerOrI64
-        | WasmType::Length => Err(BuildError::artifact(
-            "built-in WIT uses a canonical ABI type outside policy 1",
+        WasmType::Pointer | WasmType::Length => Ok(Scalar::I32),
+        WasmType::PointerOrI64 => Ok(Scalar::I64),
+        WasmType::F32 | WasmType::F64 => Err(BuildError::artifact(
+            "built-in WIT uses floating-point canonical ABI values",
         )),
     }
 }
@@ -326,7 +508,10 @@ mod tests {
             "interface webhook",
             "interface config",
             "interface secrets",
+            "interface http",
+            "interface http-anonymous",
             "resource secret",
+            "option<borrow<secret>>",
             "handle: func",
         ] {
             assert!(
@@ -334,5 +519,22 @@ mod tests {
                 "missing WIT contract `{contract}`"
             );
         }
+    }
+
+    #[test]
+    fn selects_anonymous_and_bearer_http_surfaces_without_implicit_secret_authority() {
+        let (_, _, anonymous) = load_contract(ProgramKind::Webhook, &[HTTP_EFFECT.to_owned()])
+            .expect("anonymous HTTP world should load");
+        assert_eq!(anonymous.component_imports, [HTTP_ANONYMOUS_INTERFACE]);
+
+        let (_, _, bearer) = load_contract(
+            ProgramKind::Webhook,
+            &[HTTP_EFFECT.to_owned(), SECRETS_EFFECT.to_owned()],
+        )
+        .expect("bearer HTTP world should load");
+        assert_eq!(
+            bearer.component_imports,
+            [HTTP_INTERFACE, SECRETS_INTERFACE]
+        );
     }
 }

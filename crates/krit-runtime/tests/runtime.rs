@@ -364,6 +364,16 @@ fn policy_one_default_and_hard_maximum_limits_are_exact() {
     assert_eq!(defaults.deadline(), Duration::from_secs(1));
     assert_eq!(defaults.host_calls(), 1024);
     assert_eq!(defaults.output_bytes(), 1024 * 1024);
+    assert_eq!(defaults.request_body_bytes(), 1024 * 1024);
+    assert_eq!(defaults.response_body_bytes(), 1024 * 1024);
+    assert_eq!(defaults.header_count(), 128);
+    assert_eq!(defaults.header_bytes(), 64 * 1024);
+    assert_eq!(defaults.http_calls(), 16);
+    assert_eq!(defaults.connect_timeout(), Duration::from_millis(250));
+    assert_eq!(defaults.read_timeout(), Duration::from_millis(500));
+    assert_eq!(defaults.http_timeout(), Duration::from_millis(750));
+    assert_eq!(defaults.host_config_bytes(), 64 * 1024);
+    assert_eq!(defaults.secret_bytes(), 64 * 1024);
 
     let maxima = krit_runtime::HARD_MAX_LIMITS;
     assert_eq!(maxima.component_bytes(), 16 * 1024 * 1024);
@@ -378,6 +388,16 @@ fn policy_one_default_and_hard_maximum_limits_are_exact() {
     assert_eq!(maxima.deadline(), Duration::from_secs(30));
     assert_eq!(maxima.host_calls(), 1_000_000);
     assert_eq!(maxima.output_bytes(), 16 * 1024 * 1024);
+    assert_eq!(maxima.request_body_bytes(), 16 * 1024 * 1024);
+    assert_eq!(maxima.response_body_bytes(), 16 * 1024 * 1024);
+    assert_eq!(maxima.header_count(), 1024);
+    assert_eq!(maxima.header_bytes(), 1024 * 1024);
+    assert_eq!(maxima.http_calls(), 1024);
+    assert_eq!(maxima.connect_timeout(), Duration::from_secs(5));
+    assert_eq!(maxima.read_timeout(), Duration::from_secs(10));
+    assert_eq!(maxima.http_timeout(), Duration::from_secs(20));
+    assert_eq!(maxima.host_config_bytes(), 1024 * 1024);
+    assert_eq!(maxima.secret_bytes(), 1024 * 1024);
     assert_eq!(
         Runtime::new(maxima)
             .expect("hard maxima should be configurable")

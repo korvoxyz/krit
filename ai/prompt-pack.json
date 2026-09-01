@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "promptVersion": "0.2.7",
+  "promptVersion": "0.2.8",
   "languageVersion": "0.2.0",
   "edition": "2026",
   "status": "implemented",
@@ -10,7 +10,7 @@
   "artifactMetadataSchema": 1,
   "artifactPolicyVersion": 1,
   "runtimeHostPolicyVersion": 1,
-  "sandboxStatus": "implemented-policy-1-subset",
-  "agentContractStatus": "implemented-contracts-only",
-  "httpRuntimeStatus": "unavailable"
+  "sandboxStatus": "implemented-policy-1-and-bounded-webhook-subsets",
+  "agentContractStatus": "implemented-runtime",
+  "httpRuntimeStatus": "implemented-bounded"
 }

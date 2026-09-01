@@ -96,17 +96,20 @@ provider.
 
 ### `phase4-http-runtime`
 
-**Status:** Next
+**Status:** Complete
 
-- inbound socket/HTTP serving and request limits
-- component layouts for the webhook request/response boundary
-- host configuration and opaque secret providers
-- bounded outbound HTTP/TLS connector operations
+- `krit invoke --request FILE` and loopback `krit serve [--once]`
+- bounded canonical webhook request/response/string/header-list layouts
+- exact effect-selected webhook worlds and revalidated artifact requirements
+- explicit immutable host configuration and owner-only secret-file loading
+- opaque zeroizing host-side secret resources and bearer-only consumption
+- DNS-pinned, no-redirect, exact-origin outbound HTTP/TLS with independent
+  connect/read/overall timeouts and body/header/call limits
+- fresh Store/instance/handles per request with response/stdout rollback
+- local deterministic integration and serve acceptance coverage
 
 ### Remaining Phase 4 work
 
-- bounded outbound HTTP client
-- host-managed secret handles
 - provider-neutral AI call
 - structured redacted logs and traces
 - retries, backoff, rate limits, deadlines, cancellation, and idempotency

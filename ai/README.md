@@ -13,13 +13,13 @@ not part of the compiler or runtime.
 The prompt contains only implemented Krit 0.2 syntax, including records,
 built-in Option and Result values, checked annotations, JSON conversion,
 canonical formatting, and the static rules enforced by `krit check`. It also
-contains the implemented contracts-only typed webhook, literal configuration
-read, and opaque secret acquisition forms. Socket serving, outbound HTTP/TLS,
-host value providers, connectors, and AI calls remain explicitly unavailable
-so a model does not invent Phase 4 runtime APIs. The compiler can explain
-checked contracts, build the narrower policy-1 scalar/stdout artifact subset,
-inspect its effective local permissions, and execute that subset in the
-bounded sandbox.
+contains the implemented typed webhook, literal configuration read, opaque
+secret acquisition, and exact-origin `http_request` forms. Raw sockets,
+ambient host values, secret revelation, broad network grants, and AI calls
+remain explicitly unavailable. The compiler can explain exact requirements,
+build scalar or bounded webhook artifacts, inspect effective local
+permissions, and execute them through the sandbox, fixture invocation, or
+loopback server paths.
 
 ## Use
 
@@ -46,17 +46,17 @@ krit check generated.krit
 krit explain --json generated.krit
 krit build
 krit permissions --artifact target/krit/<package>.wasm
-krit sandbox
+krit sandbox # module-init artifacts
+krit invoke --request request.json --host-config host.json # webhook artifacts
 ```
 
-`krit check` accepts the full bootstrap language. `krit build` currently
-accepts only Int, Bool, Unit, non-capturing functions, primitive control flow
-and operators, and scalar stdout. A model asked for a buildable artifact must
-avoid strings, lists, records, Option/Result, JSON, and lexical captures until
-their guest layouts exist. It must also avoid webhook/config/secret contracts:
-they intentionally fail build until `phase4-http-runtime`. A K7001 or K7002
-build diagnostic must be repaired in source rather than bypassed with host
-interpretation.
+`krit check` accepts the full bootstrap language. `krit build` accepts the
+scalar policy-1 subset and a bounded webhook subset containing strings, fixed
+HTTP records, header lists, Result/Option matching, static non-capturing
+helpers, config, secrets, and HTTP. A model must still avoid arbitrary
+composites, JSON in components, data captures, and dynamic string operators.
+A K7001 or K7002 build diagnostic must be repaired in source rather than
+bypassed with host interpretation.
 `krit sandbox` never builds or falls back to the full direct evaluator, so the
 artifact must already exist and validate with its adjacent metadata.
 
@@ -69,8 +69,9 @@ krit check agent.krit
 krit explain --json agent.krit
 ```
 
-Do not run or build that source yet. `krit run` returns K5003 and `krit build`
-returns K7002 rather than simulating configuration, secrets, or HTTP.
+Build it with an exact manifest, then invoke it using strict request and host
+config JSON. `krit run` still returns K5003 rather than simulating hosts.
+`krit invoke` and `krit serve` never build or fall back to interpretation.
 
 For a failed check, send the model:
 

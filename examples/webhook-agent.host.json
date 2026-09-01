@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "config": {
+    "agent.model": "example-model"
+  },
+  "secrets": {}
+}

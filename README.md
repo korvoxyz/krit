@@ -41,6 +41,8 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
   aliases and deterministic request/response JSON Schemas
 - literal-resource `config.read` and `secret.read` effects plus separate
   sorted capability requirements
+- direct normalized-origin `http_request` with exact `http.request` resource
+  facts and bearer-only opaque secret consumption
 - opaque `Secret` compiler/Core identity with static non-disclosure rules
 - name-resolved, inferred typed Core IR with deterministic IDs and explicit
   evaluation order
@@ -54,6 +56,12 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - reusable-engine, fresh-Store Wasmtime component hosting with fuel, epoch
   deadline, stack, StoreLimits, host-call, and buffered-output bounds
 - `krit sandbox` execution and artifact-aware effective permission reports
+- typed webhook Component Model exports with exact effect-selected config,
+  secrets, anonymous/authenticated HTTP, and optional stdout imports
+- bounded webhook invocation, immutable host configuration, zeroizing
+  host-side secret storage, DNS-pinned no-redirect outbound HTTP/TLS, and
+  loopback `serve --once`
+- deterministic non-network `krit invoke --request FILE`
 - recursive function declarations
 - exhaustive empty/cons list matching
 - deterministic comment-preserving canonical source formatting
@@ -61,11 +69,10 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - implementation-neutral conformance cases
 - strict package manifest validation
 
-The `phase4-agent-contracts` milestone is complete, but it is contracts only.
-There is no socket serving, outbound HTTP/TLS, configuration or secret value
-provider, AI invocation, or webhook component layout. Those remain in the
-separate `phase4-http-runtime` and later Phase 4 milestones. Type/effect
-generalization, other composite Wasm layouts, guided authoring, modules,
+The grouped `phase4-http-runtime` milestone is complete. Phase 4 remains in
+progress: AI invocation, observability, retries, rate limits, idempotency, and
+approval policy are intentionally not implemented. General composite Wasm
+layouts beyond the documented webhook subset, guided authoring, modules,
 dependency resolution, build caching, and production multi-tenant OS
 isolation are also future work. Krit is not production-ready.
 
@@ -185,11 +192,13 @@ component/core import surface before accepting metadata claims.
 
 Artifact policy 1 supports `Int`, `Bool`, `Unit`, recursive and higher-order
 non-capturing functions, blocks, conditionals/short circuit, checked integer
-operators, primitive comparisons, and scalar `print`/`println`. Strings,
-lists, records, Option/Result, JSON, lexical captures, and unresolved
-parametric layouts fail with stable `K7001`/`K7002` diagnostics. `krit build`
-never falls back to direct interpretation. Run only the existing validated
-artifact:
+operators, primitive comparisons, and scalar `print`/`println`. The bounded
+webhook policy-2 path additionally supports strings, the fixed HTTP records,
+header lists, Result/Option matching, static non-capturing helper references,
+config, opaque secrets, and outbound HTTP. Other composites, JSON, data
+captures, and unresolved parametric layouts fail with stable `K7001`/`K7002`
+diagnostics. `krit build` never falls back to direct interpretation. Run only
+an existing validated artifact:
 
 ```sh
 krit sandbox
@@ -202,9 +211,37 @@ and buffered output released only on success. The exact default and hard
 limits plus the serialized epoch-scheduling and pre-deadline compilation
 limitations are documented in [the sandbox specification](spec/WASM-SANDBOX.md).
 `krit run` remains the full-language direct evaluator for pure/stdout source;
-it fails with `K5003` for webhook, configuration, and secret host contracts
-rather than fabricating values. The policy-1 component subset is intentionally
-narrower.
+it fails with `K5003` for webhook, configuration, secret, and HTTP host
+operations rather than fabricating values.
+
+Invoke a webhook deterministically from an exact JSON fixture:
+
+```sh
+krit build --manifest examples/webhook-agent.krit.pkg
+krit invoke \
+  --manifest examples/webhook-agent.krit.pkg \
+  --host-config examples/webhook-agent.host.json \
+  --request examples/webhook-agent.request.json
+```
+
+Serve an already-built artifact on loopback, once for tests or without
+`--once` for a local process:
+
+```sh
+krit serve --manifest examples/webhook-agent.krit.pkg --bind 127.0.0.1:3000 --once
+```
+
+Neither command builds or falls back to source interpretation. Host config is
+strict schema-1 JSON with immutable string values and secret **file
+references**, never inline values or environment inheritance:
+
+```json
+{"schema":1,"config":{"agent.model":"example-model"},"secrets":{"example-token":{"file":"secret.bin"}}}
+```
+
+On Unix, secret files must grant no group/other permissions (for example,
+`chmod 600 secret.bin`). Host inputs cannot add names or origins absent from
+the package manifest.
 
 Request JSON Lines diagnostics for tools and AI agents:
 
@@ -239,22 +276,26 @@ Krit can check and explain a minimal webhook agent boundary:
 
 ```krit
 webhook fn handle(request: HttpRequest) -> HttpResponse {
-    let model = config_string("agent.model");
-    let token = secret("github-token");
-    record {
-        status: 200,
-        headers: [record { name: "content-type", value: "text/plain" }],
-        body: request.path,
+    match secret("github-token") {
+        Ok(token) => match http_request(
+            "https://api.example.com",
+            request,
+            Some(token),
+        ) {
+            Ok(response) => response,
+            Err(error) => record { status: 502, headers: [], body: error },
+        },
+        Err(error) => record { status: 500, headers: [], body: error },
     }
 }
 ```
 
-`config_string` returns `Result<String, String>` and `secret` returns
-`Result<Secret, String>`. Both names must be direct string literals so
-`krit explain` can report exact resources. `Secret` cannot be printed,
-compared, JSON-encoded, or stored in ordinary records/lists/variants.
-`krit check` and `krit explain` accept this contract. `krit run` and
-`krit build` deliberately fail closed until the next HTTP runtime milestone.
+`config_string` returns `Result<String, String>`, `secret` returns
+`Result<Secret, String>`, and `http_request` returns
+`Result<HttpResponse, String>`. Resource names and the normalized HTTP origin
+must be direct literals so `krit explain`, metadata, and permission review can
+report exact authority. `Secret` cannot be revealed or structurally stored;
+only direct `Some(secret)` in the bearer position is accepted.
 
 ## Language tour
 

@@ -1,3 +1,4 @@
+mod agent_compiler;
 mod compiler;
 mod error;
 mod metadata;
@@ -16,16 +17,17 @@ pub use error::{BuildError, BuildErrorKind};
 pub use metadata::{
     ARTIFACT_METADATA_SCHEMA, ARTIFACT_POLICY_VERSION, ArtifactMetadata, BuildOptions,
     COMPILER_NAME, LANGUAGE_NAME, LANGUAGE_VERSION, LanguageMetadata, PackageMetadata,
-    VersionedTool,
+    ResourceRequirementMetadata, VersionedTool,
 };
 pub use support::SUPPORTED_BACKEND_SEMANTICS;
 pub use validation::{
-    ComponentInspection, EMBEDDED_METADATA_SECTION, digest_bytes, validate_artifact,
-    validate_component,
+    ComponentInspection, EMBEDDED_METADATA_SECTION, MAX_EMBEDDED_METADATA_BYTES, digest_bytes,
+    validate_artifact, validate_component,
 };
 pub use wit::{
-    CONFIG_INTERFACE, PROGRAM_WORLD, PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STDOUT_INTERFACE,
-    WEBHOOK_INTERFACE, WEBHOOK_PROGRAM_WORLD,
+    CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, PROGRAM_WORLD, PURE_PROGRAM_WORLD,
+    SECRETS_INTERFACE, STDOUT_INTERFACE, WEBHOOK_ALL_PROGRAM_WORLD, WEBHOOK_INTERFACE,
+    WEBHOOK_PROGRAM_WORLD,
 };
 
 use compiler::encode_core;
@@ -56,8 +58,13 @@ pub fn build_component(
         }
     }
 
-    let (resolve, world, contract) = load_contract(&checked.effects)?;
-    let mut core = encode_core(module, &contract, &checked.minimum_literal_operands)?;
+    let (resolve, world, contract) = load_contract(checked.kind, &checked.effects)?;
+    let mut core = encode_core(
+        module,
+        checked.entrypoint,
+        &contract,
+        &checked.minimum_literal_operands,
+    )?;
     validate_core(&core.bytes, &contract, core.table_size)?;
     embed_component_metadata(&mut core.bytes, &resolve, world, StringEncoding::UTF8).map_err(
         |error| BuildError::artifact(format!("could not embed the parsed WIT world: {error}")),
@@ -87,15 +94,20 @@ pub fn build_component(
         ))
     })?;
 
-    let embedded =
-        EmbeddedMetadata::new(&options.edition, &contract.world, checked.effects.clone());
+    let embedded = EmbeddedMetadata::new(
+        &options.edition,
+        &contract.world,
+        checked.effects.clone(),
+        checked.requirements.clone(),
+    );
     let embedded = serde_json::to_vec(&embedded).map_err(|error| {
         BuildError::artifact(format!("could not serialize component metadata: {error}"))
     })?;
-    if embedded.len() > 1024 {
-        return Err(BuildError::artifact(
-            "component metadata exceeds the policy 1 size limit",
-        ));
+    if embedded.len() > MAX_EMBEDDED_METADATA_BYTES {
+        return Err(BuildError::artifact(format!(
+            "component metadata exceeds the {}-byte policy limit",
+            MAX_EMBEDDED_METADATA_BYTES
+        )));
     }
     let section = CustomSection {
         name: Cow::Borrowed(EMBEDDED_METADATA_SECTION),
@@ -133,6 +145,7 @@ pub fn build_component(
         digest,
         byte_size: bytes.len() as u64,
         effects: inspection.effects,
+        requirements: inspection.requirements,
         imports: inspection.imports,
         build_profile: options.build_profile.clone(),
         policy_version: ARTIFACT_POLICY_VERSION,

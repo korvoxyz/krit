@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use krit_capability::is_valid_resource_name;
+use krit_capability::{HttpOrigin, is_valid_resource_name};
 
 use crate::{
     Builtin, Diagnostic, Span,
@@ -378,6 +378,7 @@ impl fmt::Display for FunctionType {
 #[non_exhaustive]
 pub enum Effect {
     ConfigRead,
+    HttpRequest,
     IoStdout,
     SecretRead,
 }
@@ -386,6 +387,7 @@ impl Effect {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::ConfigRead => "config.read",
+            Self::HttpRequest => "http.request",
             Self::IoStdout => "io.stdout",
             Self::SecretRead => "secret.read",
         }
@@ -617,6 +619,7 @@ enum ConstraintKind {
     Addable,
     Comparable,
     JsonValue,
+    OpaqueArgument,
     Printable,
     StructuralValue,
 }
@@ -635,6 +638,7 @@ struct Analyzer {
     constraints: Vec<TypeConstraint>,
     host_builtin_references: Vec<(Span, Builtin)>,
     direct_host_builtin_references: BTreeSet<Span>,
+    allowed_secret_constructor_spans: BTreeSet<Span>,
 }
 
 #[derive(Clone)]
@@ -659,6 +663,7 @@ impl Analyzer {
             constraints: Vec::new(),
             host_builtin_references: Vec::new(),
             direct_host_builtin_references: BTreeSet::new(),
+            allowed_secret_constructor_spans: BTreeSet::new(),
         }
     }
 
@@ -931,7 +936,9 @@ impl Analyzer {
                 let (ty, resolution) = self.lookup(name, expression.span)?;
                 if matches!(
                     resolution,
-                    ResolvedName::Builtin(Builtin::ConfigString | Builtin::Secret)
+                    ResolvedName::Builtin(
+                        Builtin::ConfigString | Builtin::Secret | Builtin::HttpRequest
+                    )
                 ) {
                     let ResolvedName::Builtin(builtin) = resolution else {
                         unreachable!("matched a built-in resolution")
@@ -1112,30 +1119,71 @@ impl Analyzer {
         arguments: &[Expression],
         span: Span,
     ) -> Result<ExpressionInfo, Diagnostic> {
-        let direct_resource = if let Some(builtin) = direct_host_builtin(callee) {
+        let direct_builtin = direct_host_builtin(callee);
+        let direct_resource = if let Some(builtin) = direct_builtin {
             self.direct_host_builtin_references.insert(callee.span);
-            if arguments.len() == 1 {
-                let ExpressionKind::Literal(ValueLiteral::String(resource)) = &arguments[0].kind
-                else {
-                    return Err(Diagnostic::new(
-                        "K3008",
-                        format!(
-                            "`{}` requires a direct string-literal resource",
-                            builtin.as_str()
-                        ),
-                        arguments[0].span,
-                    ));
-                };
-                if !is_valid_resource_name(resource) {
-                    return Err(Diagnostic::new(
-                        "K3008",
-                        "capability resource must use 1-64 lowercase letters, digits, `.` or `-`, without leading/trailing punctuation or `..`/`--`",
-                        arguments[0].span,
-                    ));
+            match (builtin, arguments) {
+                (Builtin::ConfigString | Builtin::Secret, [argument]) => {
+                    let ExpressionKind::Literal(ValueLiteral::String(resource)) = &argument.kind
+                    else {
+                        return Err(Diagnostic::new(
+                            "K3008",
+                            format!(
+                                "`{}` requires a direct string-literal resource",
+                                builtin.as_str()
+                            ),
+                            argument.span,
+                        ));
+                    };
+                    if !is_valid_resource_name(resource) {
+                        return Err(Diagnostic::new(
+                            "K3008",
+                            "capability resource must use 1-64 lowercase letters, digits, `.` or `-`, without leading/trailing punctuation or `..`/`--`",
+                            argument.span,
+                        ));
+                    }
+                    Some((builtin, resource.clone()))
                 }
-                Some((builtin, resource.clone()))
-            } else {
-                None
+                (Builtin::HttpRequest, [origin, _, bearer]) => {
+                    let ExpressionKind::Literal(ValueLiteral::String(origin_value)) = &origin.kind
+                    else {
+                        return Err(Diagnostic::new(
+                            "K3008",
+                            "`http_request` requires a direct normalized exact-origin literal",
+                            origin.span,
+                        ));
+                    };
+                    let normalized = HttpOrigin::parse_exact(origin_value).map_err(|error| {
+                        Diagnostic::new(
+                            "K3008",
+                            format!("invalid `http_request` origin: {error}"),
+                            origin.span,
+                        )
+                    })?;
+                    match &bearer.kind {
+                        ExpressionKind::Variable(name) if name == "None" => {}
+                        ExpressionKind::Call {
+                            callee: constructor,
+                            arguments: constructor_arguments,
+                        } if matches!(
+                            &constructor.kind,
+                            ExpressionKind::Variable(name) if name == "Some"
+                        ) && constructor_arguments.len() == 1 =>
+                        {
+                            self.allowed_secret_constructor_spans
+                                .insert(constructor.span);
+                        }
+                        _ => {
+                            return Err(Diagnostic::new(
+                                "K3008",
+                                "`http_request` bearer must be directly `None` or `Some(secret)`",
+                                bearer.span,
+                            ));
+                        }
+                    }
+                    Some((builtin, normalized.as_str().to_owned()))
+                }
+                _ => None,
             }
         } else {
             None
@@ -1198,6 +1246,7 @@ impl Analyzer {
             let capability = match builtin {
                 Builtin::ConfigString => Effect::ConfigRead,
                 Builtin::Secret => Effect::SecretRead,
+                Builtin::HttpRequest => Effect::HttpRequest,
                 _ => unreachable!("only resource host built-ins are returned"),
             };
             effects.direct.insert(capability.clone());
@@ -1205,7 +1254,20 @@ impl Analyzer {
                 .direct_requirements
                 .insert(CapabilityRequirement::new(capability, resource));
         }
-        for (parameter, argument) in parameters.into_iter().zip(argument_types) {
+        for (index, (parameter, argument)) in parameters.into_iter().zip(argument_types).enumerate()
+        {
+            let approved_secret_use =
+                matches!(
+                    direct_builtin,
+                    Some(Builtin::HttpRequest) if index == 2
+                ) || self.allowed_secret_constructor_spans.contains(&callee.span);
+            if !approved_secret_use {
+                self.constraints.push(TypeConstraint {
+                    ty: argument.clone(),
+                    span: arguments[index].span,
+                    kind: ConstraintKind::OpaqueArgument,
+                });
+            }
             self.unify(parameter, argument, span, "function argument")?;
         }
         effects.dependencies.insert(effect);
@@ -1919,7 +1981,17 @@ impl Analyzer {
                 ),
                 ConstraintKind::Comparable => self.is_comparable(&constraint.ty),
                 ConstraintKind::JsonValue => self.is_json_value(&constraint.ty),
-                ConstraintKind::Printable | ConstraintKind::StructuralValue => {
+                ConstraintKind::OpaqueArgument | ConstraintKind::Printable => {
+                    !self.contains_secret(&constraint.ty, &mut BTreeSet::new())
+                }
+                ConstraintKind::StructuralValue
+                    if self
+                        .allowed_secret_constructor_spans
+                        .contains(&constraint.span) =>
+                {
+                    matches!(self.resolve_head(&constraint.ty), InferType::Secret)
+                }
+                ConstraintKind::StructuralValue => {
                     !self.contains_secret(&constraint.ty, &mut BTreeSet::new())
                 }
             };
@@ -1928,6 +2000,9 @@ impl Analyzer {
                     let operation = match constraint.kind {
                         ConstraintKind::Comparable => "compared",
                         ConstraintKind::JsonValue => "encoded as JSON",
+                        ConstraintKind::OpaqueArgument => {
+                            "passed outside the approved HTTP bearer position"
+                        }
                         ConstraintKind::Printable => "printed",
                         ConstraintKind::StructuralValue => "placed into ordinary structural data",
                         ConstraintKind::Addable => "used by `+`",
@@ -1960,7 +2035,9 @@ impl Analyzer {
                             self.render_type(&constraint.ty)
                         ),
                     ),
-                    ConstraintKind::Printable | ConstraintKind::StructuralValue => {
+                    ConstraintKind::OpaqueArgument
+                    | ConstraintKind::Printable
+                    | ConstraintKind::StructuralValue => {
                         unreachable!("these constraints reject only Secret")
                     }
                 };
@@ -2193,6 +2270,24 @@ impl Analyzer {
                     parameters: vec![InferType::String],
                     return_type: Box::new(InferType::Result(
                         Box::new(InferType::Secret),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::HttpRequest => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::HttpRequest);
+                InferType::Function {
+                    parameters: vec![
+                        InferType::String,
+                        InferType::HttpRequest,
+                        InferType::Option(Box::new(InferType::Secret)),
+                    ],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::HttpResponse),
                         Box::new(InferType::String),
                     )),
                     effect,
@@ -2462,7 +2557,9 @@ fn direct_host_builtin(callee: &Expression) -> Option<Builtin> {
         return None;
     };
     match Builtin::from_name(name) {
-        Some(builtin @ (Builtin::ConfigString | Builtin::Secret)) => Some(builtin),
+        Some(builtin @ (Builtin::ConfigString | Builtin::Secret | Builtin::HttpRequest)) => {
+            Some(builtin)
+        }
         _ => None,
     }
 }

@@ -1,0 +1,12 @@
+{
+  "method": "POST",
+  "path": "/webhook",
+  "query": "",
+  "headers": [
+    {
+      "name": "content-type",
+      "value": "application/json"
+    }
+  ],
+  "body": "{\"event\":\"example\"}"
+}

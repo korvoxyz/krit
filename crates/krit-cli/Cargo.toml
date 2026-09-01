@@ -17,8 +17,10 @@ krit.workspace = true
 krit-package.workspace = true
 krit-runtime.workspace = true
 krit-wasm.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tiny_http.workspace = true
 
 [lints]
 workspace = true

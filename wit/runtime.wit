@@ -39,6 +39,58 @@ interface secrets {
     acquire: func(name: string) -> result<secret, string>;
 }
 
+interface http {
+    use secrets.{secret};
+
+    record header {
+        name: string,
+        value: string,
+    }
+
+    record request {
+        method: string,
+        path: string,
+        query: string,
+        headers: list<header>,
+        body: string,
+    }
+
+    record response {
+        status: s64,
+        headers: list<header>,
+        body: string,
+    }
+
+    send: func(
+        origin: string,
+        request: request,
+        bearer: option<borrow<secret>>,
+    ) -> result<response, string>;
+}
+
+interface http-anonymous {
+    record header {
+        name: string,
+        value: string,
+    }
+
+    record request {
+        method: string,
+        path: string,
+        query: string,
+        headers: list<header>,
+        body: string,
+    }
+
+    record response {
+        status: s64,
+        headers: list<header>,
+        body: string,
+    }
+
+    send: func(origin: string, request: request) -> result<response, string>;
+}
+
 world pure-program {
     export run: func();
 }
@@ -49,5 +101,106 @@ world program {
 }
 
 world webhook-program {
+    export webhook;
+}
+
+world webhook-stdout-program {
+    import stdout;
+    export webhook;
+}
+
+world webhook-config-program {
+    import config;
+    export webhook;
+}
+
+world webhook-secrets-program {
+    import secrets;
+    export webhook;
+}
+
+world webhook-http-program {
+    import http-anonymous;
+    export webhook;
+}
+
+world webhook-stdout-config-program {
+    import stdout;
+    import config;
+    export webhook;
+}
+
+world webhook-stdout-secrets-program {
+    import stdout;
+    import secrets;
+    export webhook;
+}
+
+world webhook-stdout-http-program {
+    import stdout;
+    import http-anonymous;
+    export webhook;
+}
+
+world webhook-config-secrets-program {
+    import config;
+    import secrets;
+    export webhook;
+}
+
+world webhook-config-http-program {
+    import config;
+    import http-anonymous;
+    export webhook;
+}
+
+world webhook-secrets-http-program {
+    import secrets;
+    import http;
+    export webhook;
+}
+
+world webhook-stdout-config-secrets-program {
+    import stdout;
+    import config;
+    import secrets;
+    export webhook;
+}
+
+world webhook-stdout-config-http-program {
+    import stdout;
+    import config;
+    import http-anonymous;
+    export webhook;
+}
+
+world webhook-stdout-secrets-http-program {
+    import stdout;
+    import secrets;
+    import http;
+    export webhook;
+}
+
+world webhook-config-secrets-http-program {
+    import config;
+    import secrets;
+    import http;
+    export webhook;
+}
+
+world webhook-stdout-config-secrets-http-program {
+    import stdout;
+    import config;
+    import secrets;
+    import http;
+    export webhook;
+}
+
+world webhook-host-program {
+    import stdout;
+    import config;
+    import secrets;
+    import http;
+    import http-anonymous;
     export webhook;
 }

@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
 
 use krit_package::Manifest;
-use krit_wasm::{ArtifactMetadata, PROGRAM_WORLD, PURE_PROGRAM_WORLD, STDOUT_INTERFACE};
+use krit_wasm::{
+    ArtifactMetadata, CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, PROGRAM_WORLD,
+    PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD,
+};
 use serde::Serialize;
 
 use crate::RuntimeError;
@@ -54,6 +57,19 @@ impl GrantSet {
             effects.insert("io.stdout".to_owned());
             imports.insert(STDOUT_INTERFACE.to_owned());
         }
+        if !manifest.capabilities.config.is_empty() {
+            effects.insert("config.read".to_owned());
+            imports.insert(CONFIG_INTERFACE.to_owned());
+        }
+        if !manifest.capabilities.http.is_empty() {
+            effects.insert("http.request".to_owned());
+            imports.insert(HTTP_INTERFACE.to_owned());
+            imports.insert(HTTP_ANONYMOUS_INTERFACE.to_owned());
+        }
+        if !manifest.capabilities.secrets.is_empty() {
+            effects.insert("secret.read".to_owned());
+            imports.insert(SECRETS_INTERFACE.to_owned());
+        }
         requested.extend(
             manifest
                 .capabilities
@@ -100,11 +116,18 @@ impl GrantSet {
         if !identity_denials.is_empty() {
             return Err(RuntimeError::authorization(identity_denials.join("; ")));
         }
+
         let evaluation = self.evaluate(metadata);
-        if !evaluation.denied.is_empty() {
+        if let Some(denied) = evaluation.denied.first() {
             return Err(RuntimeError::authorization(format!(
-                "required capability `{}` is not granted by the manifest",
-                evaluation.denied[0].capability
+                "required capability `{}`{} is not granted by the manifest",
+                denied.capability,
+                denied
+                    .resource
+                    .as_deref()
+                    .map_or_else(String::new, |resource| format!(
+                        " for resource `{resource}`"
+                    ))
             )));
         }
         if !valid_policy_world(metadata)
@@ -120,24 +143,52 @@ impl GrantSet {
         Ok(())
     }
 
-    pub(crate) fn evaluate(&self, metadata: &ArtifactMetadata) -> EffectivePermissions {
-        let required = metadata
-            .effects
+    pub(crate) fn grants(&self, capability: &str, resource: Option<&str>) -> bool {
+        self.requested
             .iter()
-            .cloned()
-            .map(|capability| PermissionFact {
-                capability,
-                resource: None,
+            .any(|fact| fact.capability == capability && fact.resource.as_deref() == resource)
+    }
+
+    pub(crate) fn evaluate(&self, metadata: &ArtifactMetadata) -> EffectivePermissions {
+        let mut required = metadata
+            .requirements
+            .iter()
+            .map(|requirement| PermissionFact {
+                capability: requirement.capability.clone(),
+                resource: Some(requirement.resource.clone()),
             })
             .collect::<Vec<_>>();
+        required.extend(
+            metadata
+                .effects
+                .iter()
+                .filter(|effect| {
+                    !metadata
+                        .requirements
+                        .iter()
+                        .any(|requirement| &requirement.capability == *effect)
+                })
+                .cloned()
+                .map(|capability| PermissionFact {
+                    capability,
+                    resource: None,
+                }),
+        );
+        required.sort();
         let effective = required
             .iter()
-            .filter(|fact| self.effects.contains(&fact.capability))
+            .filter(|fact| {
+                self.effects.contains(&fact.capability)
+                    && self.grants(&fact.capability, fact.resource.as_deref())
+            })
             .cloned()
             .collect::<Vec<_>>();
         let denied = required
             .iter()
-            .filter(|fact| !self.effects.contains(&fact.capability))
+            .filter(|fact| {
+                !self.effects.contains(&fact.capability)
+                    || !self.grants(&fact.capability, fact.resource.as_deref())
+            })
             .cloned()
             .collect::<Vec<_>>();
         let mut denial_reasons = self.identity_denials(metadata);
@@ -257,12 +308,41 @@ fn render_facts(output: &mut String, heading: &str, facts: &[PermissionFact]) {
 }
 
 fn valid_policy_world(metadata: &ArtifactMetadata) -> bool {
-    match metadata.effects.as_slice() {
-        [] => metadata.world == PURE_PROGRAM_WORLD && metadata.imports.is_empty(),
-        [effect] if effect == "io.stdout" => {
-            metadata.world == PROGRAM_WORLD && metadata.imports == [STDOUT_INTERFACE]
+    let mut expected_imports = metadata
+        .effects
+        .iter()
+        .filter_map(|effect| match effect.as_str() {
+            "io.stdout" => Some(STDOUT_INTERFACE.to_owned()),
+            "config.read" => Some(CONFIG_INTERFACE.to_owned()),
+            "secret.read" => Some(SECRETS_INTERFACE.to_owned()),
+            "http.request" => Some(
+                if metadata
+                    .effects
+                    .iter()
+                    .any(|effect| effect == "secret.read")
+                {
+                    HTTP_INTERFACE
+                } else {
+                    HTTP_ANONYMOUS_INTERFACE
+                }
+                .to_owned(),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    expected_imports.sort();
+    if expected_imports != metadata.imports {
+        return false;
+    }
+    match metadata.world.as_str() {
+        PURE_PROGRAM_WORLD => metadata.effects.is_empty(),
+        PROGRAM_WORLD => metadata.effects == ["io.stdout"],
+        WEBHOOK_PROGRAM_WORLD => metadata.effects.is_empty(),
+        world => {
+            world.starts_with("krit:runtime/webhook-")
+                && world.ends_with("-program@0.2.0")
+                && !metadata.effects.is_empty()
         }
-        _ => false,
     }
 }
 
@@ -335,6 +415,7 @@ stdout = true
             digest: "unused".to_owned(),
             byte_size: 0,
             effects: vec!["io.stdout".to_owned()],
+            requirements: Vec::new(),
             imports: vec![STDOUT_INTERFACE.to_owned()],
             build_profile: "default".to_owned(),
             policy_version: ARTIFACT_POLICY_VERSION,

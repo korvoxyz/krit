@@ -1769,7 +1769,13 @@ impl<'a> Verifier<'a> {
             OperationKind::Variant { variant, payload } => {
                 if let Some(payload) = payload {
                     require_available(*payload, available, operation.result)?;
-                    if type_contains_secret(self.value_type(*payload)?) {
+                    let approved_bearer = *variant == VariantName::Some
+                        && matches!(
+                            operation.ty.as_ref(),
+                            Type::Option(element) if element.as_ref() == &Type::Secret
+                        )
+                        && self.value_type(*payload)? == &Type::Secret;
+                    if type_contains_secret(self.value_type(*payload)?) && !approved_bearer {
                         return Err(IrError::new("opaque Secret cannot be placed in a variant"));
                     }
                 }
@@ -2075,7 +2081,10 @@ impl<'a> Verifier<'a> {
                 };
                 let mut requirements = function.requirements().iter().cloned().collect::<Vec<_>>();
                 if let Some(builtin) = self.builtin_values.get(callee)
-                    && matches!(builtin, Builtin::ConfigString | Builtin::Secret)
+                    && matches!(
+                        builtin,
+                        Builtin::ConfigString | Builtin::Secret | Builtin::HttpRequest
+                    )
                 {
                     let argument = arguments.first().ok_or_else(|| {
                         IrError::new(format!(
@@ -2092,6 +2101,7 @@ impl<'a> Verifier<'a> {
                     let capability = match builtin {
                         Builtin::ConfigString => crate::Effect::ConfigRead,
                         Builtin::Secret => crate::Effect::SecretRead,
+                        Builtin::HttpRequest => crate::Effect::HttpRequest,
                         _ => unreachable!("matched resource host built-ins"),
                     };
                     requirements.push(crate::CapabilityRequirement::new(
@@ -2208,6 +2218,25 @@ impl<'a> Verifier<'a> {
                     Ok(())
                 } else {
                     Err(IrError::new("secret has invalid signature"))
+                }
+            }
+            Builtin::HttpRequest => {
+                let Type::Function(function) = ty else {
+                    return Err(IrError::new("http_request has non-function type"));
+                };
+                let expected = Type::Result(Arc::new(Type::HttpResponse), Arc::new(Type::String));
+                if function.parameters()
+                    == [
+                        Arc::new(Type::String),
+                        Arc::new(Type::HttpRequest),
+                        Arc::new(Type::Option(Arc::new(Type::Secret))),
+                    ]
+                    && function.return_type() == &expected
+                    && function.effects().contains(&crate::Effect::HttpRequest)
+                {
+                    Ok(())
+                } else {
+                    Err(IrError::new("http_request has invalid signature"))
                 }
             }
         }
@@ -2330,7 +2359,9 @@ fn verify_constructor_function(
         return Err(IrError::new("constructor has invalid function boundary"));
     }
     let parameter = function.parameters()[0].as_ref();
-    if type_contains_secret(parameter) {
+    let approved_bearer =
+        family == VariantFamily::Option && first_payload && parameter == &Type::Secret;
+    if type_contains_secret(parameter) && !approved_bearer {
         return Err(IrError::new(
             "opaque Secret cannot be placed in a constructed variant",
         ));

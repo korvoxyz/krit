@@ -16,3 +16,14 @@ pub(crate) mod stdout {
         },
     });
 }
+
+pub(crate) mod webhook {
+    wasmtime::component::bindgen!({
+        world: "webhook-host-program",
+        path: "../../wit/runtime.wit",
+        with: {
+            "krit:runtime/secrets.secret": crate::SecretHandle,
+        },
+        imports: { default: trappable },
+    });
+}

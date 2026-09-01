@@ -43,6 +43,7 @@ pub enum BuiltinFunction {
     JsonDecode,
     ConfigString,
     Secret,
+    HttpRequest,
 }
 
 impl fmt::Debug for Value {
@@ -94,6 +95,7 @@ impl Value {
             Self::Builtin(BuiltinFunction::JsonDecode) => "<function json_decode>".to_owned(),
             Self::Builtin(BuiltinFunction::ConfigString) => "<function config_string>".to_owned(),
             Self::Builtin(BuiltinFunction::Secret) => "<function secret>".to_owned(),
+            Self::Builtin(BuiltinFunction::HttpRequest) => "<function http_request>".to_owned(),
         }
     }
 
@@ -257,6 +259,7 @@ impl Evaluator<'_> {
                 "json_decode" => Ok(Value::Builtin(BuiltinFunction::JsonDecode)),
                 "config_string" => Ok(Value::Builtin(BuiltinFunction::ConfigString)),
                 "secret" => Ok(Value::Builtin(BuiltinFunction::Secret)),
+                "http_request" => Ok(Value::Builtin(BuiltinFunction::HttpRequest)),
                 _ => environment.lookup(name).ok_or_else(|| {
                     Diagnostic::new("K2001", format!("undefined name `{name}`"), expression.span)
                 }),
@@ -441,8 +444,23 @@ impl Evaluator<'_> {
                 self.block(&function.body, &call_environment)
             }
             Value::Builtin(builtin) => {
-                if arguments.len() != 1 {
-                    return Err(arity_error(1, arguments.len(), span));
+                let expected_arity = if builtin == BuiltinFunction::HttpRequest {
+                    3
+                } else {
+                    1
+                };
+                if arguments.len() != expected_arity {
+                    return Err(arity_error(expected_arity, arguments.len(), span));
+                }
+                if builtin == BuiltinFunction::HttpRequest {
+                    for argument in arguments {
+                        self.expression(argument, environment)?;
+                    }
+                    return Err(Diagnostic::new(
+                        "K5003",
+                        "HTTP host operations are unavailable in direct source execution",
+                        span,
+                    ));
                 }
                 let value = self.expression(&arguments[0], environment)?;
                 match builtin {
@@ -484,6 +502,9 @@ impl Evaluator<'_> {
                         "secret host operations are unavailable in direct source execution",
                         span,
                     )),
+                    BuiltinFunction::HttpRequest => {
+                        unreachable!("HTTP requests return before unary builtin dispatch")
+                    }
                 }
             }
             value => Err(Diagnostic::new(

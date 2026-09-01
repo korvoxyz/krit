@@ -22,6 +22,8 @@ pub struct ArtifactMetadata {
     pub digest: String,
     pub byte_size: u64,
     pub effects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirements: Vec<ResourceRequirementMetadata>,
     pub imports: Vec<String>,
     pub build_profile: String,
     pub policy_version: u32,
@@ -46,6 +48,13 @@ pub struct LanguageMetadata {
 pub struct PackageMetadata {
     pub name: String,
     pub version: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceRequirementMetadata {
+    pub capability: String,
+    pub resource: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,17 +145,25 @@ pub(crate) struct EmbeddedMetadata {
     pub edition: String,
     pub world: String,
     pub effects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirements: Vec<ResourceRequirementMetadata>,
     pub policy_version: u32,
 }
 
 impl EmbeddedMetadata {
-    pub(crate) fn new(edition: &str, world: &str, effects: Vec<String>) -> Self {
+    pub(crate) fn new(
+        edition: &str,
+        world: &str,
+        effects: Vec<String>,
+        requirements: Vec<ResourceRequirementMetadata>,
+    ) -> Self {
         Self {
             schema: ARTIFACT_METADATA_SCHEMA,
             compiler_version: env!("CARGO_PKG_VERSION").to_owned(),
             edition: edition.to_owned(),
             world: world.to_owned(),
             effects,
+            requirements,
             policy_version: ARTIFACT_POLICY_VERSION,
         }
     }

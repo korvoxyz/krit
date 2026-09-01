@@ -1,6 +1,6 @@
 # Krit Rust technical design
 
-**Status:** Accepted; policy-1 artifact backend and bounded host implemented
+**Status:** Accepted; policy-1 scalar and policy-2 webhook hosts implemented
 **Owner:** Akshay Bhardwaj
 
 ## Decision
@@ -52,7 +52,7 @@ emits validated artifacts, `krit sandbox` executes only those artifacts, and
 
 ```text
 crates/
-  krit-capability/   shared capability resource-name policy
+  krit-capability/   shared resource-name and normalized-origin policy
   krit-source/       source files, spans, line maps
   krit-syntax/       tokens, lexer, AST, parser
   krit-diagnostics/  codes, rendering, JSON schema
@@ -206,11 +206,11 @@ The implemented policy-1 artifact is a small WebAssembly component that
 selects one of two checked-in `krit:runtime@0.2.0` worlds from checked effects.
 `krit:runtime/pure-program@0.2.0` exports `run: func()` with no imports.
 `krit:runtime/program@0.2.0` exports the same function and imports the typed
-`krit:runtime/stdout@0.2.0` interface. Unused manifest grants do not widen the
-selected world. The checked-in WIT also contains contracts-only HTTP, config,
-opaque-secret resource, and typed `webhook-program` definitions. The current
-backend never selects them; exact component layouts and host composition
-belong to `phase4-http-runtime`.
+`krit:runtime/stdout@0.2.0` interface. Policy 2 selects one finite webhook
+world from the exact `io.stdout`, `config.read`, `secret.read`, and
+`http.request` effect set. Anonymous HTTP uses a separate interface so it does
+not implicitly import secret acquisition; bearer HTTP borrows the opaque
+secret resource.
 
 Krit does not grant a general WASI environment. Files, sockets, processes,
 environment variables, clocks, randomness, secrets, state, and AI calls are
@@ -220,9 +220,12 @@ unforgeable handles.
 The backend uses `i64` for `Int`, `i32` for `Bool`, zero-width `Unit`, and
 bounded-table `i32` slots for non-capturing functions. It supports recursive
 and higher-order calls, Core blocks/conditionals, checked integer operations,
-primitive comparisons, and scalar stdout. It rejects residual types, lexical
-captures, strings, composites, variants, matching, JSON conversion, and
-unknown built-ins before emission.
+primitive comparisons, and scalar stdout. The bounded webhook path adds
+guest-memory canonical strings, fixed HTTP records, header lists, selected
+Result/Option layouts and matching, static helper references, config,
+resource secrets, and HTTP. It still rejects residual types, data captures,
+general composites, JSON conversion, dynamic string operators, and unknown
+built-ins before emission.
 
 An adjacent metadata document records:
 
@@ -230,6 +233,7 @@ An adjacent metadata document records:
 - compiler build identifier
 - language edition
 - target world and sorted imports/effects
+- sorted exact capability/resource requirements
 - package-relative source entry and package identity
 - build profile and validation-policy version
 - exact final-byte BLAKE3 checksum and byte size
@@ -244,8 +248,10 @@ bounded standard/custom metadata without source text or machine paths.
 The reference host uses Wasmtime with only the component-model, Cranelift,
 runtime, and std features. One Engine is reusable, while every invocation gets
 a fresh Store, StoreLimits, host state, component instance, fuel budget, epoch
-deadline, and output buffer. The linker provides either no imports or exactly
-the checked stdout WIT interface; it never adds WASI.
+deadline, and output buffer. Validation derives the exact scalar or webhook
+surface from component shape before linking. A runtime binding can register
+extra typed definitions, but an artifact cannot name or call an interface it
+did not import. The linker never adds WASI.
 
 Validation, digest checking, authorization, input-size checks, and static
 component resource inspection precede Wasmtime compilation. Component

@@ -835,6 +835,7 @@ impl Parser {
                 | "json_encode"
                 | "json_decode"
                 | "config_string"
+                | "http_request"
                 | "secret"
         ) {
             return Err(Diagnostic::new(

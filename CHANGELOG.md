@@ -95,10 +95,34 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Opaque `Secret` analysis/Core type and static rejection of printing,
   comparison, JSON encoding, and ordinary structural storage
 - Stable `K1004`, `K3007` through `K3009`, and `K5003` diagnostics
-- Checked-in HTTP, config, and WIT-resource secret contracts plus the future
-  typed `webhook-program` base world
+- Checked-in HTTP, config, WIT-resource secret, and typed webhook contracts
 - Conformance, formatter, Core golden, explain-schema, WIT parseability,
   direct-run denial, build fail-closed, and unchanged policy-1 artifact tests
+- Direct normalized-origin `http_request(origin, request, bearer)` with exact
+  `http.request` requirements and bearer-only opaque `Secret` consumption
+- Shared URL-based normalized origin parsing for source and manifest checks
+- Finite effect-selected webhook worlds, including a separate anonymous HTTP
+  surface that does not implicitly import secret acquisition
+- Bounded policy-2 canonical ABI lowering for strings, fixed HTTP records,
+  header lists, selected Result/Option layouts and matching, and static helper
+  references while preserving policy-1 scalar artifact bytes
+- Schema-1 embedded and adjacent exact resource requirements revalidated
+  against component-derived effects/imports
+- Typed `krit-runtime` webhook invocation with fresh Stores, instances,
+  resource tables, handles, and rollback-safe output/response publication
+- Explicit immutable config values and host-owned zeroizing secret storage
+- Exact-origin ordered-header outbound HTTP/TLS via statically linked,
+  rustls-backed libcurl with native platform trust roots,
+  environment proxies disabled, redirects denied, DNS results pinned per
+  request, public-address policy, independent timeouts, and body/header/call
+  limits
+- Strict host config JSON with relative secret-file references, bounded reads,
+  no inline/environment values, owner-only Unix permission enforcement, and
+  no-follow descriptor opens
+- `krit invoke --request FILE` and loopback `krit serve [--once]` over existing
+  artifacts only, using `tiny_http` rather than a handwritten parser
+- Auditable `examples/webhook-agent.krit` plus manifest, host config, and
+  request fixtures containing no credential
 
 ### Changed
 
@@ -125,10 +149,12 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   short non-LTS support window and planned audited migration to 48 LTS
 - Made direct `krit run` fail with `K5003` when source requires an unavailable
   webhook/config/secret host, without changing existing dynamic conformance
-- Marked only the `phase4-agent-contracts` milestone complete; Phase 4 and the
-  `phase4-http-runtime` milestone remain in progress/unimplemented
+- Marked `phase4-http-runtime` complete while keeping Phase 4 in progress for
+  AI, observability, and reliability work
 - Updated the provider-neutral generation prompt to version 0.2.7 for typed
   webhook, configuration, opaque-secret, and fail-closed runtime contracts
+- Updated the provider-neutral generation prompt to version 0.2.8 for the
+  buildable bounded webhook, explicit host-input, invoke, and serve workflow
 
 ## [0.2.0] - 2026-09-01
 

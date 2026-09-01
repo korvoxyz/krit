@@ -1,6 +1,6 @@
 # WebAssembly sandbox
 
-**Status:** Policy-1 artifact pipeline and bounded reference host implemented
+**Status:** Policy-1 scalar path and policy-2 bounded webhook host implemented
 **Artifact metadata schema:** 1
 **Validation policy:** 1
 
@@ -80,9 +80,12 @@ does not maintain a second unchecked ABI declaration or add optional dummy
 imports. Krit does not grant a general WASI environment; Preview 1 inheritance
 is not a compatibility path.
 
-The same checked-in WIT package also defines contracts-only `webhook`,
-`config`, and `secrets` interfaces plus a future `webhook-program` base
-world.
+The same package defines buildable `webhook`, `config`, `secrets`, `http`, and
+`http-anonymous` interfaces. A finite deterministic webhook world exists for
+every supported effect combination. HTTP without `secret.read` selects the
+anonymous interface, so unauthenticated HTTP does not implicitly import
+secret acquisition. Worlds containing both effects select the bearer-capable
+`http` interface and the explicit `secrets` interface.
 Its HTTP records preserve header order and duplicate names. `secrets.secret`
 is a WIT `resource`, never bytes or string. The webhook base world exports the
 canonical typed `handle` operation through its exported `webhook` interface
@@ -118,13 +121,11 @@ interface secrets {
 
 ```
 
-These interfaces are parsed in tests but are not selected by the policy-1
-backend. The future HTTP backend deterministically derives an exact world from
-the base webhook export plus only interfaces named by checked effects. Worlds
-are keyed by the sorted interface-identity list, so optional dummy imports
-and source-order variation cannot widen or change a component. This avoids a
-hand-maintained combinatorial set of world variants while retaining exact
-component imports.
+The `http` interface has the same closed request/response record shapes and
+accepts `option<borrow<secrets.secret>>`; `http-anonymous` omits the bearer
+parameter. A runtime-only all-host binding world supplies linker definitions,
+but extra definitions are unreachable: validation accepts only the exact
+component imports and corresponding finite compiler world.
 
 ## Build pipeline
 
@@ -169,32 +170,47 @@ genuine Wasm integer-overflow operation; arbitrary guest `unreachable`
 instructions remain generic `K4001` traps rather than being misclassified as
 K4005.
 
+Policy 2 adds a deliberately bounded webhook ABI:
+
+- canonical UTF-8 strings and checked linear-memory allocation/reallocation
+- fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` records
+- ordered lists of headers
+- the Result/Option shapes returned by config, secrets, and HTTP
+- Result/Option matching and static references to non-capturing helpers
+- a typed webhook export plus exact stdout/config/secrets/HTTP imports
+
+The core uses guest linear-memory offsets, never host pointers. Canonical
+parameters/results, list elements, records, variants, UTF-8, and allocation
+bounds are checked by the component adapter and host.
+
 Builds fail with `K7001` for residual parametric layouts and `K7002` for
 unsupported semantics. Policy 1 rejects strings, lists, records, options,
 results, JSON conversion, lexical captures, matches, unsupported print
 values, and any operation without a correct lowering. It never substitutes a
 trapping placeholder or direct-evaluator fallback.
 
-Webhook entrypoints and config/secret calls are explicitly contracts-only.
-`krit build` rejects them with `K7002` even when their manifest resources
-match. No artifact may claim the future `webhook-program` world until request,
-response, string, list, record, result, and resource-handle layouts are
-implemented and validated by the separate `phase4-http-runtime` milestone.
+Policy 2 does not generalize these layouts to arbitrary records/lists,
+capturing closures, JSON, or dynamic string operators. Those shapes continue
+to fail closed rather than receiving fake values.
 
 ## Artifact policy
 
-The emitted core module has no start function or linear memory. Function
+Policy-1 core modules have no start function or linear memory. Function
 values use one `funcref` table whose minimum and maximum are the same finite
-size. The validator enables only core MVP plus the Component Model and rejects
+size. Policy-2 webhook modules add one bounded 32-bit non-shared memory with a
+16 MiB maximum and the standard32 realloc export; generated canonical adapter
+modules remain bounded and are included in preflight accounting. The
+validator enables only core MVP plus the Component Model and rejects
 threads, shared memory, multi-memory, memory64, SIMD, floating-point use,
 exceptions, GC, component async/threading, unknown sections, component starts,
 WASI, and undeclared imports.
 
 Schema-1 adjacent metadata contains compiler and language versions, edition,
 package name/version, target, WIT world, package-relative entry, exact digest
-and byte size, sorted effects/imports, build profile, and validation policy
-version. Embedded metadata is bounded and contains no source text, absolute
-paths, credentials, or secret values. `krit-wasm::validate_artifact`
+and byte size, sorted effects/imports, exact resource requirements, build
+profile, and validation policy version. Embedded metadata is bounded and
+contains no source text, absolute paths, credentials, or secret values.
+`krit-wasm::validate_artifact`
 revalidates the bytes, policy, embedded facts, byte size, and digest. Validation
 derives effects and the selected world from the validated component and core
 import surfaces: zero imports mean no effects and `pure-program`; the exact
@@ -216,6 +232,27 @@ output limit, deadline, fuel exhaustion, or authorization failure discards the
 entire invocation buffer. Each host write reserves and checks its complete
 addition before changing the buffer or accounting counters.
 
+Webhook invocation uses the same Engine but a fresh Store, instance, resource
+table, output buffer, and host handles. Config is explicit immutable startup
+data, never inherited environment. Secret bytes live behind an opaque
+Wasmtime resource in a host-owned `zeroize` buffer. Persistent buffers are
+zeroed on final drop; TLS/client-library transient copies cannot be guaranteed
+zeroized, so they are tightly scoped and never formatted, serialized, or
+logged.
+
+Outbound HTTP uses exactly locked `curl` 0.4.50 with a statically linked,
+rustls-backed libcurl and native platform trust roots. Environment proxies
+are disabled. HTTP/1.1 header ordering, zero redirects, exact
+scheme/host/effective-port checks, a per-request `CURLOPT_RESOLVE` pin, and
+DNS/connect/read/overall bounds no greater than the invocation deadline are
+enforced. Budgets below libcurl's one-millisecond resolution are treated as
+expired rather than rounded to its unlimited-timeout sentinel. Default policy
+rejects non-public IPv4 and IPv6 ranges, including private, shared,
+documentation, benchmark, link-local, loopback, multicast, unspecified,
+reserved, and metadata-class destinations. The only relaxation is an
+embedding/test policy for loopback; bearer authentication over plain HTTP
+needs a second explicit host-only switch.
+
 The wall deadline uses Wasmtime epoch interruption. Because an engine epoch is
 shared across Stores, each `Runtime` serializes component compilation and
 execution behind one scheduler lock. The deadline worker is cancellable and
@@ -233,6 +270,16 @@ adopted with `cargo update` plus the complete host test suite. Krit plans an
 audited move to the Wasmtime 48 LTS line before 47 leaves support. A runtime
 major or Rust MSRV increase is never implicit: it requires CI validation,
 documentation, and a changelog entry.
+
+URL parsing is pinned to `url` 2.5.8, HTTP types to `http` 1.5.0, the blocking
+HTTP/TLS client to `curl` 0.4.50, secret clearing to `zeroize` 1.9.0, and CLI
+serving to `tiny_http` 0.12.0. Unix secret opens use `rustix` 1.1.4 with
+`O_NOFOLLOW`. Default features are disabled except curl's rustls and static-libcurl
+backends. The ignored `trusted_public_https_smoke_test` exercises platform
+roots when public DNS/network access is available. Every curl/libcurl upgrade requires an audited
+`CURLOPT_RESOLVE`, proxy, redirect, TLS, timeout, and ordered-header review
+plus the complete network test suite. Exact resolved transitive versions
+remain in `Cargo.lock`.
 
 ## Resource limits
 
@@ -252,12 +299,26 @@ Policy 1 uses these exact default and hard host limits:
 | Wall deadline | 1 second | 30 seconds |
 | Host calls | 1,024 | 1,000,000 |
 | Buffered output | 1 MiB | 16 MiB |
+| Request body | 1 MiB | 16 MiB |
+| Response body | 1 MiB | 16 MiB |
+| Header count | 128 | 1,024 |
+| Header bytes | 64 KiB | 1 MiB |
+| Outbound HTTP calls | 16 | 1,024 |
+| Connect timeout | 250 ms | 5 s |
+| Read phase timeout | 500 ms | 10 s |
+| Overall HTTP timeout | 750 ms | 20 s |
+| Host config bytes | 64 KiB | 1 MiB |
+| Bytes per secret | 64 KiB | 1 MiB |
+
+The embedded authority document is capped at 48 KiB, leaving deterministic
+headroom for package, compiler, digest, import, and entry fields in the
+default 64 KiB adjacent metadata budget.
 
 The host configuration may narrow defaults or explicitly select the hard
 maximum policy, but guest code and package metadata cannot raise the selected
-limits. Policy 1 currently emits no guest linear memory and exactly one
-bounded function table; StoreLimits and preflight shape checks remain enabled
-so future or adversarial components fail closed.
+limits. Policy 1 emits no guest linear memory; policy 2 emits one bounded
+canonical memory. StoreLimits and preflight shape checks count both application
+and generated adapter resources so adversarial components fail closed.
 
 Every invocation runs on a dedicated native thread whose stack is the selected
 Wasm stack limit plus 2 MiB of fixed host headroom. This prevents guest
@@ -273,6 +334,8 @@ denial and application failure.
 ```text
 krit build [--manifest PATH] [--output PATH]
 krit sandbox [--manifest PATH] [--artifact PATH]
+krit invoke [--manifest PATH] [--artifact PATH] [--host-config PATH] --request FILE
+krit serve [--manifest PATH] [--artifact PATH] [--host-config PATH] [--bind IP:PORT] [--once]
 krit permissions --artifact PATH [--json] [MANIFEST]
 ```
 
@@ -283,6 +346,15 @@ are K7003 errors. Artifact-aware `permissions` validates the component and
 prints complete requested, required, effective, denied, import, local-grant,
 and deployment-grant facts. A denied local manifest exits 4 after printing
 the report; deployment remains `not-evaluated`.
+
+`invoke` and `serve` likewise never build or interpret source. `invoke`
+accepts strict request-schema JSON and writes only response JSON after
+success. `serve` binds loopback by default and uses the same invocation path;
+`--once` handles one accepted or rejected request. Host config JSON contains
+immutable strings and relative secret-file references only. Unknown fields,
+inline values, environment inheritance, ungranted names, escaping paths,
+symlinks, oversized files, and group/other-readable Unix secret files fail
+closed.
 
 ## Instance lifecycle
 
@@ -319,29 +391,31 @@ component linear memory unless an interface explicitly returns bounded data.
 
 ## HTTP and network safety
 
-The host, not the component, performs DNS, TLS, redirects, proxy handling, and
-connection pooling.
+The host, not the component, performs DNS, TLS, redirect rejection, proxy
+disablement, and connection setup.
 
 An outbound grant binds:
 
 - scheme
 - hostname
 - port
-- optional path prefix and method set
-- redirect policy
+- exact normalized origin (no path, query, fragment, or userinfo)
+- per-call validated origin-form path, query, method, and headers
+- fixed no-redirect policy
 - response-size limit
 - timeout and request quota
 
 Resolved IP changes and redirects cannot widen the original hostname grant.
-Private, loopback, link-local, and metadata endpoints require separate
-explicit authority.
+Private, link-local, and metadata endpoints are denied. Loopback is available
+only through an explicit embedding/test policy and never through source or a
+manifest.
 
 ## Secrets
 
-Applications refer to secrets by manifest-approved logical name. The
-contracts milestone represents them as both a dedicated Core `Secret` type
-and a WIT resource handle. Connectors will receive opaque authentication
-handles; no current host acquires or consumes one.
+Applications refer to secrets by manifest-approved logical name. The host
+acquires bounded owner-only files into a zeroizing store and returns only a
+WIT resource handle. The HTTP host borrows that resource and injects bearer
+authentication without returning bytes to the component.
 
 Secret data is excluded from:
 

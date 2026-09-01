@@ -12,6 +12,7 @@ pub enum Builtin {
     JsonDecode,
     ConfigString,
     Secret,
+    HttpRequest,
 }
 
 impl Builtin {
@@ -27,6 +28,7 @@ impl Builtin {
             "json_decode" => Some(Self::JsonDecode),
             "config_string" => Some(Self::ConfigString),
             "secret" => Some(Self::Secret),
+            "http_request" => Some(Self::HttpRequest),
             _ => None,
         }
     }
@@ -43,6 +45,7 @@ impl Builtin {
             Self::JsonDecode => "json_decode",
             Self::ConfigString => "config_string",
             Self::Secret => "secret",
+            Self::HttpRequest => "http_request",
         }
     }
 
@@ -51,7 +54,7 @@ impl Builtin {
             Self::Print | Self::Println => BuiltinCategory::HostEffect,
             Self::Some | Self::None | Self::Ok | Self::Err => BuiltinCategory::Constructor,
             Self::JsonEncode | Self::JsonDecode => BuiltinCategory::Conversion,
-            Self::ConfigString | Self::Secret => BuiltinCategory::HostEffect,
+            Self::ConfigString | Self::Secret | Self::HttpRequest => BuiltinCategory::HostEffect,
         }
     }
 }

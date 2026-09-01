@@ -1,9 +1,13 @@
 mod bindings;
 mod error;
+mod host;
 mod limits;
+mod network;
 mod permissions;
+mod webhook;
 
 use std::{
+    collections::BTreeSet,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -14,23 +18,33 @@ use std::{
 };
 
 use krit_wasm::{
-    ArtifactMetadata, ComponentInspection, PROGRAM_WORLD, PURE_PROGRAM_WORLD, validate_artifact,
+    ArtifactMetadata, ComponentInspection, PROGRAM_WORLD, PURE_PROGRAM_WORLD, WEBHOOK_INTERFACE,
+    validate_artifact,
 };
 use serde::Serialize;
 use wasmtime::{
     Config, Engine, ProfilingStrategy, Store, StoreLimits, StoreLimitsBuilder, Strategy, Trap,
-    component::{Component, HasSelf, Linker},
+    component::{Component, HasSelf, Linker, Resource, ResourceTable},
 };
 
 use error::HostLimitError;
 pub use error::{RuntimeError, RuntimeErrorKind};
+pub use host::{HostInputs, NetworkPolicy, SecretStore};
 pub use limits::{
     DEFAULT_LIMITS, HARD_MAX_LIMITS, HOST_POLICY_VERSION, HOST_STACK_HEADROOM_BYTES, RuntimeLimits,
 };
 pub use permissions::{EffectivePermissions, GrantSet, PermissionFact};
+pub use webhook::{HttpHeader, HttpRequest, HttpResponse};
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ExecutionResult {
+    pub output: Vec<u8>,
+    pub stats: ExecutionStats,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct WebhookExecutionResult {
+    pub response: HttpResponse,
     pub output: Vec<u8>,
     pub stats: ExecutionStats,
 }
@@ -43,6 +57,7 @@ pub struct ExecutionStats {
     pub fuel_consumed: u64,
     pub fuel_remaining: u64,
     pub host_calls: u64,
+    pub http_calls: u64,
     pub output_bytes: usize,
     pub elapsed_micros: u128,
 }
@@ -60,11 +75,23 @@ struct HostState {
     host_call_limit: u64,
     output_limit: usize,
     store_limits: StoreLimits,
+    limits: RuntimeLimits,
+    grants: Option<GrantSet>,
+    requirements: BTreeSet<(String, String)>,
+    inputs: HostInputs,
+    resources: ResourceTable,
+    http_calls: u64,
+    invocation_deadline: Instant,
+}
+
+pub struct SecretHandle {
+    bytes: Arc<host::SecretBytes>,
 }
 
 impl Runtime {
     pub fn new(limits: RuntimeLimits) -> Result<Self, RuntimeError> {
         limits.validate()?;
+        curl::init();
         let mut config = Config::new();
         config
             .strategy(Strategy::Cranelift)
@@ -139,12 +166,137 @@ impl Runtime {
         })
     }
 
+    pub fn invoke_webhook(
+        &self,
+        bytes: &[u8],
+        metadata: &ArtifactMetadata,
+        grants: &GrantSet,
+        inputs: &HostInputs,
+        request: HttpRequest,
+    ) -> Result<WebhookExecutionResult, RuntimeError> {
+        request.validate(self.limits)?;
+        self.validate_host_inputs(grants, inputs)?;
+        self.validate_inputs(bytes, metadata)?;
+        let inspection = validate_artifact(bytes, metadata)?;
+        grants.authorize(metadata)?;
+        self.preflight_resources(&inspection)?;
+        if inspection.exports != [WEBHOOK_INTERFACE] {
+            return Err(RuntimeError::import_mismatch(
+                "artifact does not export the typed webhook interface",
+            ));
+        }
+
+        let _epoch_guard = self
+            .epoch_lock
+            .lock()
+            .map_err(|_| RuntimeError::setup("runtime epoch scheduler lock is poisoned"))?;
+        let component = Component::new(&self.engine, bytes).map_err(|error| {
+            RuntimeError::setup(format!(
+                "validated webhook component could not be compiled by Wasmtime 47.x: {error}"
+            ))
+        })?;
+        let worker_stack_bytes = self
+            .limits
+            .wasm_stack_bytes()
+            .checked_add(HOST_STACK_HEADROOM_BYTES)
+            .ok_or_else(|| RuntimeError::setup("Wasm execution worker stack size overflowed"))?;
+
+        thread::scope(|scope| {
+            let worker = thread::Builder::new()
+                .name("krit-webhook-execution".to_owned())
+                .stack_size(worker_stack_bytes)
+                .spawn_scoped(scope, || {
+                    self.invoke_webhook_component(
+                        &component,
+                        metadata,
+                        grants.clone(),
+                        inputs.clone(),
+                        request,
+                    )
+                })
+                .map_err(|error| {
+                    RuntimeError::setup(format!(
+                        "could not start isolated webhook execution worker: {error}"
+                    ))
+                })?;
+            worker
+                .join()
+                .map_err(|_| RuntimeError::setup("isolated webhook execution worker panicked"))?
+        })
+    }
+
+    fn invoke_webhook_component(
+        &self,
+        component: &Component,
+        metadata: &ArtifactMetadata,
+        grants: GrantSet,
+        inputs: HostInputs,
+        request: HttpRequest,
+    ) -> Result<WebhookExecutionResult, RuntimeError> {
+        let started = Instant::now();
+        let mut store = Store::new(
+            &self.engine,
+            self.new_host_state(
+                Some(grants),
+                metadata
+                    .requirements
+                    .iter()
+                    .map(|requirement| {
+                        (requirement.capability.clone(), requirement.resource.clone())
+                    })
+                    .collect(),
+                inputs,
+                started,
+            ),
+        );
+        store.limiter(|state| &mut state.store_limits);
+        store
+            .set_fuel(self.limits.fuel())
+            .map_err(|error| RuntimeError::setup(format!("could not set Wasm fuel: {error}")))?;
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_trap();
+        let deadline = DeadlineWorker::start(
+            self.engine.clone(),
+            self.limits.deadline(),
+            Arc::clone(&self.active_deadline_workers),
+        )?;
+        let call = self.call_webhook(component, &mut store, request);
+        let timed_out = deadline.finish()?;
+        if timed_out {
+            return Err(RuntimeError::deadline("Wasm wall deadline exceeded"));
+        }
+        let response = call?;
+        response.validate(self.limits)?;
+        let remaining = store.get_fuel().map_err(|error| {
+            RuntimeError::setup(format!("could not read remaining fuel: {error}"))
+        })?;
+        let state = store.into_data();
+        Ok(WebhookExecutionResult {
+            stats: ExecutionStats {
+                policy_version: HOST_POLICY_VERSION,
+                fuel_budget: self.limits.fuel(),
+                fuel_consumed: self.limits.fuel().saturating_sub(remaining),
+                fuel_remaining: remaining,
+                host_calls: state.host_calls,
+                http_calls: state.http_calls,
+                output_bytes: state.output.len(),
+                elapsed_micros: started.elapsed().as_micros(),
+            },
+            output: state.output,
+            response,
+        })
+    }
+
     fn execute_component(
         &self,
         component: &Component,
         metadata: &ArtifactMetadata,
     ) -> Result<ExecutionResult, RuntimeError> {
-        let mut store = Store::new(&self.engine, self.new_host_state());
+        let started = Instant::now();
+        let mut store = Store::new(
+            &self.engine,
+            self.new_host_state(None, BTreeSet::new(), HostInputs::default(), started),
+        );
         store.limiter(|state| &mut state.store_limits);
         store
             .set_fuel(self.limits.fuel())
@@ -152,7 +304,6 @@ impl Runtime {
         store.set_epoch_deadline(1);
         store.epoch_deadline_trap();
 
-        let started = Instant::now();
         let deadline = DeadlineWorker::start(
             self.engine.clone(),
             self.limits.deadline(),
@@ -182,6 +333,7 @@ impl Runtime {
                 fuel_consumed: self.limits.fuel().saturating_sub(remaining),
                 fuel_remaining: remaining,
                 host_calls: state.host_calls,
+                http_calls: state.http_calls,
                 output_bytes: state.output.len(),
                 elapsed_micros: started.elapsed().as_micros(),
             },
@@ -252,10 +404,62 @@ impl Runtime {
                 "component memory count exceeds the host limit",
             ));
         }
+        if usize::try_from(inspection.memory_minimum_bytes)
+            .map_or(true, |bytes| bytes > self.limits.memory_bytes())
+        {
+            return Err(RuntimeError::resource(
+                "component minimum linear memory exceeds the host byte limit",
+            ));
+        }
         Ok(())
     }
 
-    fn new_host_state(&self) -> HostState {
+    fn validate_host_inputs(
+        &self,
+        grants: &GrantSet,
+        inputs: &HostInputs,
+    ) -> Result<(), RuntimeError> {
+        let mut config_bytes = 0usize;
+        for (name, value) in inputs.config() {
+            if !grants.grants("config.read", Some(name)) {
+                return Err(RuntimeError::authorization(format!(
+                    "host configuration key `{name}` is not granted by the manifest"
+                )));
+            }
+            config_bytes = config_bytes
+                .checked_add(name.len())
+                .and_then(|bytes| bytes.checked_add(value.len()))
+                .ok_or_else(|| RuntimeError::resource("host configuration size overflowed"))?;
+            if config_bytes > self.limits.host_config_bytes() {
+                return Err(RuntimeError::resource(format!(
+                    "host configuration exceeds the {}-byte limit",
+                    self.limits.host_config_bytes()
+                )));
+            }
+        }
+        for (name, size) in inputs.secrets().iter() {
+            if !grants.grants("secret.read", Some(name)) {
+                return Err(RuntimeError::authorization(format!(
+                    "host secret `{name}` is not granted by the manifest"
+                )));
+            }
+            if size > self.limits.secret_bytes() {
+                return Err(RuntimeError::resource(format!(
+                    "host secret `{name}` exceeds the {}-byte limit",
+                    self.limits.secret_bytes()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn new_host_state(
+        &self,
+        grants: Option<GrantSet>,
+        requirements: BTreeSet<(String, String)>,
+        inputs: HostInputs,
+        started: Instant,
+    ) -> HostState {
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(self.limits.memory_bytes())
             .table_elements(self.limits.table_elements())
@@ -270,6 +474,13 @@ impl Runtime {
             host_call_limit: self.limits.host_calls(),
             output_limit: self.limits.output_bytes(),
             store_limits,
+            limits: self.limits,
+            grants,
+            requirements,
+            inputs,
+            resources: ResourceTable::new(),
+            http_calls: 0,
+            invocation_deadline: started + self.limits.deadline(),
         }
     }
 
@@ -299,6 +510,59 @@ impl Runtime {
         let program = bindings::stdout::Program::instantiate(&mut *store, component, &linker)
             .map_err(map_wasmtime_error)?;
         program.call_run(&mut *store).map_err(map_wasmtime_error)
+    }
+
+    fn call_webhook(
+        &self,
+        component: &Component,
+        store: &mut Store<HostState>,
+        request: HttpRequest,
+    ) -> Result<HttpResponse, RuntimeError> {
+        let mut linker = Linker::new(&self.engine);
+        bindings::webhook::WebhookHostProgram::add_to_linker::<_, HasSelf<_>>(
+            &mut linker,
+            |state| state,
+        )
+        .map_err(|error| {
+            RuntimeError::import_mismatch(format!(
+                "could not link the exact Krit webhook host interfaces: {error}"
+            ))
+        })?;
+        let program =
+            bindings::webhook::WebhookHostProgram::instantiate(&mut *store, component, &linker)
+                .map_err(map_wasmtime_error)?;
+        let request = bindings::webhook::exports::krit::runtime::webhook::Request {
+            method: request.method,
+            path: request.path,
+            query: request.query,
+            headers: request
+                .headers
+                .into_iter()
+                .map(
+                    |header| bindings::webhook::exports::krit::runtime::webhook::Header {
+                        name: header.name,
+                        value: header.value,
+                    },
+                )
+                .collect(),
+            body: request.body,
+        };
+        let response = program
+            .krit_runtime_webhook()
+            .call_handle(&mut *store, &request)
+            .map_err(map_wasmtime_error)?;
+        Ok(HttpResponse {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(|header| HttpHeader {
+                    name: header.name,
+                    value: header.value,
+                })
+                .collect(),
+            body: response.body,
+        })
     }
 }
 
@@ -355,11 +619,236 @@ impl bindings::stdout::krit::runtime::stdout::Host for HostState {
     }
 }
 
+impl bindings::webhook::krit::runtime::stdout::Host for HostState {
+    fn write_int(&mut self, value: i64, newline: bool) -> wasmtime::Result<()> {
+        self.write(&value.to_string(), newline)
+    }
+
+    fn write_bool(&mut self, value: bool, newline: bool) -> wasmtime::Result<()> {
+        self.write(if value { "true" } else { "false" }, newline)
+    }
+
+    fn write_unit(&mut self, newline: bool) -> wasmtime::Result<()> {
+        self.write("()", newline)
+    }
+}
+
+impl bindings::webhook::krit::runtime::config::Host for HostState {
+    fn get_string(&mut self, key: String) -> wasmtime::Result<Result<String, String>> {
+        self.record_host_call()?;
+        self.require_grant("config.read", &key)?;
+        Ok(self
+            .inputs
+            .config()
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| format!("configuration key `{key}` is not configured")))
+    }
+}
+
+impl bindings::webhook::krit::runtime::secrets::HostSecret for HostState {
+    fn drop(&mut self, secret: Resource<SecretHandle>) -> wasmtime::Result<()> {
+        self.resources
+            .delete(secret)
+            .map(|_| ())
+            .map_err(|error| wasmtime::Error::msg(format!("secret handle drop failed: {error}")))
+    }
+}
+
+impl bindings::webhook::krit::runtime::secrets::Host for HostState {
+    fn acquire(
+        &mut self,
+        name: String,
+    ) -> wasmtime::Result<Result<Resource<SecretHandle>, String>> {
+        self.record_host_call()?;
+        self.require_grant("secret.read", &name)?;
+        let Some(bytes) = self.inputs.secrets().get(&name) else {
+            return Ok(Err(format!("secret `{name}` is not configured")));
+        };
+        let handle = self
+            .resources
+            .push(SecretHandle { bytes })
+            .map_err(|error| {
+                wasmtime::Error::new(RuntimeError::resource(format!(
+                    "secret handle table is full: {error}"
+                )))
+            })?;
+        Ok(Ok(handle))
+    }
+}
+
+impl bindings::webhook::krit::runtime::http::Host for HostState {
+    fn send(
+        &mut self,
+        origin: String,
+        request: bindings::webhook::krit::runtime::http::Request,
+        bearer: Option<Resource<SecretHandle>>,
+    ) -> wasmtime::Result<Result<bindings::webhook::krit::runtime::http::Response, String>> {
+        let request = HttpRequest {
+            method: request.method,
+            path: request.path,
+            query: request.query,
+            headers: request
+                .headers
+                .into_iter()
+                .map(|header| HttpHeader {
+                    name: header.name,
+                    value: header.value,
+                })
+                .collect(),
+            body: request.body,
+        };
+        let response = match self.perform_http(origin, request, bearer)? {
+            Ok(response) => response,
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(Ok(bindings::webhook::krit::runtime::http::Response {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(|header| bindings::webhook::krit::runtime::http::Header {
+                    name: header.name,
+                    value: header.value,
+                })
+                .collect(),
+            body: response.body,
+        }))
+    }
+}
+
+impl bindings::webhook::krit::runtime::http_anonymous::Host for HostState {
+    fn send(
+        &mut self,
+        origin: String,
+        request: bindings::webhook::krit::runtime::http_anonymous::Request,
+    ) -> wasmtime::Result<Result<bindings::webhook::krit::runtime::http_anonymous::Response, String>>
+    {
+        let request = HttpRequest {
+            method: request.method,
+            path: request.path,
+            query: request.query,
+            headers: request
+                .headers
+                .into_iter()
+                .map(|header| HttpHeader {
+                    name: header.name,
+                    value: header.value,
+                })
+                .collect(),
+            body: request.body,
+        };
+        let response = match self.perform_http(origin, request, None)? {
+            Ok(response) => response,
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(Ok(
+            bindings::webhook::krit::runtime::http_anonymous::Response {
+                status: response.status,
+                headers: response
+                    .headers
+                    .into_iter()
+                    .map(
+                        |header| bindings::webhook::krit::runtime::http_anonymous::Header {
+                            name: header.name,
+                            value: header.value,
+                        },
+                    )
+                    .collect(),
+                body: response.body,
+            },
+        ))
+    }
+}
+
+impl HostState {
+    fn record_host_call(&mut self) -> wasmtime::Result<()> {
+        let next = self
+            .host_calls
+            .checked_add(1)
+            .ok_or_else(|| wasmtime::Error::new(HostLimitError::Calls))?;
+        if next > self.host_call_limit {
+            return Err(wasmtime::Error::new(HostLimitError::Calls));
+        }
+        self.host_calls = next;
+        Ok(())
+    }
+
+    fn require_grant(&self, capability: &str, resource: &str) -> wasmtime::Result<()> {
+        if self
+            .grants
+            .as_ref()
+            .is_some_and(|grants| grants.grants(capability, Some(resource)))
+            && self
+                .requirements
+                .contains(&(capability.to_owned(), resource.to_owned()))
+        {
+            Ok(())
+        } else {
+            Err(wasmtime::Error::new(RuntimeError::authorization(format!(
+                "guest requested ungranted capability `{capability}` for resource `{resource}`"
+            ))))
+        }
+    }
+
+    fn perform_http(
+        &mut self,
+        origin: String,
+        request: HttpRequest,
+        bearer: Option<Resource<SecretHandle>>,
+    ) -> wasmtime::Result<Result<HttpResponse, String>> {
+        self.record_host_call()?;
+        self.require_grant("http.request", &origin)?;
+        let parsed = krit_capability::HttpOrigin::parse_exact(&origin).map_err(|error| {
+            wasmtime::Error::new(RuntimeError::authorization(format!(
+                "guest requested invalid HTTP origin `{origin}`: {error}"
+            )))
+        })?;
+        let next_http_calls = self
+            .http_calls
+            .checked_add(1)
+            .ok_or_else(|| wasmtime::Error::new(HostLimitError::Calls))?;
+        if next_http_calls > self.limits.http_calls() {
+            return Err(wasmtime::Error::new(RuntimeError::host_calls(
+                "outbound HTTP call limit exceeded",
+            )));
+        }
+        self.http_calls = next_http_calls;
+        request
+            .validate(self.limits)
+            .map_err(wasmtime::Error::new)?;
+        let bearer = bearer
+            .as_ref()
+            .map(|handle| {
+                self.resources
+                    .get(handle)
+                    .map(|secret| Arc::clone(&secret.bytes))
+            })
+            .transpose()
+            .map_err(|error| wasmtime::Error::msg(format!("invalid secret handle: {error}")))?;
+        let remaining = self
+            .invocation_deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        Ok(network::send(
+            &parsed,
+            &request,
+            bearer.as_deref(),
+            self.inputs.network_policy(),
+            self.limits,
+            remaining,
+        ))
+    }
+}
+
 fn map_wasmtime_error(error: wasmtime::Error) -> RuntimeError {
+    if let Some(runtime) = error.downcast_ref::<RuntimeError>() {
+        return runtime.clone();
+    }
     if let Some(host) = error.downcast_ref::<HostLimitError>() {
         return match host {
-            HostLimitError::Calls => RuntimeError::host_calls("stdout host-call limit exceeded"),
-            HostLimitError::Output => RuntimeError::output("stdout output-byte limit exceeded"),
+            HostLimitError::Calls => RuntimeError::host_calls("host-call limit exceeded"),
+            HostLimitError::Output => RuntimeError::output("buffered output-byte limit exceeded"),
         };
     }
     if let Some(trap) = error.downcast_ref::<Trap>() {

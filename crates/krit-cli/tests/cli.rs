@@ -1,7 +1,9 @@
 use std::{
     fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpStream,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -433,6 +435,28 @@ fn direct_run_fails_closed_for_unavailable_agent_hosts() {
         String::from_utf8(webhook_output.stderr)
             .expect("diagnostic should be UTF-8")
             .contains("error[K5003]: webhook entrypoints are unavailable")
+    );
+
+    let http = directory.file(
+        "http.krit",
+        r#"let response = http_request(
+    "https://api.example.com",
+    record { method: "GET", path: "/", query: "", headers: [], body: "" },
+    None,
+);
+"#,
+    );
+    let http_output = krit()
+        .arg("run")
+        .arg(&http)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(http_output.status.code(), Some(4));
+    assert!(http_output.stdout.is_empty());
+    assert!(
+        String::from_utf8(http_output.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K5003]")
     );
 }
 
@@ -1269,7 +1293,7 @@ license = "Apache-2.0"
 }
 
 #[test]
-fn build_checks_agent_resources_then_rejects_contract_only_layouts() {
+fn build_checks_agent_resources_then_builds_the_webhook_runtime() {
     let directory = TestDirectory::new("build-agent-contracts");
     directory.file(
         "main.krit",
@@ -1333,7 +1357,7 @@ secrets = ["github-token"]
 "#,
     )
     .expect("manifest should be widened");
-    let unsupported = krit()
+    let built = krit()
         .arg("build")
         .arg("--manifest")
         .arg(&manifest)
@@ -1341,14 +1365,419 @@ secrets = ["github-token"]
         .arg(&output)
         .output()
         .expect("Krit should start");
-    assert_eq!(unsupported.status.code(), Some(1));
-    assert!(unsupported.stdout.is_empty());
-    let unsupported = String::from_utf8(unsupported.stderr).expect("diagnostic should be UTF-8");
-    assert!(unsupported.contains("error[K7002]"));
-    assert!(unsupported.contains("contracts-only"));
-    assert!(unsupported.contains("phase4-http-runtime"));
-    assert!(!output.exists());
-    assert!(!metadata_path(&output).exists());
+    assert!(built.status.success());
+    assert!(built.stderr.is_empty());
+    assert!(output.exists());
+    let metadata: ArtifactMetadata = serde_json::from_slice(
+        &fs::read(metadata_path(&output)).expect("metadata should be readable"),
+    )
+    .expect("metadata should parse");
+    assert_eq!(metadata.effects, ["config.read", "secret.read"]);
+    assert_eq!(metadata.requirements.len(), 2);
+    validate_artifact(
+        &fs::read(&output).expect("component should be readable"),
+        &metadata,
+    )
+    .expect("webhook component should validate");
+}
+
+#[test]
+fn invoke_runs_the_typed_handler_and_prints_only_response_json() {
+    let directory = TestDirectory::new("invoke-webhook");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 201, headers: request.headers, body: request.body }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/webhook"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+"#,
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let request = directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/echo","query":"","headers":[{"name":"x-test","value":"one"}],"body":"hello"}"#,
+    );
+    let invoked = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should invoke");
+    assert!(invoked.status.success());
+    assert!(invoked.stderr.is_empty());
+    assert_eq!(
+        invoked.stdout,
+        b"{\"status\":201,\"headers\":[{\"name\":\"x-test\",\"value\":\"one\"}],\"body\":\"hello\"}\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn invoke_loads_owner_only_secret_files_without_disclosure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TestDirectory::new("invoke-secret-file");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match secret("unit-secret") {
+        Ok(value) => record { status: 204, headers: [], body: "" },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/secret-webhook"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+secrets = ["unit-secret"]
+"#,
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let secret_value = "fixture-private-value";
+    let secret = directory.file("secret.bin", secret_value);
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600))
+        .expect("secret permissions should set");
+    let host = directory.file(
+        "host.json",
+        r#"{"schema":1,"config":{},"secrets":{"unit-secret":{"file":"secret.bin"}}}"#,
+    );
+    let request = directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":""}"#,
+    );
+    let invoked = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--host-config")
+        .arg(&host)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should invoke");
+    assert!(
+        invoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&invoked.stderr)
+    );
+    assert_eq!(
+        invoked.stdout,
+        b"{\"status\":204,\"headers\":[],\"body\":\"\"}\n"
+    );
+    assert!(!String::from_utf8_lossy(&invoked.stdout).contains(secret_value));
+    assert!(!String::from_utf8_lossy(&invoked.stderr).contains(secret_value));
+    let artifact = directory.path.join("target/krit/secret-webhook.wasm");
+    assert!(
+        !fs::read(&artifact)
+            .expect("artifact should read")
+            .windows(secret_value.len())
+            .any(|window| window == secret_value.as_bytes())
+    );
+    assert!(
+        !fs::read(metadata_path(&artifact))
+            .expect("metadata should read")
+            .windows(secret_value.len())
+            .any(|window| window == secret_value.as_bytes())
+    );
+
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644))
+        .expect("secret permissions should widen");
+    let denied = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--host-config")
+        .arg(&host)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should reject broad secret permissions");
+    assert_eq!(denied.status.code(), Some(1));
+    assert!(denied.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("group or other permissions"));
+    assert!(!String::from_utf8_lossy(&denied.stderr).contains(secret_value));
+}
+
+#[test]
+fn host_config_cannot_add_manifest_grants() {
+    let directory = TestDirectory::new("host-config-grants");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.body }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/grants"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+"#,
+    );
+    assert!(
+        krit_in(&directory)
+            .args(["build", "--manifest"])
+            .arg(&manifest)
+            .output()
+            .expect("Krit should build")
+            .status
+            .success()
+    );
+    let host = directory.file(
+        "host.json",
+        r#"{"schema":1,"config":{"extra.key":"value"},"secrets":{}}"#,
+    );
+    let request = directory.file(
+        "request.json",
+        r#"{"method":"GET","path":"/","query":"","headers":[],"body":""}"#,
+    );
+    let denied = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--host-config")
+        .arg(&host)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should reject extra host grants");
+    assert_eq!(denied.status.code(), Some(4));
+    assert!(denied.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("error[K5001]"));
+
+    fs::write(
+        &host,
+        r#"{"schema":1,"config":{},"secrets":{},"inlineSecret":"forbidden"}"#,
+    )
+    .expect("host config should be replaced");
+    let malformed = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--host-config")
+        .arg(&host)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should reject unknown host config fields");
+    assert_eq!(malformed.status.code(), Some(1));
+    assert!(malformed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&malformed.stderr).contains("error[K7003]"));
+}
+
+#[test]
+fn serve_once_handles_a_real_http_request() {
+    let directory = TestDirectory::new("serve-once");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record {
+        status: 203,
+        headers: [record { name: "x-krit", value: "served" }],
+        body: request.body,
+    }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/server"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+"#,
+    );
+    assert!(
+        krit_in(&directory)
+            .args(["build", "--manifest"])
+            .arg(&manifest)
+            .output()
+            .expect("Krit should build")
+            .status
+            .success()
+    );
+    let mut child = krit_in(&directory)
+        .args(["serve", "--manifest"])
+        .arg(&manifest)
+        .args(["--bind", "127.0.0.1:0", "--once"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Krit server should start");
+    let stderr = child.stderr.take().expect("server stderr should be piped");
+    let mut stderr = BufReader::new(stderr);
+    let mut listening = String::new();
+    stderr
+        .read_line(&mut listening)
+        .expect("server listening line should read");
+    assert!(listening.starts_with("krit serve listening on http://127.0.0.1:"));
+    let address = listening
+        .trim()
+        .strip_prefix("krit serve listening on http://")
+        .expect("listening prefix should exist");
+    let mut stream = TcpStream::connect(address).expect("server should accept connections");
+    stream
+        .write_all(
+            b"POST /hook?one=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        )
+        .expect("request should write");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("response should read");
+    let output = child
+        .wait_with_output()
+        .expect("one-shot server should exit");
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 203 "));
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("\r\nx-krit: served\r\n")
+    );
+    assert!(response.ends_with("\r\n\r\nhello"));
+}
+
+#[test]
+fn serve_once_rejects_oversized_input_without_guest_execution() {
+    let directory = TestDirectory::new("serve-oversized");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    println(999);
+    record { status: 200, headers: [], body: request.body }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/oversized"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+stdout = true
+"#,
+    );
+    assert!(
+        krit_in(&directory)
+            .args(["build", "--manifest"])
+            .arg(&manifest)
+            .output()
+            .expect("Krit should build")
+            .status
+            .success()
+    );
+    let mut child = krit_in(&directory)
+        .args(["serve", "--manifest"])
+        .arg(&manifest)
+        .args(["--bind", "127.0.0.1:0", "--once"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Krit server should start");
+    let stderr = child.stderr.take().expect("server stderr should be piped");
+    let mut stderr = BufReader::new(stderr);
+    let mut listening = String::new();
+    stderr
+        .read_line(&mut listening)
+        .expect("server listening line should read");
+    let address = listening
+        .trim()
+        .strip_prefix("krit serve listening on http://")
+        .expect("listening prefix should exist");
+    let mut stream = TcpStream::connect(address).expect("server should accept connections");
+    stream
+        .write_all(
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n",
+        )
+        .expect("oversized request headers should write");
+    stream
+        .write_all(&vec![b'x'; 1_048_577])
+        .expect("oversized request body should write");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("rejection response should read");
+    let output = child
+        .wait_with_output()
+        .expect("one-shot server should exit");
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty(), "guest must not execute");
+    assert!(
+        String::from_utf8(response)
+            .expect("response should be UTF-8")
+            .starts_with("HTTP/1.1 413 ")
+    );
 }
 
 #[test]

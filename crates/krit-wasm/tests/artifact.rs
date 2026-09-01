@@ -2,8 +2,9 @@ use std::{fs, path::Path};
 
 use krit::{Source, analyze, lower, parse_source};
 use krit_wasm::{
-    ArtifactMetadata, BuildErrorKind, BuildOptions, EMBEDDED_METADATA_SECTION, PROGRAM_WORLD,
-    PURE_PROGRAM_WORLD, STDOUT_INTERFACE, build_component, digest_bytes, validate_artifact,
+    ArtifactMetadata, BuildErrorKind, BuildOptions, EMBEDDED_METADATA_SECTION,
+    HTTP_ANONYMOUS_INTERFACE, MAX_EMBEDDED_METADATA_BYTES, PROGRAM_WORLD, PURE_PROGRAM_WORLD,
+    STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD, build_component, digest_bytes, validate_artifact,
     validate_component,
 };
 use wasm_encoder::{
@@ -284,6 +285,89 @@ fn restrictive_validation_rejects_forbidden_core_features() {
         .expect_err("shared memory must be rejected by the feature policy");
     assert_eq!(error.kind(), BuildErrorKind::InvalidArtifact);
     assert!(error.to_string().contains("policy 1 validation"));
+}
+
+#[test]
+fn builds_a_typed_webhook_with_exact_http_requirements_and_memory() {
+    let source = Source::new(
+        "src/main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match http_request("https://api.example.com", request, None) {
+        Ok(response) => response,
+        Err(error) => record { status: 502, headers: [], body: error },
+    }
+}
+"#,
+    );
+    let program = parse_source(&source).expect("webhook source should parse");
+    let analysis = analyze(&program).expect("webhook source should analyze");
+    let module = lower(&program, &analysis).expect("webhook source should lower");
+    let mut options = BuildOptions::new("2026", "test/webhook", "1.0.0", "src/main.krit");
+    options.grant_effect("http.request");
+    let artifact = build_component(&module, &options).expect("webhook should compile");
+
+    assert!(artifact.metadata.world.contains("webhook-http-program"));
+    assert_eq!(artifact.metadata.imports, [HTTP_ANONYMOUS_INTERFACE]);
+    assert_eq!(artifact.metadata.effects, ["http.request"]);
+    assert_eq!(artifact.metadata.requirements.len(), 1);
+    assert_eq!(
+        artifact.metadata.requirements[0].resource,
+        "https://api.example.com"
+    );
+    let inspection = validate_artifact(&artifact.bytes, &artifact.metadata)
+        .expect("webhook artifact should validate");
+    assert_eq!(inspection.exports, ["krit:runtime/webhook@0.2.0"]);
+    assert_eq!(inspection.memory_count, 1);
+    assert!(inspection.memory_minimum_bytes > 0);
+    assert_eq!(inspection.memory_maximum_bytes, 16 * 1024 * 1024);
+
+    let tampered =
+        replace_embedded_metadata(&artifact.bytes, &artifact.metadata.world, &["http.request"]);
+    let mut metadata = artifact.metadata;
+    metadata.digest = digest_bytes(&tampered);
+    metadata.byte_size = tampered.len() as u64;
+    let error = validate_artifact(&tampered, &metadata)
+        .expect_err("underdeclared exact resources must fail component validation");
+    assert_eq!(error.kind(), BuildErrorKind::InvalidArtifact);
+
+    assert_ne!(metadata.world, WEBHOOK_PROGRAM_WORLD);
+}
+
+#[test]
+fn embedded_metadata_supports_realistic_capability_sets() {
+    let reads = (0..32)
+        .map(|index| format!("    config_string(\"service.key-{index}\");\n"))
+        .collect::<String>();
+    let source = Source::new(
+        "src/main.krit",
+        format!(
+            "webhook fn handle(request: HttpRequest) -> HttpResponse {{\n{reads}    record {{ status: 200, headers: [], body: request.body }}\n}}\n"
+        ),
+    );
+    let program = parse_source(&source).expect("webhook source should parse");
+    let analysis = analyze(&program).expect("webhook source should analyze");
+    let module = lower(&program, &analysis).expect("webhook source should lower");
+    let mut options = BuildOptions::new("2026", "test/webhook", "1.0.0", "src/main.krit");
+    options.grant_effect("config.read");
+
+    let artifact = build_component(&module, &options)
+        .expect("realistic capability metadata should fit the policy");
+    assert_eq!(artifact.metadata.requirements.len(), 32);
+    let embedded_size = Parser::new(0)
+        .parse_all(&artifact.bytes)
+        .filter_map(Result::ok)
+        .find_map(|payload| match payload {
+            Payload::CustomSection(section) if section.name() == EMBEDDED_METADATA_SECTION => {
+                Some(section.data().len())
+            }
+            _ => None,
+        })
+        .expect("component should contain embedded metadata");
+    assert!(embedded_size > 1024);
+    assert!(embedded_size <= MAX_EMBEDDED_METADATA_BYTES);
+    validate_artifact(&artifact.bytes, &artifact.metadata)
+        .expect("artifact with realistic capability metadata should validate");
 }
 
 fn replace_all_equal_length(bytes: &mut [u8], from: &[u8], to: &[u8]) {

@@ -1,8 +1,11 @@
+mod host_config;
+
 use std::{
     collections::BTreeMap,
     env, fs,
     fs::OpenOptions,
     io::{self, Read, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -12,7 +15,9 @@ use krit::{
     analyze, execute, format_source, lower, parse_source,
 };
 use krit_package::Manifest;
-use krit_runtime::{GrantSet, Runtime, RuntimeError, RuntimeErrorKind, RuntimeLimits};
+use krit_runtime::{
+    GrantSet, HttpHeader, HttpRequest, Runtime, RuntimeError, RuntimeErrorKind, RuntimeLimits,
+};
 use krit_wasm::{ArtifactMetadata, BuildErrorKind, BuildOptions, build_component};
 use serde::Serialize;
 
@@ -52,6 +57,8 @@ fn run(arguments: Vec<String>) -> u8 {
         "prompt" => prompt_command(&arguments[1..]),
         "permissions" => permissions_command(&arguments[1..]),
         "sandbox" => sandbox_command(&arguments[1..]),
+        "invoke" => invoke_command(&arguments[1..]),
+        "serve" => serve_command(&arguments[1..]),
         "package" => package_command(&arguments[1..]),
         unknown => {
             eprintln!("krit: unknown command `{unknown}`");
@@ -133,6 +140,15 @@ fn build_command(arguments: &[String]) -> u8 {
     options.target.clone_from(&manifest.package.target);
     if manifest.capabilities.stdout {
         options.grant_effect("io.stdout");
+    }
+    if !manifest.capabilities.config.is_empty() {
+        options.grant_effect("config.read");
+    }
+    if !manifest.capabilities.http.is_empty() {
+        options.grant_effect("http.request");
+    }
+    if !manifest.capabilities.secrets.is_empty() {
+        options.grant_effect("secret.read");
     }
     let artifact = match build_component(&module, &options) {
         Ok(artifact) => artifact,
@@ -1100,6 +1116,11 @@ fn manifest_grants_requirement(
             .secrets
             .iter()
             .any(|resource| resource == requirement.resource()),
+        Effect::HttpRequest => manifest
+            .capabilities
+            .http
+            .iter()
+            .any(|resource| resource == requirement.resource()),
         Effect::IoStdout => manifest.capabilities.stdout,
         _ => false,
     }
@@ -1190,6 +1211,489 @@ fn prompt_command(arguments: &[String]) -> u8 {
     }
     print!("{GENERATION_PROMPT}");
     0
+}
+
+struct InvokeOptions {
+    manifest: PathBuf,
+    artifact: Option<PathBuf>,
+    host_config: Option<PathBuf>,
+    request: PathBuf,
+}
+
+struct ServeOptions {
+    manifest: PathBuf,
+    artifact: Option<PathBuf>,
+    host_config: Option<PathBuf>,
+    bind: SocketAddr,
+    once: bool,
+}
+
+fn invoke_command(arguments: &[String]) -> u8 {
+    let options = match parse_invoke_options(arguments) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("krit: {message}");
+            return 2;
+        }
+    };
+    let manifest = match Manifest::load(&options.manifest) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!(
+                "{}:1:1: error[K6001]: {error}",
+                options.manifest.to_string_lossy()
+            );
+            return 3;
+        }
+    };
+    let limits = RuntimeLimits::default();
+    let artifact_path = options
+        .artifact
+        .unwrap_or_else(|| default_build_output(&options.manifest, &manifest));
+    let artifact = match load_artifact(&artifact_path, limits) {
+        Ok(artifact) => artifact,
+        Err(message) => return report_artifact_error(&artifact_path, &message),
+    };
+    let host_inputs = match host_config::load(options.host_config.as_deref(), &manifest, limits) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            let code = if error.kind() == host_config::HostConfigErrorKind::Authorization {
+                "K5001"
+            } else {
+                "K7003"
+            };
+            eprintln!(
+                "{}:1:1: error[{code}]: {}",
+                options
+                    .host_config
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("<host-config>"))
+                    .to_string_lossy(),
+                error.message()
+            );
+            return if error.kind() == host_config::HostConfigErrorKind::Authorization {
+                4
+            } else {
+                1
+            };
+        }
+    };
+    let request_limit = limits
+        .request_body_bytes()
+        .saturating_add(limits.header_bytes())
+        .saturating_add(64 * 1024);
+    let request_bytes = match read_bounded(&options.request, request_limit) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "{}:1:1: error[K7003]: could not read request fixture: {error}",
+                options.request.to_string_lossy()
+            );
+            return 1;
+        }
+    };
+    let request: HttpRequest = match serde_json::from_slice(&request_bytes) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!(
+                "{}:1:1: error[K4001]: invalid strict request fixture JSON: {error}",
+                options.request.to_string_lossy()
+            );
+            return 1;
+        }
+    };
+    let runtime = match Runtime::new(limits) {
+        Ok(runtime) => runtime,
+        Err(error) => return report_runtime_error(&artifact_path, &error),
+    };
+    let result = match runtime.invoke_webhook(
+        &artifact.bytes,
+        &artifact.metadata,
+        &GrantSet::from_manifest(&manifest),
+        &host_inputs,
+        request,
+    ) {
+        Ok(result) => result,
+        Err(error) => return report_runtime_error(&artifact_path, &error),
+    };
+    let mut response = match serde_json::to_vec(&result.response) {
+        Ok(response) => response,
+        Err(error) => return internal_error("KICE0003", "serializing webhook response", &error),
+    };
+    response.push(b'\n');
+    if let Err(error) = write_buffered_output(&mut io::stdout().lock(), &response) {
+        eprintln!("krit: error[K4007]: could not publish webhook response: {error}");
+        return 1;
+    }
+    0
+}
+
+fn serve_command(arguments: &[String]) -> u8 {
+    let options = match parse_serve_options(arguments) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("krit: {message}");
+            return 2;
+        }
+    };
+    let manifest = match Manifest::load(&options.manifest) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!(
+                "{}:1:1: error[K6001]: {error}",
+                options.manifest.to_string_lossy()
+            );
+            return 3;
+        }
+    };
+    let limits = RuntimeLimits::default();
+    let artifact_path = options
+        .artifact
+        .unwrap_or_else(|| default_build_output(&options.manifest, &manifest));
+    let artifact = match load_artifact(&artifact_path, limits) {
+        Ok(artifact) => artifact,
+        Err(message) => return report_artifact_error(&artifact_path, &message),
+    };
+    let host_inputs = match host_config::load(options.host_config.as_deref(), &manifest, limits) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            let authorization = error.kind() == host_config::HostConfigErrorKind::Authorization;
+            let code = if authorization { "K5001" } else { "K7003" };
+            eprintln!(
+                "{}:1:1: error[{code}]: {}",
+                options
+                    .host_config
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("<host-config>"))
+                    .to_string_lossy(),
+                error.message()
+            );
+            return if authorization { 4 } else { 1 };
+        }
+    };
+    let runtime = match Runtime::new(limits) {
+        Ok(runtime) => runtime,
+        Err(error) => return report_runtime_error(&artifact_path, &error),
+    };
+    let grants = GrantSet::from_manifest(&manifest);
+    let effective = match runtime.permissions(&artifact.bytes, &artifact.metadata, &grants) {
+        Ok(effective) => effective,
+        Err(error) => return report_runtime_error(&artifact_path, &error),
+    };
+    if !effective.allowed() {
+        eprintln!(
+            "{}:1:1: error[K5001]: artifact requirements are not granted by the manifest",
+            artifact_path.to_string_lossy()
+        );
+        return 4;
+    }
+    if !options.bind.ip().is_loopback() {
+        eprintln!("krit: `serve --bind` must use a loopback address");
+        return 2;
+    }
+    let server = match tiny_http::Server::http(options.bind) {
+        Ok(server) => server,
+        Err(error) => {
+            eprintln!("krit: error[K7003]: could not bind HTTP server: {error}");
+            return 1;
+        }
+    };
+    eprintln!("krit serve listening on http://{}", server.server_addr());
+    loop {
+        let mut incoming = match server.recv() {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("krit: error[K7003]: HTTP server failed: {error}");
+                return 1;
+            }
+        };
+        let request = match read_inbound_request(&mut incoming, limits) {
+            Ok(request) => request,
+            Err(error) => {
+                if let Err(write_error) = respond_error(incoming, error.status, &error.message) {
+                    eprintln!(
+                        "krit: error[K4007]: could not publish rejected HTTP response: {write_error}"
+                    );
+                    return 1;
+                }
+                if options.once {
+                    return 0;
+                }
+                continue;
+            }
+        };
+        let result = runtime.invoke_webhook(
+            &artifact.bytes,
+            &artifact.metadata,
+            &grants,
+            &host_inputs,
+            request,
+        );
+        match result {
+            Ok(result) => {
+                let mut response =
+                    tiny_http::Response::from_data(result.response.body.into_bytes())
+                        .with_status_code(result.response.status as u16);
+                for header in result.response.headers {
+                    let header = match tiny_http::Header::from_bytes(
+                        header.name.as_bytes(),
+                        header.value.as_bytes(),
+                    ) {
+                        Ok(header) => header,
+                        Err(()) => {
+                            eprintln!(
+                                "krit: error[K4001]: validated guest response header could not be encoded"
+                            );
+                            return 1;
+                        }
+                    };
+                    response.add_header(header);
+                }
+                if let Err(error) = incoming.respond(response) {
+                    eprintln!("krit: error[K4007]: could not publish HTTP response: {error}");
+                    return 1;
+                }
+                if let Err(error) = write_buffered_output(&mut io::stdout().lock(), &result.output)
+                {
+                    eprintln!("krit: error[K4007]: could not publish guest output: {error}");
+                    return 1;
+                }
+            }
+            Err(error) => {
+                if let Err(write_error) = respond_error(incoming, 500, "webhook invocation failed")
+                {
+                    eprintln!(
+                        "krit: error[K4007]: could not publish invocation failure response: {write_error}"
+                    );
+                    return 1;
+                }
+                let exit = report_runtime_error(&artifact_path, &error);
+                if options.once {
+                    return exit;
+                }
+            }
+        }
+        if options.once {
+            return 0;
+        }
+    }
+}
+
+struct InboundError {
+    status: u16,
+    message: String,
+}
+
+fn read_inbound_request(
+    request: &mut tiny_http::Request,
+    limits: RuntimeLimits,
+) -> Result<HttpRequest, InboundError> {
+    if request.headers().len() > limits.header_count() {
+        return Err(InboundError {
+            status: 431,
+            message: "too many request headers".to_owned(),
+        });
+    }
+    let header_bytes = request.headers().iter().try_fold(0usize, |total, header| {
+        total
+            .checked_add(header.field.as_str().as_str().len())
+            .and_then(|value| value.checked_add(header.value.as_str().len()))
+    });
+    if header_bytes.is_none_or(|bytes| bytes > limits.header_bytes()) {
+        return Err(InboundError {
+            status: 431,
+            message: "request headers are too large".to_owned(),
+        });
+    }
+    if request
+        .body_length()
+        .is_some_and(|length| length > limits.request_body_bytes())
+    {
+        return Err(InboundError {
+            status: 413,
+            message: "request body is too large".to_owned(),
+        });
+    }
+    let mut body = Vec::new();
+    request
+        .as_reader()
+        .take(limits.request_body_bytes().saturating_add(1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| InboundError {
+            status: 400,
+            message: "could not read request body".to_owned(),
+        })?;
+    if body.len() > limits.request_body_bytes() {
+        return Err(InboundError {
+            status: 413,
+            message: "request body is too large".to_owned(),
+        });
+    }
+    let body = String::from_utf8(body).map_err(|_| InboundError {
+        status: 400,
+        message: "request body must be valid UTF-8".to_owned(),
+    })?;
+    let (path, query) = request
+        .url()
+        .split_once('?')
+        .map_or((request.url(), ""), |(path, query)| (path, query));
+    let headers = request
+        .headers()
+        .iter()
+        .filter(|header| {
+            !matches!(
+                header.field.as_str().as_str().to_ascii_lowercase().as_str(),
+                "connection"
+                    | "content-length"
+                    | "host"
+                    | "keep-alive"
+                    | "proxy-connection"
+                    | "te"
+                    | "trailer"
+                    | "transfer-encoding"
+                    | "upgrade"
+            )
+        })
+        .map(|header| HttpHeader {
+            name: header.field.as_str().as_str().to_owned(),
+            value: header.value.as_str().to_owned(),
+        })
+        .collect();
+    Ok(HttpRequest {
+        method: request.method().as_str().to_owned(),
+        path: path.to_owned(),
+        query: query.to_owned(),
+        headers,
+        body,
+    })
+}
+
+fn respond_error(request: tiny_http::Request, status: u16, message: &str) -> io::Result<()> {
+    request.respond(tiny_http::Response::from_string(message).with_status_code(status))
+}
+
+fn parse_invoke_options(arguments: &[String]) -> Result<InvokeOptions, String> {
+    let mut manifest = PathBuf::from("krit.pkg");
+    let mut artifact = None;
+    let mut host_config = None;
+    let mut request = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--manifest" => {
+                manifest = option_path(arguments, index, "--manifest")?;
+                index += 2;
+            }
+            argument if argument.starts_with("--manifest=") => {
+                manifest = assigned_path(argument, "--manifest")?;
+                index += 1;
+            }
+            "--artifact" => {
+                artifact = Some(option_path(arguments, index, "--artifact")?);
+                index += 2;
+            }
+            argument if argument.starts_with("--artifact=") => {
+                artifact = Some(assigned_path(argument, "--artifact")?);
+                index += 1;
+            }
+            "--host-config" => {
+                host_config = Some(option_path(arguments, index, "--host-config")?);
+                index += 2;
+            }
+            argument if argument.starts_with("--host-config=") => {
+                host_config = Some(assigned_path(argument, "--host-config")?);
+                index += 1;
+            }
+            "--request" => {
+                request = Some(option_path(arguments, index, "--request")?);
+                index += 2;
+            }
+            argument if argument.starts_with("--request=") => {
+                request = Some(assigned_path(argument, "--request")?);
+                index += 1;
+            }
+            argument if argument.starts_with('-') => {
+                return Err(format!("unknown option `{argument}`"));
+            }
+            argument => return Err(format!("unexpected invoke argument `{argument}`")),
+        }
+    }
+    Ok(InvokeOptions {
+        manifest,
+        artifact,
+        host_config,
+        request: request.ok_or_else(|| "`invoke` requires `--request FILE`".to_owned())?,
+    })
+}
+
+fn parse_serve_options(arguments: &[String]) -> Result<ServeOptions, String> {
+    let mut manifest = PathBuf::from("krit.pkg");
+    let mut artifact = None;
+    let mut host_config = None;
+    let mut bind = "127.0.0.1:3000"
+        .parse()
+        .expect("default loopback bind address should parse");
+    let mut once = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--manifest" => {
+                manifest = option_path(arguments, index, "--manifest")?;
+                index += 2;
+            }
+            argument if argument.starts_with("--manifest=") => {
+                manifest = assigned_path(argument, "--manifest")?;
+                index += 1;
+            }
+            "--artifact" => {
+                artifact = Some(option_path(arguments, index, "--artifact")?);
+                index += 2;
+            }
+            argument if argument.starts_with("--artifact=") => {
+                artifact = Some(assigned_path(argument, "--artifact")?);
+                index += 1;
+            }
+            "--host-config" => {
+                host_config = Some(option_path(arguments, index, "--host-config")?);
+                index += 2;
+            }
+            argument if argument.starts_with("--host-config=") => {
+                host_config = Some(assigned_path(argument, "--host-config")?);
+                index += 1;
+            }
+            "--bind" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "`--bind` requires a socket address".to_owned())?;
+                bind = value
+                    .parse()
+                    .map_err(|_| "`--bind` requires an IP socket address".to_owned())?;
+                index += 2;
+            }
+            argument if argument.starts_with("--bind=") => {
+                let value = argument.split_once('=').map_or("", |(_, value)| value);
+                bind = value
+                    .parse()
+                    .map_err(|_| "`--bind` requires an IP socket address".to_owned())?;
+                index += 1;
+            }
+            "--once" => {
+                once = true;
+                index += 1;
+            }
+            argument if argument.starts_with('-') => {
+                return Err(format!("unknown option `{argument}`"));
+            }
+            argument => return Err(format!("unexpected serve argument `{argument}`")),
+        }
+    }
+    Ok(ServeOptions {
+        manifest,
+        artifact,
+        host_config,
+        bind,
+        once,
+    })
 }
 
 fn sandbox_command(arguments: &[String]) -> u8 {
@@ -1470,6 +1974,8 @@ USAGE:
     krit prompt
     krit permissions [--artifact PATH] [--json] [MANIFEST]
     krit sandbox [--manifest PATH] [--artifact PATH]
+    krit invoke [--manifest PATH] [--artifact PATH] [--host-config PATH] --request FILE
+    krit serve [--manifest PATH] [--artifact PATH] [--host-config PATH] [--bind IP:PORT] [--once]
     krit package check [MANIFEST]
     krit --version
     krit --help"

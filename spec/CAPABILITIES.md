@@ -1,6 +1,6 @@
 # Capability model
 
-**Status:** Implemented contracts with draft hosts
+**Status:** Implemented bounded config/secret/HTTP host
 **Target:** Krit 0.3
 
 ## Rule
@@ -47,11 +47,11 @@ secrets = ["github-token", "slack-token"]
 ```
 
 The schema-1 manifest implements requests for `stdout`, `config`, `http`, and
-`secrets`. The language now emits literal-resource facts for `config.read`
-and `secret.read`, but no configuration/secret value provider or outbound
-HTTP host exists yet. Files, generic sockets, processes, environment
-variables, clocks, randomness, state, queues, storage, and AI invocation
-remain unavailable.
+`secrets`. The language emits literal-resource facts for `config.read`, `secret.read`,
+and `http.request`. The bounded webhook host implements these three
+capabilities. Files, generic sockets, processes, environment variables,
+clocks, randomness, state, queues, storage, and AI invocation remain
+unavailable.
 
 Paths are package-root-relative and resolved before execution. A lexical path
 that escapes the granted root is rejected. Symlink and platform-specific path
@@ -63,25 +63,32 @@ pattern. DNS rebinding and redirects cannot expand the original grant.
 Secret grants expose opaque handles where possible. Secrets must not appear in
 debug output, diagnostics, cache keys, lockfiles, or telemetry.
 
-## Contract-only host operations
+## Bounded host operations
 
 The edition-2026 source contracts are:
 
 ```krit
 config_string("agent.model") // Result<String, String>
 secret("github-token")       // Result<Secret, String>
+http_request(
+    "https://api.github.com",
+    request,
+    Some(token),
+)                            // Result<HttpResponse, String>
 ```
 
 The string must be a direct literal so analysis can emit one exact sorted
 requirement pair. `config_string` emits `config.read` plus its key.
-`secret` emits `secret.read` plus its logical name. The opaque `Secret` handle
-cannot be printed, compared, JSON-encoded, structurally stored, or revealed.
-No host value is read during checking or explanation.
+`secret` emits `secret.read` plus its logical name. `http_request` emits
+`http.request` plus one normalized exact origin. Its bearer argument is
+directly `None` or `Some(secret)`; this is the only approved structural use of
+the opaque handle. The host injects the Authorization header without exposing
+secret bytes. No host value is read during checking or explanation.
 
 Package build orchestration intersects these requirements with manifest
-resources and reports `K5001` for an absent match. A matching manifest does
-not make a component buildable in this contracts milestone: unsupported
-webhook/config/secret backend layouts still fail closed with `K7002`.
+resources and reports `K5001` for an absent exact match. A matching supported
+webhook compiles to an effect-selected typed component; unsupported general
+composites and captures still fail closed with `K7001`/`K7002`.
 
 ## Grant authority
 
@@ -115,8 +122,10 @@ Artifact-aware JSON uses schema 1 and includes `world`, `required`,
 ## Development mode
 
 Standalone source execution may receive `io.stdout` only. A source containing
-a webhook entrypoint or configuration/secret host call fails with `K5003`;
-there is no fallback value and no `--allow` escape hatch in this milestone.
+a webhook entrypoint or configuration/secret/HTTP host call fails with
+`K5003`; there is no fallback value or `--allow` escape hatch. `krit invoke`
+and `krit serve` load only an existing validated artifact and explicit host
+inputs.
 
 Package execution reads grants from the root manifest and may still require
 interactive or host approval. CI should use a non-interactive explicit policy.

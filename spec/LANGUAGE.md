@@ -9,11 +9,11 @@ This document defines the syntax and runtime behavior required by the initial
 Rust implementation. The bootstrap static checker is specified in
 `TYPES-AND-EFFECTS.md`, and the evaluator-independent typed Core form is
 described in `docs/technical-design.md`. This milestone also defines
-contracts-only webhook entrypoints, configuration reads, and opaque secret
-acquisition. Their HTTP host and WebAssembly layouts are deliberately not
-implemented until the `phase4-http-runtime` milestone. Policy-1 component
-generation and bounded sandbox execution remain implemented only for the
-documented scalar/stdout subset.
+typed webhook entrypoints, configuration reads, opaque secret acquisition,
+and exact-origin outbound HTTP. The direct evaluator remains intentionally
+hostless; these operations execute only through the bounded Component Model
+runtime. General component generation remains narrower than the full dynamic
+language.
 
 The historical Racket S-expression syntax is not accepted by Krit 0.2.
 
@@ -38,7 +38,7 @@ else false fn if let match record true webhook
 Reserved built-in names:
 
 ```text
-Err None Ok Some config_string json_decode json_encode print println secret
+Err None Ok Some config_string http_request json_decode json_encode print println secret
 ```
 
 A binding cannot use a keyword or reserved built-in name.
@@ -219,10 +219,10 @@ name and value, independent of field order.
 `Some(value)`, `None`, `Ok(value)`, and `Err(value)` are ordinary immutable
 runtime values. An opaque `Secret` is the exception to ordinary structural
 composition: it cannot be printed, compared, JSON-encoded, or placed in a
-list, record, `Option`, or user-constructed `Result`. The host operation
-`secret` returns `Result<Secret, String>` so acquisition failure remains
-visible; matching that result may bind the handle for a future approved host
-connector operation.
+list, record, or user-constructed `Result`. The sole `Option` exception is a
+direct `Some(secret)` bearer argument to `http_request`; no other
+`Option<Secret>` storage is accepted. The host injects the credential without
+exposing bytes to guest code.
 
 ## 7. Bindings and scope
 
@@ -433,10 +433,10 @@ Output rendering is deterministic:
 - variants: `Some(value)`, `None`, `Ok(value)`, or `Err(value)`
 - functions: `<function>` or `<function name>`
 
-Output is the only host effect executable by the direct evaluator and the
-policy-1 WebAssembly runtime. It is modeled as `io.stdout`. Contract-only
-`config.read` and `secret.read` operations are statically visible but have no
-value provider in this milestone.
+Output is the only host effect executable by the direct evaluator. It is
+modeled as `io.stdout`. The component runtime additionally provides bounded
+`config.read`, `secret.read`, and `http.request` interfaces to typed webhook
+artifacts.
 
 ## 13. JSON conversion
 
@@ -464,24 +464,33 @@ numbers are rejected. Encoding a function directly or inside another value is
 `K4008`. `Secret` is rejected statically and can never reach JSON conversion.
 Invalid JSON or JSON without a Krit representation is `K4009`.
 
-## 13.1 Configuration and secret host contracts
+## 13.1 Configuration, secret, and HTTP host contracts
 
 ```krit
 config_string("agent.model") // Result<String, String>
 secret("github-token")       // Result<Secret, String>
+http_request(
+    "https://api.example.com",
+    request,
+    Some(token),
+)                            // Result<HttpResponse, String>
 ```
 
-Both operations require exactly one direct string-literal resource argument.
-Indirect use of either host operation as a first-class function and calls
-with computed names are rejected because capability requirements would not be
-statically knowable. A configuration read has effect `config.read` and
+Config and secret operations require exactly one direct string-literal
+resource argument. `http_request` requires a direct normalized exact-origin
+literal, an `HttpRequest`, and directly `None` or `Some(secret)`. Indirect host
+operation use and computed resources are rejected because capability
+requirements would not be statically knowable. A configuration read has
+effect `config.read` and
 requirement pair `("config.read", "agent.model")`. Secret acquisition has
-effect `secret.read` and the corresponding literal-resource requirement.
+effect `secret.read`; outbound HTTP has `http.request` and the exact origin.
 
 The source checker does not require a manifest. Package build orchestration
 checks requirements against the schema-1 manifest. The direct evaluator emits
-`K5003` because these host operations are unavailable; it never substitutes
-an empty string, environment variable, or secret bytes.
+`K5003` because these host operations are unavailable there; it never
+substitutes an empty string, environment variable, network response, or secret
+bytes. `krit invoke` and `krit serve` execute the separately built component
+with explicit immutable host inputs.
 
 ## 14. Evaluation failure
 
@@ -498,9 +507,9 @@ The following are errors rather than implementation-defined behavior:
 - function comparison
 - missing record field
 - JSON encoding of a function
-- non-literal configuration or secret resource
+- non-literal configuration, secret, or HTTP-origin resource
 - printing, comparing, encoding, or structurally storing an opaque secret
-- unavailable webhook, configuration, or secret direct-run host contract
+- unavailable webhook, configuration, secret, or HTTP direct-run host contract
 - invalid or unsupported JSON
 
 Evaluation stops at the first error. Errors follow `DIAGNOSTICS.md`.

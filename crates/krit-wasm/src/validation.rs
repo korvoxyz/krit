@@ -9,11 +9,17 @@ use wit_component::DecodedWasm;
 
 use crate::{
     ARTIFACT_METADATA_SCHEMA, ARTIFACT_POLICY_VERSION, ArtifactMetadata, BuildError, COMPILER_NAME,
-    EmbeddedMetadata, LANGUAGE_NAME, LANGUAGE_VERSION, STDOUT_INTERFACE, WASM_COMPONENT_TARGET,
-    wit::{STDOUT_EFFECT, WitContract, contract_from_world, load_contract},
+    CONFIG_INTERFACE, EmbeddedMetadata, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, LANGUAGE_NAME,
+    LANGUAGE_VERSION, ResourceRequirementMetadata, SECRETS_INTERFACE, STDOUT_INTERFACE,
+    WASM_COMPONENT_TARGET, WEBHOOK_INTERFACE,
+    wit::{
+        CONFIG_EFFECT, HTTP_EFFECT, ProgramKind, SECRETS_EFFECT, STDOUT_EFFECT, WitContract,
+        contract_from_world, load_contract,
+    },
 };
 
 pub const EMBEDDED_METADATA_SECTION: &str = "krit.metadata";
+pub const MAX_EMBEDDED_METADATA_BYTES: usize = 48 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentInspection {
@@ -21,10 +27,13 @@ pub struct ComponentInspection {
     pub imports: Vec<String>,
     pub exports: Vec<String>,
     pub effects: Vec<String>,
+    pub requirements: Vec<ResourceRequirementMetadata>,
     pub core_module_count: u32,
     pub table_count: u32,
     pub table_elements: u64,
     pub memory_count: u32,
+    pub memory_minimum_bytes: u64,
+    pub memory_maximum_bytes: u64,
 }
 
 pub fn digest_bytes(bytes: &[u8]) -> String {
@@ -54,6 +63,7 @@ pub(crate) fn validate_core(
     let mut exports = BTreeSet::new();
     let mut tables = Vec::new();
     let mut memory_count = 0u32;
+    let mut memories = Vec::new();
     let mut top_encoding = None;
 
     for payload in Parser::new(0).parse_all(bytes) {
@@ -75,12 +85,19 @@ pub(crate) fn validate_core(
             Payload::ExportSection(section) => {
                 for export in section {
                     let export = export.map_err(parse_error)?;
-                    if export.kind != ExternalKind::Func {
-                        return Err(BuildError::artifact(
-                            "core WebAssembly contains a non-function export",
-                        ));
+                    match export.kind {
+                        ExternalKind::Func => {
+                            exports.insert((export.name, 0u8));
+                        }
+                        ExternalKind::Memory if export.name == contract.memory_export => {
+                            exports.insert((export.name, 1u8));
+                        }
+                        _ => {
+                            return Err(BuildError::artifact(
+                                "core WebAssembly contains an unexpected non-function export",
+                            ));
+                        }
                     }
-                    exports.insert(export.name);
                 }
             }
             Payload::TableSection(section) => {
@@ -89,9 +106,13 @@ pub(crate) fn validate_core(
                 }
             }
             Payload::MemorySection(section) => {
-                memory_count = memory_count
-                    .checked_add(section.count())
-                    .ok_or_else(|| BuildError::artifact("too many core WebAssembly memories"))?;
+                for memory in section {
+                    let memory = memory.map_err(parse_error)?;
+                    memory_count = memory_count.checked_add(1).ok_or_else(|| {
+                        BuildError::artifact("too many core WebAssembly memories")
+                    })?;
+                    memories.push(memory);
+                }
             }
             Payload::StartSection { .. } => {
                 return Err(BuildError::artifact(
@@ -123,19 +144,36 @@ pub(crate) fn validate_core(
             "core WebAssembly imports do not match the parsed WIT contract",
         ));
     }
-    let expected_exports = BTreeSet::from([
-        contract.run_export.as_str(),
-        contract.post_run_export.as_str(),
+    let mut expected_exports = BTreeSet::from([
+        (contract.entry_export.as_str(), 0u8),
+        (contract.post_entry_export.as_str(), 0u8),
     ]);
+    if contract.requires_memory {
+        expected_exports.insert((contract.memory_export.as_str(), 1u8));
+        expected_exports.insert((contract.realloc_export.as_str(), 0u8));
+    }
     if exports != expected_exports {
         return Err(BuildError::artifact(
             "core WebAssembly exports do not match the parsed WIT contract",
         ));
     }
-    if memory_count != 0 {
+    if memory_count != u32::from(contract.requires_memory) {
         return Err(BuildError::artifact(
-            "WebAssembly policy 1 does not permit guest linear memory",
+            "WebAssembly policy 1 core memory count does not match the selected WIT world",
         ));
+    }
+    if contract.requires_memory {
+        let memory = memories[0];
+        if memory.memory64
+            || memory.shared
+            || memory.initial == 0
+            || memory.maximum != Some(256)
+            || memory.page_size_log2.is_some()
+        {
+            return Err(BuildError::artifact(
+                "bounded webhook core memory violates policy 1",
+            ));
+        }
     }
     if tables.len() != 1 {
         return Err(BuildError::artifact(
@@ -175,6 +213,8 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
     let mut table_count = 0u32;
     let mut table_elements = 0u64;
     let mut memory_count = 0u32;
+    let mut memory_minimum_bytes = 0u64;
+    let mut memory_maximum_bytes = 0u64;
     let mut embedded = None;
 
     for payload in Parser::new(0).parse_all(bytes) {
@@ -223,7 +263,10 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
                     if export.name.implements.is_some()
                         || export.name.version_suffix.is_some()
                         || export.name.external_id.is_some()
-                        || export.kind != ComponentExternalKind::Func
+                        || !matches!(
+                            export.kind,
+                            ComponentExternalKind::Func | ComponentExternalKind::Instance
+                        )
                     {
                         return Err(BuildError::artifact(
                             "component export uses a forbidden name or type",
@@ -235,12 +278,15 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
             Payload::ImportSection(section) => {
                 for import in section.into_imports() {
                     let import = import.map_err(parse_error)?;
-                    if !matches!(import.ty, TypeRef::Func(_)) {
-                        return Err(BuildError::artifact(
-                            "embedded core module contains a non-function import",
-                        ));
+                    if core_module_count == 1 {
+                        if !matches!(import.ty, TypeRef::Func(_)) {
+                            return Err(BuildError::artifact(format!(
+                                "main core module contains a non-function import `{}::{}`",
+                                import.module, import.name
+                            )));
+                        }
+                        core_imports.push((import.module.to_owned(), import.name.to_owned()));
                     }
-                    core_imports.push((import.module.to_owned(), import.name.to_owned()));
                 }
             }
             Payload::TableSection(section) => {
@@ -272,12 +318,24 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
                     if memory.memory64
                         || memory.shared
                         || memory.maximum.is_none()
+                        || memory.maximum > Some(256)
                         || memory.page_size_log2.is_some()
                     {
                         return Err(BuildError::artifact(
                             "embedded core memory violates policy 1",
                         ));
                     }
+                    memory_minimum_bytes = memory_minimum_bytes
+                        .checked_add(memory.initial.saturating_mul(65_536))
+                        .ok_or_else(|| BuildError::artifact("minimum memory size overflowed"))?;
+                    memory_maximum_bytes = memory_maximum_bytes
+                        .checked_add(
+                            memory
+                                .maximum
+                                .expect("bounded memory checked above")
+                                .saturating_mul(65_536),
+                        )
+                        .ok_or_else(|| BuildError::artifact("maximum memory size overflowed"))?;
                 }
             }
             Payload::StartSection { .. } | Payload::ComponentStartSection { .. } => {
@@ -293,10 +351,16 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
             Payload::CustomSection(section)
                 if depth == 0 && section.name() == EMBEDDED_METADATA_SECTION =>
             {
-                if embedded.is_some() || section.data().len() > 1024 {
+                if embedded.is_some() {
                     return Err(BuildError::artifact(
-                        "component metadata section is duplicate or oversized",
+                        "component metadata section is duplicate",
                     ));
+                }
+                if section.data().len() > MAX_EMBEDDED_METADATA_BYTES {
+                    return Err(BuildError::artifact(format!(
+                        "component metadata section exceeds the {}-byte policy limit",
+                        MAX_EMBEDDED_METADATA_BYTES
+                    )));
                 }
                 embedded = Some(
                     serde_json::from_slice::<EmbeddedMetadata>(section.data()).map_err(
@@ -324,21 +388,45 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
     }
     imports.sort();
     exports.sort();
-    if exports != ["run"] {
-        return Err(BuildError::artifact(
-            "component exports do not match a policy 1 WIT world",
-        ));
-    }
-    let effects = match imports.as_slice() {
-        [] => Vec::new(),
-        [import] if import == STDOUT_INTERFACE => vec![STDOUT_EFFECT.to_owned()],
+    let kind = match exports.as_slice() {
+        [export] if export == "run" => ProgramKind::Module,
+        [export] if export == WEBHOOK_INTERFACE => ProgramKind::Webhook,
         _ => {
             return Err(BuildError::artifact(
-                "component imports do not match WebAssembly policy 1",
+                "component exports do not match a policy 1 WIT world",
             ));
         }
     };
-    let (_, _, contract) = load_contract(&effects)?;
+    if !sorted_unique(&imports) {
+        return Err(BuildError::artifact(
+            "component imports must be sorted and unique",
+        ));
+    }
+    let mut effects = Vec::with_capacity(imports.len());
+    for import in &imports {
+        effects.push(
+            match import.as_str() {
+                STDOUT_INTERFACE => STDOUT_EFFECT,
+                CONFIG_INTERFACE => CONFIG_EFFECT,
+                SECRETS_INTERFACE => SECRETS_EFFECT,
+                HTTP_INTERFACE => HTTP_EFFECT,
+                HTTP_ANONYMOUS_INTERFACE => HTTP_EFFECT,
+                _ => {
+                    return Err(BuildError::artifact(
+                        "component imports do not match WebAssembly policy 1",
+                    ));
+                }
+            }
+            .to_owned(),
+        );
+    }
+    effects.sort();
+    let (_, _, contract) = load_contract(kind, &effects)?;
+    if contract.component_imports != imports || contract.component_export != exports[0] {
+        return Err(BuildError::artifact(
+            "component surface does not match its deterministic WIT world",
+        ));
+    }
     let mut expected_core_imports = contract
         .imports
         .iter()
@@ -351,10 +439,13 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
             "embedded core imports do not match the selected WIT world",
         ));
     }
-    if core_module_count != 1 || table_count != 1 || memory_count != 0 {
-        return Err(BuildError::artifact(
-            "component core module, table, or memory shape violates policy 1",
-        ));
+    if !(1..=4).contains(&core_module_count)
+        || !(1..=4).contains(&table_count)
+        || memory_count != u32::from(contract.requires_memory)
+    {
+        return Err(BuildError::artifact(format!(
+            "component core shape violates policy 1 (modules={core_module_count}, tables={table_count}, memories={memory_count})"
+        )));
     }
 
     let embedded =
@@ -364,6 +455,7 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
         || embedded.edition != "2026"
         || embedded.world != contract.world
         || embedded.effects != effects
+        || !valid_requirements(&embedded.requirements, &effects)
         || embedded.policy_version != ARTIFACT_POLICY_VERSION
         || !sorted_unique(&embedded.effects)
     {
@@ -380,10 +472,13 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
         imports,
         exports,
         effects,
+        requirements: embedded.requirements,
         core_module_count,
         table_count,
         table_elements,
         memory_count,
+        memory_minimum_bytes,
+        memory_maximum_bytes,
     })
 }
 
@@ -403,6 +498,7 @@ pub fn validate_artifact(
         || metadata.package.version.is_empty()
         || !safe_entry(&metadata.entry)
         || !sorted_unique(&metadata.effects)
+        || !valid_requirements(&metadata.requirements, &metadata.effects)
         || !sorted_unique(&metadata.imports)
     {
         return Err(BuildError::metadata(
@@ -425,11 +521,13 @@ pub fn validate_artifact(
     if metadata.world != inspection.world
         || metadata.imports != inspection.imports
         || metadata.effects != inspection.effects
+        || metadata.requirements != inspection.requirements
     {
         return Err(BuildError::metadata(
             "artifact metadata world, imports, or effects do not match the component",
         ));
     }
+
     Ok(inspection)
 }
 
@@ -449,15 +547,41 @@ fn verify_decoded_world(bytes: &[u8], expected: &WitContract) -> Result<(), Buil
     expected_imports.sort();
     if decoded.component_imports != expected.component_imports
         || decoded_imports != expected_imports
-        || decoded.run_export != expected.run_export
-        || decoded.post_run_export != expected.post_run_export
-        || decoded.run_signature != expected.run_signature
+        || decoded.component_export != expected.component_export
+        || decoded.entry_export != expected.entry_export
+        || decoded.post_entry_export != expected.post_entry_export
+        || decoded.entry_signature != expected.entry_signature
+        || decoded.post_entry_signature != expected.post_entry_signature
+        || decoded.kind != expected.kind
     {
         return Err(BuildError::artifact(
             "decoded component does not implement the selected WIT world",
         ));
     }
+
     Ok(())
+}
+
+fn valid_requirements(requirements: &[ResourceRequirementMetadata], effects: &[String]) -> bool {
+    requirements.windows(2).all(|pair| pair[0] < pair[1])
+        && effects.iter().all(|effect| {
+            effect == STDOUT_EFFECT
+                || requirements
+                    .iter()
+                    .any(|requirement| &requirement.capability == effect)
+        })
+        && requirements.iter().all(|requirement| {
+            effects.binary_search(&requirement.capability).is_ok()
+                && match requirement.capability.as_str() {
+                    CONFIG_EFFECT | SECRETS_EFFECT => {
+                        krit_capability::is_valid_resource_name(&requirement.resource)
+                    }
+                    HTTP_EFFECT => {
+                        krit_capability::HttpOrigin::parse_exact(&requirement.resource).is_ok()
+                    }
+                    _ => false,
+                }
+        })
 }
 
 fn verify_producers(bytes: &[u8]) -> Result<(), BuildError> {

@@ -123,8 +123,8 @@ pub(crate) enum HostLimitError {
 impl fmt::Display for HostLimitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Calls => formatter.write_str("stdout host-call limit exceeded"),
-            Self::Output => formatter.write_str("stdout output-byte limit exceeded"),
+            Self::Calls => formatter.write_str("host-call limit exceeded"),
+            Self::Output => formatter.write_str("buffered output-byte limit exceeded"),
         }
     }
 }

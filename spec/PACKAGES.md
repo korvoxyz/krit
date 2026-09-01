@@ -136,8 +136,10 @@ For schema-1 agent contracts, package build planning compares the analyzer's
 sorted literal-resource requirements with the manifest before backend
 emission. `config.read("agent.model")` requires an exact `config` entry and
 `secret.read("github-token")` requires an exact `secrets` entry. Missing
-resources are `K5001`; matching resources do not make contracts-only webhook
-or host-value layouts buildable before `phase4-http-runtime`.
+resources are `K5001`. `http.request("https://api.example.com")` likewise
+requires one exact normalized `http` entry. Matching resources permit the
+bounded webhook backend only; unsupported general composite layouts still
+fail closed.
 
 Cache hits must be behaviorally identical to clean builds. A corrupt artifact
 is rejected by checksum rather than executed.

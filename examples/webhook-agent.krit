@@ -1,0 +1,25 @@
+fn failure(message: String) -> HttpResponse {
+    record { status: 502, headers: [], body: message }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match config_string("agent.model") {
+        Ok(model) => match secret("example-token") {
+            Ok(token) => {
+                let outbound: HttpRequest = record {
+                    method: "POST",
+                    path: "/v1/events",
+                    query: "",
+                    headers: [record { name: "x-krit-model", value: model }],
+                    body: request.body,
+                };
+                match http_request("https://api.example.com", outbound, Some(token)) {
+                    Ok(response) => response,
+                    Err(error) => failure(error),
+                }
+            },
+            Err(error) => failure(error),
+        },
+        Err(error) => failure(error),
+    }
+}

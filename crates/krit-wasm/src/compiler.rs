@@ -5,8 +5,8 @@ use std::{
 };
 
 use krit::{
-    BinaryOperator, Builtin, CoreBlock, CoreFunction, CoreModule, CoreOperation, OperationKind,
-    Type, UnaryOperator, ValueId, ValueLiteral,
+    BinaryOperator, Builtin, CoreBlock, CoreFunction, CoreModule, CoreOperation, FunctionId,
+    OperationKind, Type, UnaryOperator, ValueId, ValueLiteral,
 };
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind,
@@ -97,9 +97,18 @@ impl BuiltinFlavor {
 
 pub(crate) fn encode_core(
     module: &CoreModule,
+    entrypoint: FunctionId,
     contract: &WitContract,
     minimum_literal_operands: &BTreeSet<ValueId>,
 ) -> Result<EncodedCore, BuildError> {
+    if contract.requires_memory {
+        return crate::agent_compiler::encode_webhook_core(
+            module,
+            entrypoint,
+            contract,
+            minimum_literal_operands,
+        );
+    }
     let builtin_flavors = collect_builtin_flavors(module)?;
     let builtin_slots = builtin_flavors
         .iter()
@@ -130,7 +139,8 @@ pub(crate) fn encode_core(
             .copied()
             .map(BuiltinFlavor::signature),
     );
-    signatures.insert(contract.run_signature.clone());
+    signatures.insert(contract.entry_signature.clone());
+    signatures.insert(contract.post_entry_signature.clone());
 
     let signature_indices = signatures
         .into_iter()
@@ -167,7 +177,7 @@ pub(crate) fn encode_core(
     for flavor in &builtin_flavors {
         functions.function(signature_indices[&flavor.signature()]);
     }
-    functions.function(signature_indices[&contract.run_signature]);
+    functions.function(signature_indices[&contract.post_entry_signature]);
 
     let table_size = u32::try_from(module.functions().len() + builtin_flavors.len())
         .map_err(|_| BuildError::artifact("WebAssembly function table is too large"))?;
@@ -183,14 +193,17 @@ pub(crate) fn encode_core(
     let import_count = u32::try_from(contract.imports.len())
         .map_err(|_| BuildError::artifact("too many WebAssembly imports"))?;
     let mut exports = ExportSection::new();
-    let entrypoint = module.entrypoint().as_u32();
     exports.export(
-        &contract.run_export,
+        &contract.entry_export,
         ExportKind::Func,
-        import_count + entrypoint,
+        import_count + entrypoint.as_u32(),
     );
     let post_run_index = import_count + table_size;
-    exports.export(&contract.post_run_export, ExportKind::Func, post_run_index);
+    exports.export(
+        &contract.post_entry_export,
+        ExportKind::Func,
+        post_run_index,
+    );
 
     let table_functions = (0..table_size)
         .map(|definition| import_count + definition)

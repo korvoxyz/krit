@@ -178,6 +178,64 @@ fn config_and_secret_resources_must_be_direct_valid_literals() {
 }
 
 #[test]
+fn outbound_http_requires_an_exact_normalized_origin_and_direct_bearer() {
+    let analysis = analyze_source(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+        match secret("upstream-token") {
+            Ok(token) => match http_request("https://api.example.com", request, Some(token)) {
+                Ok(response) => response,
+                Err(error) => record { status: 502, headers: [], body: error },
+            },
+            Err(error) => record { status: 500, headers: [], body: error },
+        }
+}
+"#,
+    )
+    .expect("exact HTTP origin and bearer use should analyze");
+    let webhook = analysis
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.kind() == SymbolKind::Webhook)
+        .expect("webhook should exist");
+    let Type::Function(function) = webhook.ty() else {
+        panic!("webhook should have a function type");
+    };
+    assert_eq!(
+        function
+            .effects()
+            .iter()
+            .map(Effect::as_str)
+            .collect::<Vec<_>>(),
+        ["http.request", "secret.read"]
+    );
+    assert_eq!(
+        function
+            .requirements()
+            .iter()
+            .map(|requirement| (
+                requirement.capability().as_str(),
+                requirement.resource().to_owned(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("http.request", "https://api.example.com".to_owned()),
+            ("secret.read", "upstream-token".to_owned()),
+        ]
+    );
+
+    for source in [
+        r#"let origin = "https://api.example.com"; http_request(origin, record { method: "GET", path: "/", query: "", headers: [], body: "" }, None);"#,
+        r#"http_request("HTTPS://api.example.com", record { method: "GET", path: "/", query: "", headers: [], body: "" }, None);"#,
+        r#"http_request("https://api.example.com/", record { method: "GET", path: "/", query: "", headers: [], body: "" }, None);"#,
+        r#"http_request("https://api.example.com:443", record { method: "GET", path: "/", query: "", headers: [], body: "" }, None);"#,
+        r#"let bearer: Option<Secret> = None; http_request("https://api.example.com", record { method: "GET", path: "/", query: "", headers: [], body: "" }, bearer);"#,
+    ] {
+        assert_eq!(diagnostic_code(source), "K3008", "{source}");
+    }
+}
+
+#[test]
 fn empty_secret_containers_lower_without_storing_a_handle() {
     for text in [
         "let values: List<Secret> = [];",
@@ -241,6 +299,7 @@ fn secret_handles_cannot_be_revealed_or_stored() {
         r#"let stored = record { value: secret("github-token") };"#,
         r#"match secret("github-token") { Ok(value) => Some(value), Err(message) => None };"#,
         r#"let decoded: Secret = json_decode("\"not-a-handle\"");"#,
+        r#"fn consume(value: Secret) -> Unit {} match secret("github-token") { Ok(value) => consume(value), Err(message) => {} };"#,
     ] {
         assert_eq!(diagnostic_code(source), "K3009", "{source}");
     }
