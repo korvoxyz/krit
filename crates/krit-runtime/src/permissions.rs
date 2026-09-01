@@ -2,8 +2,9 @@ use std::collections::BTreeSet;
 
 use krit_package::Manifest;
 use krit_wasm::{
-    ArtifactMetadata, CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, PROGRAM_WORLD,
-    PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD,
+    AI_INTERFACE, ArtifactMetadata, CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE,
+    LOGGING_INTERFACE, PROGRAM_WORLD, PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STDOUT_INTERFACE,
+    WEBHOOK_PROGRAM_WORLD,
 };
 use serde::Serialize;
 
@@ -28,6 +29,12 @@ pub struct PermissionFact {
     pub resource: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ApprovalFact {
+    pub operation: String,
+    pub resource: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectivePermissions {
@@ -39,6 +46,8 @@ pub struct EffectivePermissions {
     pub effective: Vec<PermissionFact>,
     pub denied: Vec<PermissionFact>,
     pub imports: Vec<String>,
+    pub approval_required: Vec<ApprovalFact>,
+    pub approval_status: &'static str,
     pub denial_reasons: Vec<String>,
     pub local_grant_status: &'static str,
     pub deployment_grant_status: &'static str,
@@ -70,6 +79,18 @@ impl GrantSet {
             effects.insert("secret.read".to_owned());
             imports.insert(SECRETS_INTERFACE.to_owned());
         }
+        if !manifest.capabilities.ai.is_empty() {
+            effects.insert("ai.invoke".to_owned());
+            imports.insert(AI_INTERFACE.to_owned());
+        }
+        if manifest.capabilities.logs {
+            requested.push(PermissionFact {
+                capability: "observe.log".to_owned(),
+                resource: None,
+            });
+            effects.insert("observe.log".to_owned());
+            imports.insert(LOGGING_INTERFACE.to_owned());
+        }
         requested.extend(
             manifest
                 .capabilities
@@ -78,6 +99,17 @@ impl GrantSet {
                 .cloned()
                 .map(|resource| PermissionFact {
                     capability: "config.read".to_owned(),
+                    resource: Some(resource),
+                }),
+        );
+        requested.extend(
+            manifest
+                .capabilities
+                .ai
+                .iter()
+                .cloned()
+                .map(|resource| PermissionFact {
+                    capability: "ai.invoke".to_owned(),
                     resource: Some(resource),
                 }),
         );
@@ -203,6 +235,14 @@ impl GrantSet {
         } else {
             "denied"
         };
+        let approval_required = metadata
+            .approvals
+            .iter()
+            .map(|approval| ApprovalFact {
+                operation: approval.operation.clone(),
+                resource: approval.resource.clone(),
+            })
+            .collect();
         EffectivePermissions {
             schema: 1,
             package: metadata.package.name.clone(),
@@ -212,6 +252,8 @@ impl GrantSet {
             effective,
             denied,
             imports: metadata.imports.clone(),
+            approval_required,
+            approval_status: "not-evaluated",
             denial_reasons,
             local_grant_status,
             deployment_grant_status: "not-evaluated",
@@ -276,6 +318,21 @@ impl EffectivePermissions {
                 output.push_str(reason);
                 output.push('\n');
             }
+            output.push_str("Approval required:\n");
+            if self.approval_required.is_empty() {
+                output.push_str("  (none)\n");
+            } else {
+                for approval in &self.approval_required {
+                    output.push_str("  ");
+                    output.push_str(&approval.operation);
+                    output.push_str(": ");
+                    output.push_str(&approval.resource);
+                    output.push('\n');
+                }
+            }
+            output.push_str("Approval policy: ");
+            output.push_str(self.approval_status);
+            output.push('\n');
         }
         output.push_str("Local manifest grants: ");
         output.push_str(self.local_grant_status);
@@ -327,6 +384,8 @@ fn valid_policy_world(metadata: &ArtifactMetadata) -> bool {
                 }
                 .to_owned(),
             ),
+            "ai.invoke" => Some(AI_INTERFACE.to_owned()),
+            "observe.log" => Some(LOGGING_INTERFACE.to_owned()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -416,6 +475,7 @@ stdout = true
             byte_size: 0,
             effects: vec!["io.stdout".to_owned()],
             requirements: Vec::new(),
+            approvals: Vec::new(),
             imports: vec![STDOUT_INTERFACE.to_owned()],
             build_profile: "default".to_owned(),
             policy_version: ARTIFACT_POLICY_VERSION,

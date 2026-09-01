@@ -1,6 +1,6 @@
 # Static types and effects
 
-**Status:** Implemented baseline with typed Core facts and draft extensions
+**Status:** Implemented through bounded Phase 4 host contracts
 **Target:** Krit 0.2 bootstrap
 
 ## Goals
@@ -31,6 +31,7 @@ Record { field: Type, ... }
 HttpHeader
 HttpRequest
 HttpResponse
+LogField
 Secret
 fn(A, B) -> C
 ```
@@ -105,9 +106,9 @@ secret.read
 ai.invoke
 ```
 
-Implemented analysis recognizes `io.stdout`, `config.read`, and `secret.read`.
-Only `io.stdout` has an executable host in this milestone. Pure functions
-have an empty effect set. Calling a function adds its effects to the caller,
+Implemented analysis recognizes `io.stdout`, `config.read`, `secret.read`,
+`http.request`, `ai.invoke`, and `observe.log`. Pure functions have an empty
+effect set. Calling a function adds its effects to the caller,
 including recursive and higher-order propagation. Branch and match effects
 are conservative unions. JSON conversion is pure.
 
@@ -116,8 +117,8 @@ The Rust API returns effects in sorted deterministic order through
 `Analysis` separately exposes sorted, deduplicated literal-resource
 requirements through `Analysis::requirements`; function, expression, and
 block facts expose the same transitive requirement summaries. A requirement
-is the ordered pair `(capability, resource)`, currently
-`config.read`/configuration-key or `secret.read`/secret-name. Coarse effects
+is the ordered pair `(capability, resource)`, currently `config.read`/configuration-key, `secret.read`/secret-name,
+`http.request`/exact-origin, or `ai.invoke`/adapter-name. Coarse effects
 never erase or replace these resource identities. `Analysis` also exposes
 normalized symbol facts and resolved symbol or built-in identities. Core
 lowering consumes those facts and does not run an independent inference
@@ -166,6 +167,7 @@ serialize, or turn the handle into ordinary application data:
 - `json_encode`
 - list and record construction
 - `Some`, `Ok`, or `Err` construction
+- structured logging fields
 
 `Result<Secret, String>` produced by `secret("literal")` is an explicit host
 operation result, not permission to construct arbitrary secret-containing

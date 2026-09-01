@@ -8,6 +8,12 @@ entry = "webhook-agent.krit"
 license = "Apache-2.0"
 
 [capabilities]
-config = ["agent.model"]
-http = ["https://api.example.com"]
-secrets = ["example-token"]
+config = ["reference.repository"]
+http = [
+    "https://ai.example.invalid",
+    "https://github.example.invalid",
+    "https://message.example.invalid",
+]
+secrets = ["ai-token", "github-token", "message-token"]
+ai = ["reviewer"]
+logs = true

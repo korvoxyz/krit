@@ -48,6 +48,8 @@ stdout = true
 config = ["agent.model", "agent.timeout-ms"]
 http = ["https://api.github.com", "https://slack.com"]
 secrets = ["github-token", "slack-token"]
+ai = ["reviewer"]
+logs = true
 ```
 
 Package names contain a lowercase namespace and name separated by `/`.
@@ -137,9 +139,12 @@ sorted literal-resource requirements with the manifest before backend
 emission. `config.read("agent.model")` requires an exact `config` entry and
 `secret.read("github-token")` requires an exact `secrets` entry. Missing
 resources are `K5001`. `http.request("https://api.example.com")` likewise
-requires one exact normalized `http` entry. Matching resources permit the
-bounded webhook backend only; unsupported general composite layouts still
-fail closed.
+requires one exact normalized `http` entry, and `ai.invoke("reviewer")`
+requires one exact sorted `ai` entry. `observe.log` requires `logs = true`.
+Matching resources permit the bounded webhook backend only; unsupported
+general composite layouts still fail closed. Host-config adapter origins,
+secrets, retry/rate keys, and approval resources must also be manifest-granted
+and cannot widen this plan.
 
 Cache hits must be behaviorally identical to clean builds. A corrupt artifact
 is rejected by checksum rather than executed.

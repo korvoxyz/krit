@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+blake3.workspace = true
 curl.workspace = true
 http.workspace = true
 krit-capability.workspace = true

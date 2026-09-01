@@ -10,10 +10,10 @@ Rust implementation. The bootstrap static checker is specified in
 `TYPES-AND-EFFECTS.md`, and the evaluator-independent typed Core form is
 described in `docs/technical-design.md`. This milestone also defines
 typed webhook entrypoints, configuration reads, opaque secret acquisition,
-and exact-origin outbound HTTP. The direct evaluator remains intentionally
-hostless; these operations execute only through the bounded Component Model
-runtime. General component generation remains narrower than the full dynamic
-language.
+exact-origin outbound HTTP, provider-neutral AI invocation, and structured
+logging. The direct evaluator remains intentionally hostless; these operations
+execute only through the bounded Component Model runtime. General component
+generation remains narrower than the full dynamic language.
 
 The historical Racket S-expression syntax is not accepted by Krit 0.2.
 
@@ -38,7 +38,7 @@ else false fn if let match record true webhook
 Reserved built-in names:
 
 ```text
-Err None Ok Some config_string http_request json_decode json_encode print println secret
+Err None Ok Some ai_invoke config_string http_request json_decode json_encode log_error log_info print println secret
 ```
 
 A binding cannot use a keyword or reserved built-in name.
@@ -150,7 +150,8 @@ result-arm      = "Ok", "(", identifier, ")", "=>", expression
                 | "Err", "(", identifier, ")", "=>", expression ;
 
 type            = "Int" | "Bool" | "String" | "Unit"
-                | "HttpHeader" | "HttpRequest" | "HttpResponse" | "Secret"
+                | "HttpHeader" | "HttpRequest" | "HttpResponse"
+                | "LogField" | "Secret"
                 | "List", "<", type, ">"
                 | "Option", "<", type, ">"
                 | "Result", "<", type, ",", type, ">"
@@ -174,7 +175,7 @@ webhook fn name(request: HttpRequest) -> HttpResponse {
 }
 ```
 
-The source name is a compiler fact. A future host exports the declaration
+The source name is a compiler fact. The component host exports the declaration
 through the canonical `krit:runtime/webhook@0.2.0` interface's `handle`
 operation; the name does not create an ambient network listener.
 
@@ -310,7 +311,7 @@ HttpResponse = Record {
 
 Header order is preserved and duplicate header names are representable.
 `HttpResponse` is exact: a response with a missing or additional field is a
-type error. Status-range validation belongs to the future HTTP host, not the
+type error. Status-range validation belongs to the component HTTP host, not the
 static type checker. These built-ins do not add general user-defined type
 alias syntax.
 
@@ -435,8 +436,8 @@ Output rendering is deterministic:
 
 Output is the only host effect executable by the direct evaluator. It is
 modeled as `io.stdout`. The component runtime additionally provides bounded
-`config.read`, `secret.read`, and `http.request` interfaces to typed webhook
-artifacts.
+`config.read`, `secret.read`, `http.request`, `ai.invoke`, and `observe.log`
+interfaces to typed webhook artifacts.
 
 ## 13. JSON conversion
 
@@ -464,7 +465,13 @@ numbers are rejected. Encoding a function directly or inside another value is
 `K4008`. `Secret` is rejected statically and can never reach JSON conversion.
 Invalid JSON or JSON without a Krit representation is `K4009`.
 
-## 13.1 Configuration, secret, and HTTP host contracts
+The policy-2 component backend implements one additional fail-closed
+specialization: when the inferred result is `String`, an unescaped JSON string
+is validated and decoded without importing a host interface. Escapes and all
+other component JSON shapes remain `K7002` or a bounded guest validation trap;
+there is no evaluator fallback.
+
+## 13.1 Configuration, secret, HTTP, AI, and logging host contracts
 
 ```krit
 config_string("agent.model") // Result<String, String>
@@ -474,6 +481,9 @@ http_request(
     request,
     Some(token),
 )                            // Result<HttpResponse, String>
+ai_invoke("reviewer", input) // Result<String, String>
+log_info("review.started", fields) // Result<Unit, String>
+log_error("review.failed", fields) // Result<Unit, String>
 ```
 
 Config and secret operations require exactly one direct string-literal
@@ -484,6 +494,17 @@ requirements would not be statically knowable. A configuration read has
 effect `config.read` and
 requirement pair `("config.read", "agent.model")`. Secret acquisition has
 effect `secret.read`; outbound HTTP has `http.request` and the exact origin.
+
+`ai_invoke` requires a direct canonical adapter-name literal and adds
+`ai.invoke("adapter")`. It returns bounded raw UTF-8 model text. The text is
+nondeterministic and untrusted; source must explicitly validate or parse it
+before structured use. The host never executes model output.
+
+`LogField` is the closed alias `Record { name: String, value: String }`.
+`log_info` and `log_error` require a direct canonical event literal and an
+ordered `List<LogField>`, add `observe.log`, and return a fallible unit result.
+No `Secret` can enter a log field. Host-side validation, redaction, buffering,
+and publication are defined in `AI-OBSERVABILITY.md`.
 
 The source checker does not require a manifest. Package build orchestration
 checks requirements against the schema-1 manifest. The direct evaluator emits
@@ -507,9 +528,11 @@ The following are errors rather than implementation-defined behavior:
 - function comparison
 - missing record field
 - JSON encoding of a function
-- non-literal configuration, secret, or HTTP-origin resource
+- non-literal configuration, secret, HTTP-origin, AI-adapter, or log-event
+  resource
 - printing, comparing, encoding, or structurally storing an opaque secret
-- unavailable webhook, configuration, secret, or HTTP direct-run host contract
+- unavailable webhook, configuration, secret, HTTP, AI, or logging direct-run
+  host contract
 - invalid or unsupported JSON
 
 Evaluation stops at the first error. Errors follow `DIAGNOSTICS.md`.

@@ -2,6 +2,8 @@ use std::{error::Error, fmt};
 
 use krit_wasm::{BuildError, BuildErrorKind};
 
+use crate::LogEvent;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RuntimeErrorKind {
@@ -11,6 +13,7 @@ pub enum RuntimeErrorKind {
     ImportMismatch,
     FuelExhausted,
     DeadlineExceeded,
+    Cancelled,
     ResourceLimit,
     HostCallLimit,
     OutputLimit,
@@ -25,6 +28,7 @@ pub struct RuntimeError {
     code: &'static str,
     kind: RuntimeErrorKind,
     message: String,
+    events: Vec<LogEvent>,
 }
 
 impl RuntimeError {
@@ -37,6 +41,7 @@ impl RuntimeError {
             code,
             kind,
             message: message.into(),
+            events: Vec::new(),
         }
     }
 
@@ -54,6 +59,10 @@ impl RuntimeError {
 
     pub(crate) fn deadline(message: impl Into<String>) -> Self {
         Self::new("K5102", RuntimeErrorKind::DeadlineExceeded, message)
+    }
+
+    pub(crate) fn cancelled(message: impl Into<String>) -> Self {
+        Self::new("K5106", RuntimeErrorKind::Cancelled, message)
     }
 
     pub(crate) fn resource(message: impl Into<String>) -> Self {
@@ -91,6 +100,15 @@ impl RuntimeError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn events(&self) -> &[LogEvent] {
+        &self.events
+    }
+
+    pub(crate) fn with_events(mut self, events: Vec<LogEvent>) -> Self {
+        self.events = events;
+        self
     }
 }
 

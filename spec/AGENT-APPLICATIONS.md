@@ -124,8 +124,9 @@ AI is an optional connector, not a privileged language construct. Calls use:
 - explicit nondeterminism
 - an `ai.invoke` capability
 
-Model output is untrusted external input and must pass its declared schema
-before use.
+The Phase 4 neutral operation returns bounded raw UTF-8. Model output is
+untrusted external input and must be explicitly validated or parsed before
+structured use. A richer expected-output-schema adapter remains future work.
 
 ## Observability
 
@@ -153,12 +154,13 @@ The first end-to-end acceptance application:
 The source should remain short enough to review as application policy rather
 than infrastructure code.
 
-The `phase4-agent-contracts` milestone implements only the readable,
-checkable boundary needed to author that application: one typed `webhook fn`,
-fixed HTTP record aliases and JSON Schemas, literal-resource config/secret
-facts, and an opaque secret identity. It intentionally does not listen on a
-socket, perform HTTP/TLS, load values, invoke AI, or satisfy this end-to-end
-acceptance application.
+Phase 4 now implements this bounded reference boundary: typed webhook/config/
+secret/HTTP interfaces, provider-neutral AI invocation, structured redacted
+logs, retries, finite rates, cancellation, process-local idempotency, and
+default-deny sensitive-operation approval. The reference acceptance flow is
+covered with local mocks and exact artifact permission facts. Durable state,
+distributed rate policy, and deployment approval evaluation remain future
+work.
 
 ## Success measures
 

@@ -426,6 +426,8 @@ struct FunctionContext<'a> {
     locals: BTreeMap<ValueId, u32>,
     value_types: BTreeMap<ValueId, Arc<Type>>,
     scratch_i32: u32,
+    scratch_i32_2: u32,
+    scratch_i32_3: u32,
 }
 
 fn encode_function(
@@ -477,7 +479,13 @@ fn encode_function(
                 .map_err(|_| BuildError::artifact("too many WebAssembly locals"))?,
         )
         .ok_or_else(|| BuildError::artifact("too many WebAssembly locals"))?;
-    local_declarations.push(Scalar::I32);
+    let scratch_i32_2 = scratch_i32
+        .checked_add(1)
+        .ok_or_else(|| BuildError::artifact("too many WebAssembly locals"))?;
+    let scratch_i32_3 = scratch_i32
+        .checked_add(2)
+        .ok_or_else(|| BuildError::artifact("too many WebAssembly locals"))?;
+    local_declarations.extend([Scalar::I32; 3]);
 
     let mut function = Function::new(
         local_declarations
@@ -490,6 +498,8 @@ fn encode_function(
         locals,
         value_types,
         scratch_i32,
+        scratch_i32_2,
+        scratch_i32_3,
     };
 
     for capture in &core.captures {
@@ -786,6 +796,18 @@ fn encode_builtin_call(
     arguments: &[ValueId],
 ) -> Result<(), BuildError> {
     match builtin {
+        Builtin::AiInvoke => {
+            let [adapter, input] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "ai_invoke call does not have two arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *adapter)?;
+            load_string_flat(function, context, *input)?;
+            load_value(function, context, operation.result)?;
+            call_import(function, context, "invoke")?;
+        }
         Builtin::Print | Builtin::Println => {
             let argument = arguments
                 .first()
@@ -863,7 +885,41 @@ fn encode_builtin_call(
             load_value(function, context, operation.result)?;
             call_import(function, context, "send")?;
         }
-        Builtin::None | Builtin::JsonEncode | Builtin::JsonDecode => {
+        Builtin::LogInfo | Builtin::LogError => {
+            let [event, fields] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "structured log call does not have two arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *event)?;
+            load_pair_list_flat(function, context, *fields)?;
+            load_value(function, context, operation.result)?;
+            call_import(
+                function,
+                context,
+                if builtin == Builtin::LogInfo {
+                    "info"
+                } else {
+                    "error"
+                },
+            )?;
+        }
+        Builtin::JsonDecode => {
+            let [input] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "json_decode call does not have one argument",
+                ));
+            };
+            if operation.ty.as_ref() != &Type::String {
+                return Err(BuildError::unsupported(
+                    "bounded webhook JSON decoding supports only String",
+                    operation.source,
+                ));
+            }
+            encode_json_string_decode(function, context, operation.result, *input)?;
+        }
+        Builtin::None | Builtin::JsonEncode => {
             return Err(BuildError::unsupported(
                 format!(
                     "built-in `{}` has no bounded webhook call lowering",
@@ -874,6 +930,101 @@ fn encode_builtin_call(
         }
     }
     Ok(())
+}
+
+fn encode_json_string_decode(
+    function: &mut Function,
+    context: &FunctionContext<'_>,
+    result: ValueId,
+    input: ValueId,
+) -> Result<(), BuildError> {
+    load_value(function, context, input)?;
+    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+    function.instruction(&Instruction::LocalSet(context.scratch_i32));
+    load_value(function, context, input)?;
+    function.instruction(&Instruction::I32Load(memarg(4, 2)));
+    function.instruction(&Instruction::LocalSet(context.scratch_i32_2));
+
+    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
+    function.instruction(&Instruction::I32Const(2));
+    function.instruction(&Instruction::I32LtU);
+    trap_unreachable_if(function);
+
+    function.instruction(&Instruction::LocalGet(context.scratch_i32));
+    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
+    function.instruction(&Instruction::I32Const(34));
+    function.instruction(&Instruction::I32Ne);
+    trap_unreachable_if(function);
+
+    function.instruction(&Instruction::LocalGet(context.scratch_i32));
+    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Sub);
+    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
+    function.instruction(&Instruction::I32Const(34));
+    function.instruction(&Instruction::I32Ne);
+    trap_unreachable_if(function);
+
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::LocalSet(context.scratch_i32_3));
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
+    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Sub);
+    function.instruction(&Instruction::I32GeU);
+    function.instruction(&Instruction::BrIf(1));
+
+    function.instruction(&Instruction::LocalGet(context.scratch_i32));
+    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
+    function.instruction(&Instruction::I32Const(32));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::LocalGet(context.scratch_i32));
+    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
+    function.instruction(&Instruction::I32Const(34));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::I32Or);
+    function.instruction(&Instruction::LocalGet(context.scratch_i32));
+    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
+    function.instruction(&Instruction::I32Const(92));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::I32Or);
+    trap_unreachable_if(function);
+
+    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(context.scratch_i32_3));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+
+    allocate_result(function, context, result, 8, 4)?;
+    load_value(function, context, result)?;
+    function.instruction(&Instruction::LocalGet(context.scratch_i32));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Store(memarg(0, 2)));
+    load_value(function, context, result)?;
+    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
+    function.instruction(&Instruction::I32Const(2));
+    function.instruction(&Instruction::I32Sub);
+    function.instruction(&Instruction::I32Store(memarg(4, 2)));
+    Ok(())
+}
+
+fn trap_unreachable_if(function: &mut Function) {
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::Unreachable);
+    function.instruction(&Instruction::End);
 }
 
 fn encode_variant(
@@ -1084,12 +1235,13 @@ fn encode_variant_arm(
             ));
             function.instruction(&Instruction::I32Add);
         } else {
-            load_value(function, context, subject)?;
             match value_layout(&parameter.ty)? {
                 Some(Scalar::I32) => {
+                    load_value(function, context, subject)?;
                     function.instruction(&Instruction::I32Load(memarg(layout.payload_offset, 2)));
                 }
                 Some(Scalar::I64) => {
+                    load_value(function, context, subject)?;
                     function.instruction(&Instruction::I64Load(memarg(layout.payload_offset, 3)));
                 }
                 None => {}
@@ -1179,6 +1331,18 @@ fn load_request_flat(
         load_value(function, context, value)?;
         function.instruction(&Instruction::I32Load(memarg(offset, 2)));
     }
+    Ok(())
+}
+
+fn load_pair_list_flat(
+    function: &mut Function,
+    context: &FunctionContext<'_>,
+    value: ValueId,
+) -> Result<(), BuildError> {
+    load_value(function, context, value)?;
+    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+    load_value(function, context, value)?;
+    function.instruction(&Instruction::I32Load(memarg(4, 2)));
     Ok(())
 }
 
@@ -1792,6 +1956,7 @@ fn value_layout(ty: &Type) -> Result<Option<Scalar>, BuildError> {
         | Type::HttpHeader
         | Type::HttpRequest
         | Type::HttpResponse
+        | Type::LogField
         | Type::Secret
         | Type::List(_)
         | Type::Record(_)
@@ -1813,14 +1978,14 @@ struct Layout {
 }
 
 fn memory_layout(ty: &Type) -> Result<Layout, BuildError> {
-    if is_string(ty) || is_header_list(ty) {
+    if is_string(ty) || is_header_list(ty) || is_log_field_list(ty) {
         return Ok(Layout {
             size: 8,
             align: 4,
             payload_offset: 0,
         });
     }
-    if is_header(ty) {
+    if is_header(ty) || is_log_field(ty) {
         return Ok(Layout {
             size: 16,
             align: 4,
@@ -1862,6 +2027,15 @@ fn variant_layout(ty: &Type) -> Result<Layout, BuildError> {
             })
         }
         Type::Result(value, error)
+            if value.as_ref() == &Type::Unit && error.as_ref() == &Type::String =>
+        {
+            Ok(Layout {
+                size: 12,
+                align: 4,
+                payload_offset: 4,
+            })
+        }
+        Type::Result(value, error)
             if value.as_ref() == &Type::HttpResponse && error.as_ref() == &Type::String =>
         {
             Ok(Layout {
@@ -1878,7 +2052,7 @@ fn variant_layout(ty: &Type) -> Result<Layout, BuildError> {
 }
 
 fn record_layout(ty: &Type) -> Result<Layout, BuildError> {
-    if is_header(ty) || is_request(ty) || is_response(ty) {
+    if is_header(ty) || is_request(ty) || is_response(ty) || is_log_field(ty) {
         memory_layout(ty)
     } else {
         Err(BuildError::unsupported(
@@ -1894,6 +2068,13 @@ fn record_field(ty: &Type, field: &str) -> Result<(u32, Type), BuildError> {
             "name" => Ok((0, Type::String)),
             "value" => Ok((8, Type::String)),
             _ => Err(BuildError::invalid_core("unknown HttpHeader field")),
+        };
+    }
+    if is_log_field(ty) {
+        return match field {
+            "name" => Ok((0, Type::String)),
+            "value" => Ok((8, Type::String)),
+            _ => Err(BuildError::invalid_core("unknown LogField field")),
         };
     }
     if is_request(ty) {
@@ -1927,6 +2108,7 @@ fn is_pointer_value(ty: &Type) -> bool {
             | Type::HttpHeader
             | Type::HttpRequest
             | Type::HttpResponse
+            | Type::LogField
             | Type::List(_)
             | Type::Record(_)
             | Type::Option(_)
@@ -1942,9 +2124,23 @@ fn is_header_list(ty: &Type) -> bool {
     matches!(ty, Type::List(element) if is_header(element))
 }
 
+fn is_log_field_list(ty: &Type) -> bool {
+    matches!(ty, Type::List(element) if is_log_field(element))
+}
+
 fn is_header(ty: &Type) -> bool {
     match ty {
         Type::HttpHeader => true,
+        Type::Record(fields) => {
+            record_matches(fields, &[("name", Type::String), ("value", Type::String)])
+        }
+        _ => false,
+    }
+}
+
+fn is_log_field(ty: &Type) -> bool {
+    match ty {
+        Type::LogField => true,
         Type::Record(fields) => {
             record_matches(fields, &[("name", Type::String), ("value", Type::String)])
         }
@@ -1999,6 +2195,7 @@ fn equivalent(left: &Type, right: &Type) -> bool {
         || (is_header(left) && is_header(right))
         || (is_request(left) && is_request(right))
         || (is_response(left) && is_response(right))
+        || (is_log_field(left) && is_log_field(right))
         || matches!(
             (left, right),
             (Type::List(left), Type::List(right)) if equivalent(left, right)

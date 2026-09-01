@@ -254,6 +254,7 @@ pub enum Type {
     HttpHeader,
     HttpRequest,
     HttpResponse,
+    LogField,
     Secret,
     List(Arc<Self>),
     Record(Vec<RecordType>),
@@ -273,6 +274,7 @@ impl fmt::Display for Type {
             Self::HttpHeader => formatter.write_str("HttpHeader"),
             Self::HttpRequest => formatter.write_str("HttpRequest"),
             Self::HttpResponse => formatter.write_str("HttpResponse"),
+            Self::LogField => formatter.write_str("LogField"),
             Self::Secret => formatter.write_str("Secret"),
             Self::List(element) => write!(formatter, "List<{element}>"),
             Self::Record(fields) => {
@@ -377,18 +379,22 @@ impl fmt::Display for FunctionType {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum Effect {
+    AiInvoke,
     ConfigRead,
     HttpRequest,
     IoStdout,
+    ObserveLog,
     SecretRead,
 }
 
 impl Effect {
     pub const fn as_str(&self) -> &'static str {
         match self {
+            Self::AiInvoke => "ai.invoke",
             Self::ConfigRead => "config.read",
             Self::HttpRequest => "http.request",
             Self::IoStdout => "io.stdout",
+            Self::ObserveLog => "observe.log",
             Self::SecretRead => "secret.read",
         }
     }
@@ -539,6 +545,7 @@ enum InferType {
     HttpHeader,
     HttpRequest,
     HttpResponse,
+    LogField,
     Secret,
     List(Box<Self>),
     Record {
@@ -937,7 +944,12 @@ impl Analyzer {
                 if matches!(
                     resolution,
                     ResolvedName::Builtin(
-                        Builtin::ConfigString | Builtin::Secret | Builtin::HttpRequest
+                        Builtin::AiInvoke
+                            | Builtin::ConfigString
+                            | Builtin::Secret
+                            | Builtin::HttpRequest
+                            | Builtin::LogInfo
+                            | Builtin::LogError
                     )
                 ) {
                     let ResolvedName::Builtin(builtin) = resolution else {
@@ -1123,6 +1135,24 @@ impl Analyzer {
         let direct_resource = if let Some(builtin) = direct_builtin {
             self.direct_host_builtin_references.insert(callee.span);
             match (builtin, arguments) {
+                (Builtin::AiInvoke, [adapter, _]) => {
+                    let ExpressionKind::Literal(ValueLiteral::String(resource)) = &adapter.kind
+                    else {
+                        return Err(Diagnostic::new(
+                            "K3008",
+                            "`ai_invoke` requires a direct string-literal adapter name",
+                            adapter.span,
+                        ));
+                    };
+                    if !is_valid_resource_name(resource) {
+                        return Err(Diagnostic::new(
+                            "K3008",
+                            "AI adapter name must use 1-64 lowercase letters, digits, `.` or `-`, without leading/trailing punctuation or `..`/`--`",
+                            adapter.span,
+                        ));
+                    }
+                    Some((builtin, resource.clone()))
+                }
                 (Builtin::ConfigString | Builtin::Secret, [argument]) => {
                     let ExpressionKind::Literal(ValueLiteral::String(resource)) = &argument.kind
                     else {
@@ -1182,6 +1212,26 @@ impl Analyzer {
                         }
                     }
                     Some((builtin, normalized.as_str().to_owned()))
+                }
+                (Builtin::LogInfo | Builtin::LogError, [event, _]) => {
+                    let ExpressionKind::Literal(ValueLiteral::String(name)) = &event.kind else {
+                        return Err(Diagnostic::new(
+                            "K3008",
+                            format!(
+                                "`{}` requires a direct string-literal event name",
+                                builtin.as_str()
+                            ),
+                            event.span,
+                        ));
+                    };
+                    if !is_valid_resource_name(name) {
+                        return Err(Diagnostic::new(
+                            "K3008",
+                            "log event name must use 1-64 lowercase letters, digits, `.` or `-`, without leading/trailing punctuation or `..`/`--`",
+                            event.span,
+                        ));
+                    }
+                    None
                 }
                 _ => None,
             }
@@ -1244,6 +1294,7 @@ impl Analyzer {
         }
         if let Some((builtin, resource)) = direct_resource {
             let capability = match builtin {
+                Builtin::AiInvoke => Effect::AiInvoke,
                 Builtin::ConfigString => Effect::ConfigRead,
                 Builtin::Secret => Effect::SecretRead,
                 Builtin::HttpRequest => Effect::HttpRequest,
@@ -1256,6 +1307,15 @@ impl Analyzer {
         }
         for (index, (parameter, argument)) in parameters.into_iter().zip(argument_types).enumerate()
         {
+            if matches!(direct_builtin, Some(Builtin::LogInfo | Builtin::LogError))
+                && self.contains_secret(&argument, &mut BTreeSet::new())
+            {
+                return Err(Diagnostic::new(
+                    "K3009",
+                    "opaque `Secret` values cannot be placed into structured log fields",
+                    arguments[index].span,
+                ));
+            }
             let approved_secret_use =
                 matches!(
                     direct_builtin,
@@ -1454,6 +1514,7 @@ impl Analyzer {
             TypeKind::HttpHeader => InferType::HttpHeader,
             TypeKind::HttpRequest => InferType::HttpRequest,
             TypeKind::HttpResponse => InferType::HttpResponse,
+            TypeKind::LogField => InferType::LogField,
             TypeKind::Secret => InferType::Secret,
             TypeKind::List(element) => InferType::List(Box::new(self.annotation(element))),
             TypeKind::Option(element) => InferType::Option(Box::new(self.annotation(element))),
@@ -1603,8 +1664,10 @@ impl Analyzer {
                 let field_type = self.require_field(InferType::Variable(variable), field, span)?;
                 Ok((field_type, InferType::Variable(variable)))
             }
-            nominal
-            @ (InferType::HttpHeader | InferType::HttpRequest | InferType::HttpResponse) => {
+            nominal @ (InferType::HttpHeader
+            | InferType::HttpRequest
+            | InferType::HttpResponse
+            | InferType::LogField) => {
                 let (field_type, _) =
                     self.require_field_and_widen(contract_record(&nominal), field, span)?;
                 Ok((field_type, nominal))
@@ -1680,10 +1743,13 @@ impl Analyzer {
             (InferType::HttpHeader, InferType::HttpHeader) => Ok(InferType::HttpHeader),
             (InferType::HttpRequest, InferType::HttpRequest) => Ok(InferType::HttpRequest),
             (InferType::HttpResponse, InferType::HttpResponse) => Ok(InferType::HttpResponse),
+            (InferType::LogField, InferType::LogField) => Ok(InferType::LogField),
             (InferType::Secret, InferType::Secret) => Ok(InferType::Secret),
             (
-                nominal
-                @ (InferType::HttpHeader | InferType::HttpRequest | InferType::HttpResponse),
+                nominal @ (InferType::HttpHeader
+                | InferType::HttpRequest
+                | InferType::HttpResponse
+                | InferType::LogField),
                 record @ InferType::Record { .. },
             ) => {
                 self.unify_inner(contract_record(&nominal), record, span)?;
@@ -1691,8 +1757,10 @@ impl Analyzer {
             }
             (
                 record @ InferType::Record { .. },
-                nominal
-                @ (InferType::HttpHeader | InferType::HttpRequest | InferType::HttpResponse),
+                nominal @ (InferType::HttpHeader
+                | InferType::HttpRequest
+                | InferType::HttpResponse
+                | InferType::LogField),
             ) => {
                 self.unify_inner(record, contract_record(&nominal), span)?;
                 Ok(nominal)
@@ -1946,6 +2014,7 @@ impl Analyzer {
             | InferType::HttpHeader
             | InferType::HttpRequest
             | InferType::HttpResponse
+            | InferType::LogField
             | InferType::Secret => false,
         }
     }
@@ -2099,7 +2168,8 @@ impl Analyzer {
             | InferType::Unit
             | InferType::HttpHeader
             | InferType::HttpRequest
-            | InferType::HttpResponse => true,
+            | InferType::HttpResponse
+            | InferType::LogField => true,
             InferType::Secret => false,
         }
     }
@@ -2141,7 +2211,8 @@ impl Analyzer {
             | InferType::Unit
             | InferType::HttpHeader
             | InferType::HttpRequest
-            | InferType::HttpResponse => false,
+            | InferType::HttpResponse
+            | InferType::LogField => false,
         }
     }
 
@@ -2158,6 +2229,20 @@ impl Analyzer {
     fn builtin(&mut self, name: &str, span: Span) -> Option<(InferType, ResolvedName)> {
         let builtin = Builtin::from_name(name)?;
         let ty = match builtin {
+            Builtin::AiInvoke => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::AiInvoke);
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::String),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
             Builtin::Print | Builtin::Println => {
                 let value = self.fresh_type();
                 self.constraints.push(TypeConstraint {
@@ -2288,6 +2373,23 @@ impl Analyzer {
                     ],
                     return_type: Box::new(InferType::Result(
                         Box::new(InferType::HttpResponse),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::LogInfo | Builtin::LogError => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::ObserveLog);
+                InferType::Function {
+                    parameters: vec![
+                        InferType::String,
+                        InferType::List(Box::new(InferType::LogField)),
+                    ],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Unit),
                         Box::new(InferType::String),
                     )),
                     effect,
@@ -2473,6 +2575,7 @@ impl<'a> TypeNormalizer<'a> {
             InferType::HttpHeader => Arc::new(Type::HttpHeader),
             InferType::HttpRequest => Arc::new(Type::HttpRequest),
             InferType::HttpResponse => Arc::new(Type::HttpResponse),
+            InferType::LogField => Arc::new(Type::LogField),
             InferType::Secret => Arc::new(Type::Secret),
             InferType::List(element) => Arc::new(Type::List(self.normalize(element))),
             InferType::Record { fields, .. } => Arc::new(Type::Record(
@@ -2526,6 +2629,10 @@ fn contract_record(nominal: &InferType) -> InferType {
             ("name".to_owned(), InferType::String),
             ("value".to_owned(), InferType::String),
         ]),
+        InferType::LogField => BTreeMap::from([
+            ("name".to_owned(), InferType::String),
+            ("value".to_owned(), InferType::String),
+        ]),
         InferType::HttpRequest => BTreeMap::from([
             ("body".to_owned(), InferType::String),
             (
@@ -2544,7 +2651,7 @@ fn contract_record(nominal: &InferType) -> InferType {
             ),
             ("status".to_owned(), InferType::Int),
         ]),
-        _ => unreachable!("only HTTP contract types have structural aliases"),
+        _ => unreachable!("only built-in record contract types have structural aliases"),
     };
     InferType::Record {
         fields,
@@ -2557,9 +2664,14 @@ fn direct_host_builtin(callee: &Expression) -> Option<Builtin> {
         return None;
     };
     match Builtin::from_name(name) {
-        Some(builtin @ (Builtin::ConfigString | Builtin::Secret | Builtin::HttpRequest)) => {
-            Some(builtin)
-        }
+        Some(
+            builtin @ (Builtin::AiInvoke
+            | Builtin::ConfigString
+            | Builtin::Secret
+            | Builtin::HttpRequest
+            | Builtin::LogInfo
+            | Builtin::LogError),
+        ) => Some(builtin),
         _ => None,
     }
 }

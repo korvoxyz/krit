@@ -6,7 +6,7 @@ use krit::{
 };
 
 use crate::BuildError;
-use crate::{ResourceRequirementMetadata, wit::ProgramKind};
+use crate::{ApprovalRequirementMetadata, ResourceRequirementMetadata, wit::ProgramKind};
 
 pub const SUPPORTED_BACKEND_SEMANTICS: &str = "\
 Krit Wasm policy 1 supports Int (i64), Bool (i32), zero-width Unit, \
@@ -14,15 +14,17 @@ non-capturing function values (i32 table slots), recursive and higher-order call
 blocks, conditionals/short circuit, checked integer operators, primitive equality, \
 and print/println of Int, Bool, or Unit. Webhook policy 2 additionally supports \
 String values, the closed HttpHeader/HttpRequest/HttpResponse records, header lists, \
-Result/Option matching, exact config/secret/http host calls, and static non-capturing \
-helper references. Other composites, JSON, data captures, residual types, and list \
-matching fail closed.";
+LogField records and field lists, Result/Option matching, exact config/secret/http/AI \
+host calls, structured logging, unescaped JSON string decoding, and static \
+non-capturing helper references. Other composites, general JSON, data captures, \
+residual types, and list matching fail closed.";
 
 pub(crate) struct CheckedModule {
     pub kind: ProgramKind,
     pub entrypoint: krit::FunctionId,
     pub effects: Vec<String>,
     pub requirements: Vec<ResourceRequirementMetadata>,
+    pub approvals: Vec<ApprovalRequirementMetadata>,
     pub minimum_literal_operands: BTreeSet<krit::ValueId>,
 }
 
@@ -100,13 +102,160 @@ pub(crate) fn check_module(module: &CoreModule) -> Result<CheckedModule, BuildEr
         .collect::<Vec<_>>();
     requirements.sort();
     requirements.dedup();
+    let approvals = approval_requirements(module, &requirements);
     Ok(CheckedModule {
         kind,
         entrypoint,
         effects,
         requirements,
+        approvals,
         minimum_literal_operands,
     })
+}
+
+fn approval_requirements(
+    module: &CoreModule,
+    requirements: &[ResourceRequirementMetadata],
+) -> Vec<ApprovalRequirementMetadata> {
+    let mut approvals = requirements
+        .iter()
+        .filter(|requirement| requirement.capability == "ai.invoke")
+        .map(|requirement| ApprovalRequirementMetadata {
+            operation: "ai.invoke".to_owned(),
+            resource: requirement.resource.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    let mut builtins = BTreeMap::new();
+    let mut strings = BTreeMap::new();
+    let mut bearer_options = BTreeSet::new();
+    for function in module.functions() {
+        collect_approval_values(
+            &function.body,
+            &mut builtins,
+            &mut strings,
+            &mut bearer_options,
+        );
+    }
+    for function in module.functions() {
+        collect_bearer_approvals(
+            &function.body,
+            &builtins,
+            &strings,
+            &bearer_options,
+            &mut approvals,
+        );
+    }
+    approvals.into_iter().collect()
+}
+
+fn collect_approval_values(
+    block: &CoreBlock,
+    builtins: &mut BTreeMap<krit::ValueId, Builtin>,
+    strings: &mut BTreeMap<krit::ValueId, String>,
+    bearer_options: &mut BTreeSet<krit::ValueId>,
+) {
+    for operation in &block.operations {
+        match &operation.kind {
+            OperationKind::Builtin(builtin) => {
+                builtins.insert(operation.result, *builtin);
+            }
+            OperationKind::Literal(ValueLiteral::String(value)) => {
+                strings.insert(operation.result, value.clone());
+            }
+            OperationKind::Variant {
+                variant: krit::VariantName::Some,
+                payload: Some(_),
+            } if matches!(
+                operation.ty.as_ref(),
+                Type::Option(element) if element.as_ref() == &Type::Secret
+            ) =>
+            {
+                bearer_options.insert(operation.result);
+            }
+            OperationKind::Call { callee, .. }
+                if builtins.get(callee) == Some(&Builtin::Some)
+                    && matches!(
+                        operation.ty.as_ref(),
+                        Type::Option(element) if element.as_ref() == &Type::Secret
+                    ) =>
+            {
+                bearer_options.insert(operation.result);
+            }
+            OperationKind::Block { block } => {
+                collect_approval_values(block, builtins, strings, bearer_options);
+            }
+            OperationKind::If {
+                consequent,
+                alternative,
+                ..
+            } => {
+                collect_approval_values(consequent, builtins, strings, bearer_options);
+                collect_approval_values(alternative, builtins, strings, bearer_options);
+            }
+            OperationKind::MatchList { empty, cons, .. } => {
+                collect_approval_values(empty, builtins, strings, bearer_options);
+                collect_approval_values(cons, builtins, strings, bearer_options);
+            }
+            OperationKind::MatchVariant { arms, .. } => {
+                for arm in arms {
+                    collect_approval_values(&arm.block, builtins, strings, bearer_options);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_bearer_approvals(
+    block: &CoreBlock,
+    builtins: &BTreeMap<krit::ValueId, Builtin>,
+    strings: &BTreeMap<krit::ValueId, String>,
+    bearer_options: &BTreeSet<krit::ValueId>,
+    approvals: &mut BTreeSet<ApprovalRequirementMetadata>,
+) {
+    for operation in &block.operations {
+        match &operation.kind {
+            OperationKind::Call { callee, arguments }
+                if builtins.get(callee) == Some(&Builtin::HttpRequest)
+                    && arguments.len() == 3
+                    && bearer_options.contains(&arguments[2]) =>
+            {
+                if let Some(origin) = strings.get(&arguments[0]) {
+                    approvals.insert(ApprovalRequirementMetadata {
+                        operation: "http.bearer".to_owned(),
+                        resource: origin.clone(),
+                    });
+                }
+            }
+            OperationKind::Block { block } => {
+                collect_bearer_approvals(block, builtins, strings, bearer_options, approvals)
+            }
+            OperationKind::If {
+                consequent,
+                alternative,
+                ..
+            } => {
+                collect_bearer_approvals(consequent, builtins, strings, bearer_options, approvals);
+                collect_bearer_approvals(alternative, builtins, strings, bearer_options, approvals);
+            }
+            OperationKind::MatchList { empty, cons, .. } => {
+                collect_bearer_approvals(empty, builtins, strings, bearer_options, approvals);
+                collect_bearer_approvals(cons, builtins, strings, bearer_options, approvals);
+            }
+            OperationKind::MatchVariant { arms, .. } => {
+                for arm in arms {
+                    collect_bearer_approvals(
+                        &arm.block,
+                        builtins,
+                        strings,
+                        bearer_options,
+                        approvals,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) fn first_effect_span(module: &CoreModule) -> Option<Span> {
@@ -282,12 +431,14 @@ fn check_operation(
             ));
         }
         OperationKind::Variant { .. } => {}
-        OperationKind::List(_) if webhook && is_header_list(&operation.ty) => {}
+        OperationKind::List(_)
+            if webhook && (is_header_list(&operation.ty) || is_log_field_list(&operation.ty)) => {}
         OperationKind::List(_) | OperationKind::MatchList { .. } => {
             return Err(unsupported_layout("List", operation.source));
         }
         OperationKind::Record(_) | OperationKind::Field { .. }
-            if webhook && is_http_contract_type(&operation.ty) => {}
+            if webhook && (is_http_contract_type(&operation.ty) || is_log_field(&operation.ty)) => {
+        }
         OperationKind::Field { .. } if webhook && is_supported_webhook_type(&operation.ty) => {}
         OperationKind::Record(_) | OperationKind::Field { .. } => {
             return Err(unsupported_layout("Record", operation.source));
@@ -334,6 +485,20 @@ fn check_builtin(
         ));
     };
     match builtin {
+        Builtin::AiInvoke
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::String && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
         Builtin::Print | Builtin::Println => {
             if function.parameters().len() != 1 || function.return_type() != &Type::Unit {
                 return Err(BuildError::unsupported(
@@ -401,6 +566,26 @@ fn check_builtin(
         {
             Ok(())
         }
+        Builtin::LogInfo | Builtin::LogError
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::List(std::sync::Arc::new(Type::LogField))),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::Unit && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::JsonDecode
+            if function.parameters() == [std::sync::Arc::new(Type::String)]
+                && function.return_type() == &Type::String =>
+        {
+            Ok(())
+        }
         _ => Err(BuildError::unsupported(
             format!(
                 "built-in `{}` has no bounded webhook ABI lowering for `{ty}`",
@@ -438,7 +623,12 @@ fn check_type_inner(
             "WebAssembly layout requires specialization of a parametric type",
             span,
         )),
-        Type::String | Type::HttpHeader | Type::HttpRequest | Type::HttpResponse | Type::Secret
+        Type::String
+        | Type::HttpHeader
+        | Type::HttpRequest
+        | Type::HttpResponse
+        | Type::LogField
+        | Type::Secret
             if webhook =>
         {
             Ok(())
@@ -452,6 +642,7 @@ fn check_type_inner(
         Type::HttpHeader => Err(unsupported_layout("HttpHeader", span)),
         Type::HttpRequest => Err(unsupported_layout("HttpRequest", span)),
         Type::HttpResponse => Err(unsupported_layout("HttpResponse", span)),
+        Type::LogField => Err(unsupported_layout("LogField", span)),
         Type::Secret => Err(unsupported_layout("Secret", span)),
         Type::List(_) => Err(unsupported_layout("List", span)),
         Type::Record(_) => Err(unsupported_layout("Record", span)),
@@ -690,15 +881,16 @@ fn is_supported_webhook_type(ty: &Type) -> bool {
         | Type::HttpHeader
         | Type::HttpRequest
         | Type::HttpResponse
+        | Type::LogField
         | Type::Secret => true,
-        Type::List(_) => is_header_list(ty),
-        Type::Record(_) => is_http_contract_type(ty),
+        Type::List(_) => is_header_list(ty) || is_log_field_list(ty),
+        Type::Record(_) => is_http_contract_type(ty) || is_log_field(ty),
         Type::Option(element) => element.as_ref() == &Type::Secret,
         Type::Result(value, error) => {
             error.as_ref() == &Type::String
                 && matches!(
                     value.as_ref(),
-                    Type::String | Type::Secret | Type::HttpResponse
+                    Type::Unit | Type::String | Type::Secret | Type::HttpResponse
                 )
         }
         Type::Function(function) => {
@@ -716,6 +908,10 @@ fn is_header_list(ty: &Type) -> bool {
     matches!(ty, Type::List(element) if is_http_header(element))
 }
 
+fn is_log_field_list(ty: &Type) -> bool {
+    matches!(ty, Type::List(element) if is_log_field(element))
+}
+
 fn is_http_contract_type(ty: &Type) -> bool {
     matches!(
         ty,
@@ -723,6 +919,16 @@ fn is_http_contract_type(ty: &Type) -> bool {
     ) || is_http_header(ty)
         || is_http_request(ty)
         || is_http_response(ty)
+}
+
+fn is_log_field(ty: &Type) -> bool {
+    match ty {
+        Type::LogField => true,
+        Type::Record(fields) => {
+            record_fields_match(fields, &[("name", Type::String), ("value", Type::String)])
+        }
+        _ => false,
+    }
 }
 
 fn is_http_header(ty: &Type) -> bool {
@@ -782,6 +988,7 @@ fn webhook_type_equivalent(left: &Type, right: &Type) -> bool {
         || (is_http_header(left) && is_http_header(right))
         || (is_http_request(left) && is_http_request(right))
         || (is_http_response(left) && is_http_response(right))
+        || (is_log_field(left) && is_log_field(right))
         || matches!(
             (left, right),
             (Type::List(left), Type::List(right))
@@ -887,6 +1094,7 @@ fn contains_residual(ty: &Type) -> bool {
         | Type::HttpHeader
         | Type::HttpRequest
         | Type::HttpResponse
+        | Type::LogField
         | Type::Secret => false,
     }
 }

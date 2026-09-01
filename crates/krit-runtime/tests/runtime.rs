@@ -72,6 +72,22 @@ fn runs_factorial_with_exact_buffered_output_and_stats() {
 }
 
 #[test]
+fn generic_component_cancellation_is_checked_before_instantiation() {
+    let artifact = compile("println(42);\n", true);
+    let cancellation = krit_runtime::CancellationHandle::new();
+    cancellation.cancel();
+    let error = Runtime::default()
+        .execute_with_cancellation(
+            &artifact.bytes,
+            &artifact.metadata,
+            &GrantSet::from_manifest(&manifest(true)),
+            &cancellation,
+        )
+        .expect_err("cancelled component must not instantiate");
+    assert_eq!(error.code(), "K5106");
+}
+
+#[test]
 fn pure_world_links_zero_imports_and_ignores_unused_manifest_authority() {
     let artifact = compile("let answer = 6 * 7;\n", false);
     assert_eq!(artifact.metadata.world, PURE_PROGRAM_WORLD);
@@ -369,6 +385,14 @@ fn policy_one_default_and_hard_maximum_limits_are_exact() {
     assert_eq!(defaults.header_count(), 128);
     assert_eq!(defaults.header_bytes(), 64 * 1024);
     assert_eq!(defaults.http_calls(), 16);
+    assert_eq!(defaults.ai_calls(), 8);
+    assert_eq!(defaults.ai_input_bytes(), 64 * 1024);
+    assert_eq!(defaults.ai_response_bytes(), 64 * 1024);
+    assert_eq!(defaults.ai_timeout(), Duration::from_millis(750));
+    assert_eq!(defaults.log_events(), 128);
+    assert_eq!(defaults.log_fields(), 32);
+    assert_eq!(defaults.log_value_bytes(), 4 * 1024);
+    assert_eq!(defaults.log_bytes(), 64 * 1024);
     assert_eq!(defaults.connect_timeout(), Duration::from_millis(250));
     assert_eq!(defaults.read_timeout(), Duration::from_millis(500));
     assert_eq!(defaults.http_timeout(), Duration::from_millis(750));
@@ -393,6 +417,14 @@ fn policy_one_default_and_hard_maximum_limits_are_exact() {
     assert_eq!(maxima.header_count(), 1024);
     assert_eq!(maxima.header_bytes(), 1024 * 1024);
     assert_eq!(maxima.http_calls(), 1024);
+    assert_eq!(maxima.ai_calls(), 256);
+    assert_eq!(maxima.ai_input_bytes(), 1024 * 1024);
+    assert_eq!(maxima.ai_response_bytes(), 1024 * 1024);
+    assert_eq!(maxima.ai_timeout(), Duration::from_secs(20));
+    assert_eq!(maxima.log_events(), 1024);
+    assert_eq!(maxima.log_fields(), 128);
+    assert_eq!(maxima.log_value_bytes(), 64 * 1024);
+    assert_eq!(maxima.log_bytes(), 1024 * 1024);
     assert_eq!(maxima.connect_timeout(), Duration::from_secs(5));
     assert_eq!(maxima.read_timeout(), Duration::from_secs(10));
     assert_eq!(maxima.http_timeout(), Duration::from_secs(20));

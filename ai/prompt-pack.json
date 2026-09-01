@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "promptVersion": "0.2.8",
+  "promptVersion": "0.2.9",
   "languageVersion": "0.2.0",
   "edition": "2026",
   "status": "implemented",
@@ -10,7 +10,10 @@
   "artifactMetadataSchema": 1,
   "artifactPolicyVersion": 1,
   "runtimeHostPolicyVersion": 1,
-  "sandboxStatus": "implemented-policy-1-and-bounded-webhook-subsets",
-  "agentContractStatus": "implemented-runtime",
-  "httpRuntimeStatus": "implemented-bounded"
+  "sandboxStatus": "implemented-policy-1-and-phase4-bounded-webhook-subsets",
+  "agentContractStatus": "implemented-phase4-runtime",
+  "httpRuntimeStatus": "implemented-bounded",
+  "aiRuntimeStatus": "implemented-provider-neutral-http-json",
+  "observabilityStatus": "implemented-structured-redacted",
+  "reliabilityStatus": "implemented-process-local-bounded"
 }

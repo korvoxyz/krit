@@ -76,7 +76,7 @@ language layouts and the HTTP/agent host belong to later phases.
 
 ## Phase 4: stateless reference agent
 
-**Status:** In progress
+**Status:** Complete
 
 ### `phase4-agent-contracts`
 
@@ -108,15 +108,35 @@ provider.
 - fresh Store/instance/handles per request with response/stdout rollback
 - local deterministic integration and serve acceptance coverage
 
-### Remaining Phase 4 work
+### `phase4-ai-observability`
 
-- provider-neutral AI call
-- structured redacted logs and traces
-- retries, backoff, rate limits, deadlines, cancellation, and idempotency
-- human approval before declared sensitive operations
+**Status:** Complete
+
+- provider-neutral `ai_invoke` with one typed AI component interface and the
+  deterministic host-side `http-json` adapter
+- typed ordered `log_info`/`log_error` events, invocation buffering,
+  deterministic redaction, and stderr-only JSON Lines publication
+- bounded safe-request retries, capped backoff and Retry-After handling,
+  finite per-resource rate policy, and numeric attempt stats
+- embedding cancellation checked before instantiation, on host calls and
+  backoff, and by libcurl during active transfers
+- process-local bounded TTL/LRU inbound idempotency with replay and conflict
+  detection
+- default-deny approval callbacks for AI and bearer HTTP, plus explicit
+  noninteractive CLI allow entries
+- strict schema-2 host policy with schema-1 migration compatibility
+- auditable GitHub-like -> neutral AI -> messaging-like reference flow using
+  only bounded loopback mocks in tests
 
 Gate: the reference webhook agent calls GitHub, an AI adapter, and one
-messaging adapter inside the sandbox with every permission visible.
+messaging adapter inside the sandbox with every permission visible. The gate
+is demonstrated by `crates/krit-runtime/tests/phase4.rs` and
+`examples/webhook-agent.krit`; artifact permissions separately report exact
+grants, imports, and approval-required resources.
+
+Phase 4 idempotency and rate state are process-local and best-effort. Model
+output remains nondeterministic and untrusted. Deployment approval/grant
+evaluation remains outside the local artifact report.
 
 ## Phase 5: guided authoring
 

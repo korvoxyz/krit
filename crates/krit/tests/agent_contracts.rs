@@ -304,3 +304,73 @@ fn secret_handles_cannot_be_revealed_or_stored() {
         assert_eq!(diagnostic_code(source), "K3009", "{source}");
     }
 }
+
+#[test]
+fn ai_and_logging_contracts_emit_exact_sorted_facts() {
+    let analysis = analyze_source(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    log_info(
+        "review.started",
+        [record { name: "delivery", value: request.path }],
+    );
+    match ai_invoke("reviewer", request.body) {
+        Ok(output) => record { status: 200, headers: [], body: output },
+        Err(error) => record { status: 502, headers: [], body: error },
+    }
+}
+"#,
+    )
+    .expect("AI and logging source should analyze");
+    let webhook = analysis
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.kind() == SymbolKind::Webhook)
+        .expect("webhook should exist");
+    let Type::Function(function) = webhook.ty() else {
+        panic!("webhook should be a function");
+    };
+    assert_eq!(
+        function
+            .effects()
+            .iter()
+            .map(Effect::as_str)
+            .collect::<Vec<_>>(),
+        ["ai.invoke", "observe.log"]
+    );
+    assert_eq!(
+        function
+            .requirements()
+            .iter()
+            .map(|requirement| (
+                requirement.capability().as_str(),
+                requirement.resource().to_owned(),
+            ))
+            .collect::<Vec<_>>(),
+        [("ai.invoke", "reviewer".to_owned())]
+    );
+}
+
+#[test]
+fn ai_adapter_and_log_event_names_must_be_direct_canonical_literals() {
+    for source in [
+        r#"let adapter = "reviewer"; ai_invoke(adapter, "input");"#,
+        r#"let invoke = ai_invoke; invoke("reviewer", "input");"#,
+        r#"ai_invoke("Reviewer", "input");"#,
+        r#"let event = "review.started"; log_info(event, []);"#,
+        r#"let log = log_error; log("review.failed", []);"#,
+        r#"log_info("review..started", []);"#,
+    ] {
+        assert_eq!(diagnostic_code(source), "K3008", "{source}");
+    }
+}
+
+#[test]
+fn logging_cannot_accept_or_structurally_hide_secret_handles() {
+    for source in [
+        r#"match secret("token") { Ok(value) => log_info("review.started", [record { name: "token", value: value }]), Err(error) => Err(error) };"#,
+        r#"match secret("token") { Ok(value) => log_error("review.failed", [record { name: "value", value: json_encode(value) }]), Err(error) => Err(error) };"#,
+    ] {
+        assert_eq!(diagnostic_code(source), "K3009", "{source}");
+    }
+}

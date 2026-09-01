@@ -2,10 +2,10 @@ use std::{fs, path::Path};
 
 use krit::{Source, analyze, lower, parse_source};
 use krit_wasm::{
-    ArtifactMetadata, BuildErrorKind, BuildOptions, EMBEDDED_METADATA_SECTION,
-    HTTP_ANONYMOUS_INTERFACE, MAX_EMBEDDED_METADATA_BYTES, PROGRAM_WORLD, PURE_PROGRAM_WORLD,
-    STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD, build_component, digest_bytes, validate_artifact,
-    validate_component,
+    AI_INTERFACE, ArtifactMetadata, BuildErrorKind, BuildOptions, EMBEDDED_METADATA_SECTION,
+    HTTP_ANONYMOUS_INTERFACE, LOGGING_INTERFACE, MAX_EMBEDDED_METADATA_BYTES, PROGRAM_WORLD,
+    PURE_PROGRAM_WORLD, STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD, build_component, digest_bytes,
+    validate_artifact, validate_component,
 };
 use wasm_encoder::{
     Component, CustomSection, MemorySection, MemoryType, Module, ModuleSection, RawSection,
@@ -368,6 +368,99 @@ fn embedded_metadata_supports_realistic_capability_sets() {
     assert!(embedded_size <= MAX_EMBEDDED_METADATA_BYTES);
     validate_artifact(&artifact.bytes, &artifact.metadata)
         .expect("artifact with realistic capability metadata should validate");
+}
+
+#[test]
+fn ai_only_and_log_only_webhooks_select_exact_least_authority_worlds() {
+    for (source_text, effect, interface, world_fragment) in [
+        (
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match ai_invoke("reviewer", request.body) {
+        Ok(output) => record { status: 200, headers: [], body: output },
+        Err(error) => record { status: 502, headers: [], body: error },
+    }
+}
+"#,
+            "ai.invoke",
+            AI_INTERFACE,
+            "webhook-ai-program",
+        ),
+        (
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    log_info("request.received", [record { name: "path", value: request.path }]);
+    record { status: 200, headers: [], body: request.body }
+}
+"#,
+            "observe.log",
+            LOGGING_INTERFACE,
+            "webhook-logs-program",
+        ),
+    ] {
+        let source = Source::new("src/main.krit", source_text);
+        let program = parse_source(&source).expect("source should parse");
+        let analysis = analyze(&program).expect("source should analyze");
+        let module = lower(&program, &analysis).expect("source should lower");
+        let mut options = BuildOptions::new("2026", "test/webhook", "1.0.0", "src/main.krit");
+        options.grant_effect(effect);
+        let artifact = build_component(&module, &options).expect("source should compile");
+        assert!(artifact.metadata.world.contains(world_fragment));
+        assert_eq!(artifact.metadata.imports, [interface]);
+        assert_eq!(artifact.metadata.effects, [effect]);
+        validate_artifact(&artifact.bytes, &artifact.metadata)
+            .expect("least-authority artifact should validate");
+    }
+}
+
+#[test]
+fn ai_approval_metadata_and_bounded_json_string_decoding_are_validated() {
+    let source = Source::new(
+        "src/main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match ai_invoke("reviewer", request.body) {
+        Ok(output) => {
+            let parsed: String = json_decode(output);
+            record { status: 200, headers: [], body: parsed }
+        },
+        Err(error) => record { status: 502, headers: [], body: error },
+    }
+}
+"#,
+    );
+    let program = parse_source(&source).expect("source should parse");
+    let analysis = analyze(&program).expect("source should analyze");
+    let module = lower(&program, &analysis).expect("source should lower");
+    let mut options = BuildOptions::new("2026", "test/webhook", "1.0.0", "src/main.krit");
+    options.grant_effect("ai.invoke");
+    let artifact = build_component(&module, &options).expect("source should compile");
+    assert_eq!(artifact.metadata.approvals.len(), 1);
+    assert_eq!(artifact.metadata.approvals[0].operation, "ai.invoke");
+    assert_eq!(artifact.metadata.approvals[0].resource, "reviewer");
+
+    let mut forged = artifact.metadata.clone();
+    forged.approvals.clear();
+    let error = validate_artifact(&artifact.bytes, &forged)
+        .expect_err("adjacent approval metadata cannot omit embedded requirements");
+    assert_eq!(error.kind(), BuildErrorKind::Metadata);
+
+    let unsupported = Source::new(
+        "src/main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let parsed: Record { value: String } = json_decode(request.body);
+    record { status: 200, headers: [], body: parsed.value }
+}
+"#,
+    );
+    let program = parse_source(&unsupported).expect("source should parse");
+    let analysis = analyze(&program).expect("source should analyze");
+    let module = lower(&program, &analysis).expect("source should lower");
+    let options = BuildOptions::new("2026", "test/webhook", "1.0.0", "src/main.krit");
+    let error = build_component(&module, &options)
+        .expect_err("general JSON decoding must remain outside policy 2");
+    assert_eq!(error.code(), "K7002");
 }
 
 fn replace_all_equal_length(bytes: &mut [u8], from: &[u8], to: &[u8]) {

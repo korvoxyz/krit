@@ -24,6 +24,8 @@ pub struct ArtifactMetadata {
     pub effects: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requirements: Vec<ResourceRequirementMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<ApprovalRequirementMetadata>,
     pub imports: Vec<String>,
     pub build_profile: String,
     pub policy_version: u32,
@@ -54,6 +56,13 @@ pub struct PackageMetadata {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceRequirementMetadata {
     pub capability: String,
+    pub resource: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApprovalRequirementMetadata {
+    pub operation: String,
     pub resource: String,
 }
 
@@ -147,6 +156,8 @@ pub(crate) struct EmbeddedMetadata {
     pub effects: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requirements: Vec<ResourceRequirementMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<ApprovalRequirementMetadata>,
     pub policy_version: u32,
 }
 
@@ -156,6 +167,7 @@ impl EmbeddedMetadata {
         world: &str,
         effects: Vec<String>,
         requirements: Vec<ResourceRequirementMetadata>,
+        approvals: Vec<ApprovalRequirementMetadata>,
     ) -> Self {
         Self {
             schema: ARTIFACT_METADATA_SCHEMA,
@@ -164,6 +176,7 @@ impl EmbeddedMetadata {
             world: world.to_owned(),
             effects,
             requirements,
+            approvals,
             policy_version: ARTIFACT_POLICY_VERSION,
         }
     }

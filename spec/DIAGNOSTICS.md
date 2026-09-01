@@ -104,6 +104,7 @@ Initial required codes:
 | `K5103` | Wasm memory, table, instance, stack, or host resource limit exceeded |
 | `K5104` | Host-call limit exceeded |
 | `K5105` | Buffered output-byte limit exceeded |
+| `K5106` | Embedding cancellation requested before guest execution |
 | `K6001` | Invalid package manifest |
 | `K6002` | Lockfile is stale or invalid |
 | `K7001` | Residual or unresolved type requires specialization before layout |

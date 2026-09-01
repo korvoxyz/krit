@@ -34,6 +34,7 @@ pub struct FunctionValue {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuiltinFunction {
+    AiInvoke,
     Print,
     Println,
     Some,
@@ -44,6 +45,8 @@ pub enum BuiltinFunction {
     ConfigString,
     Secret,
     HttpRequest,
+    LogInfo,
+    LogError,
 }
 
 impl fmt::Debug for Value {
@@ -86,6 +89,7 @@ impl Value {
                 || "<function>".to_owned(),
                 |name| format!("<function {name}>"),
             ),
+            Self::Builtin(BuiltinFunction::AiInvoke) => "<function ai_invoke>".to_owned(),
             Self::Builtin(BuiltinFunction::Print) => "<function print>".to_owned(),
             Self::Builtin(BuiltinFunction::Println) => "<function println>".to_owned(),
             Self::Builtin(BuiltinFunction::Some) => "<function Some>".to_owned(),
@@ -96,6 +100,8 @@ impl Value {
             Self::Builtin(BuiltinFunction::ConfigString) => "<function config_string>".to_owned(),
             Self::Builtin(BuiltinFunction::Secret) => "<function secret>".to_owned(),
             Self::Builtin(BuiltinFunction::HttpRequest) => "<function http_request>".to_owned(),
+            Self::Builtin(BuiltinFunction::LogInfo) => "<function log_info>".to_owned(),
+            Self::Builtin(BuiltinFunction::LogError) => "<function log_error>".to_owned(),
         }
     }
 
@@ -246,6 +252,7 @@ impl Evaluator<'_> {
         match &expression.kind {
             ExpressionKind::Literal(literal) => self.literal(literal, expression.span),
             ExpressionKind::Variable(name) => match name.as_str() {
+                "ai_invoke" => Ok(Value::Builtin(BuiltinFunction::AiInvoke)),
                 "print" => Ok(Value::Builtin(BuiltinFunction::Print)),
                 "println" => Ok(Value::Builtin(BuiltinFunction::Println)),
                 "Some" => Ok(Value::Builtin(BuiltinFunction::Some)),
@@ -260,6 +267,8 @@ impl Evaluator<'_> {
                 "config_string" => Ok(Value::Builtin(BuiltinFunction::ConfigString)),
                 "secret" => Ok(Value::Builtin(BuiltinFunction::Secret)),
                 "http_request" => Ok(Value::Builtin(BuiltinFunction::HttpRequest)),
+                "log_info" => Ok(Value::Builtin(BuiltinFunction::LogInfo)),
+                "log_error" => Ok(Value::Builtin(BuiltinFunction::LogError)),
                 _ => environment.lookup(name).ok_or_else(|| {
                     Diagnostic::new("K2001", format!("undefined name `{name}`"), expression.span)
                 }),
@@ -444,10 +453,12 @@ impl Evaluator<'_> {
                 self.block(&function.body, &call_environment)
             }
             Value::Builtin(builtin) => {
-                let expected_arity = if builtin == BuiltinFunction::HttpRequest {
-                    3
-                } else {
-                    1
+                let expected_arity = match builtin {
+                    BuiltinFunction::HttpRequest => 3,
+                    BuiltinFunction::AiInvoke
+                    | BuiltinFunction::LogInfo
+                    | BuiltinFunction::LogError => 2,
+                    _ => 1,
                 };
                 if arguments.len() != expected_arity {
                     return Err(arity_error(expected_arity, arguments.len(), span));
@@ -459,6 +470,28 @@ impl Evaluator<'_> {
                     return Err(Diagnostic::new(
                         "K5003",
                         "HTTP host operations are unavailable in direct source execution",
+                        span,
+                    ));
+                }
+                if matches!(
+                    builtin,
+                    BuiltinFunction::AiInvoke
+                        | BuiltinFunction::LogInfo
+                        | BuiltinFunction::LogError
+                ) {
+                    for argument in arguments {
+                        self.expression(argument, environment)?;
+                    }
+                    let operation = match builtin {
+                        BuiltinFunction::AiInvoke => "AI invocation",
+                        BuiltinFunction::LogInfo | BuiltinFunction::LogError => {
+                            "structured logging"
+                        }
+                        _ => unreachable!("matched host operations"),
+                    };
+                    return Err(Diagnostic::new(
+                        "K5003",
+                        format!("{operation} is unavailable in direct source execution"),
                         span,
                     ));
                 }
@@ -504,6 +537,11 @@ impl Evaluator<'_> {
                     )),
                     BuiltinFunction::HttpRequest => {
                         unreachable!("HTTP requests return before unary builtin dispatch")
+                    }
+                    BuiltinFunction::AiInvoke
+                    | BuiltinFunction::LogInfo
+                    | BuiltinFunction::LogError => {
+                        unreachable!("binary host operations return before unary builtin dispatch")
                     }
                 }
             }

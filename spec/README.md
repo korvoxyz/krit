@@ -18,11 +18,12 @@ infer semantics from historical interpreter behavior.
 | [LANGUAGE.md](LANGUAGE.md) | Normative | Krit 0.2 source syntax and runtime semantics |
 | [DIAGNOSTICS.md](DIAGNOSTICS.md) | Normative | Human and machine diagnostic contract |
 | [WEBHOOK-CONTRACTS.md](WEBHOOK-CONTRACTS.md) | Normative bounded runtime | Typed webhook, config, opaque secrets, and exact-origin HTTP |
+| [AI-OBSERVABILITY.md](AI-OBSERVABILITY.md) | Normative bounded runtime | Neutral AI invocation, structured logs, retries, rate, cancellation, idempotency, and approval |
 | [AGENT-APPLICATIONS.md](AGENT-APPLICATIONS.md) | Draft | Agent, bot, backend, and integration application model |
 | [TYPES-AND-EFFECTS.md](TYPES-AND-EFFECTS.md) | Implemented baseline | Static types and effect checking |
 | [CAPABILITIES.md](CAPABILITIES.md) | Implemented bounded HTTP host | Runtime authority and sandbox boundaries |
 | [PACKAGES.md](PACKAGES.md) | Draft | Modules, manifests, lockfiles, and registries |
-| [WASM-SANDBOX.md](WASM-SANDBOX.md) | Implemented baseline | Policy-1 scalar and policy-2 webhook components |
+| [WASM-SANDBOX.md](WASM-SANDBOX.md) | Implemented Phase 4 | Policy-1 scalar and bounded stateless webhook components |
 | [GUIDED-AUTHORING.md](GUIDED-AUTHORING.md) | Draft | Deterministic and optional LLM coding guidance |
 
 `LANGUAGE.md` deliberately defines a new readable syntax for the Rust

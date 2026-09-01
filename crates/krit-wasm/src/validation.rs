@@ -8,13 +8,14 @@ use wasmparser::{
 use wit_component::DecodedWasm;
 
 use crate::{
-    ARTIFACT_METADATA_SCHEMA, ARTIFACT_POLICY_VERSION, ArtifactMetadata, BuildError, COMPILER_NAME,
-    CONFIG_INTERFACE, EmbeddedMetadata, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, LANGUAGE_NAME,
-    LANGUAGE_VERSION, ResourceRequirementMetadata, SECRETS_INTERFACE, STDOUT_INTERFACE,
-    WASM_COMPONENT_TARGET, WEBHOOK_INTERFACE,
+    AI_INTERFACE, ARTIFACT_METADATA_SCHEMA, ARTIFACT_POLICY_VERSION, ApprovalRequirementMetadata,
+    ArtifactMetadata, BuildError, COMPILER_NAME, CONFIG_INTERFACE, EmbeddedMetadata,
+    HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, LANGUAGE_NAME, LANGUAGE_VERSION, LOGGING_INTERFACE,
+    ResourceRequirementMetadata, SECRETS_INTERFACE, STDOUT_INTERFACE, WASM_COMPONENT_TARGET,
+    WEBHOOK_INTERFACE,
     wit::{
-        CONFIG_EFFECT, HTTP_EFFECT, ProgramKind, SECRETS_EFFECT, STDOUT_EFFECT, WitContract,
-        contract_from_world, load_contract,
+        AI_EFFECT, CONFIG_EFFECT, HTTP_EFFECT, LOGGING_EFFECT, ProgramKind, SECRETS_EFFECT,
+        STDOUT_EFFECT, WitContract, contract_from_world, load_contract,
     },
 };
 
@@ -28,6 +29,7 @@ pub struct ComponentInspection {
     pub exports: Vec<String>,
     pub effects: Vec<String>,
     pub requirements: Vec<ResourceRequirementMetadata>,
+    pub approvals: Vec<ApprovalRequirementMetadata>,
     pub core_module_count: u32,
     pub table_count: u32,
     pub table_elements: u64,
@@ -407,10 +409,12 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
         effects.push(
             match import.as_str() {
                 STDOUT_INTERFACE => STDOUT_EFFECT,
+                AI_INTERFACE => AI_EFFECT,
                 CONFIG_INTERFACE => CONFIG_EFFECT,
                 SECRETS_INTERFACE => SECRETS_EFFECT,
                 HTTP_INTERFACE => HTTP_EFFECT,
                 HTTP_ANONYMOUS_INTERFACE => HTTP_EFFECT,
+                LOGGING_INTERFACE => LOGGING_EFFECT,
                 _ => {
                     return Err(BuildError::artifact(
                         "component imports do not match WebAssembly policy 1",
@@ -439,8 +443,8 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
             "embedded core imports do not match the selected WIT world",
         ));
     }
-    if !(1..=4).contains(&core_module_count)
-        || !(1..=4).contains(&table_count)
+    if !(1..=8).contains(&core_module_count)
+        || !(1..=8).contains(&table_count)
         || memory_count != u32::from(contract.requires_memory)
     {
         return Err(BuildError::artifact(format!(
@@ -456,6 +460,7 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
         || embedded.world != contract.world
         || embedded.effects != effects
         || !valid_requirements(&embedded.requirements, &effects)
+        || !valid_approvals(&embedded.approvals, &embedded.requirements, &effects)
         || embedded.policy_version != ARTIFACT_POLICY_VERSION
         || !sorted_unique(&embedded.effects)
     {
@@ -473,6 +478,7 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
         exports,
         effects,
         requirements: embedded.requirements,
+        approvals: embedded.approvals,
         core_module_count,
         table_count,
         table_elements,
@@ -499,6 +505,11 @@ pub fn validate_artifact(
         || !safe_entry(&metadata.entry)
         || !sorted_unique(&metadata.effects)
         || !valid_requirements(&metadata.requirements, &metadata.effects)
+        || !valid_approvals(
+            &metadata.approvals,
+            &metadata.requirements,
+            &metadata.effects,
+        )
         || !sorted_unique(&metadata.imports)
     {
         return Err(BuildError::metadata(
@@ -522,6 +533,7 @@ pub fn validate_artifact(
         || metadata.imports != inspection.imports
         || metadata.effects != inspection.effects
         || metadata.requirements != inspection.requirements
+        || metadata.approvals != inspection.approvals
     {
         return Err(BuildError::metadata(
             "artifact metadata world, imports, or effects do not match the component",
@@ -566,6 +578,7 @@ fn valid_requirements(requirements: &[ResourceRequirementMetadata], effects: &[S
     requirements.windows(2).all(|pair| pair[0] < pair[1])
         && effects.iter().all(|effect| {
             effect == STDOUT_EFFECT
+                || effect == LOGGING_EFFECT
                 || requirements
                     .iter()
                     .any(|requirement| &requirement.capability == effect)
@@ -573,7 +586,7 @@ fn valid_requirements(requirements: &[ResourceRequirementMetadata], effects: &[S
         && requirements.iter().all(|requirement| {
             effects.binary_search(&requirement.capability).is_ok()
                 && match requirement.capability.as_str() {
-                    CONFIG_EFFECT | SECRETS_EFFECT => {
+                    AI_EFFECT | CONFIG_EFFECT | SECRETS_EFFECT => {
                         krit_capability::is_valid_resource_name(&requirement.resource)
                     }
                     HTTP_EFFECT => {
@@ -582,6 +595,39 @@ fn valid_requirements(requirements: &[ResourceRequirementMetadata], effects: &[S
                     _ => false,
                 }
         })
+}
+
+fn valid_approvals(
+    approvals: &[ApprovalRequirementMetadata],
+    requirements: &[ResourceRequirementMetadata],
+    effects: &[String],
+) -> bool {
+    approvals.windows(2).all(|pair| pair[0] < pair[1])
+        && requirements
+            .iter()
+            .filter(|requirement| requirement.capability == AI_EFFECT)
+            .all(|requirement| {
+                approvals.iter().any(|approval| {
+                    approval.operation == "ai.invoke" && approval.resource == requirement.resource
+                })
+            })
+        && approvals
+            .iter()
+            .all(|approval| match approval.operation.as_str() {
+                "ai.invoke" => requirements.iter().any(|requirement| {
+                    requirement.capability == AI_EFFECT && requirement.resource == approval.resource
+                }),
+                "http.bearer" => {
+                    effects
+                        .binary_search_by(|effect| effect.as_str().cmp(SECRETS_EFFECT))
+                        .is_ok()
+                        && requirements.iter().any(|requirement| {
+                            requirement.capability == HTTP_EFFECT
+                                && requirement.resource == approval.resource
+                        })
+                }
+                _ => false,
+            })
 }
 
 fn verify_producers(bytes: &[u8]) -> Result<(), BuildError> {

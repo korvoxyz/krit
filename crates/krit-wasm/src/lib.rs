@@ -15,9 +15,9 @@ use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
 
 pub use error::{BuildError, BuildErrorKind};
 pub use metadata::{
-    ARTIFACT_METADATA_SCHEMA, ARTIFACT_POLICY_VERSION, ArtifactMetadata, BuildOptions,
-    COMPILER_NAME, LANGUAGE_NAME, LANGUAGE_VERSION, LanguageMetadata, PackageMetadata,
-    ResourceRequirementMetadata, VersionedTool,
+    ARTIFACT_METADATA_SCHEMA, ARTIFACT_POLICY_VERSION, ApprovalRequirementMetadata,
+    ArtifactMetadata, BuildOptions, COMPILER_NAME, LANGUAGE_NAME, LANGUAGE_VERSION,
+    LanguageMetadata, PackageMetadata, ResourceRequirementMetadata, VersionedTool,
 };
 pub use support::SUPPORTED_BACKEND_SEMANTICS;
 pub use validation::{
@@ -25,9 +25,9 @@ pub use validation::{
     validate_artifact, validate_component,
 };
 pub use wit::{
-    CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, PROGRAM_WORLD, PURE_PROGRAM_WORLD,
-    SECRETS_INTERFACE, STDOUT_INTERFACE, WEBHOOK_ALL_PROGRAM_WORLD, WEBHOOK_INTERFACE,
-    WEBHOOK_PROGRAM_WORLD,
+    AI_INTERFACE, CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, LOGGING_INTERFACE,
+    PROGRAM_WORLD, PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STDOUT_INTERFACE,
+    WEBHOOK_ALL_PROGRAM_WORLD, WEBHOOK_INTERFACE, WEBHOOK_PROGRAM_WORLD,
 };
 
 use compiler::encode_core;
@@ -99,6 +99,7 @@ pub fn build_component(
         &contract.world,
         checked.effects.clone(),
         checked.requirements.clone(),
+        checked.approvals.clone(),
     );
     let embedded = serde_json::to_vec(&embedded).map_err(|error| {
         BuildError::artifact(format!("could not serialize component metadata: {error}"))
@@ -146,6 +147,7 @@ pub fn build_component(
         byte_size: bytes.len() as u64,
         effects: inspection.effects,
         requirements: inspection.requirements,
+        approvals: inspection.approvals,
         imports: inspection.imports,
         build_profile: options.build_profile.clone(),
         policy_version: ARTIFACT_POLICY_VERSION,

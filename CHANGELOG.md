@@ -123,6 +123,44 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   artifacts only, using `tiny_http` rather than a handwritten parser
 - Auditable `examples/webhook-agent.krit` plus manifest, host config, and
   request fixtures containing no credential
+- Provider-neutral fallible `ai_invoke("adapter", input)` source/Core
+  contract with exact `ai.invoke` requirements and typed Component Model AI
+  imports
+- Manifest schema-1 `ai` and `logs` requests plus exact least-authority
+  AI-only, log-only, and combined finite webhook worlds
+- Deterministic host-side `http-json` AI adapter with strict request/response
+  mapping, bounded input/output/timeout, optional opaque bearer secret, and no
+  provider SDK dependency
+- Typed ordered `LogField` values and fallible `log_info`/`log_error`
+  operations with invocation-local sequencing, atomic validation, bounded
+  buffering, key-based and exact-secret-value redaction, and separate result
+  events
+- Success/failure structured-log JSON Lines publication on CLI stderr without
+  changing invoke response stdout or served HTTP bodies
+- Reusable stateful `AgentHost`, embedding `CancellationHandle`, and
+  `ApprovalPolicy` APIs
+- Bounded transport retries for connection/timeouts and 429/502/503/504,
+  restricted to GET/HEAD or explicit valid idempotency keys, with capped
+  deterministic backoff and Retry-After handling
+- Finite per-resource fixed-window AI/HTTP rates with bounded LRU tracking and
+  visible guest errors
+- Entry- and byte-bounded process-local TTL/LRU inbound idempotency replay,
+  exact request digest conflicts, response replay without guest execution,
+  and exclusion of failed/trapped invocations
+- Default-deny AI and bearer-HTTP approval checks before secrets/network and
+  before every retry, with approval-required artifact permission facts
+- Strict host config schema 2 for adapters, approvals, retries, rates, and
+  idempotency; schema 1 remains readable but bearer operations now require
+  migration to explicit schema-2 approval
+- Stable pre-execution cancellation diagnostic `K5106`, libcurl progress
+  cancellation/deadline aborts, bounded DNS workers, and cancellation-aware
+  backoff
+- Bounded policy-2 unescaped JSON-string decoding for explicit reference
+  model-output validation; all general JSON component shapes remain
+  fail-closed
+- Local-only reference integration coverage proving GitHub-like -> neutral AI
+  -> messaging-like order, retry/auth boundaries, output/log/stats facts, and
+  exact permissions without Internet access or real credentials
 
 ### Changed
 
@@ -155,6 +193,12 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   webhook, configuration, opaque-secret, and fail-closed runtime contracts
 - Updated the provider-neutral generation prompt to version 0.2.8 for the
   buildable bounded webhook, explicit host-input, invoke, and serve workflow
+- Completed `phase4-ai-observability` and the Phase 4 stateless reference-agent
+  gate; Phase 5 LSP/guided authoring and Phase 6 durable state remain
+  unstarted
+- Updated the provider-neutral generation prompt to version 0.2.9 for neutral
+  AI calls, structured logs, explicit model-output validation, and bounded
+  reliability/approval policy
 
 ## [0.2.0] - 2026-09-01
 

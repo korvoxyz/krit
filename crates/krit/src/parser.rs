@@ -752,6 +752,7 @@ impl Parser {
             "HttpHeader" => TypeKind::HttpHeader,
             "HttpRequest" => TypeKind::HttpRequest,
             "HttpResponse" => TypeKind::HttpResponse,
+            "LogField" => TypeKind::LogField,
             "Secret" => TypeKind::Secret,
             "List" => {
                 self.expect(TokenKind::Less)?;
@@ -828,6 +829,7 @@ impl Parser {
             name.as_str(),
             "print"
                 | "println"
+                | "ai_invoke"
                 | "Some"
                 | "None"
                 | "Ok"
@@ -836,6 +838,8 @@ impl Parser {
                 | "json_decode"
                 | "config_string"
                 | "http_request"
+                | "log_info"
+                | "log_error"
                 | "secret"
         ) {
             return Err(Diagnostic::new(

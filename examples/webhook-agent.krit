@@ -1,20 +1,74 @@
 fn failure(message: String) -> HttpResponse {
-    record { status: 502, headers: [], body: message }
+    log_error("reference.failed", [record { name: "reason", value: message }]);
+    record { status: 502, headers: [], body: "reference flow failed" }
 }
 
 webhook fn handle(request: HttpRequest) -> HttpResponse {
-    match config_string("agent.model") {
-        Ok(model) => match secret("example-token") {
-            Ok(token) => {
-                let outbound: HttpRequest = record {
-                    method: "POST",
-                    path: "/v1/events",
+    log_info("reference.received", [record { name: "delivery", value: request.path }]);
+    match config_string("reference.repository") {
+        Ok(repository) => match secret("github-token") {
+            Ok(github_token) => {
+                let github_request: HttpRequest = record {
+                    method: "GET",
+                    path: "/repos/example/issues/1",
                     query: "",
-                    headers: [record { name: "x-krit-model", value: model }],
-                    body: request.body,
+                    headers: [record { name: "x-reference-repository", value: repository }],
+                    body: "",
                 };
-                match http_request("https://api.example.com", outbound, Some(token)) {
-                    Ok(response) => response,
+                match http_request(
+                    "https://github.example.invalid",
+                    github_request,
+                    Some(github_token),
+                ) {
+                    Ok(github_response) => {
+                        match ai_invoke("reviewer", github_response.body) {
+                            Ok(model_output) => {
+                                // Model output is raw, nondeterministic, untrusted text.
+                                let summary: String = json_decode(model_output);
+                                match secret("message-token") {
+                                    Ok(message_token) => {
+                                        let message_request: HttpRequest = record {
+                                            method: "POST",
+                                            path: "/messages",
+                                            query: "",
+                                            headers: [
+                                                record {
+                                                    name: "idempotency-key",
+                                                    value: "reference-delivery",
+                                                },
+                                            ],
+                                            body: summary,
+                                        };
+                                        match http_request(
+                                            "https://message.example.invalid",
+                                            message_request,
+                                            Some(message_token),
+                                        ) {
+                                            Ok(message_response) => {
+                                                log_info(
+                                                    "reference.completed",
+                                                    [
+                                                        record {
+                                                            name: "adapter",
+                                                            value: "reviewer",
+                                                        },
+                                                    ],
+                                                );
+                                                record {
+                                                    status: 200,
+                                                    headers: message_response.headers,
+                                                    body: summary,
+                                                }
+                                            },
+                                            Err(error) => failure(error),
+                                        }
+                                    },
+                                    Err(error) => failure(error),
+                                }
+                            },
+                            Err(error) => failure(error),
+                        }
+                    },
                     Err(error) => failure(error),
                 }
             },

@@ -902,6 +902,7 @@ dependencies = [
 name = "krit-runtime"
 version = "0.2.0"
 dependencies = [
+ "blake3",
  "curl",
  "http",
  "krit",

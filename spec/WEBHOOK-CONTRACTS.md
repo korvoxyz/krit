@@ -2,7 +2,7 @@
 
 **Status:** Normative compiler and bounded host contract
 **Contract schema:** 1
-**Runtime status:** Implemented by `phase4-http-runtime`
+**Runtime status:** Extended by `phase4-ai-observability`
 
 ## Source entrypoint
 
@@ -42,7 +42,7 @@ HttpResponse = Record {
 
 These are built-in closed aliases, not user-defined type syntax. Header list
 order is preserved and duplicate names are representable. A response must
-contain exactly its three fields. The future HTTP host validates status range,
+contain exactly its three fields. The HTTP host validates status range,
 request limits, and protocol syntax.
 
 ## Request JSON Schema
@@ -213,11 +213,12 @@ host config, binds loopback by default, and creates a fresh invocation per
 request. `--once` serves one accepted or rejected request for deterministic
 tests.
 
-Host configuration is explicit immutable schema-1 JSON. Config values are
-strings; secrets are relative file references. Unknown fields and ungranted
-names fail closed. Unix secret files must grant no group/other permissions.
-Secret bytes stay in a host-owned zeroizing store and only a Wasmtime resource
-handle enters the guest.
+Host configuration is explicit immutable JSON. Schema 1 contains string
+config and relative secret-file references; schema 2 compatibly adds the
+bounded AI/reliability/approval policy defined in `AI-OBSERVABILITY.md`.
+Unknown fields and ungranted names fail closed. Unix secret files must grant
+no group/other permissions. Secret bytes stay in a host-owned zeroizing store
+and only a Wasmtime resource handle enters the guest.
 
 Outbound HTTP verifies the exact origin on every call, disables redirects,
 pins the one request's DNS result, rejects non-public IPv4/IPv6 ranges
@@ -237,5 +238,8 @@ the semantic identity at both adapters. Authenticated and anonymous HTTP are
 also separate WIT interfaces so `None` does not silently grant secret
 acquisition.
 
-AI calls, observability, retries, rate limits, idempotency, and approval policy
-remain outside this milestone.
+`AI-OBSERVABILITY.md` normatively extends this contract with provider-neutral
+AI invocation, structured redacted logging, retries, rate limits,
+cancellation, process-local idempotency, and approval policy. The HTTP record,
+secret, origin, rollback, and fresh-Store rules in this document remain
+unchanged.

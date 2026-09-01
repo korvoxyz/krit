@@ -43,6 +43,10 @@ pub struct Capabilities {
     pub http: Vec<String>,
     #[serde(default)]
     pub secrets: Vec<String>,
+    #[serde(default)]
+    pub ai: Vec<String>,
+    #[serde(default)]
+    pub logs: bool,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -138,16 +142,24 @@ impl Manifest {
             })?;
         }
         validate_unique_names("configuration key", &self.capabilities.config)?;
+        validate_capability_count("configuration key", &self.capabilities.config)?;
         for name in &self.capabilities.config {
             validate_resource_name("configuration key", name)?;
         }
         validate_unique_names("HTTP origin", &self.capabilities.http)?;
+        validate_capability_count("HTTP origin", &self.capabilities.http)?;
         for origin in &self.capabilities.http {
             validate_http_origin(origin)?;
         }
         validate_unique_names("secret name", &self.capabilities.secrets)?;
+        validate_capability_count("secret name", &self.capabilities.secrets)?;
         for name in &self.capabilities.secrets {
             validate_resource_name("secret name", name)?;
+        }
+        validate_sorted_unique_names("AI adapter", &self.capabilities.ai)?;
+        validate_capability_count("AI adapter", &self.capabilities.ai)?;
+        for name in &self.capabilities.ai {
+            validate_resource_name("AI adapter", name)?;
         }
         Ok(())
     }
@@ -206,6 +218,22 @@ impl Manifest {
                 resource: Some(resource),
             }
         }));
+        requested.extend(
+            self.capabilities
+                .ai
+                .iter()
+                .cloned()
+                .map(|resource| PermissionRequest {
+                    capability: "ai.invoke",
+                    resource: Some(resource),
+                }),
+        );
+        if self.capabilities.logs {
+            requested.push(PermissionRequest {
+                capability: "observe.log",
+                resource: None,
+            });
+        }
         requested.sort();
         PermissionPlan {
             schema: 1,
@@ -297,6 +325,26 @@ fn validate_unique_names(kind: &str, values: &[String]) -> Result<(), ManifestEr
         return Err(ManifestError::new(format!(
             "duplicate {kind} `{}`",
             duplicate[0]
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sorted_unique_names(kind: &str, values: &[String]) -> Result<(), ManifestError> {
+    if let Some(pair) = values.windows(2).find(|pair| pair[0] >= pair[1]) {
+        return Err(ManifestError::new(if pair[0] == pair[1] {
+            format!("duplicate {kind} `{}`", pair[0])
+        } else {
+            format!("{kind} entries must be sorted and unique")
+        }));
+    }
+    Ok(())
+}
+
+fn validate_capability_count(kind: &str, values: &[String]) -> Result<(), ManifestError> {
+    if values.len() > 256 {
+        return Err(ManifestError::new(format!(
+            "too many {kind} entries; maximum is 256"
         )));
     }
     Ok(())
@@ -413,5 +461,30 @@ mod tests {
         );
         let error = Manifest::parse(&manifest).expect_err("duplicate secret should fail");
         assert!(error.to_string().contains("duplicate secret name"));
+    }
+
+    #[test]
+    fn validates_sorted_ai_and_structured_log_permissions() {
+        let manifest = Manifest::parse(&VALID.replace(
+            "stdout = true",
+            "stdout = true\nai = [\"reviewer\", \"summarizer\"]\nlogs = true",
+        ))
+        .expect("AI and logging requests should validate");
+        assert_eq!(
+            manifest
+                .permission_plan()
+                .requested
+                .iter()
+                .filter(|request| { matches!(request.capability, "ai.invoke" | "observe.log") })
+                .count(),
+            3
+        );
+
+        let unsorted = VALID.replace(
+            "stdout = true",
+            "stdout = true\nai = [\"summarizer\", \"reviewer\"]",
+        );
+        let error = Manifest::parse(&unsorted).expect_err("AI names must be sorted");
+        assert!(error.to_string().contains("sorted and unique"));
     }
 }

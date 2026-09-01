@@ -24,6 +24,14 @@ pub struct RuntimeLimits {
     header_count: usize,
     header_bytes: usize,
     http_calls: u64,
+    ai_calls: u64,
+    ai_input_bytes: usize,
+    ai_response_bytes: usize,
+    ai_timeout: Duration,
+    log_events: usize,
+    log_fields: usize,
+    log_value_bytes: usize,
+    log_bytes: usize,
     connect_timeout: Duration,
     read_timeout: Duration,
     http_timeout: Duration,
@@ -49,6 +57,14 @@ pub const HARD_MAX_LIMITS: RuntimeLimits = RuntimeLimits {
     header_count: 1024,
     header_bytes: 1024 * 1024,
     http_calls: 1024,
+    ai_calls: 256,
+    ai_input_bytes: 1024 * 1024,
+    ai_response_bytes: 1024 * 1024,
+    ai_timeout: Duration::from_secs(20),
+    log_events: 1024,
+    log_fields: 128,
+    log_value_bytes: 64 * 1024,
+    log_bytes: 1024 * 1024,
     connect_timeout: Duration::from_secs(5),
     read_timeout: Duration::from_secs(10),
     http_timeout: Duration::from_secs(20),
@@ -74,6 +90,14 @@ pub const DEFAULT_LIMITS: RuntimeLimits = RuntimeLimits {
     header_count: 128,
     header_bytes: 64 * 1024,
     http_calls: 16,
+    ai_calls: 8,
+    ai_input_bytes: 64 * 1024,
+    ai_response_bytes: 64 * 1024,
+    ai_timeout: Duration::from_millis(750),
+    log_events: 128,
+    log_fields: 32,
+    log_value_bytes: 4 * 1024,
+    log_bytes: 64 * 1024,
     connect_timeout: Duration::from_millis(250),
     read_timeout: Duration::from_millis(500),
     http_timeout: Duration::from_millis(750),
@@ -154,6 +178,38 @@ impl RuntimeLimits {
 
     pub const fn http_calls(self) -> u64 {
         self.http_calls
+    }
+
+    pub const fn ai_calls(self) -> u64 {
+        self.ai_calls
+    }
+
+    pub const fn ai_input_bytes(self) -> usize {
+        self.ai_input_bytes
+    }
+
+    pub const fn ai_response_bytes(self) -> usize {
+        self.ai_response_bytes
+    }
+
+    pub const fn ai_timeout(self) -> Duration {
+        self.ai_timeout
+    }
+
+    pub const fn log_events(self) -> usize {
+        self.log_events
+    }
+
+    pub const fn log_fields(self) -> usize {
+        self.log_fields
+    }
+
+    pub const fn log_value_bytes(self) -> usize {
+        self.log_value_bytes
+    }
+
+    pub const fn log_bytes(self) -> usize {
+        self.log_bytes
     }
 
     pub const fn connect_timeout(self) -> Duration {
@@ -252,6 +308,38 @@ impl RuntimeLimits {
         narrow(&mut self.http_calls, value, "HTTP call")
     }
 
+    pub fn narrow_ai_calls(&mut self, value: u64) -> Result<(), RuntimeError> {
+        narrow(&mut self.ai_calls, value, "AI call")
+    }
+
+    pub fn narrow_ai_input_bytes(&mut self, value: usize) -> Result<(), RuntimeError> {
+        narrow(&mut self.ai_input_bytes, value, "AI input byte")
+    }
+
+    pub fn narrow_ai_response_bytes(&mut self, value: usize) -> Result<(), RuntimeError> {
+        narrow(&mut self.ai_response_bytes, value, "AI response byte")
+    }
+
+    pub fn narrow_ai_timeout(&mut self, value: Duration) -> Result<(), RuntimeError> {
+        narrow_duration(&mut self.ai_timeout, value, "AI timeout")
+    }
+
+    pub fn narrow_log_events(&mut self, value: usize) -> Result<(), RuntimeError> {
+        narrow(&mut self.log_events, value, "log event")
+    }
+
+    pub fn narrow_log_fields(&mut self, value: usize) -> Result<(), RuntimeError> {
+        narrow(&mut self.log_fields, value, "log field")
+    }
+
+    pub fn narrow_log_value_bytes(&mut self, value: usize) -> Result<(), RuntimeError> {
+        narrow(&mut self.log_value_bytes, value, "log value byte")
+    }
+
+    pub fn narrow_log_bytes(&mut self, value: usize) -> Result<(), RuntimeError> {
+        narrow(&mut self.log_bytes, value, "log byte")
+    }
+
     pub fn narrow_connect_timeout(&mut self, value: Duration) -> Result<(), RuntimeError> {
         narrow_duration(&mut self.connect_timeout, value, "connect timeout")
     }
@@ -293,6 +381,15 @@ impl RuntimeLimits {
             || self.header_count > HARD_MAX_LIMITS.header_count
             || self.header_bytes > HARD_MAX_LIMITS.header_bytes
             || self.http_calls > HARD_MAX_LIMITS.http_calls
+            || self.ai_calls > HARD_MAX_LIMITS.ai_calls
+            || self.ai_input_bytes > HARD_MAX_LIMITS.ai_input_bytes
+            || self.ai_response_bytes > HARD_MAX_LIMITS.ai_response_bytes
+            || self.ai_timeout.is_zero()
+            || self.ai_timeout > HARD_MAX_LIMITS.ai_timeout
+            || self.log_events > HARD_MAX_LIMITS.log_events
+            || self.log_fields > HARD_MAX_LIMITS.log_fields
+            || self.log_value_bytes > HARD_MAX_LIMITS.log_value_bytes
+            || self.log_bytes > HARD_MAX_LIMITS.log_bytes
             || self.connect_timeout.is_zero()
             || self.connect_timeout > HARD_MAX_LIMITS.connect_timeout
             || self.read_timeout.is_zero()

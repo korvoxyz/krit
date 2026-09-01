@@ -16,7 +16,8 @@ use krit::{
 };
 use krit_package::Manifest;
 use krit_runtime::{
-    GrantSet, HttpHeader, HttpRequest, Runtime, RuntimeError, RuntimeErrorKind, RuntimeLimits,
+    GrantSet, HttpHeader, HttpRequest, LogEvent, LogField, LogLevel, Runtime, RuntimeError,
+    RuntimeErrorKind, RuntimeLimits,
 };
 use krit_wasm::{ArtifactMetadata, BuildErrorKind, BuildOptions, build_component};
 use serde::Serialize;
@@ -149,6 +150,12 @@ fn build_command(arguments: &[String]) -> u8 {
     }
     if !manifest.capabilities.secrets.is_empty() {
         options.grant_effect("secret.read");
+    }
+    if !manifest.capabilities.ai.is_empty() {
+        options.grant_effect("ai.invoke");
+    }
+    if manifest.capabilities.logs {
+        options.grant_effect("observe.log");
     }
     let artifact = match build_component(&module, &options) {
         Ok(artifact) => artifact,
@@ -1121,6 +1128,12 @@ fn manifest_grants_requirement(
             .http
             .iter()
             .any(|resource| resource == requirement.resource()),
+        Effect::AiInvoke => manifest
+            .capabilities
+            .ai
+            .iter()
+            .any(|resource| resource == requirement.resource()),
+        Effect::ObserveLog => manifest.capabilities.logs,
         Effect::IoStdout => manifest.capabilities.stdout,
         _ => false,
     }
@@ -1254,8 +1267,8 @@ fn invoke_command(arguments: &[String]) -> u8 {
         Ok(artifact) => artifact,
         Err(message) => return report_artifact_error(&artifact_path, &message),
     };
-    let host_inputs = match host_config::load(options.host_config.as_deref(), &manifest, limits) {
-        Ok(inputs) => inputs,
+    let agent_host = match host_config::load(options.host_config.as_deref(), &manifest, limits) {
+        Ok(host) => host,
         Err(error) => {
             let code = if error.kind() == host_config::HostConfigErrorKind::Authorization {
                 "K5001"
@@ -1306,16 +1319,20 @@ fn invoke_command(arguments: &[String]) -> u8 {
         Ok(runtime) => runtime,
         Err(error) => return report_runtime_error(&artifact_path, &error),
     };
-    let result = match runtime.invoke_webhook(
+    let result = match runtime.invoke_webhook_with_host(
         &artifact.bytes,
         &artifact.metadata,
         &GrantSet::from_manifest(&manifest),
-        &host_inputs,
+        &agent_host,
         request,
     ) {
         Ok(result) => result,
         Err(error) => return report_runtime_error(&artifact_path, &error),
     };
+    if let Err(error) = publish_logs(&result.events, "success") {
+        eprintln!("krit: error[K4007]: could not publish structured logs: {error}");
+        return 1;
+    }
     let mut response = match serde_json::to_vec(&result.response) {
         Ok(response) => response,
         Err(error) => return internal_error("KICE0003", "serializing webhook response", &error),
@@ -1354,8 +1371,8 @@ fn serve_command(arguments: &[String]) -> u8 {
         Ok(artifact) => artifact,
         Err(message) => return report_artifact_error(&artifact_path, &message),
     };
-    let host_inputs = match host_config::load(options.host_config.as_deref(), &manifest, limits) {
-        Ok(inputs) => inputs,
+    let agent_host = match host_config::load(options.host_config.as_deref(), &manifest, limits) {
+        Ok(host) => host,
         Err(error) => {
             let authorization = error.kind() == host_config::HostConfigErrorKind::Authorization;
             let code = if authorization { "K5001" } else { "K7003" };
@@ -1422,15 +1439,19 @@ fn serve_command(arguments: &[String]) -> u8 {
                 continue;
             }
         };
-        let result = runtime.invoke_webhook(
+        let result = runtime.invoke_webhook_with_host(
             &artifact.bytes,
             &artifact.metadata,
             &grants,
-            &host_inputs,
+            &agent_host,
             request,
         );
         match result {
             Ok(result) => {
+                if let Err(error) = publish_logs(&result.events, "success") {
+                    eprintln!("krit: error[K4007]: could not publish structured logs: {error}");
+                    return 1;
+                }
                 let mut response =
                     tiny_http::Response::from_data(result.response.body.into_bytes())
                         .with_status_code(result.response.status as u16);
@@ -1943,6 +1964,10 @@ fn report_artifact_error(path: &Path, message: &str) -> u8 {
 }
 
 fn report_runtime_error(path: &Path, error: &RuntimeError) -> u8 {
+    if let Err(write_error) = publish_logs(error.events(), "failure") {
+        eprintln!("krit: error[K4007]: could not publish structured logs: {write_error}");
+        return 1;
+    }
     eprintln!(
         "{}:1:1: error[{}]: {}",
         path.to_string_lossy(),
@@ -1957,6 +1982,34 @@ fn report_runtime_error(path: &Path, error: &RuntimeError) -> u8 {
     } else {
         1
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishedLogEvent<'a> {
+    schema: u32,
+    sequence: u64,
+    level: LogLevel,
+    event: &'a str,
+    fields: &'a [LogField],
+    outcome: &'a str,
+}
+
+fn publish_logs(events: &[LogEvent], outcome: &str) -> io::Result<()> {
+    let mut stderr = io::stderr().lock();
+    for event in events {
+        let published = PublishedLogEvent {
+            schema: 1,
+            sequence: event.sequence,
+            level: event.level,
+            event: &event.event,
+            fields: &event.fields,
+            outcome,
+        };
+        serde_json::to_writer(&mut stderr, &published).map_err(io::Error::other)?;
+        stderr.write_all(b"\n")?;
+    }
+    stderr.flush()
 }
 
 fn print_help() {

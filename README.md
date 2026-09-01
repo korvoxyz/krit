@@ -43,6 +43,13 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
   sorted capability requirements
 - direct normalized-origin `http_request` with exact `http.request` resource
   facts and bearer-only opaque secret consumption
+- provider-neutral `ai_invoke` with exact adapter facts and one host-side
+  deterministic `http-json` adapter
+- ordered typed `log_info`/`log_error` events with bounded buffering,
+  key/value redaction, and stderr-only JSON Lines publication
+- reusable stateful `AgentHost` policy for bounded retries, per-resource rate
+  limits, embedding cancellation, process-local idempotency, and default-deny
+  AI/bearer approval
 - opaque `Secret` compiler/Core identity with static non-disclosure rules
 - name-resolved, inferred typed Core IR with deterministic IDs and explicit
   evaluation order
@@ -57,11 +64,13 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
   deadline, stack, StoreLimits, host-call, and buffered-output bounds
 - `krit sandbox` execution and artifact-aware effective permission reports
 - typed webhook Component Model exports with exact effect-selected config,
-  secrets, anonymous/authenticated HTTP, and optional stdout imports
+  secrets, anonymous/authenticated HTTP, AI, logging, and optional stdout
+  imports
 - bounded webhook invocation, immutable host configuration, zeroizing
   host-side secret storage, DNS-pinned no-redirect outbound HTTP/TLS, and
   loopback `serve --once`
-- deterministic non-network `krit invoke --request FILE`
+- deterministic fixture-driven `krit invoke --request FILE` with all outbound
+  access still constrained by exact host policy
 - recursive function declarations
 - exhaustive empty/cons list matching
 - deterministic comment-preserving canonical source formatting
@@ -69,12 +78,12 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - implementation-neutral conformance cases
 - strict package manifest validation
 
-The grouped `phase4-http-runtime` milestone is complete. Phase 4 remains in
-progress: AI invocation, observability, retries, rate limits, idempotency, and
-approval policy are intentionally not implemented. General composite Wasm
-layouts beyond the documented webhook subset, guided authoring, modules,
-dependency resolution, build caching, and production multi-tenant OS
-isolation are also future work. Krit is not production-ready.
+Phase 4 is complete for the bounded stateless reference agent. The checked
+reference flow calls a GitHub-like origin, one neutral AI adapter, and one
+messaging-like origin with exact permissions and approval requirements.
+General composite Wasm layouts beyond the documented webhook subset, guided
+authoring, modules, dependency resolution, build caching, and production
+multi-tenant OS isolation are also future work. Krit is not production-ready.
 
 ## Requirements
 
@@ -171,7 +180,9 @@ krit permissions --artifact target/krit/krit.wasm
 krit permissions --artifact target/krit/krit.wasm --json
 ```
 
-Deployment grants remain explicitly `not-evaluated`.
+Deployment grants remain explicitly `not-evaluated`. Artifact-aware reports
+also list approval-required AI adapters and bearer HTTP origins separately;
+they do not claim that deployment approval has been evaluated.
 
 Build the package's validated WebAssembly component:
 
@@ -183,8 +194,9 @@ krit build --manifest path/to/krit.pkg --output dist/program.wasm
 The default output is `target/krit/krit.wasm` for this repository, with
 metadata at `target/krit/krit.wasm.json`. Metadata schema 1 includes the exact
 `blake3:<hex>` digest and byte size, package-relative entry, WIT world, sorted
-effects/imports, and policy version. The digest covers the final component
-bytes after bounded embedded metadata is attached. Pure programs select the
+effects/imports, exact resource and approval-required facts, and policy
+version. The digest covers the final component bytes after bounded embedded
+metadata is attached. Pure programs select the
 zero-import `pure-program` world; programs with the checked `io.stdout` effect
 select `program` and its stdout interface. Unused manifest grants do not widen
 artifact imports, and validation derives the world and effects from the actual
@@ -195,10 +207,12 @@ non-capturing functions, blocks, conditionals/short circuit, checked integer
 operators, primitive comparisons, and scalar `print`/`println`. The bounded
 webhook policy-2 path additionally supports strings, the fixed HTTP records,
 header lists, Result/Option matching, static non-capturing helper references,
-config, opaque secrets, and outbound HTTP. Other composites, JSON, data
-captures, and unresolved parametric layouts fail with stable `K7001`/`K7002`
-diagnostics. `krit build` never falls back to direct interpretation. Run only
-an existing validated artifact:
+config, opaque secrets, outbound HTTP, neutral AI calls, ordered log fields,
+and unescaped JSON-string decoding used to validate the reference model
+output. Other composites, general JSON shapes, escaped JSON strings, data
+captures, and unresolved parametric layouts fail closed with stable
+`K7001`/`K7002` diagnostics or a bounded guest trap. `krit build` never falls
+back to direct interpretation. Run only an existing validated artifact:
 
 ```sh
 krit sandbox
@@ -211,8 +225,8 @@ and buffered output released only on success. The exact default and hard
 limits plus the serialized epoch-scheduling and pre-deadline compilation
 limitations are documented in [the sandbox specification](spec/WASM-SANDBOX.md).
 `krit run` remains the full-language direct evaluator for pure/stdout source;
-it fails with `K5003` for webhook, configuration, secret, and HTTP host
-operations rather than fabricating values.
+it fails with `K5003` for webhook, configuration, secret, HTTP, AI, and
+structured-log host operations rather than fabricating values.
 
 Invoke a webhook deterministically from an exact JSON fixture:
 
@@ -224,6 +238,12 @@ krit invoke \
   --request examples/webhook-agent.request.json
 ```
 
+The checked-in host file contains placeholder policy and no secret values, so
+the default invocation fails safely as an application response before making
+network calls. The successful all-local three-service gate is the
+`reference_webhook_runs_github_ai_and_messaging_with_exact_audit_facts`
+integration test in `crates/krit-runtime/tests/phase4.rs`.
+
 Serve an already-built artifact on loopback, once for tests or without
 `--once` for a local process:
 
@@ -231,17 +251,53 @@ Serve an already-built artifact on loopback, once for tests or without
 krit serve --manifest examples/webhook-agent.krit.pkg --bind 127.0.0.1:3000 --once
 ```
 
-Neither command builds or falls back to source interpretation. Host config is
-strict schema-1 JSON with immutable string values and secret **file
-references**, never inline values or environment inheritance:
+Neither command builds or falls back to source interpretation. Host config
+schema 1 remains accepted for immutable strings and secret **file
+references**, but sensitive bearer calls are now default-denied. Migrate those
+hosts to schema 2 and add exact `http.bearer` approval entries. Schema 2 adds
+strict AI adapter, retry, rate, byte-bounded idempotency, and noninteractive
+approval policy:
 
 ```json
-{"schema":1,"config":{"agent.model":"example-model"},"secrets":{"example-token":{"file":"secret.bin"}}}
+{
+  "schema": 2,
+  "config": {"reference.repository": "example/repository"},
+  "secrets": {"ai-token": {"file": "secrets/ai-token"}},
+  "aiAdapters": {
+    "reviewer": {
+      "kind": "http-json",
+      "origin": "https://ai.example.invalid",
+      "path": "/v1/invoke",
+      "model": "deployment-model",
+      "secret": "ai-token",
+      "maxInputBytes": 65536,
+      "maxResponseBytes": 65536,
+      "timeoutMs": 750
+    }
+  },
+  "approvals": [{"operation": "ai.invoke", "resource": "reviewer"}]
+}
 ```
 
 On Unix, secret files must grant no group/other permissions (for example,
 `chmod 600 secret.bin`). Host inputs cannot add names or origins absent from
-the package manifest.
+the package manifest. Unknown fields and values above hard count, byte,
+attempt, timeout, window, or TTL bounds fail closed.
+
+`invoke` writes only the exact response JSON to stdout. Structured application
+logs are compact JSON Lines on stderr after completion. `serve` never puts
+logs in HTTP bodies. Validated redacted logs from a failed invocation may be
+published with `"outcome":"failure"`; partial response and normal output
+remain rolled back.
+
+Retries never re-execute guest code. They apply only to connection/timeouts or
+429/502/503/504 for GET/HEAD or a request with a valid ordinary
+`idempotency-key`. AI and HTTP rate state and inbound response idempotency are
+bounded process-local memory only: restart and multi-process deployments reset
+them, concurrent first use can duplicate work, and Phase 6 will replace
+best-effort replay with durable transactional records. Model output remains
+nondeterministic raw UTF-8 and must be parsed or validated by source before
+structured use.
 
 Request JSON Lines diagnostics for tools and AI agents:
 
@@ -292,10 +348,14 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
 
 `config_string` returns `Result<String, String>`, `secret` returns
 `Result<Secret, String>`, and `http_request` returns
-`Result<HttpResponse, String>`. Resource names and the normalized HTTP origin
-must be direct literals so `krit explain`, metadata, and permission review can
-report exact authority. `Secret` cannot be revealed or structurally stored;
-only direct `Some(secret)` in the bearer position is accepted.
+`Result<HttpResponse, String>`. `ai_invoke("adapter", input)` returns raw
+`Result<String, String>`. `log_info` and `log_error` accept a canonical event
+literal plus an ordered `List<LogField>`, where `LogField` is
+`Record { name: String, value: String }`. Resource names and normalized HTTP
+origins must be direct literals so `krit explain`, metadata, and permission
+review can report exact authority. `Secret` cannot be revealed or
+structurally stored; only direct `Some(secret)` in the bearer position is
+accepted.
 
 ## Language tour
 
@@ -392,11 +452,12 @@ The specification is the semantic authority:
 - [Krit 0.2 language](spec/LANGUAGE.md)
 - [Diagnostic contract](spec/DIAGNOSTICS.md)
 - [Webhook agent contracts](spec/WEBHOOK-CONTRACTS.md) — compiler contracts
-  only
+  and bounded HTTP runtime
+- [AI and observability policy](spec/AI-OBSERVABILITY.md) — normative Phase 4
+  AI, logs, reliability, idempotency, cancellation, and approval
 - [Agent application model](spec/AGENT-APPLICATIONS.md) — draft
-- [Types and effects](spec/TYPES-AND-EFFECTS.md) — implemented baseline
-- [Capabilities](spec/CAPABILITIES.md) — compiler contracts implemented,
-  runtime hosts draft
+- [Types and effects](spec/TYPES-AND-EFFECTS.md) — implemented Phase 4 subset
+- [Capabilities](spec/CAPABILITIES.md) — bounded Phase 4 host implemented
 - [Modules and packages](spec/PACKAGES.md) — draft
 - [WebAssembly sandbox](spec/WASM-SANDBOX.md) — policy-1 artifact and bounded
   host implemented
@@ -437,10 +498,11 @@ The accepted implementation path is:
 4. typed verified Core IR and deterministic explanations (complete)
 5. Core layout diagnostics, validated WebAssembly component artifacts, and one
    bounded host (complete for policy 1)
-6. webhook/config/secret compiler contracts (complete), then the separate
-   HTTP runtime, outbound HTTP, secret providers, and AI calls
+6. stateless webhook/config/secret/HTTP/AI/log host and reliability policy
+   (complete)
 7. optional provider-neutral inline prediction with visible checked edits
-8. broader connectors and packaging only after the reference agent succeeds
+   (Phase 5; not started here)
+8. durable state and replay only after the stateless reference gate (Phase 6)
 
 Performance claims follow [docs/performance.md](docs/performance.md), not
 implementation-language assumptions.

@@ -162,6 +162,7 @@ pub enum TypeKind {
     HttpHeader,
     HttpRequest,
     HttpResponse,
+    LogField,
     Secret,
     List(Box<TypeAnnotation>),
     Option(Box<TypeAnnotation>),

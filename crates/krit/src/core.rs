@@ -2083,7 +2083,10 @@ impl<'a> Verifier<'a> {
                 if let Some(builtin) = self.builtin_values.get(callee)
                     && matches!(
                         builtin,
-                        Builtin::ConfigString | Builtin::Secret | Builtin::HttpRequest
+                        Builtin::AiInvoke
+                            | Builtin::ConfigString
+                            | Builtin::Secret
+                            | Builtin::HttpRequest
                     )
                 {
                     let argument = arguments.first().ok_or_else(|| {
@@ -2099,6 +2102,7 @@ impl<'a> Verifier<'a> {
                         ))
                     })?;
                     let capability = match builtin {
+                        Builtin::AiInvoke => crate::Effect::AiInvoke,
                         Builtin::ConfigString => crate::Effect::ConfigRead,
                         Builtin::Secret => crate::Effect::SecretRead,
                         Builtin::HttpRequest => crate::Effect::HttpRequest,
@@ -2149,6 +2153,20 @@ impl<'a> Verifier<'a> {
             Builtin::None => Err(IrError::new(
                 "None must lower as a variant value, not a builtin function",
             )),
+            Builtin::AiInvoke => {
+                let Type::Function(function) = ty else {
+                    return Err(IrError::new("ai_invoke has non-function type"));
+                };
+                let expected = Type::Result(Arc::new(Type::String), Arc::new(Type::String));
+                if function.parameters() == [Arc::new(Type::String), Arc::new(Type::String)]
+                    && function.return_type() == &expected
+                    && function.effects().contains(&crate::Effect::AiInvoke)
+                {
+                    Ok(())
+                } else {
+                    Err(IrError::new("ai_invoke has invalid signature"))
+                }
+            }
             Builtin::Print | Builtin::Println => {
                 let Type::Function(function) = ty else {
                     return Err(IrError::new(format!("{builtin} has non-function type")));
@@ -2237,6 +2255,30 @@ impl<'a> Verifier<'a> {
                     Ok(())
                 } else {
                     Err(IrError::new("http_request has invalid signature"))
+                }
+            }
+            Builtin::LogInfo | Builtin::LogError => {
+                let Type::Function(function) = ty else {
+                    return Err(IrError::new(format!(
+                        "{} has non-function type",
+                        builtin.as_str()
+                    )));
+                };
+                let expected = Type::Result(Arc::new(Type::Unit), Arc::new(Type::String));
+                if function.parameters()
+                    == [
+                        Arc::new(Type::String),
+                        Arc::new(Type::List(Arc::new(Type::LogField))),
+                    ]
+                    && function.return_type() == &expected
+                    && function.effects().contains(&crate::Effect::ObserveLog)
+                {
+                    Ok(())
+                } else {
+                    Err(IrError::new(format!(
+                        "{} has invalid signature",
+                        builtin.as_str()
+                    )))
                 }
             }
         }
@@ -2441,6 +2483,9 @@ fn type_equivalent(left: &Type, right: &Type) -> bool {
                 ],
             )
         }
+        (Type::LogField, Type::Record(fields)) | (Type::Record(fields), Type::LogField) => {
+            record_matches(fields, &[("name", Type::String), ("value", Type::String)])
+        }
         (Type::List(left), Type::List(right)) | (Type::Option(left), Type::Option(right)) => {
             type_equivalent(left, right)
         }
@@ -2501,6 +2546,10 @@ fn record_field_type(ty: &Type, name: &str) -> Option<Arc<Type>> {
             "body" => Some(Arc::new(Type::String)),
             _ => None,
         },
+        Type::LogField => match name {
+            "name" | "value" => Some(Arc::new(Type::String)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -2522,6 +2571,7 @@ fn type_contains_no_function(ty: &Type) -> bool {
         | Type::HttpHeader
         | Type::HttpRequest
         | Type::HttpResponse
+        | Type::LogField
         | Type::Variable(_) => true,
         Type::Secret => false,
     }
@@ -2547,6 +2597,7 @@ fn type_contains_secret(ty: &Type) -> bool {
         | Type::HttpHeader
         | Type::HttpRequest
         | Type::HttpResponse
+        | Type::LogField
         | Type::Variable(_) => false,
     }
 }
@@ -2641,6 +2692,7 @@ fn type_has_residual(ty: &Type, visited: &mut HashSet<*const Type>) -> bool {
         | Type::HttpHeader
         | Type::HttpRequest
         | Type::HttpResponse
+        | Type::LogField
         | Type::Secret => false,
     }
 }

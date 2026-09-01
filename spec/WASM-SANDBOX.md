@@ -1,6 +1,6 @@
 # WebAssembly sandbox
 
-**Status:** Policy-1 scalar path and policy-2 bounded webhook host implemented
+**Status:** Policy-1 scalar path and Phase 4 policy-2 host implemented
 **Artifact metadata schema:** 1
 **Validation policy:** 1
 
@@ -80,9 +80,10 @@ does not maintain a second unchecked ABI declaration or add optional dummy
 imports. Krit does not grant a general WASI environment; Preview 1 inheritance
 is not a compatibility path.
 
-The same package defines buildable `webhook`, `config`, `secrets`, `http`, and
-`http-anonymous` interfaces. A finite deterministic webhook world exists for
-every supported effect combination. HTTP without `secret.read` selects the
+The same package defines buildable `webhook`, `config`, `secrets`, `http`,
+`http-anonymous`, `ai`, and `logging` interfaces. A finite deterministic
+webhook world exists for every supported effect combination. HTTP without
+`secret.read` selects the
 anonymous interface, so unauthenticated HTTP does not implicitly import
 secret acquisition. Worlds containing both effects select the bearer-capable
 `http` interface and the explicit `secrets` interface.
@@ -178,6 +179,7 @@ Policy 2 adds a deliberately bounded webhook ABI:
 - the Result/Option shapes returned by config, secrets, and HTTP
 - Result/Option matching and static references to non-capturing helpers
 - a typed webhook export plus exact stdout/config/secrets/HTTP imports
+- neutral AI string results and ordered structured logging fields
 
 The core uses guest linear-memory offsets, never host pointers. Canonical
 parameters/results, list elements, records, variants, UTF-8, and allocation
@@ -208,7 +210,8 @@ WASI, and undeclared imports.
 Schema-1 adjacent metadata contains compiler and language versions, edition,
 package name/version, target, WIT world, package-relative entry, exact digest
 and byte size, sorted effects/imports, exact resource requirements, build
-profile, and validation policy version. Embedded metadata is bounded and
+profile, approval-required AI/bearer resources, and validation policy version.
+Embedded metadata is bounded and
 contains no source text, absolute paths, credentials, or secret values.
 `krit-wasm::validate_artifact`
 revalidates the bytes, policy, embedded facts, byte size, and digest. Validation
@@ -233,7 +236,10 @@ entire invocation buffer. Each host write reserves and checks its complete
 addition before changing the buffer or accounting counters.
 
 Webhook invocation uses the same Engine but a fresh Store, instance, resource
-table, output buffer, and host handles. Config is explicit immutable startup
+table, output buffer, structured-log buffer, and host handles. A reusable
+embedding-owned `AgentHost` separately owns bounded rate and idempotency state
+across requests. Idempotency is bounded by both entry count and retained
+response bytes. Config is explicit immutable startup
 data, never inherited environment. Secret bytes live behind an opaque
 Wasmtime resource in a host-owned `zeroize` buffer. Persistent buffers are
 zeroed on final drop; TLS/client-library transient copies cannot be guaranteed
@@ -252,6 +258,31 @@ documentation, benchmark, link-local, loopback, multicast, unspecified,
 reserved, and metadata-class destinations. The only relaxation is an
 embedding/test policy for loopback; bearer authentication over plain HTTP
 needs a second explicit host-only switch.
+
+The neutral AI interface selects a named host adapter. Phase 4 includes only
+`http-json`, which constructs and parses one strict provider mapping behind a
+provider-neutral Rust trait. Adapter origin and optional secret must already
+be manifest-granted. Prompts, provider bodies, model output, and credentials
+are absent from metadata, permission output, default logs, cache keys, and
+stats.
+
+Transport retries occur inside one host operation and never re-enter guest
+code. Only connection/timeouts and 429/502/503/504 are retryable, and only for
+GET/HEAD or a request carrying one valid ordinary idempotency key. Backoff and
+Retry-After are capped by the total deadline. Finite fixed-window counters are
+owned by `AgentHost` and keyed by exact origin or adapter.
+
+An atomic embedding cancellation handle is checked before instantiation, on
+every host call and retry/backoff, during DNS waiting, and by libcurl's
+progress callback during active transfers. DNS worker creation is capped.
+Epoch interruption remains responsible for guest execution but is not relied
+upon to interrupt blocking HTTP.
+
+Inbound mutating requests may use one bounded `Idempotency-Key`.
+`AgentHost` stores only completed serialized responses in a process-local
+TTL/LRU cache. Matching requests replay without Store creation; digest
+conflicts return 409. Failed/trapped invocations and in-progress work are not
+cached. This is explicitly not durable or distributed state.
 
 The wall deadline uses Wasmtime epoch interruption. Because an engine epoch is
 shared across Stores, each `Runtime` serializes component compilation and
@@ -283,7 +314,8 @@ remain in `Cargo.lock`.
 
 ## Resource limits
 
-Policy 1 uses these exact default and hard host limits:
+The runtime uses these exact default and hard host limits across policy 1 and
+the bounded policy-2 webhook surface:
 
 | Resource | Default | Hard maximum |
 |---|---:|---:|
@@ -304,6 +336,14 @@ Policy 1 uses these exact default and hard host limits:
 | Header count | 128 | 1,024 |
 | Header bytes | 64 KiB | 1 MiB |
 | Outbound HTTP calls | 16 | 1,024 |
+| AI calls | 8 | 256 |
+| AI input | 64 KiB | 1 MiB |
+| AI response | 64 KiB | 1 MiB |
+| AI timeout | 750 ms | 20 s |
+| Structured log events | 128 | 1,024 |
+| Fields per log event | 32 | 128 |
+| Bytes per log field value | 4 KiB | 64 KiB |
+| Total structured log bytes | 64 KiB | 1 MiB |
 | Connect timeout | 250 ms | 5 s |
 | Read phase timeout | 500 ms | 10 s |
 | Overall HTTP timeout | 750 ms | 20 s |
@@ -350,11 +390,20 @@ the report; deployment remains `not-evaluated`.
 `invoke` and `serve` likewise never build or interpret source. `invoke`
 accepts strict request-schema JSON and writes only response JSON after
 success. `serve` binds loopback by default and uses the same invocation path;
-`--once` handles one accepted or rejected request. Host config JSON contains
-immutable strings and relative secret-file references only. Unknown fields,
-inline values, environment inheritance, ungranted names, escaping paths,
-symlinks, oversized files, and group/other-readable Unix secret files fail
-closed.
+`--once` handles one accepted or rejected request. Host config schema 1
+contains immutable strings and relative secret-file references only. Strict
+schema 2 retains those fields and adds bounded AI adapters, retries, rates,
+idempotency, and explicit noninteractive approval allow entries. Unknown
+fields, inline values, environment inheritance, ungranted names, escaping
+paths, symlinks, oversized files, and group/other-readable Unix secret files
+fail closed.
+
+`invoke` response JSON remains exact on stdout. Structured application logs
+are emitted as JSON Lines on stderr only after completion. `serve` never
+places them in an HTTP body. Validated redacted failure logs may publish with
+an explicit failure outcome while normal output/response remains rolled back.
+Artifact permissions list approval-required resources separately and keep
+deployment and approval evaluation `not-evaluated`.
 
 ## Instance lifecycle
 

@@ -10,6 +10,8 @@ use zeroize::Zeroize;
 
 use crate::RuntimeError;
 
+pub const MAX_HOST_INPUT_ENTRIES: usize = 256;
+
 #[derive(Clone, Default)]
 pub struct SecretStore {
     inner: Arc<BTreeMap<String, Arc<SecretBytes>>>,
@@ -32,6 +34,11 @@ pub(crate) struct SecretBytes(Vec<u8>);
 
 impl SecretStore {
     pub fn new(values: BTreeMap<String, Vec<u8>>) -> Result<Self, RuntimeError> {
+        if values.len() > MAX_HOST_INPUT_ENTRIES {
+            return Err(RuntimeError::resource(format!(
+                "host secrets exceed the {MAX_HOST_INPUT_ENTRIES}-entry limit"
+            )));
+        }
         let mut secrets = BTreeMap::new();
         for (name, bytes) in values {
             if !is_valid_resource_name(&name) {
@@ -59,6 +66,10 @@ impl SecretStore {
             .iter()
             .map(|(name, bytes)| (name.as_str(), bytes.0.len()))
     }
+
+    pub(crate) fn contains_exact_value(&self, value: &[u8]) -> bool {
+        self.inner.values().any(|secret| secret.0 == value)
+    }
 }
 
 impl HostInputs {
@@ -66,6 +77,11 @@ impl HostInputs {
         config: BTreeMap<String, String>,
         secrets: SecretStore,
     ) -> Result<Self, RuntimeError> {
+        if config.len() > MAX_HOST_INPUT_ENTRIES {
+            return Err(RuntimeError::resource(format!(
+                "host configuration exceeds the {MAX_HOST_INPUT_ENTRIES}-entry limit"
+            )));
+        }
         if let Some(name) = config.keys().find(|name| !is_valid_resource_name(name)) {
             return Err(RuntimeError::setup(format!(
                 "invalid host configuration key `{name}`"

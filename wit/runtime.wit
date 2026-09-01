@@ -196,11 +196,379 @@ world webhook-stdout-config-secrets-http-program {
     export webhook;
 }
 
+interface ai {
+    invoke: func(adapter: string, input: string) -> result<string, string>;
+}
+
+interface logging {
+    record field {
+        name: string,
+        value: string,
+    }
+
+    info: func(event: string, fields: list<field>) -> result<_, string>;
+    error: func(event: string, fields: list<field>) -> result<_, string>;
+}
+
+world webhook-ai-program {
+    import ai;
+    export webhook;
+}
+
+world webhook-stdout-ai-program {
+    import stdout;
+    import ai;
+    export webhook;
+}
+
+world webhook-config-ai-program {
+    import config;
+    import ai;
+    export webhook;
+}
+
+world webhook-stdout-config-ai-program {
+    import stdout;
+    import config;
+    import ai;
+    export webhook;
+}
+
+world webhook-secrets-ai-program {
+    import secrets;
+    import ai;
+    export webhook;
+}
+
+world webhook-stdout-secrets-ai-program {
+    import stdout;
+    import secrets;
+    import ai;
+    export webhook;
+}
+
+world webhook-config-secrets-ai-program {
+    import config;
+    import secrets;
+    import ai;
+    export webhook;
+}
+
+world webhook-stdout-config-secrets-ai-program {
+    import stdout;
+    import config;
+    import secrets;
+    import ai;
+    export webhook;
+}
+
+world webhook-http-ai-program {
+    import http-anonymous;
+    import ai;
+    export webhook;
+}
+
+world webhook-stdout-http-ai-program {
+    import stdout;
+    import http-anonymous;
+    import ai;
+    export webhook;
+}
+
+world webhook-config-http-ai-program {
+    import config;
+    import http-anonymous;
+    import ai;
+    export webhook;
+}
+
+world webhook-stdout-config-http-ai-program {
+    import stdout;
+    import config;
+    import http-anonymous;
+    import ai;
+    export webhook;
+}
+
+world webhook-secrets-http-ai-program {
+    import secrets;
+    import http;
+    import ai;
+    export webhook;
+}
+
+world webhook-stdout-secrets-http-ai-program {
+    import stdout;
+    import secrets;
+    import http;
+    import ai;
+    export webhook;
+}
+
+world webhook-config-secrets-http-ai-program {
+    import config;
+    import secrets;
+    import http;
+    import ai;
+    export webhook;
+}
+
+world webhook-stdout-config-secrets-http-ai-program {
+    import stdout;
+    import config;
+    import secrets;
+    import http;
+    import ai;
+    export webhook;
+}
+
+world webhook-logs-program {
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-logs-program {
+    import stdout;
+    import logging;
+    export webhook;
+}
+
+world webhook-config-logs-program {
+    import config;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-config-logs-program {
+    import stdout;
+    import config;
+    import logging;
+    export webhook;
+}
+
+world webhook-secrets-logs-program {
+    import secrets;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-secrets-logs-program {
+    import stdout;
+    import secrets;
+    import logging;
+    export webhook;
+}
+
+world webhook-config-secrets-logs-program {
+    import config;
+    import secrets;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-config-secrets-logs-program {
+    import stdout;
+    import config;
+    import secrets;
+    import logging;
+    export webhook;
+}
+
+world webhook-http-logs-program {
+    import http-anonymous;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-http-logs-program {
+    import stdout;
+    import http-anonymous;
+    import logging;
+    export webhook;
+}
+
+world webhook-config-http-logs-program {
+    import config;
+    import http-anonymous;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-config-http-logs-program {
+    import stdout;
+    import config;
+    import http-anonymous;
+    import logging;
+    export webhook;
+}
+
+world webhook-secrets-http-logs-program {
+    import secrets;
+    import http;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-secrets-http-logs-program {
+    import stdout;
+    import secrets;
+    import http;
+    import logging;
+    export webhook;
+}
+
+world webhook-config-secrets-http-logs-program {
+    import config;
+    import secrets;
+    import http;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-config-secrets-http-logs-program {
+    import stdout;
+    import config;
+    import secrets;
+    import http;
+    import logging;
+    export webhook;
+}
+
+world webhook-ai-logs-program {
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-ai-logs-program {
+    import stdout;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-config-ai-logs-program {
+    import config;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-config-ai-logs-program {
+    import stdout;
+    import config;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-secrets-ai-logs-program {
+    import secrets;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-secrets-ai-logs-program {
+    import stdout;
+    import secrets;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-config-secrets-ai-logs-program {
+    import config;
+    import secrets;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-config-secrets-ai-logs-program {
+    import stdout;
+    import config;
+    import secrets;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-http-ai-logs-program {
+    import http-anonymous;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-http-ai-logs-program {
+    import stdout;
+    import http-anonymous;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-config-http-ai-logs-program {
+    import config;
+    import http-anonymous;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-config-http-ai-logs-program {
+    import stdout;
+    import config;
+    import http-anonymous;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-secrets-http-ai-logs-program {
+    import secrets;
+    import http;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-secrets-http-ai-logs-program {
+    import stdout;
+    import secrets;
+    import http;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-config-secrets-http-ai-logs-program {
+    import config;
+    import secrets;
+    import http;
+    import ai;
+    import logging;
+    export webhook;
+}
+
+world webhook-stdout-config-secrets-http-ai-logs-program {
+    import stdout;
+    import config;
+    import secrets;
+    import http;
+    import ai;
+    import logging;
+    export webhook;
+}
+
 world webhook-host-program {
     import stdout;
     import config;
     import secrets;
     import http;
     import http-anonymous;
+    import ai;
+    import logging;
     export webhook;
 }

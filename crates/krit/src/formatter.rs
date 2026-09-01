@@ -633,6 +633,7 @@ impl SyntaxCollector {
             | TypeKind::HttpHeader
             | TypeKind::HttpRequest
             | TypeKind::HttpResponse
+            | TypeKind::LogField
             | TypeKind::Secret => {}
         }
     }

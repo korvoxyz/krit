@@ -1,6 +1,6 @@
 # Krit Rust technical design
 
-**Status:** Accepted; policy-1 scalar and policy-2 webhook hosts implemented
+**Status:** Accepted; Phase 4 stateless reference host implemented
 **Owner:** Akshay Bhardwaj
 
 ## Decision
@@ -208,13 +208,14 @@ selects one of two checked-in `krit:runtime@0.2.0` worlds from checked effects.
 `krit:runtime/program@0.2.0` exports the same function and imports the typed
 `krit:runtime/stdout@0.2.0` interface. Policy 2 selects one finite webhook
 world from the exact `io.stdout`, `config.read`, `secret.read`, and
-`http.request` effect set. Anonymous HTTP uses a separate interface so it does
-not implicitly import secret acquisition; bearer HTTP borrows the opaque
-secret resource.
+`http.request`, `ai.invoke`, and `observe.log` effect set. Anonymous HTTP uses
+a separate interface so it does not implicitly import secret acquisition;
+bearer HTTP borrows the opaque secret resource. AI-only and log-only
+components import exactly their one typed interface.
 
 Krit does not grant a general WASI environment. Files, sockets, processes,
 environment variables, clocks, randomness, secrets, state, and AI calls are
-host resources available only through explicit component imports and
+unavailable except through their exact explicit component imports and
 unforgeable handles.
 
 The backend uses `i64` for `Int`, `i32` for `Bool`, zero-width `Unit`, and
@@ -224,8 +225,10 @@ primitive comparisons, and scalar stdout. The bounded webhook path adds
 guest-memory canonical strings, fixed HTTP records, header lists, selected
 Result/Option layouts and matching, static helper references, config,
 resource secrets, and HTTP. It still rejects residual types, data captures,
-general composites, JSON conversion, dynamic string operators, and unknown
-built-ins before emission.
+general composites, general JSON conversion, dynamic string operators, and
+unknown built-ins before emission. Phase 4 additionally lowers neutral AI
+string results, ordered `LogField` lists, fallible structured logging, and the
+one unescaped JSON-string decode used by the reference source.
 
 An adjacent metadata document records:
 
@@ -234,6 +237,7 @@ An adjacent metadata document records:
 - language edition
 - target world and sorted imports/effects
 - sorted exact capability/resource requirements
+- sorted exact approval-required AI/bearer resources
 - package-relative source entry and package identity
 - build profile and validation-policy version
 - exact final-byte BLAKE3 checksum and byte size
@@ -260,6 +264,25 @@ scheduling is serialized per Runtime because increments affect all Stores
 using an Engine; each cancellable deadline worker is joined before returning.
 Output remains buffered until success, so failed invocations publish no
 partial stdout.
+
+The embedding creates one reusable `AgentHost` for policy state while every
+component Store remains fresh. `AgentHost` owns strict AI adapter definitions,
+fixed-window rate counters, completed-response idempotency entries, and an
+approval callback. All maps have hard bounds and LRU replacement where
+specified. The CLI accepts legacy host config schema 1 and strict schema 2;
+schema 2 can only configure resources already granted by the manifest.
+
+One provider-neutral `AiAdapter` trait hides the milestone `http-json`
+provider mapping. Prompts and responses cross only the typed AI call and
+adapter transport; they are not metadata, permission facts, stats, or default
+logs. Source receives raw untrusted UTF-8 and explicitly validates it.
+
+Retries wrap individual network attempts, never guest execution. They are
+restricted by method/idempotency, retryable transport/status classes, capped
+backoff, approval, finite rates, cancellation, and the total deadline. An
+atomic cancellation handle is checked at host boundaries and drives libcurl's
+progress callback. Inbound response idempotency is process-local bounded
+TTL/LRU state and is deliberately not the durable Phase 6 design.
 
 Wasmtime 47 is a short-supported non-LTS line. `Cargo.toml` accepts security
 patches compatible with 47.0.4, and `Cargo.lock` records the exact tested

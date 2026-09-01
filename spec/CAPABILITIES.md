@@ -1,7 +1,7 @@
 # Capability model
 
-**Status:** Implemented bounded config/secret/HTTP host
-**Target:** Krit 0.3
+**Status:** Implemented bounded Phase 4 host
+**Target:** Krit 0.4
 
 ## Rule
 
@@ -44,14 +44,16 @@ stdout = true
 config = ["agent.model", "agent.timeout-ms"]
 http = ["https://api.github.com", "https://slack.com"]
 secrets = ["github-token", "slack-token"]
+ai = ["reviewer"]
+logs = true
 ```
 
-The schema-1 manifest implements requests for `stdout`, `config`, `http`, and
-`secrets`. The language emits literal-resource facts for `config.read`, `secret.read`,
-and `http.request`. The bounded webhook host implements these three
-capabilities. Files, generic sockets, processes, environment variables,
-clocks, randomness, state, queues, storage, and AI invocation remain
-unavailable.
+The schema-1 manifest implements requests for `stdout`, `config`, `http`,
+`secrets`, `ai`, and structured `logs`. The language emits literal-resource
+facts for `config.read`, `secret.read`, `http.request`, and `ai.invoke`;
+`observe.log` is resource-free. Files, generic sockets, processes,
+environment variables, clocks, randomness, durable state, queues, and storage
+remain unavailable.
 
 Paths are package-root-relative and resolved before execution. A lexical path
 that escapes the granted root is rejected. Symlink and platform-specific path
@@ -75,6 +77,8 @@ http_request(
     request,
     Some(token),
 )                            // Result<HttpResponse, String>
+ai_invoke("reviewer", input) // Result<String, String>
+log_info("review.started", fields) // Result<Unit, String>
 ```
 
 The string must be a direct literal so analysis can emit one exact sorted
@@ -83,7 +87,10 @@ requirement pair. `config_string` emits `config.read` plus its key.
 `http.request` plus one normalized exact origin. Its bearer argument is
 directly `None` or `Some(secret)`; this is the only approved structural use of
 the opaque handle. The host injects the Authorization header without exposing
-secret bytes. No host value is read during checking or explanation.
+secret bytes. `ai_invoke` emits `ai.invoke` plus one named adapter.
+`log_info` and `log_error` emit `observe.log`; their event names are direct
+canonical literals and their ordered fields contain only ordinary strings.
+No host value is read during checking or explanation.
 
 Package build orchestration intersects these requirements with manifest
 resources and reports `K5001` for an absent exact match. A matching supported
@@ -103,8 +110,10 @@ Dependencies contribute required effects but cannot add grants.
 `krit permissions` without an artifact displays the unchanged requested plan.
 `krit permissions --artifact PATH` validates the artifact and displays
 requested, required, effective, denied, exact imports, and local denial
-reasons. A denied report is printed completely and exits 4. Deployment policy
-is not implemented and remains `not-evaluated`.
+reasons. It separately displays approval-required AI adapters and bearer HTTP
+origins without treating approval as a grant. A denied report is printed
+completely and exits 4. Deployment and approval policy evaluation remain
+`not-evaluated` in this inspection command.
 
 The request-only `krit permissions --json` output remains:
 
@@ -116,8 +125,8 @@ Requests sort by capability and resource. Configuration keys, HTTP origins,
 and secret names are identifiers only; their values are never included.
 
 Artifact-aware JSON uses schema 1 and includes `world`, `required`,
-`effective`, `denied`, `imports`, `denialReasons`, `localGrantStatus`, and
-`deploymentGrantStatus`.
+`effective`, `denied`, `imports`, `approvalRequired`, `approvalStatus`,
+`denialReasons`, `localGrantStatus`, and `deploymentGrantStatus`.
 
 ## Development mode
 
@@ -159,26 +168,35 @@ The complete boundary is defined in `WASM-SANDBOX.md`.
 
 ## Revocation and accounting
 
-Embedding hosts may revoke handles between operations. Long-running operations
-receive cancellation. Future limits may include bytes, requests, tokens,
-process count, CPU time, wall time, and memory.
+Embedding hosts may revoke handles between operations. Phase 4 exposes an
+atomic cancellation handle checked before instantiation, on every host call
+and backoff, and during active libcurl transfers. Current limits include
+bytes, requests, AI/HTTP calls, logs, fuel, stack, memory, and wall time;
+provider token accounting remains future work.
 
 Quota exhaustion is distinct from permission denial and receives a separate
 diagnostic.
 
 ## AI providers
 
-AI calls are library/runtime capabilities, not core syntax. Provider adapters
-implement a versioned neutral interface containing:
+AI calls are optional library/runtime capabilities, not core syntax or a
+build requirement. Provider adapters implement a versioned neutral interface
+containing:
 
 - model identifier
-- structured input
-- structured output schema
+- bounded UTF-8 input
+- bounded raw UTF-8 output
 - timeout and resource limits
 - explicit nondeterminism declaration
 
+Schema-directed structured messages and output are future adapter revisions.
+The current source must explicitly validate or parse raw output.
+
 Prompts and responses are private capability data. They are never uploaded for
 telemetry by default.
+
+The exact implemented Phase 4 contracts, privacy boundary, and reliability
+policy are normative in `AI-OBSERVABILITY.md`.
 
 ## Service delivery order
 

@@ -1,7 +1,72 @@
 {
-  "schema": 1,
+  "schema": 2,
   "config": {
-    "agent.model": "example-model"
+    "reference.repository": "example/repository"
   },
-  "secrets": {}
+  "secrets": {},
+  "aiAdapters": {
+    "reviewer": {
+      "kind": "http-json",
+      "origin": "https://ai.example.invalid",
+      "path": "/v1/invoke",
+      "model": "replace-with-deployment-model",
+      "secret": "ai-token",
+      "maxInputBytes": 65536,
+      "maxResponseBytes": 65536,
+      "timeoutMs": 750
+    }
+  },
+  "approvals": [
+    {
+      "operation": "ai.invoke",
+      "resource": "reviewer"
+    },
+    {
+      "operation": "http.bearer",
+      "resource": "https://github.example.invalid"
+    },
+    {
+      "operation": "http.bearer",
+      "resource": "https://message.example.invalid"
+    }
+  ],
+  "retries": {
+    "defaultHttp": {
+      "maxAttempts": 1,
+      "baseDelayMs": 25,
+      "maxDelayMs": 200
+    },
+    "defaultAi": {
+      "maxAttempts": 1,
+      "baseDelayMs": 25,
+      "maxDelayMs": 200
+    },
+    "http": {
+      "https://github.example.invalid": {
+        "maxAttempts": 2,
+        "baseDelayMs": 25,
+        "maxDelayMs": 100
+      }
+    },
+    "ai": {}
+  },
+  "rateLimits": {
+    "defaultHttp": {
+      "capacity": 64,
+      "windowMs": 60000
+    },
+    "defaultAi": {
+      "capacity": 16,
+      "windowMs": 60000
+    },
+    "http": {},
+    "ai": {},
+    "maxTrackedResources": 128
+  },
+  "idempotency": {
+    "maxEntries": 128,
+    "maxBytes": 16777216,
+    "ttlMs": 300000,
+    "maxKeyBytes": 128
+  }
 }

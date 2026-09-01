@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     io::{Read, Write},
     net::TcpListener,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
@@ -10,8 +10,8 @@ use std::{
 use krit::{Source, analyze, lower, parse_source};
 use krit_package::Manifest;
 use krit_runtime::{
-    GrantSet, HostInputs, HttpHeader, HttpRequest, HttpResponse, NetworkPolicy, Runtime,
-    SecretStore,
+    AgentHost, AgentHostPolicy, ApprovalOperation, ExplicitApprovalPolicy, GrantSet, HostInputs,
+    HttpHeader, HttpRequest, HttpResponse, NetworkPolicy, Runtime, SecretStore,
 };
 use krit_wasm::{BuildOptions, BuiltComponent, build_component};
 
@@ -250,12 +250,21 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
     )
     .expect("host inputs should be valid")
     .with_network_policy(NetworkPolicy::loopback_for_tests().with_plaintext_bearer_for_tests());
+    let host = AgentHost::new(
+        inputs,
+        AgentHostPolicy::default(),
+        Arc::new(
+            ExplicitApprovalPolicy::new([(ApprovalOperation::HttpBearer, origin.clone())])
+                .expect("approval should be valid"),
+        ),
+    )
+    .expect("agent host should be valid");
     let result = Runtime::default()
-        .invoke_webhook(
+        .invoke_webhook_with_host(
             &artifact.bytes,
             &artifact.metadata,
             &GrantSet::from_manifest(&manifest),
-            &inputs,
+            &host,
             request("hello"),
         )
         .expect("bounded outbound webhook should run");
@@ -413,21 +422,31 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
     let manifest = manifest(&format!(
         "http = [\"{origin}\"]\nsecrets = [\"unit-secret\"]"
     ));
+    let inputs = HostInputs::new(
+        BTreeMap::new(),
+        SecretStore::new(BTreeMap::from([(
+            "unit-secret".to_owned(),
+            b"unit-value".to_vec(),
+        )]))
+        .expect("secret store should be valid"),
+    )
+    .expect("inputs should be valid")
+    .with_network_policy(NetworkPolicy::loopback_for_tests());
+    let host = AgentHost::new(
+        inputs,
+        AgentHostPolicy::default(),
+        Arc::new(
+            ExplicitApprovalPolicy::new([(ApprovalOperation::HttpBearer, origin.clone())])
+                .expect("approval should be valid"),
+        ),
+    )
+    .expect("agent host should be valid");
     let denied = Runtime::default()
-        .invoke_webhook(
+        .invoke_webhook_with_host(
             &artifact.bytes,
             &artifact.metadata,
             &GrantSet::from_manifest(&manifest),
-            &HostInputs::new(
-                BTreeMap::new(),
-                SecretStore::new(BTreeMap::from([(
-                    "unit-secret".to_owned(),
-                    b"unit-value".to_vec(),
-                )]))
-                .expect("secret store should be valid"),
-            )
-            .expect("inputs should be valid")
-            .with_network_policy(NetworkPolicy::loopback_for_tests()),
+            &host,
             request(""),
         )
         .expect("plaintext bearer denial should be guest-visible");

@@ -14,12 +14,13 @@ The prompt contains only implemented Krit 0.2 syntax, including records,
 built-in Option and Result values, checked annotations, JSON conversion,
 canonical formatting, and the static rules enforced by `krit check`. It also
 contains the implemented typed webhook, literal configuration read, opaque
-secret acquisition, and exact-origin `http_request` forms. Raw sockets,
-ambient host values, secret revelation, broad network grants, and AI calls
-remain explicitly unavailable. The compiler can explain exact requirements,
-build scalar or bounded webhook artifacts, inspect effective local
-permissions, and execute them through the sandbox, fixture invocation, or
-loopback server paths.
+secret acquisition, exact-origin `http_request`, provider-neutral
+`ai_invoke`, and structured `log_info`/`log_error` forms. Raw sockets, ambient
+host values, secret revelation, broad network grants, provider SDKs, and
+self-approval remain explicitly unavailable. The compiler can explain exact
+requirements, build scalar or bounded webhook artifacts, inspect effective
+local permissions, and execute them through the sandbox, fixture invocation,
+or loopback server paths.
 
 ## Use
 
@@ -53,10 +54,11 @@ krit invoke --request request.json --host-config host.json # webhook artifacts
 `krit check` accepts the full bootstrap language. `krit build` accepts the
 scalar policy-1 subset and a bounded webhook subset containing strings, fixed
 HTTP records, header lists, Result/Option matching, static non-capturing
-helpers, config, secrets, and HTTP. A model must still avoid arbitrary
-composites, JSON in components, data captures, and dynamic string operators.
-A K7001 or K7002 build diagnostic must be repaired in source rather than
-bypassed with host interpretation.
+helpers, config, secrets, HTTP, AI strings, log fields, and bounded unescaped
+JSON-string decoding. A model must still avoid arbitrary composites, general
+JSON in components, escaped JSON strings, data captures, and dynamic string
+operators. A K7001 or K7002 build diagnostic must be repaired in source
+rather than bypassed with host interpretation.
 `krit sandbox` never builds or falls back to the full direct evaluator, so the
 artifact must already exist and validate with its adjacent metadata.
 
@@ -70,8 +72,16 @@ krit explain --json agent.krit
 ```
 
 Build it with an exact manifest, then invoke it using strict request and host
-config JSON. `krit run` still returns K5003 rather than simulating hosts.
+config JSON. Schema 2 host config owns adapter mappings, retries, finite rates,
+process-local idempotency, and explicit noninteractive approvals.
+`krit run` still returns K5003 rather than simulating hosts.
 `krit invoke` and `krit serve` never build or fall back to interpretation.
+
+AI output is nondeterministic untrusted raw UTF-8. Generated source must match
+the `Result`, explicitly parse or validate data before structured use, and
+never execute it. Prompts, responses, credentials, and sensitive request
+values must not be logged by default. `invoke` response JSON stays on stdout;
+structured log JSON Lines use stderr.
 
 For a failed check, send the model:
 
@@ -127,4 +137,5 @@ Old packs remain available for projects pinned to an older language version.
 Krit does not choose a provider or upload source automatically. The user or
 editor configures a local or remote model and explicitly selects context.
 Secrets, capability values, ignored files, and runtime data are excluded from
-prompt context.
+prompt context. Runtime AI adapter prompts and responses are not telemetry,
+permission facts, cache keys, diagnostics, or default structured logs.

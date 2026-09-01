@@ -458,6 +458,26 @@ fn direct_run_fails_closed_for_unavailable_agent_hosts() {
             .expect("diagnostic should be UTF-8")
             .contains("error[K5003]")
     );
+
+    for (name, source) in [
+        ("ai.krit", "ai_invoke(\"reviewer\", \"input\");\n"),
+        ("log.krit", "log_info(\"request.started\", []);\n"),
+    ] {
+        let path = directory.file(name, source);
+        let output = krit()
+            .arg("run")
+            .arg(&path)
+            .output()
+            .expect("Krit should start");
+        assert_eq!(output.status.code(), Some(4), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        assert!(
+            String::from_utf8(output.stderr)
+                .expect("diagnostic should be UTF-8")
+                .contains("error[K5003]"),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -1618,12 +1638,306 @@ license = "Apache-2.0"
 }
 
 #[test]
+fn invoke_keeps_response_json_on_stdout_and_publishes_logs_on_stderr() {
+    let directory = TestDirectory::new("invoke-structured-logs");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    log_info(
+        "request.received",
+        [
+            record { name: "authorization", value: request.body },
+            record { name: "path", value: request.path },
+        ],
+    );
+    record { status: 200, headers: [], body: "ok" }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/log-webhook"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+logs = true
+"#,
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let request = directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/logged","query":"","headers":[],"body":"private"}"#,
+    );
+    let invoked = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should invoke");
+    assert!(invoked.status.success());
+    assert_eq!(
+        invoked.stdout,
+        b"{\"status\":200,\"headers\":[],\"body\":\"ok\"}\n"
+    );
+    let line: serde_json::Value =
+        serde_json::from_slice(&invoked.stderr).expect("stderr should be one JSON log line");
+    assert_eq!(line["schema"], 1);
+    assert_eq!(line["sequence"], 0);
+    assert_eq!(line["event"], "request.received");
+    assert_eq!(line["outcome"], "success");
+    assert_eq!(line["fields"][0]["value"], "[REDACTED]");
+    assert_eq!(line["fields"][1]["value"], "/logged");
+    assert!(!String::from_utf8_lossy(&invoked.stderr).contains("private"));
+}
+
+#[test]
+fn failed_invoke_publishes_only_redacted_failure_logs_and_no_response() {
+    let directory = TestDirectory::new("invoke-failure-logs");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    log_error(
+        "request.failed",
+        [record { name: "api-key", value: request.body }],
+    );
+    record { status: 99, headers: [], body: "not-published" }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/failure-log-webhook"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+logs = true
+"#,
+    );
+    assert!(
+        krit_in(&directory)
+            .args(["build", "--manifest"])
+            .arg(&manifest)
+            .output()
+            .expect("Krit should build")
+            .status
+            .success()
+    );
+    let request = directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":"private-failure"}"#,
+    );
+    let invoked = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should invoke");
+    assert_eq!(invoked.status.code(), Some(1));
+    assert!(invoked.stdout.is_empty());
+    let stderr = String::from_utf8(invoked.stderr).expect("stderr should be UTF-8");
+    let mut lines = stderr.lines();
+    let log: serde_json::Value =
+        serde_json::from_str(lines.next().expect("failure log")).expect("valid log JSON");
+    assert_eq!(log["outcome"], "failure");
+    assert_eq!(log["fields"][0]["value"], "[REDACTED]");
+    assert!(lines.next().expect("diagnostic").contains("error[K4001]"));
+    assert!(!stderr.contains("private-failure"));
+    assert!(!stderr.contains("not-published"));
+}
+
+#[test]
+fn schema_two_host_policy_cannot_add_ai_or_http_authority() {
+    let directory = TestDirectory::new("host-config-schema-two-grants");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.body }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/schema-two"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+"#,
+    );
+    assert!(
+        krit_in(&directory)
+            .args(["build", "--manifest"])
+            .arg(&manifest)
+            .output()
+            .expect("Krit should build")
+            .status
+            .success()
+    );
+    let host = directory.file(
+        "host.json",
+        r#"{
+  "schema": 2,
+  "aiAdapters": {
+    "reviewer": {
+      "kind": "http-json",
+      "origin": "https://ai.example",
+      "path": "/invoke",
+      "model": "test",
+      "maxInputBytes": 1024,
+      "maxResponseBytes": 1024,
+      "timeoutMs": 100
+    }
+  }
+}"#,
+    );
+    let request = directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":""}"#,
+    );
+    let denied = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--host-config")
+        .arg(&host)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should reject host-added AI authority");
+    assert_eq!(denied.status.code(), Some(4));
+    assert!(denied.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("AI adapter `reviewer`"));
+}
+
+#[test]
+fn schema_two_host_policy_is_compatible_with_a_nonexecuted_ai_branch() {
+    let directory = TestDirectory::new("host-config-schema-two-valid");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    if true {
+        record { status: 200, headers: [], body: request.body }
+    } else {
+        match ai_invoke("reviewer", request.body) {
+            Ok(output) => record { status: 200, headers: [], body: output },
+            Err(error) => record { status: 503, headers: [], body: error },
+        }
+    }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/schema-two-valid"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+http = ["https://ai.example.invalid"]
+ai = ["reviewer"]
+"#,
+    );
+    assert!(
+        krit_in(&directory)
+            .args(["build", "--manifest"])
+            .arg(&manifest)
+            .output()
+            .expect("Krit should build")
+            .status
+            .success()
+    );
+    let host = directory.file(
+        "host.json",
+        r#"{
+  "schema": 2,
+  "aiAdapters": {
+    "reviewer": {
+      "kind": "http-json",
+      "origin": "https://ai.example.invalid",
+      "path": "/invoke",
+      "model": "test",
+      "maxInputBytes": 1024,
+      "maxResponseBytes": 1024,
+      "timeoutMs": 100
+    }
+  },
+  "approvals": [
+    {"operation": "ai.invoke", "resource": "reviewer"}
+  ]
+}"#,
+    );
+    let request = directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":"ok"}"#,
+    );
+    let invoked = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--host-config")
+        .arg(&host)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should invoke");
+    assert!(
+        invoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&invoked.stderr)
+    );
+    assert_eq!(
+        invoked.stdout,
+        b"{\"status\":200,\"headers\":[],\"body\":\"ok\"}\n"
+    );
+}
+
+#[test]
 fn serve_once_handles_a_real_http_request() {
     let directory = TestDirectory::new("serve-once");
     directory.file(
         "main.krit",
         r#"
 webhook fn handle(request: HttpRequest) -> HttpResponse {
+    log_info("serve.received", [record { name: "path", value: request.path }]);
     record {
         status: 203,
         headers: [record { name: "x-krit", value: "served" }],
@@ -1645,6 +1959,7 @@ entry = "main.krit"
 license = "Apache-2.0"
 
 [capabilities]
+logs = true
 "#,
     );
     assert!(
@@ -1685,6 +2000,13 @@ license = "Apache-2.0"
     stream
         .read_to_end(&mut response)
         .expect("response should read");
+    let mut log_line = String::new();
+    stderr
+        .read_line(&mut log_line)
+        .expect("structured log line should read");
+    let log: serde_json::Value = serde_json::from_str(&log_line).expect("serve log should be JSON");
+    assert_eq!(log["event"], "serve.received");
+    assert_eq!(log["outcome"], "success");
     let output = child
         .wait_with_output()
         .expect("one-shot server should exit");
