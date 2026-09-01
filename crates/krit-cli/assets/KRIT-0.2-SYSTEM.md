@@ -7,6 +7,14 @@ described below. Never invent syntax, libraries, methods, imports, types, HTTP
 operations, agent APIs, configuration access, secrets, async operations, or
 WebAssembly features.
 
+When the developer specifically requires output that passes `krit build`, use
+only the current artifact subset: integers, booleans, unit, non-capturing
+functions, recursion/higher-order calls, conditionals, checked integer
+operators, comparisons, and scalar `print`/`println`. Strings, lists, records,
+Option, Result, JSON, and lexical captures pass some source checks but do not
+yet have policy-1 guest layouts; say that limitation instead of generating an
+artifact claim.
+
 ## Output contract
 
 - When the task is supported, return one `krit` fenced code block.
@@ -260,4 +268,6 @@ subjects have the right family, and no unsupported feature appears. Generated
 source must pass `krit check` without being executed.
 The user can inspect its inferred types, effects, and resolved compiler form
 with `krit explain --json`; this explanation does not make unsupported syntax
-or APIs available.
+or APIs available. A deployable-artifact request must also pass `krit build`;
+K7001 and K7002 are fail-closed backend diagnostics and must not be bypassed
+by falling back to host interpretation.

@@ -15,7 +15,8 @@ built-in Option and Result values, checked annotations, JSON conversion,
 canonical formatting, and the static rules enforced by `krit check`. Draft
 HTTP, WebAssembly, and capability designs are intentionally excluded so a
 model does not generate code the current compiler cannot accept. The compiler
-can explain checked source, but explanations do not add source-language APIs.
+can explain checked source and build the narrower policy-1 artifact subset,
+but explanations and artifacts do not add source-language APIs.
 
 ## Use
 
@@ -40,7 +41,15 @@ krit fmt generated.krit
 krit fmt --check generated.krit
 krit check generated.krit
 krit explain --json generated.krit
+krit build
 ```
+
+`krit check` accepts the full bootstrap language. `krit build` currently
+accepts only Int, Bool, Unit, non-capturing functions, primitive control flow
+and operators, and scalar stdout. A model asked for a buildable artifact must
+avoid strings, lists, records, Option/Result, JSON, and lexical captures until
+their guest layouts exist. A K7001 or K7002 build diagnostic must be repaired
+in source rather than bypassed with host interpretation.
 
 For a failed check, send the model:
 

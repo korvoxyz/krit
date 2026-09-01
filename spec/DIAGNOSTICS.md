@@ -95,6 +95,10 @@ Initial required codes:
 | `K5001` | Required capability not granted |
 | `K6001` | Invalid package manifest |
 | `K6002` | Lockfile is stale or invalid |
+| `K7001` | Residual or unresolved type requires specialization before layout |
+| `K7002` | Core semantics or concrete layout is unsupported by the artifact target |
+| `K7003` | WebAssembly emission, validation, metadata attachment, or output failed |
+| `K7004` | Artifact metadata, byte size, or content digest mismatch |
 | `K8001` | Source is not canonically formatted in formatter check mode |
 
 ## Exit statuses
@@ -105,7 +109,7 @@ Initial required codes:
 | `1` | Source, compile, runtime, test, or conformance failure |
 | `2` | Invalid CLI usage |
 | `3` | Package resolution, lockfile, registry, or build-plan failure |
-| `4` | Capability grant or sandbox setup failure |
+| `4` | Capability grant or sandbox setup failure, including `krit build` K5001 |
 | `101` | Internal compiler error |
 
 An internal compiler error is always a Krit bug. It must include a stable crash

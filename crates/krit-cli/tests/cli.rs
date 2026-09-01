@@ -5,6 +5,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use krit_wasm::{ArtifactMetadata, validate_artifact};
+
 static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory {
@@ -588,4 +590,286 @@ fn prints_the_versioned_generation_prompt() {
             .any(|window| window == b"Never invent syntax")
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn builds_default_and_custom_component_outputs() {
+    let directory = TestDirectory::new("build-outputs");
+    directory.file("main.krit", "println(720);\n");
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/program"
+version = "1.2.3"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+stdout = true
+"#,
+    );
+
+    let default = krit()
+        .arg("build")
+        .arg("--manifest")
+        .arg(&manifest)
+        .output()
+        .expect("Krit should start");
+    assert!(
+        default.status.success(),
+        "{}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    let default_component = directory.path.join("target/krit/program.wasm");
+    assert!(default_component.is_file());
+    assert_valid_artifact(&default_component);
+    assert_eq!(
+        String::from_utf8(default.stdout).expect("build output should be UTF-8"),
+        format!(
+            "built {}\nmetadata {}.json\n",
+            default_component.display(),
+            default_component.display()
+        )
+    );
+
+    let custom_component = directory.path.join("dist/custom.component.wasm");
+    let custom = krit()
+        .arg("build")
+        .arg(format!("--manifest={}", manifest.display()))
+        .arg("--output")
+        .arg(&custom_component)
+        .output()
+        .expect("Krit should start");
+    assert!(
+        custom.status.success(),
+        "{}",
+        String::from_utf8_lossy(&custom.stderr)
+    );
+    assert_valid_artifact(&custom_component);
+
+    let mut relative_command = krit();
+    relative_command.current_dir(&directory.path);
+    let relative = relative_command
+        .args([
+            "build",
+            "--manifest",
+            "krit.pkg",
+            "--output",
+            "relative.wasm",
+        ])
+        .output()
+        .expect("Krit should start");
+    assert!(
+        relative.status.success(),
+        "{}",
+        String::from_utf8_lossy(&relative.stderr)
+    );
+    assert_valid_artifact(&directory.path.join("relative.wasm"));
+}
+
+#[test]
+fn build_fails_closed_for_capabilities_and_unsupported_layouts() {
+    let directory = TestDirectory::new("build-fail-closed");
+    directory.file("main.krit", "println(1);\n");
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/program"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+"#,
+    );
+    let output = directory.path.join("program.wasm");
+    let denied = krit()
+        .arg("build")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(denied.status.code(), Some(4));
+    assert!(denied.stdout.is_empty());
+    assert!(
+        String::from_utf8(denied.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K5001]")
+    );
+    assert!(!output.exists());
+    assert!(!metadata_path(&output).exists());
+
+    fs::write(directory.path.join("main.krit"), "println(\"text\");\n")
+        .expect("source should be replaced");
+    let manifest_text = fs::read_to_string(&manifest).expect("manifest should be readable");
+    fs::write(
+        &manifest,
+        format!("{manifest_text}\n[capabilities]\nstdout = true\n"),
+    )
+    .expect("manifest should be replaced");
+    let unsupported = krit()
+        .arg("build")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(unsupported.status.code(), Some(1));
+    assert!(unsupported.stdout.is_empty());
+    assert!(
+        String::from_utf8(unsupported.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K7002]")
+    );
+    assert!(!output.exists());
+    assert!(!metadata_path(&output).exists());
+}
+
+#[test]
+fn build_output_failure_preserves_the_previous_pair() {
+    let directory = TestDirectory::new("build-atomic-failure");
+    directory.file("main.krit", "println(1);\n");
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/program"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+stdout = true
+"#,
+    );
+    let output = directory.file("program.wasm", "previous component");
+    let metadata = metadata_path(&output);
+    fs::create_dir(&metadata).expect("metadata destination should be a directory");
+
+    let failed = krit()
+        .arg("build")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+    assert!(
+        String::from_utf8(failed.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K7003]")
+    );
+    assert_eq!(
+        fs::read_to_string(&output).expect("old component should remain"),
+        "previous component"
+    );
+    assert!(metadata.is_dir());
+    assert_eq!(
+        fs::read_dir(&directory.path)
+            .expect("test directory should be readable")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".krit-"))
+            .count(),
+        0,
+        "failed build should not leave staged files"
+    );
+}
+
+#[test]
+fn build_rejects_invalid_options() {
+    for arguments in [
+        vec!["build", "--unknown"],
+        vec!["build", "--manifest"],
+        vec!["build", "--output"],
+        vec!["build", "krit.pkg"],
+    ] {
+        let output = krit().args(arguments).output().expect("Krit should start");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .expect("diagnostic should be UTF-8")
+                .starts_with("krit: ")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn build_rejects_an_entry_symlink_that_escapes_the_package() {
+    use std::os::unix::fs::symlink;
+
+    let directory = TestDirectory::new("build-entry-symlink");
+    let outside = directory
+        .path
+        .parent()
+        .expect("test directory should have a parent")
+        .join(format!(
+            "outside-{}-{}.krit",
+            std::process::id(),
+            TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+    fs::write(&outside, "println(1);\n").expect("outside source should be written");
+    symlink(&outside, directory.path.join("main.krit")).expect("entry symlink should be created");
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/program"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+stdout = true
+"#,
+    );
+
+    let output = krit()
+        .arg("build")
+        .arg("--manifest")
+        .arg(&manifest)
+        .output()
+        .expect("Krit should start");
+    let _ = fs::remove_file(&outside);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K6001]")
+    );
+    assert!(!directory.path.join("target").exists());
+}
+
+fn assert_valid_artifact(path: &Path) {
+    let bytes = fs::read(path).expect("component should be readable");
+    let metadata: ArtifactMetadata = serde_json::from_slice(
+        &fs::read(metadata_path(path)).expect("artifact metadata should be readable"),
+    )
+    .expect("artifact metadata should be valid JSON");
+    validate_artifact(&bytes, &metadata).expect("CLI artifact should validate");
+}
+
+fn metadata_path(path: &Path) -> PathBuf {
+    let mut metadata = path.as_os_str().to_os_string();
+    metadata.push(".json");
+    PathBuf::from(metadata)
 }

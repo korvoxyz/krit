@@ -3,6 +3,7 @@ members = [
     "crates/krit",
     "crates/krit-cli",
     "crates/krit-package",
+    "crates/krit-wasm",
 ]
 resolver = "2"
 
@@ -17,10 +18,23 @@ repository = "https://github.com/akshay-bhardwaj/Krit"
 [workspace.dependencies]
 krit = { path = "crates/krit" }
 krit-package = { path = "crates/krit-package" }
+krit-wasm = { path = "crates/krit-wasm" }
+blake3 = "1.8.7"
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
+wasm-encoder = { version = "0.258.0", default-features = false, features = ["std"] }
+wasm-metadata = { version = "0.258.0", default-features = false }
+wasmparser = { version = "0.258.0", default-features = false, features = [
+    "component-model",
+    "features",
+    "prefer-btree-collections",
+    "std",
+    "validate",
+] }
+wit-component = { version = "0.258.0", default-features = false }
+wit-parser = { version = "0.258.0", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

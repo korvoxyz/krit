@@ -21,7 +21,7 @@ infer semantics from historical interpreter behavior.
 | [TYPES-AND-EFFECTS.md](TYPES-AND-EFFECTS.md) | Implemented baseline | Static types and effect checking |
 | [CAPABILITIES.md](CAPABILITIES.md) | Draft | Runtime authority and sandbox boundaries |
 | [PACKAGES.md](PACKAGES.md) | Draft | Modules, manifests, lockfiles, and registries |
-| [WASM-SANDBOX.md](WASM-SANDBOX.md) | Draft | WebAssembly component and host security boundary |
+| [WASM-SANDBOX.md](WASM-SANDBOX.md) | Artifact baseline | Implemented component artifacts; host boundary remains draft |
 | [GUIDED-AUTHORING.md](GUIDED-AUTHORING.md) | Draft | Deterministic and optional LLM coding guidance |
 
 `LANGUAGE.md` deliberately defines a new readable syntax for the Rust

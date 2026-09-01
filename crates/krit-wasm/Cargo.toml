@@ -1,6 +1,6 @@
 [package]
-name = "krit-cli"
-description = "Command-line interface for the Krit programming language"
+name = "krit-wasm"
+description = "Validated WebAssembly component artifact backend for Krit"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,16 +8,16 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "krit"
-path = "src/main.rs"
-
 [dependencies]
+blake3.workspace = true
 krit.workspace = true
-krit-package.workspace = true
-krit-wasm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+wasm-encoder.workspace = true
+wasm-metadata.workspace = true
+wasmparser.workspace = true
+wit-component.workspace = true
+wit-parser.workspace = true
 
 [lints]
 workspace = true

@@ -50,21 +50,24 @@ errors can be represented without untyped maps or hidden exceptions.
 
 ## Phase 3: WebAssembly boundary
 
-**Status:** In progress; typed Core IR milestone complete
+**Status:** In progress; deterministic artifact milestone complete
 
 - typed Core IR (complete)
 - deterministic `krit explain` compiler facts (complete)
-- specialization/monomorphization of residual parametric Core types, or stable
-  source diagnostics before layout
-- closure of open structural record requirements before selecting Wasm layouts
-- WebAssembly component generation
-- artifact validation and hashing
+- stable `K7001` residual-layout diagnostics (complete for artifact policy 1;
+  general specialization remains future work)
+- stable rejection of layouts and captures outside the initial backend subset
+  (complete)
+- WebAssembly component generation for Int, Bool, Unit, non-capturing
+  functions, control flow, checked operators, and scalar stdout (complete)
+- explicit feature/import validation, schema-1 metadata, and exact-byte BLAKE3
+  hashing (complete)
 - one Rust component host
 - memory, fuel, stack, host-call, output, and deadline limits
 - effective `krit permissions`
 
-Gate: a pure component behaves identically to the direct evaluator and cannot
-access ambient host resources.
+The host and differential execution gate remain open. No current command
+executes a component.
 
 ## Phase 4: stateless reference agent
 

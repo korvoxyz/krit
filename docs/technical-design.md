@@ -1,6 +1,6 @@
 # Krit Rust technical design
 
-**Status:** Accepted; typed Core IR implemented
+**Status:** Accepted; typed Core IR and artifact backend implemented
 **Owner:** Akshay Bhardwaj
 
 ## Decision
@@ -42,12 +42,11 @@ source database -> lexer -> parser -> AST
 ```
 
 The Rust bootstrap implements source, lexer, parser, AST, diagnostics, name
-resolution, type/effect analysis, a verified typed Core IR, and a direct
-evaluator that establishes runtime semantics. The first deployable backend is
-a WebAssembly component, but no WebAssembly crate or artifact exists yet. The
-backend becomes the default only after differential tests prove equivalent
-behavior. The direct evaluator remains a development oracle, not a deployment
-runtime.
+resolution, type/effect analysis, a verified typed Core IR, a direct evaluator
+that establishes runtime semantics, and `krit-wasm`, a strict Core-to-component
+artifact backend. `krit build` emits validated artifacts but no component host
+exists yet. `krit run` therefore remains the direct evaluator and no sandbox
+execution claim is made.
 
 ## Workspace
 
@@ -197,28 +196,45 @@ Initial optimizations:
 
 ## WebAssembly component target
 
-The primary deployable artifact is a small WebAssembly component. It exports
-typed HTTP, webhook, schedule, queue, or agent-tool entry points and imports
-only narrow host interfaces authorized for the package.
+The implemented policy-1 artifact is a small WebAssembly component that
+selects one of two checked-in `krit:runtime@0.2.0` worlds from checked effects.
+`krit:runtime/pure-program@0.2.0` exports `run: func()` with no imports.
+`krit:runtime/program@0.2.0` exports the same function and imports the typed
+`krit:runtime/stdout@0.2.0` interface. Unused manifest grants do not widen the
+selected world. HTTP, webhook, schedule, queue, and agent-tool entry points
+remain future worlds.
 
 Krit does not grant a general WASI environment. Files, sockets, processes,
 environment variables, clocks, randomness, secrets, state, and AI calls are
 host resources available only through explicit component imports and
 unforgeable handles.
 
-An artifact records:
+The backend uses `i64` for `Int`, `i32` for `Bool`, zero-width `Unit`, and
+bounded-table `i32` slots for non-capturing functions. It supports recursive
+and higher-order calls, Core blocks/conditionals, checked integer operations,
+primitive comparisons, and scalar stdout. It rejects residual types, lexical
+captures, strings, composites, variants, matching, JSON conversion, and
+unknown built-ins before emission.
+
+An adjacent metadata document records:
 
 - WebAssembly Component Model version
 - compiler build identifier
 - language edition
-- public interface and inferred effect hashes
-- source-map and explanation metadata selected by profile
-- artifact checksum
+- target world and sorted imports/effects
+- package-relative source entry and package identity
+- build profile and validation-policy version
+- exact final-byte BLAKE3 checksum and byte size
 
-Unknown features or interfaces fail closed. Every component is validated
-before storage and instantiation.
+Core and component bytes are validated with an explicit fail-closed feature
+and import policy. WIT canonical ABI names and signatures are derived from the
+selected world in the parsed checked-in package. Validation derives policy
+effects and world selection from the exact component and core import surfaces,
+then requires embedded and adjacent metadata to match. Components contain
+bounded standard/custom metadata without source text or machine paths.
 
-Wasmtime is the initial reference host candidate. The host enforces fuel or
+Wasmtime is still only the initial reference host candidate and is not a
+dependency. The future host will enforce fuel or
 epoch interruption, memory, stack, host-call, output, and wall-time limits.
 Untrusted multi-tenant execution adds a restricted OS process or container.
 `spec/WASM-SANDBOX.md` defines the security contract.

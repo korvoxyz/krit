@@ -1,0 +1,16 @@
+package krit:runtime@0.2.0;
+
+interface stdout {
+    write-int: func(value: s64, newline: bool);
+    write-bool: func(value: bool, newline: bool);
+    write-unit: func(newline: bool);
+}
+
+world pure-program {
+    export run: func();
+}
+
+world program {
+    import stdout;
+    export run: func();
+}

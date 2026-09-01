@@ -11,6 +11,7 @@ use krit::{
     run_source,
 };
 use krit_package::Manifest;
+use krit_wasm::{BuildErrorKind, BuildOptions, build_component};
 use serde::Serialize;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -43,6 +44,7 @@ fn run(arguments: Vec<String>) -> u8 {
         }
         "run" => source_command(&arguments[1..], SourceAction::Run),
         "check" => source_command(&arguments[1..], SourceAction::Check),
+        "build" => build_command(&arguments[1..]),
         "explain" => explain_command(&arguments[1..]),
         "fmt" => fmt_command(&arguments[1..]),
         "prompt" => prompt_command(&arguments[1..]),
@@ -52,6 +54,309 @@ fn run(arguments: Vec<String>) -> u8 {
             eprintln!("krit: unknown command `{unknown}`");
             eprintln!("Run `krit --help` for usage.");
             2
+        }
+    }
+}
+
+fn build_command(arguments: &[String]) -> u8 {
+    let (manifest_path, requested_output) = match parse_build_options(arguments) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("krit: {message}");
+            return 2;
+        }
+    };
+    let manifest = match Manifest::load(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!(
+                "{}:1:1: error[K6001]: {error}",
+                manifest_path.to_string_lossy()
+            );
+            return 3;
+        }
+    };
+    let entry_path = match manifest.resolve_entry(&manifest_path) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!(
+                "{}:1:1: error[K6001]: {error}",
+                manifest_path.to_string_lossy()
+            );
+            return 3;
+        }
+    };
+    let entry_name = manifest.package.entry.to_string_lossy().replace('\\', "/");
+    let text = match fs::read_to_string(&entry_path) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("{entry_name}:1:1: error[K7003]: could not read package entry: {error}");
+            return 1;
+        }
+    };
+    let source = Source::new(entry_name.clone(), text);
+    let program = match parse_source(&source) {
+        Ok(program) => program,
+        Err(diagnostic) => return report(&diagnostic, &source, DiagnosticFormat::Human),
+    };
+    let analysis = match analyze(&program) {
+        Ok(analysis) => analysis,
+        Err(diagnostic) => return report(&diagnostic, &source, DiagnosticFormat::Human),
+    };
+    let module = match lower(&program, &analysis) {
+        Ok(module) => module,
+        Err(error) => return internal_error("KICE0001", "lowering Core IR", &error),
+    };
+
+    let mut options = BuildOptions::new(
+        &manifest.package.edition,
+        &manifest.package.name,
+        &manifest.package.version,
+        &entry_name,
+    );
+    options.target.clone_from(&manifest.package.target);
+    if manifest.capabilities.stdout {
+        options.grant_effect("io.stdout");
+    }
+    let artifact = match build_component(&module, &options) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            let span = error.span().unwrap_or_else(|| Span::new(0, 0));
+            let diagnostic = Diagnostic::new(error.code(), error.message(), span);
+            eprintln!("{}", diagnostic.render_human(&source));
+            return if error.kind() == BuildErrorKind::Capability {
+                4
+            } else {
+                1
+            };
+        }
+    };
+
+    let output =
+        requested_output.unwrap_or_else(|| default_build_output(&manifest_path, &manifest));
+    let metadata_path = metadata_path(&output);
+    let mut metadata = match serde_json::to_vec_pretty(&artifact.metadata) {
+        Ok(metadata) => metadata,
+        Err(error) => return internal_error("KICE0003", "serializing artifact metadata", &error),
+    };
+    metadata.push(b'\n');
+    if let Err(error) = replace_build_outputs(&output, &artifact.bytes, &metadata_path, &metadata) {
+        eprintln!("{}:1:1: error[K7003]: {error}", output.to_string_lossy());
+        return 1;
+    }
+    println!("built {}", output.display());
+    println!("metadata {}", metadata_path.display());
+    0
+}
+
+fn parse_build_options(arguments: &[String]) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let mut manifest = PathBuf::from("krit.pkg");
+    let mut output = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--manifest" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "`--manifest` requires a path".to_owned())?;
+                manifest = PathBuf::from(value);
+                index += 2;
+            }
+            argument if argument.starts_with("--manifest=") => {
+                let value = argument
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default();
+                if value.is_empty() {
+                    return Err("`--manifest` requires a path".to_owned());
+                }
+                manifest = PathBuf::from(value);
+                index += 1;
+            }
+            "--output" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "`--output` requires a path".to_owned())?;
+                output = Some(PathBuf::from(value));
+                index += 2;
+            }
+            argument if argument.starts_with("--output=") => {
+                let value = argument
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default();
+                if value.is_empty() {
+                    return Err("`--output` requires a path".to_owned());
+                }
+                output = Some(PathBuf::from(value));
+                index += 1;
+            }
+            argument if argument.starts_with('-') => {
+                return Err(format!("unknown option `{argument}`"));
+            }
+            argument => {
+                return Err(format!("unexpected build argument `{argument}`"));
+            }
+        }
+    }
+    Ok((manifest, output))
+}
+
+fn default_build_output(manifest_path: &Path, manifest: &Manifest) -> PathBuf {
+    let root = manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let package = manifest
+        .package
+        .name
+        .rsplit_once('/')
+        .map_or(manifest.package.name.as_str(), |(_, name)| name);
+    root.join("target/krit").join(format!("{package}.wasm"))
+}
+
+fn metadata_path(output: &Path) -> PathBuf {
+    let mut path = output.as_os_str().to_os_string();
+    path.push(".json");
+    PathBuf::from(path)
+}
+
+struct BuildOutputFile {
+    path: PathBuf,
+    staged: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+fn replace_build_outputs(
+    component_path: &Path,
+    component: &[u8],
+    metadata_path: &Path,
+    metadata: &[u8],
+) -> Result<(), String> {
+    validate_build_destination(component_path)?;
+    validate_build_destination(metadata_path)?;
+    let component_staged = stage_build_output(component_path, component, "component")?;
+    let metadata_staged = match stage_build_output(metadata_path, metadata, "metadata") {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = fs::remove_file(&component_staged);
+            return Err(error);
+        }
+    };
+    let mut files = [
+        BuildOutputFile {
+            path: component_path.to_owned(),
+            staged: component_staged,
+            backup: None,
+        },
+        BuildOutputFile {
+            path: metadata_path.to_owned(),
+            staged: metadata_staged,
+            backup: None,
+        },
+    ];
+
+    for index in 0..files.len() {
+        if files[index].path.exists() {
+            let backup = match allocate_build_sidecar(&files[index].path, "backup") {
+                Ok(backup) => backup,
+                Err(error) => {
+                    restore_build_outputs(&mut files);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = fs::rename(&files[index].path, &backup) {
+                restore_build_outputs(&mut files);
+                return Err(format!(
+                    "could not stage existing output {}: {error}",
+                    files[index].path.display()
+                ));
+            }
+            files[index].backup = Some(backup);
+        }
+    }
+
+    for index in 0..files.len() {
+        if let Err(error) = fs::rename(&files[index].staged, &files[index].path) {
+            for installed in &files[..index] {
+                let _ = fs::remove_file(&installed.path);
+            }
+            restore_build_outputs(&mut files);
+            return Err(format!(
+                "could not replace output {}: {error}",
+                files[index].path.display()
+            ));
+        }
+    }
+    for file in files {
+        if let Some(backup) = file.backup {
+            let _ = fs::remove_file(backup);
+        }
+    }
+    Ok(())
+}
+
+fn validate_build_destination(path: &Path) -> Result<(), String> {
+    if path.exists() && !path.is_file() {
+        return Err(format!("output {} is not a regular file", path.display()));
+    }
+    let parent = output_parent(path);
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "could not create output directory {}: {error}",
+            parent.display()
+        )
+    })
+}
+
+fn stage_build_output(path: &Path, bytes: &[u8], label: &str) -> Result<PathBuf, String> {
+    let staged = allocate_build_sidecar(path, label)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|error| format!("could not create staged {label}: {error}"))?;
+    if let Err(error) = output.write_all(bytes).and_then(|()| output.sync_all()) {
+        drop(output);
+        let _ = fs::remove_file(&staged);
+        return Err(format!("could not write staged {label}: {error}"));
+    }
+    Ok(staged)
+}
+
+fn allocate_build_sidecar(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let parent = output_parent(path);
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("invalid output path {}", path.display()))?;
+    for attempt in 0..100 {
+        let mut sidecar = std::ffi::OsString::from(".");
+        sidecar.push(name);
+        sidecar.push(format!(".krit-{label}-{}-{attempt}", std::process::id()));
+        let candidate = parent.join(sidecar);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "could not allocate staged output beside {}",
+        path.display()
+    ))
+}
+
+fn output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn restore_build_outputs(files: &mut [BuildOutputFile]) {
+    for file in files {
+        if file.staged.exists() {
+            let _ = fs::remove_file(&file.staged);
+        }
+        if let Some(backup) = file.backup.take() {
+            let _ = fs::rename(backup, &file.path);
         }
     }
 }
@@ -590,6 +895,7 @@ An open, human-auditable language for the age of AI.
 USAGE:
     krit run [--diagnostic-format human|json] FILE
     krit check [--diagnostic-format human|json] FILE
+    krit build [--manifest PATH] [--output PATH]
     krit explain [--json] FILE
     krit fmt [--check] FILE...
     krit prompt

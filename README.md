@@ -41,6 +41,11 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
   evaluation order
 - verified closures, recursive self bindings, captures, branches, and matches
 - stable human and schema-1 JSON compiler explanations
+- deterministic validator-accepted WebAssembly Component Model artifacts for
+  the initial layout-concrete Core subset
+- effect-selected `krit:runtime@0.2.0` pure and stdout WIT worlds
+- explicit fail-closed Wasm feature/import policy, schema-1 adjacent metadata,
+  and exact-byte BLAKE3 digests
 - recursive function declarations
 - exhaustive empty/cons list matching
 - deterministic comment-preserving canonical source formatting
@@ -48,10 +53,11 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - implementation-neutral conformance cases
 - strict package manifest validation
 
-Type/effect generalization beyond the bootstrap checker, capability
-enforcement, WebAssembly generation or hosting, agent APIs, guided authoring,
-modules, dependency resolution, and build caching are specified directions,
-not yet implemented features. Krit is not production-ready.
+Type/effect generalization beyond the bootstrap checker, composite Wasm
+layouts, the component runtime host, sandbox resource enforcement, agent APIs,
+guided authoring, modules, dependency resolution, and build caching are
+specified directions, not yet implemented features. Krit is not
+production-ready.
 
 ## Requirements
 
@@ -140,6 +146,31 @@ krit permissions --json
 Phase 1 validates configuration keys, opaque secret names, and exact
 outbound HTTP origins in `krit.pkg`. It reports requested authority only;
 deployment grants and sandbox enforcement arrive with the WebAssembly host.
+
+Build the package's validated WebAssembly component:
+
+```sh
+krit build
+krit build --manifest path/to/krit.pkg --output dist/program.wasm
+```
+
+The default output is `target/krit/krit.wasm` for this repository, with
+metadata at `target/krit/krit.wasm.json`. Metadata schema 1 includes the exact
+`blake3:<hex>` digest and byte size, package-relative entry, WIT world, sorted
+effects/imports, and policy version. The digest covers the final component
+bytes after bounded embedded metadata is attached. Pure programs select the
+zero-import `pure-program` world; programs with the checked `io.stdout` effect
+select `program` and its stdout interface. Unused manifest grants do not widen
+artifact imports, and validation derives the world and effects from the actual
+component/core import surface before accepting metadata claims.
+
+Artifact policy 1 supports `Int`, `Bool`, `Unit`, recursive and higher-order
+non-capturing functions, blocks, conditionals/short circuit, checked integer
+operators, primitive comparisons, and scalar `print`/`println`. Strings,
+lists, records, Option/Result, JSON, lexical captures, and unresolved
+parametric layouts fail with stable `K7001`/`K7002` diagnostics. `krit build`
+never falls back to direct interpretation. No command instantiates the
+component yet; `krit run` remains the direct evaluator.
 
 Request JSON Lines diagnostics for tools and AI agents:
 
@@ -245,6 +276,7 @@ version = "0.2.0"
 edition = "2026"
 entry = "examples/factorial.krit"
 license = "Apache-2.0"
+target = "wasm-component"
 
 [capabilities]
 stdout = true
@@ -265,7 +297,8 @@ The specification is the semantic authority:
 - [Types and effects](spec/TYPES-AND-EFFECTS.md) — implemented baseline
 - [Capabilities](spec/CAPABILITIES.md) — draft
 - [Modules and packages](spec/PACKAGES.md) — draft
-- [WebAssembly sandbox](spec/WASM-SANDBOX.md) — draft
+- [WebAssembly sandbox](spec/WASM-SANDBOX.md) — artifact baseline implemented;
+  host draft
 - [Guided AI authoring](spec/GUIDED-AUTHORING.md) — draft
 - [Narrow product MVP](docs/mvp.md)
 - [Agent platform roadmap](docs/agent-roadmap.md)
@@ -300,8 +333,8 @@ The accepted implementation path is:
 3. name resolution, static type/effect checking, and canonical formatting
    (complete)
 4. typed verified Core IR and deterministic explanations (complete)
-5. Core specialization/layout diagnostics, a validated WebAssembly component
-   backend, and one bounded host
+5. Core layout diagnostics and validated WebAssembly component artifacts
+   (complete for policy 1), followed by one bounded host
 6. HTTP/webhook interfaces with outbound HTTP, secrets, and AI calls
 7. optional provider-neutral inline prediction with visible checked edits
 8. broader connectors and packaging only after the reference agent succeeds

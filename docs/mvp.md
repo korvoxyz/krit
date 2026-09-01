@@ -35,7 +35,8 @@ async-runtime, TLS, SDK, or memory-management infrastructure.
 
 ## Required runtime work
 
-- one WebAssembly component backend
+- one WebAssembly component artifact backend (implemented for policy-1 scalar
+  Core; host execution remains)
 - one Rust component host
 - typed HTTP request/response interface
 - outbound HTTP allow-list

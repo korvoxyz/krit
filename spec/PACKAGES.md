@@ -57,7 +57,8 @@ globally identified by `(registry, namespace, name)`, not name alone.
 Versions follow Semantic Versioning 2.0.0. Published package contents are
 immutable for a version.
 
-`wasm-component` is the initial deployable target. Unknown targets are errors.
+`wasm-component` is the implemented artifact target and the default when
+`target` is omitted for schema-1 compatibility. Unknown targets are errors.
 The target selects an artifact contract, not additional ambient capabilities.
 
 ## Dependency sources
@@ -202,10 +203,13 @@ krit publish
 All mutating package commands support `--dry-run`. Resolution and build plans
 have stable JSON output for agent use.
 
-The planned MVP scope includes only `check`, `build`, `run`, `explain`, and
-`permissions` for one local package. The current bootstrap has no artifact
-`build` command or WebAssembly output yet. Registry, publishing, and workspace
-commands remain deferred rather than blocking the first sandboxed agent.
+The bootstrap implements `krit build [--manifest PATH] [--output PATH]` for one
+local package. The default output is
+`target/krit/<package-name>.wasm` beside the manifest, with schema-1 metadata
+at `<component>.json`. Entry paths are package-relative and must resolve inside
+the package. Missing inferred authority fails before output replacement.
+Registry, publishing, workspaces, dependency resolution, caching, and the
+component runtime remain deferred.
 
 ## Open decisions
 

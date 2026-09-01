@@ -27,6 +27,8 @@ pub struct Package {
     pub edition: String,
     pub entry: PathBuf,
     pub license: String,
+    #[serde(default = "default_target")]
+    pub target: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -85,14 +87,7 @@ impl Manifest {
             ManifestError::new(format!("could not read {}: {error}", path.display()))
         })?;
         let manifest = Self::parse(&contents)?;
-        let root = path.parent().unwrap_or_else(|| Path::new("."));
-        let entry = root.join(&manifest.package.entry);
-        if !entry.is_file() {
-            return Err(ManifestError::new(format!(
-                "package entry `{}` does not exist or is not a file",
-                manifest.package.entry.display()
-            )));
-        }
+        manifest.resolve_entry(path)?;
         Ok(manifest)
     }
 
@@ -124,6 +119,12 @@ impl Manifest {
             )));
         }
         validate_entry_path(&self.package.entry)?;
+        if self.package.target != "wasm-component" {
+            return Err(ManifestError::new(format!(
+                "unsupported package target `{}`; expected `wasm-component`",
+                self.package.target
+            )));
+        }
         if self.package.license.trim().is_empty() {
             return Err(ManifestError::new("package license cannot be empty"));
         }
@@ -150,6 +151,33 @@ impl Manifest {
         Ok(())
     }
 
+    pub fn resolve_entry(&self, manifest_path: &Path) -> Result<PathBuf, ManifestError> {
+        let root = manifest_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let canonical_root = root.canonicalize().map_err(|error| {
+            ManifestError::new(format!(
+                "could not resolve manifest directory {}: {error}",
+                root.display()
+            ))
+        })?;
+        let entry = canonical_root.join(&self.package.entry);
+        let canonical_entry = entry.canonicalize().map_err(|error| {
+            ManifestError::new(format!(
+                "package entry `{}` does not exist or is not accessible: {error}",
+                self.package.entry.display()
+            ))
+        })?;
+        if !canonical_entry.starts_with(&canonical_root) || !canonical_entry.is_file() {
+            return Err(ManifestError::new(format!(
+                "package entry `{}` must resolve to a file inside the package",
+                self.package.entry.display()
+            )));
+        }
+        Ok(canonical_entry)
+    }
+
     pub fn permission_plan(&self) -> PermissionPlan {
         let mut requested = Vec::new();
         if self.capabilities.stdout {
@@ -158,6 +186,7 @@ impl Manifest {
                 resource: None,
             });
         }
+
         requested.extend(self.capabilities.config.iter().cloned().map(|resource| {
             PermissionRequest {
                 capability: "config.read",
@@ -184,6 +213,10 @@ impl Manifest {
             grant_status: "not-evaluated",
         }
     }
+}
+
+fn default_target() -> String {
+    "wasm-component".to_owned()
 }
 
 impl PermissionPlan {
@@ -385,6 +418,19 @@ mod tests {
         )
         .expect_err("parent traversal should fail");
         assert!(error.to_string().contains("package-relative"));
+    }
+
+    #[test]
+    fn defaults_and_validates_the_component_target() {
+        let manifest = Manifest::parse(VALID).expect("manifest should be valid");
+        assert_eq!(manifest.package.target, "wasm-component");
+
+        let error = Manifest::parse(&VALID.replace(
+            "license = \"Apache-2.0\"",
+            "license = \"Apache-2.0\"\ntarget = \"native\"",
+        ))
+        .expect_err("unknown package targets should fail");
+        assert!(error.to_string().contains("unsupported package target"));
     }
 
     #[test]

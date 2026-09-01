@@ -1,13 +1,16 @@
 # WebAssembly sandbox
 
-**Status:** Draft
-**Target:** Krit 0.4
+**Status:** Artifact pipeline implemented; runtime host draft
+**Artifact metadata schema:** 1
+**Validation policy:** 1
 
 ## Decision
 
 The primary deployable Krit artifact is a small WebAssembly component. The
-component has no ambient filesystem, network, process, environment, clock,
-randomness, secret, or AI access.
+implemented policy-1 artifact has no ambient filesystem, network, process,
+environment, clock, randomness, secret, AI, or WASI access. A component host
+is not implemented yet, so this milestone builds and inspects artifacts but
+does not execute them in a sandbox.
 
 All external operations cross typed host interfaces backed by explicit
 capability handles.
@@ -46,21 +49,35 @@ Krit targets the WebAssembly Component Model and canonical typed interfaces.
 The exact supported version is recorded in the compiler and artifact metadata.
 Unknown component features fail closed.
 
-Components export typed agent entry points and import only interfaces selected
-from the package's resolved capability plan.
+The checked-in package `krit:runtime@0.2.0` defines two versioned policy-1
+worlds. `pure-program` exports `run: func()` with no imports. `program` exports
+the same function and imports only `krit:runtime/stdout@0.2.0`:
 
-Conceptual imports:
+```wit
+interface stdout {
+    write-int: func(value: s64, newline: bool);
+    write-bool: func(value: bool, newline: bool);
+    write-unit: func(newline: bool);
+}
 
-```text
-krit:http/client
-krit:secrets/read
-krit:ai/invoke
-krit:state/key-value
-krit:log/structured
+world pure-program {
+    export run: func();
+}
+
+world program {
+    import stdout;
+    export run: func();
+}
 ```
 
-Krit does not grant a general WASI environment to agent components. Preview-1
-filesystem and socket inheritance are not a compatibility path.
+The backend selects the exact world from checked effects: no effects select
+`pure-program`, while exactly `io.stdout` selects `program`. Manifest grants
+are only an upper bound and unused stdout authority does not add an import.
+The backend derives the standard32 core names and canonical ABI signatures
+from the selected parsed WIT and verifies the expected scalar contract. It
+does not maintain a second unchecked ABI declaration or add optional dummy
+imports. Krit does not grant a general WASI environment; Preview 1 inheritance
+is not a compatibility path.
 
 ## Build pipeline
 
@@ -68,21 +85,70 @@ filesystem and socket inheritance are not a compatibility path.
 Krit source
     -> resolve + type/effect check
     -> typed Core IR
-    -> WebAssembly component
-    -> validate
-    -> attach source/effect/interface metadata
-    -> content hash
-    -> optional signature
-    -> immutable artifact store
+    -> policy-1 layout/support check
+    -> wasm-encoder core module
+    -> restricted core validation
+    -> embed parsed WIT component types
+    -> wit-component componentization with validation
+    -> bounded standard + krit.metadata metadata
+    -> restricted component validation
+    -> BLAKE3 hash of the exact final bytes
+    -> adjacent schema-1 artifact metadata
 ```
 
-Validation occurs after compilation and before every untrusted artifact enters
-the cache. Cached validation can be trusted only when the runtime, validator,
-artifact bytes, and feature policy hashes match.
+`krit build` performs this complete pipeline in memory before writing. The
+component and adjacent JSON are staged beside their destinations and replaced
+with rollback on failure. The digest is `blake3:<hex>` and is stored beside,
+not inside, the hashed bytes.
 
-## Host runtime
+## Implemented backend support
 
-The Rust host runtime:
+Policy 1 represents `Int` as core `i64`, `Bool` as core `i32`, `Unit` as a
+zero-width value, and non-capturing function values as bounded-table `i32`
+slots. It supports:
+
+- integer, boolean, unit, and non-capturing function values
+- named recursion and higher-order non-capturing calls through `call_indirect`
+- literals, immutable binds, discards, nested blocks, conditionals, and
+  source-ordered short circuiting
+- checked negation, addition, subtraction, multiplication, division, and
+  remainder
+- integer ordering and primitive equality
+- `print` and `println` for `Int`, `Bool`, and `Unit`
+
+Overflow, division by zero, and remainder by zero produce deterministic Wasm
+traps. Mapping traps to stable runtime diagnostics belongs to the host
+milestone.
+
+Builds fail with `K7001` for residual parametric layouts and `K7002` for
+unsupported semantics. Policy 1 rejects strings, lists, records, options,
+results, JSON conversion, lexical captures, matches, unsupported print
+values, and any operation without a correct lowering. It never substitutes a
+trapping placeholder or direct-evaluator fallback.
+
+## Artifact policy
+
+The emitted core module has no start function or linear memory. Function
+values use one `funcref` table whose minimum and maximum are the same finite
+size. The validator enables only core MVP plus the Component Model and rejects
+threads, shared memory, multi-memory, memory64, SIMD, floating-point use,
+exceptions, GC, component async/threading, unknown sections, component starts,
+WASI, and undeclared imports.
+
+Schema-1 adjacent metadata contains compiler and language versions, edition,
+package name/version, target, WIT world, package-relative entry, exact digest
+and byte size, sorted effects/imports, build profile, and validation policy
+version. Embedded metadata is bounded and contains no source text, absolute
+paths, credentials, or secret values. `krit-wasm::validate_artifact`
+revalidates the bytes, policy, embedded facts, byte size, and digest. Validation
+derives effects and the selected world from the validated component and core
+import surfaces: zero imports mean no effects and `pure-program`; the exact
+stdout component interface and canonical core imports mean `io.stdout` and
+`program`. Embedded and adjacent claims must match those derived facts.
+
+## Host runtime (not implemented)
+
+The planned Rust host runtime will:
 
 - validates component structure and imports
 - constructs capability handles

@@ -9,8 +9,8 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 
 ### Added
 
-- Draft agent application, WebAssembly sandbox, and guided AI authoring
-  specifications
+- Draft agent application and guided AI authoring specifications plus the
+  WebAssembly sandbox design now backed by an artifact-policy baseline
 - Narrow reference-agent MVP and explicit deferred scope
 - Phased agent service roadmap from authority planning through durable state,
   queues, databases, and optional caches
@@ -54,6 +54,24 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   lowering coverage
 - `krit explain [--json] FILE` with human compiler facts and deterministic
   schema-1 JSON serialized through `serde_json`
+- Dedicated `krit-wasm` artifact crate consuming verified Core without
+  reparsing or inference
+- Checked-in `krit:runtime@0.2.0` WIT package with effect-selected
+  `pure-program` and stdout `program` worlds
+- Deterministic core Wasm and Component Model emission for Int, Bool, Unit,
+  checked operators, control flow, recursion, and non-capturing higher-order
+  calls
+- Fail-closed K7001/K7002 backend diagnostics for residual types, composites,
+  JSON, lexical captures, unsupported output, and unlowered operations
+- Explicit core/component feature and import validation with no WASI, start,
+  memory, threads, GC, exceptions, or component async, plus effects and world
+  derived from the validated import surface rather than metadata claims
+- Bounded embedded producers/custom metadata plus deterministic adjacent
+  schema-1 metadata and exact final-byte BLAKE3 digests
+- `krit build [--manifest PATH] [--output PATH]` with safe package entry
+  resolution, capability checking, deterministic defaults, and rollback-safe
+  output replacement
+- Public artifact inspection, policy validation, and digest verification APIs
 
 ### Changed
 
@@ -68,7 +86,10 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   preserving its success output, then lower and verify typed Core IR
 - Marked the readable-agent-data phase complete
 - Started Phase 3 with the Core IR boundary only; WebAssembly generation and
-  sandbox hosting remain unimplemented
+  artifact generation are now implemented; sandbox hosting remains
+  unimplemented
+- Updated the provider-neutral generation prompt to version 0.2.5 for the
+  checked artifact-build workflow and strict backend subset
 
 ## [0.2.0] - 2026-09-01
 
