@@ -46,6 +46,9 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - effect-selected `krit:runtime@0.2.0` pure and stdout WIT worlds
 - explicit fail-closed Wasm feature/import policy, schema-1 adjacent metadata,
   and exact-byte BLAKE3 digests
+- reusable-engine, fresh-Store Wasmtime component hosting with fuel, epoch
+  deadline, stack, StoreLimits, host-call, and buffered-output bounds
+- `krit sandbox` execution and artifact-aware effective permission reports
 - recursive function declarations
 - exhaustive empty/cons list matching
 - deterministic comment-preserving canonical source formatting
@@ -54,8 +57,8 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - strict package manifest validation
 
 Type/effect generalization beyond the bootstrap checker, composite Wasm
-layouts, the component runtime host, sandbox resource enforcement, agent APIs,
-guided authoring, modules, dependency resolution, and build caching are
+layouts, HTTP/agent host APIs, guided authoring, modules, dependency
+resolution, build caching, and production multi-tenant OS isolation are
 specified directions, not yet implemented features. Krit is not
 production-ready.
 
@@ -143,9 +146,16 @@ krit permissions
 krit permissions --json
 ```
 
-Phase 1 validates configuration keys, opaque secret names, and exact
-outbound HTTP origins in `krit.pkg`. It reports requested authority only;
-deployment grants and sandbox enforcement arrive with the WebAssembly host.
+Without `--artifact`, this remains the phase-1 requested-authority report.
+Artifact-aware inspection validates the adjacent metadata and component, then
+compares its exact effects/imports with the local manifest:
+
+```sh
+krit permissions --artifact target/krit/krit.wasm
+krit permissions --artifact target/krit/krit.wasm --json
+```
+
+Deployment grants remain explicitly `not-evaluated`.
 
 Build the package's validated WebAssembly component:
 
@@ -169,8 +179,21 @@ non-capturing functions, blocks, conditionals/short circuit, checked integer
 operators, primitive comparisons, and scalar `print`/`println`. Strings,
 lists, records, Option/Result, JSON, lexical captures, and unresolved
 parametric layouts fail with stable `K7001`/`K7002` diagnostics. `krit build`
-never falls back to direct interpretation. No command instantiates the
-component yet; `krit run` remains the direct evaluator.
+never falls back to direct interpretation. Run only the existing validated
+artifact:
+
+```sh
+krit sandbox
+krit sandbox --manifest path/to/krit.pkg --artifact dist/program.wasm
+```
+
+`sandbox` never builds or falls back to source execution. It uses a reusable
+Wasmtime engine with a fresh Store and instance, no WASI or inherited stdout,
+and buffered output released only on success. The exact default and hard
+limits plus the serialized epoch-scheduling and pre-deadline compilation
+limitations are documented in [the sandbox specification](spec/WASM-SANDBOX.md).
+`krit run` remains the full-language direct evaluator; the policy-1 component
+subset is intentionally narrower.
 
 Request JSON Lines diagnostics for tools and AI agents:
 
@@ -297,14 +320,15 @@ The specification is the semantic authority:
 - [Types and effects](spec/TYPES-AND-EFFECTS.md) — implemented baseline
 - [Capabilities](spec/CAPABILITIES.md) — draft
 - [Modules and packages](spec/PACKAGES.md) — draft
-- [WebAssembly sandbox](spec/WASM-SANDBOX.md) — artifact baseline implemented;
-  host draft
+- [WebAssembly sandbox](spec/WASM-SANDBOX.md) — policy-1 artifact and bounded
+  host implemented
 - [Guided AI authoring](spec/GUIDED-AUTHORING.md) — draft
 - [Narrow product MVP](docs/mvp.md)
 - [Agent platform roadmap](docs/agent-roadmap.md)
 - [Rust technical design](docs/technical-design.md)
 - [Performance methodology](docs/performance.md)
 - [Initial measured baseline](benchmarks/baseline.json)
+- [Policy-1 Wasm host baseline](benchmarks/phase3-wasm-host.json)
 - [Conformance suite](conformance/README.md)
 
 The Racket prototype is preserved only in Git history at tag
@@ -333,8 +357,8 @@ The accepted implementation path is:
 3. name resolution, static type/effect checking, and canonical formatting
    (complete)
 4. typed verified Core IR and deterministic explanations (complete)
-5. Core layout diagnostics and validated WebAssembly component artifacts
-   (complete for policy 1), followed by one bounded host
+5. Core layout diagnostics, validated WebAssembly component artifacts, and one
+   bounded host (complete for policy 1)
 6. HTTP/webhook interfaces with outbound HTTP, secrets, and AI calls
 7. optional provider-neutral inline prediction with visible checked edits
 8. broader connectors and packaging only after the reference agent succeeds

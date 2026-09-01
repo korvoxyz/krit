@@ -1,7 +1,7 @@
 use std::{
     env, fs,
     fs::OpenOptions,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -11,7 +11,8 @@ use krit::{
     run_source,
 };
 use krit_package::Manifest;
-use krit_wasm::{BuildErrorKind, BuildOptions, build_component};
+use krit_runtime::{GrantSet, Runtime, RuntimeError, RuntimeErrorKind, RuntimeLimits};
+use krit_wasm::{ArtifactMetadata, BuildErrorKind, BuildOptions, build_component};
 use serde::Serialize;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -49,6 +50,7 @@ fn run(arguments: Vec<String>) -> u8 {
         "fmt" => fmt_command(&arguments[1..]),
         "prompt" => prompt_command(&arguments[1..]),
         "permissions" => permissions_command(&arguments[1..]),
+        "sandbox" => sandbox_command(&arguments[1..]),
         "package" => package_command(&arguments[1..]),
         unknown => {
             eprintln!("krit: unknown command `{unknown}`");
@@ -850,27 +852,128 @@ fn prompt_command(arguments: &[String]) -> u8 {
     0
 }
 
-fn permissions_command(arguments: &[String]) -> u8 {
-    let mut json = false;
-    let mut manifest_path = None;
-    for argument in arguments {
-        match argument.as_str() {
-            "--json" => json = true,
+fn sandbox_command(arguments: &[String]) -> u8 {
+    let (manifest_path, requested_artifact) = match parse_sandbox_options(arguments) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("krit: {message}");
+            return 2;
+        }
+    };
+    let manifest = match Manifest::load(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!(
+                "{}:1:1: error[K6001]: {error}",
+                manifest_path.to_string_lossy()
+            );
+            return 3;
+        }
+    };
+    let artifact_path =
+        requested_artifact.unwrap_or_else(|| default_build_output(&manifest_path, &manifest));
+    let limits = RuntimeLimits::default();
+    let artifact = match load_artifact(&artifact_path, limits) {
+        Ok(artifact) => artifact,
+        Err(message) => return report_artifact_error(&artifact_path, &message),
+    };
+    let runtime = match Runtime::new(limits) {
+        Ok(runtime) => runtime,
+        Err(error) => return report_runtime_error(&artifact_path, &error),
+    };
+    let result = match runtime.execute(
+        &artifact.bytes,
+        &artifact.metadata,
+        &GrantSet::from_manifest(&manifest),
+    ) {
+        Ok(result) => result,
+        Err(error) => return report_runtime_error(&artifact_path, &error),
+    };
+    let mut stdout = io::stdout().lock();
+    if let Err(error) = write_buffered_output(&mut stdout, &result.output) {
+        eprintln!("krit: error[K4007]: could not write buffered sandbox output: {error}");
+        return 1;
+    }
+    0
+}
+
+fn write_buffered_output(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    output.write_all(bytes)?;
+    output.flush()
+}
+
+fn parse_sandbox_options(arguments: &[String]) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let mut manifest = PathBuf::from("krit.pkg");
+    let mut artifact = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--manifest" => {
+                manifest = option_path(arguments, index, "--manifest")?;
+                index += 2;
+            }
+            argument if argument.starts_with("--manifest=") => {
+                manifest = assigned_path(argument, "--manifest")?;
+                index += 1;
+            }
+            "--artifact" => {
+                if artifact.is_some() {
+                    return Err("`--artifact` may be specified only once".to_owned());
+                }
+                artifact = Some(option_path(arguments, index, "--artifact")?);
+                index += 2;
+            }
+            argument if argument.starts_with("--artifact=") => {
+                if artifact.is_some() {
+                    return Err("`--artifact` may be specified only once".to_owned());
+                }
+                artifact = Some(assigned_path(argument, "--artifact")?);
+                index += 1;
+            }
             argument if argument.starts_with('-') => {
-                eprintln!("krit: unknown option `{argument}`");
-                return 2;
+                return Err(format!("unknown option `{argument}`"));
             }
-            argument if manifest_path.is_none() => manifest_path = Some(argument),
-            _ => {
-                eprintln!("krit: expected at most one manifest path");
-                return 2;
-            }
+            argument => return Err(format!("unexpected sandbox argument `{argument}`")),
         }
     }
+    Ok((manifest, artifact))
+}
 
-    let path = manifest_path.map_or_else(|| PathBuf::from("krit.pkg"), PathBuf::from);
+fn permissions_command(arguments: &[String]) -> u8 {
+    let (json, artifact_path, path) = match parse_permissions_options(arguments) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("krit: {message}");
+            return 2;
+        }
+    };
     match Manifest::load(&path) {
         Ok(manifest) => {
+            if let Some(artifact_path) = artifact_path {
+                let limits = RuntimeLimits::default();
+                let artifact = match load_artifact(&artifact_path, limits) {
+                    Ok(artifact) => artifact,
+                    Err(message) => return report_artifact_error(&artifact_path, &message),
+                };
+                let runtime = match Runtime::new(limits) {
+                    Ok(runtime) => runtime,
+                    Err(error) => return report_runtime_error(&artifact_path, &error),
+                };
+                let effective = match runtime.permissions(
+                    &artifact.bytes,
+                    &artifact.metadata,
+                    &GrantSet::from_manifest(&manifest),
+                ) {
+                    Ok(effective) => effective,
+                    Err(error) => return report_runtime_error(&artifact_path, &error),
+                };
+                if json {
+                    println!("{}", effective.render_json());
+                } else {
+                    print!("{}", effective.render_human());
+                }
+                return if effective.allowed() { 0 } else { 4 };
+            }
             let plan = manifest.permission_plan();
             if json {
                 println!("{}", plan.render_json());
@@ -883,6 +986,132 @@ fn permissions_command(arguments: &[String]) -> u8 {
             eprintln!("{}:1:1: error[K6001]: {error}", path.to_string_lossy());
             3
         }
+    }
+}
+
+fn parse_permissions_options(
+    arguments: &[String],
+) -> Result<(bool, Option<PathBuf>, PathBuf), String> {
+    let mut json = false;
+    let mut artifact = None;
+    let mut manifest = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--artifact" => {
+                if artifact.is_some() {
+                    return Err("`--artifact` may be specified only once".to_owned());
+                }
+                artifact = Some(option_path(arguments, index, "--artifact")?);
+                index += 2;
+            }
+            argument if argument.starts_with("--artifact=") => {
+                if artifact.is_some() {
+                    return Err("`--artifact` may be specified only once".to_owned());
+                }
+                artifact = Some(assigned_path(argument, "--artifact")?);
+                index += 1;
+            }
+            argument if argument.starts_with('-') => {
+                return Err(format!("unknown option `{argument}`"));
+            }
+            argument if manifest.is_none() => {
+                manifest = Some(PathBuf::from(argument));
+                index += 1;
+            }
+            _ => return Err("expected at most one manifest path".to_owned()),
+        }
+    }
+    Ok((
+        json,
+        artifact,
+        manifest.unwrap_or_else(|| PathBuf::from("krit.pkg")),
+    ))
+}
+
+fn option_path(arguments: &[String], index: usize, option: &str) -> Result<PathBuf, String> {
+    arguments
+        .get(index + 1)
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("`{option}` requires a path"))
+}
+
+fn assigned_path(argument: &str, option: &str) -> Result<PathBuf, String> {
+    let value = argument
+        .split_once('=')
+        .map(|(_, value)| value)
+        .unwrap_or_default();
+    if value.is_empty() {
+        Err(format!("`{option}` requires a path"))
+    } else {
+        Ok(PathBuf::from(value))
+    }
+}
+
+struct LoadedArtifact {
+    bytes: Vec<u8>,
+    metadata: ArtifactMetadata,
+}
+
+fn load_artifact(path: &Path, limits: RuntimeLimits) -> Result<LoadedArtifact, String> {
+    let bytes = read_bounded(path, limits.component_bytes()).map_err(|error| {
+        format!(
+            "could not read WebAssembly artifact {}; run `krit build` first or pass `--artifact PATH`: {error}",
+            path.display()
+        )
+    })?;
+    let sidecar = metadata_path(path);
+    let metadata_bytes = read_bounded(&sidecar, limits.metadata_bytes()).map_err(|error| {
+        format!(
+            "could not read adjacent artifact metadata {}; run `krit build` to create the component and sidecar together: {error}",
+            sidecar.display()
+        )
+    })?;
+    let metadata = serde_json::from_slice(&metadata_bytes).map_err(|error| {
+        format!(
+            "could not deserialize artifact metadata {} using schema 1: {error}",
+            sidecar.display()
+        )
+    })?;
+    Ok(LoadedArtifact { bytes, metadata })
+}
+
+fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > limit {
+        return Err(format!("file exceeds the {limit}-byte host input limit"));
+    }
+    Ok(bytes)
+}
+
+fn report_artifact_error(path: &Path, message: &str) -> u8 {
+    eprintln!("{}:1:1: error[K7003]: {message}", path.to_string_lossy());
+    1
+}
+
+fn report_runtime_error(path: &Path, error: &RuntimeError) -> u8 {
+    eprintln!(
+        "{}:1:1: error[{}]: {}",
+        path.to_string_lossy(),
+        error.code(),
+        error.message()
+    );
+    if matches!(
+        error.kind(),
+        RuntimeErrorKind::Authorization | RuntimeErrorKind::ImportMismatch
+    ) {
+        4
+    } else {
+        1
     }
 }
 
@@ -899,7 +1128,8 @@ USAGE:
     krit explain [--json] FILE
     krit fmt [--check] FILE...
     krit prompt
-    krit permissions [--json] [MANIFEST]
+    krit permissions [--artifact PATH] [--json] [MANIFEST]
+    krit sandbox [--manifest PATH] [--artifact PATH]
     krit package check [MANIFEST]
     krit --version
     krit --help"
@@ -942,6 +1172,25 @@ mod tests {
             paths,
             [PathBuf::from("one.krit"), PathBuf::from("-two.krit")]
         );
+    }
+
+    #[test]
+    fn reports_buffered_output_write_failures() {
+        struct FailedOutput;
+
+        impl Write for FailedOutput {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("closed output"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = write_buffered_output(&mut FailedOutput, b"buffered")
+            .expect_err("failed stdout should be reported");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 
     #[test]

@@ -13,10 +13,11 @@ not part of the compiler or runtime.
 The prompt contains only implemented Krit 0.2 syntax, including records,
 built-in Option and Result values, checked annotations, JSON conversion,
 canonical formatting, and the static rules enforced by `krit check`. Draft
-HTTP, WebAssembly, and capability designs are intentionally excluded so a
-model does not generate code the current compiler cannot accept. The compiler
-can explain checked source and build the narrower policy-1 artifact subset,
-but explanations and artifacts do not add source-language APIs.
+HTTP/agent and future capability APIs are intentionally excluded so a model
+does not generate code the current compiler cannot accept. The compiler can
+explain checked source, build the narrower policy-1 artifact subset, inspect
+its effective local permissions, and execute it in the bounded sandbox, but
+those commands do not add source-language APIs.
 
 ## Use
 
@@ -42,6 +43,8 @@ krit fmt --check generated.krit
 krit check generated.krit
 krit explain --json generated.krit
 krit build
+krit permissions --artifact target/krit/<package>.wasm
+krit sandbox
 ```
 
 `krit check` accepts the full bootstrap language. `krit build` currently
@@ -50,6 +53,8 @@ and operators, and scalar stdout. A model asked for a buildable artifact must
 avoid strings, lists, records, Option/Result, JSON, and lexical captures until
 their guest layouts exist. A K7001 or K7002 build diagnostic must be repaired
 in source rather than bypassed with host interpretation.
+`krit sandbox` never builds or falls back to the full direct evaluator, so the
+artifact must already exist and validate with its adjacent metadata.
 
 For a failed check, send the model:
 
@@ -66,6 +71,8 @@ checking:
 krit explain generated.krit
 krit run generated.krit
 krit permissions
+krit permissions --artifact target/krit/<package>.wasm
+krit sandbox
 ```
 
 ## Provider contract

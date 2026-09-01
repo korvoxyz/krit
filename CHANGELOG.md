@@ -72,6 +72,17 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   resolution, capability checking, deterministic defaults, and rollback-safe
   output replacement
 - Public artifact inspection, policy validation, and digest verification APIs
+- `krit-runtime`, a reusable-engine Wasmtime component host with a fresh Store
+  and instance per invocation, exact pure/stdout WIT linking, no WASI, bounded
+  precompile inputs, StoreLimits, stack, fuel, serialized epoch deadlines,
+  host-call limits, and rollback-safe buffered output
+- `krit sandbox [--manifest PATH] [--artifact PATH]` with no automatic build or
+  evaluator fallback and stable authorization/runtime exit statuses
+- Artifact-aware human and JSON `krit permissions --artifact PATH` reports
+  with complete denied output and deployment status kept `not-evaluated`
+- Stable host diagnostics `K5002` and `K5101` through `K5105`
+- Genuine Wasm integer-overflow traps for compiler checked arithmetic so an
+  adversarial `unreachable` remains generic `K4001`
 
 ### Changed
 
@@ -85,11 +96,17 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Made `krit check` perform semantic analysis without executing source while
   preserving its success output, then lower and verify typed Core IR
 - Marked the readable-agent-data phase complete
-- Started Phase 3 with the Core IR boundary only; WebAssembly generation and
-  artifact generation are now implemented; sandbox hosting remains
-  unimplemented
+- Completed Phase 3 for the policy-1 scalar/stdout subset: Core IR, component
+  artifacts, bounded sandbox hosting, differential execution, and effective
+  local permission inspection. Full-language layouts and agent interfaces
+  remain later work.
 - Updated the provider-neutral generation prompt to version 0.2.5 for the
   checked artifact-build workflow and strict backend subset
+- Updated the provider-neutral generation workflow to version 0.2.6 with
+  explicit sandbox execution and artifact permission-review commands
+- Changed the Wasmtime requirement from an exact 47.0.4 pin to compatible
+  47.0.4 while retaining the tested patch in `Cargo.lock`; documented the
+  short non-LTS support window and planned audited migration to 48 LTS
 
 ## [0.2.0] - 2026-09-01
 

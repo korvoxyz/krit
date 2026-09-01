@@ -136,6 +136,12 @@ than recomputation is removed.
 
 ## Baseline file
 
-`benchmarks/baseline.json` stores environment metadata and raw results. It is
-created only after the Rust CLI and benchmark workloads exist; fabricated
-targets are not a baseline.
+`benchmarks/baseline.json` stores the initial direct-CLI environment metadata
+and raw results. `benchmarks/phase3-wasm-host.json` records the first measured
+host baseline: a 1,393-byte factorial component, 4.523 ms median release
+process startup, 7.744 ms median end-to-end factorial sandbox invocation, and
+5.453 ms median artifact-permission inspection on the recorded Apple M3 Max
+environment. These are local reference measurements, not cross-machine
+targets or steady-state runtime throughput. The host file preserves every raw
+sample and states that process startup, validation, JIT compilation,
+instantiation, execution, and cleanup are included.

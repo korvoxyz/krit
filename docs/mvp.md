@@ -36,14 +36,16 @@ async-runtime, TLS, SDK, or memory-management infrastructure.
 ## Required runtime work
 
 - one WebAssembly component artifact backend (implemented for policy-1 scalar
-  Core; host execution remains)
-- one Rust component host
+  Core)
+- one Rust component host (implemented for policy 1; full language and agent
+  interfaces remain)
 - typed HTTP request/response interface
 - outbound HTTP allow-list
 - opaque secret handles
 - one provider-neutral AI interface
-- memory, fuel, deadline, request, response, log, and model-token limits
-- fresh or provably reset invocation state
+- memory, fuel, deadline, stack, host-call, and output limits (implemented for
+  policy 1; request/response/log/model limits follow their future interfaces)
+- fresh or provably reset invocation state (fresh Store/instance implemented)
 - structured redacted logs
 
 ## Required authoring work
@@ -52,8 +54,9 @@ async-runtime, TLS, SDK, or memory-management infrastructure.
 - parser, name, type, effect, and capability diagnostics
 - `krit check`
 - `krit explain` (typed Core/type/effect facts implemented; agent interfaces
-  and effective permissions remain future work)
-- `krit permissions`
+  remain future work)
+- `krit permissions` (requested and artifact-effective reports implemented)
+- `krit sandbox` (policy-1 execution implemented)
 - language-server compiler facts
 - one optional inline prediction provider
 - accepted suggestions formatted and checked immediately

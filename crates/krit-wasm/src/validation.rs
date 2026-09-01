@@ -23,6 +23,7 @@ pub struct ComponentInspection {
     pub effects: Vec<String>,
     pub core_module_count: u32,
     pub table_count: u32,
+    pub table_elements: u64,
     pub memory_count: u32,
 }
 
@@ -172,6 +173,7 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
     let mut core_imports = Vec::new();
     let mut core_module_count = 0u32;
     let mut table_count = 0u32;
+    let mut table_elements = 0u64;
     let mut memory_count = 0u32;
     let mut embedded = None;
 
@@ -256,6 +258,9 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
                             "embedded core function table violates policy 1",
                         ));
                     }
+                    table_elements = table_elements
+                        .checked_add(table.maximum.expect("bounded table checked above"))
+                        .ok_or_else(|| BuildError::artifact("too many function table elements"))?;
                 }
             }
             Payload::MemorySection(section) => {
@@ -377,6 +382,7 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
         effects,
         core_module_count,
         table_count,
+        table_elements,
         memory_count,
     })
 }

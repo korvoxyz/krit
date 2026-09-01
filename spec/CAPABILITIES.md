@@ -70,11 +70,13 @@ The effective grant is the intersection of:
 
 Dependencies contribute required effects but cannot add grants.
 
-`krit permissions` displays requested, granted, denied, and unused
-capabilities with the source package that introduced each requirement.
+`krit permissions` without an artifact displays the unchanged requested plan.
+`krit permissions --artifact PATH` validates the artifact and displays
+requested, required, effective, denied, exact imports, and local denial
+reasons. A denied report is printed completely and exits 4. Deployment policy
+is not implemented and remains `not-evaluated`.
 
-Before a deployment host exists, `krit permissions` reports the requested
-plan and marks grants as `not-evaluated`. `krit permissions --json` emits:
+The request-only `krit permissions --json` output remains:
 
 ```json
 {"schema":1,"package":"akshay/agent","requested":[{"capability":"http.request","resource":"https://api.github.com"},{"capability":"secret.read","resource":"github-token"}],"grantStatus":"not-evaluated"}
@@ -82,6 +84,10 @@ plan and marks grants as `not-evaluated`. `krit permissions --json` emits:
 
 Requests sort by capability and resource. Configuration keys, HTTP origins,
 and secret names are identifiers only; their values are never included.
+
+Artifact-aware JSON uses schema 1 and includes `world`, `required`,
+`effective`, `denied`, `imports`, `denialReasons`, `localGrantStatus`, and
+`deploymentGrantStatus`.
 
 ## Development mode
 

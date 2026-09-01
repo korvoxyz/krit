@@ -203,13 +203,16 @@ krit publish
 All mutating package commands support `--dry-run`. Resolution and build plans
 have stable JSON output for agent use.
 
-The bootstrap implements `krit build [--manifest PATH] [--output PATH]` for one
-local package. The default output is
+The bootstrap implements `krit build [--manifest PATH] [--output PATH]`,
+`krit sandbox [--manifest PATH] [--artifact PATH]`, and
+`krit permissions --artifact PATH [--json] [MANIFEST]` for one local package.
+The default build/sandbox artifact is
 `target/krit/<package-name>.wasm` beside the manifest, with schema-1 metadata
 at `<component>.json`. Entry paths are package-relative and must resolve inside
-the package. Missing inferred authority fails before output replacement.
+the package. Missing inferred authority fails before output replacement or
+execution. Sandbox never builds or falls back to source evaluation.
 Registry, publishing, workspaces, dependency resolution, caching, and the
-component runtime remain deferred.
+full-language/agent component runtime remain deferred.
 
 ## Open decisions
 

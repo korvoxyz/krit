@@ -556,7 +556,7 @@ fn encode_unary(
             load_value(function, context, operand)?;
             function.instruction(&Instruction::I64Const(i64::MIN));
             function.instruction(&Instruction::I64Eq);
-            trap_if(function);
+            trap_integer_overflow_if(function);
             function.instruction(&Instruction::I64Const(0));
             load_value(function, context, operand)?;
             function.instruction(&Instruction::I64Sub);
@@ -588,7 +588,7 @@ fn encode_binary(
             function.instruction(&Instruction::I64And);
             function.instruction(&Instruction::I64Const(0));
             function.instruction(&Instruction::I64LtS);
-            trap_if(function);
+            trap_integer_overflow_if(function);
         }
         BinaryOperator::Subtract => {
             load_pair(function, context, left, right)?;
@@ -603,7 +603,7 @@ fn encode_binary(
             function.instruction(&Instruction::I64And);
             function.instruction(&Instruction::I64Const(0));
             function.instruction(&Instruction::I64LtS);
-            trap_if(function);
+            trap_integer_overflow_if(function);
         }
         BinaryOperator::Multiply => {
             load_pair(function, context, left, right)?;
@@ -618,7 +618,7 @@ fn encode_binary(
             function.instruction(&Instruction::I64DivS);
             load_value(function, context, left)?;
             function.instruction(&Instruction::I64Ne);
-            trap_if(function);
+            trap_integer_overflow_if(function);
             function.instruction(&Instruction::End);
         }
         BinaryOperator::Divide => {
@@ -634,7 +634,7 @@ fn encode_binary(
             function.instruction(&Instruction::I64Const(-1));
             function.instruction(&Instruction::I64Eq);
             function.instruction(&Instruction::I32And);
-            trap_if(function);
+            trap_integer_overflow_if(function);
             load_pair(function, context, left, right)?;
             function.instruction(&Instruction::I64RemS);
             store_value(function, context, result)?;
@@ -699,9 +699,12 @@ fn encode_binary(
     Ok(())
 }
 
-fn trap_if(function: &mut Function) {
+fn trap_integer_overflow_if(function: &mut Function) {
     function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::Unreachable);
+    function.instruction(&Instruction::I64Const(i64::MIN));
+    function.instruction(&Instruction::I64Const(-1));
+    function.instruction(&Instruction::I64DivS);
+    function.instruction(&Instruction::Drop);
     function.instruction(&Instruction::End);
 }
 

@@ -1,6 +1,6 @@
 # Krit Rust technical design
 
-**Status:** Accepted; typed Core IR and artifact backend implemented
+**Status:** Accepted; policy-1 artifact backend and bounded host implemented
 **Owner:** Akshay Bhardwaj
 
 ## Decision
@@ -44,9 +44,9 @@ source database -> lexer -> parser -> AST
 The Rust bootstrap implements source, lexer, parser, AST, diagnostics, name
 resolution, type/effect analysis, a verified typed Core IR, a direct evaluator
 that establishes runtime semantics, and `krit-wasm`, a strict Core-to-component
-artifact backend. `krit build` emits validated artifacts but no component host
-exists yet. `krit run` therefore remains the direct evaluator and no sandbox
-execution claim is made.
+artifact backend, plus `krit-runtime`, a bounded component host. `krit build`
+emits validated artifacts, `krit sandbox` executes only those artifacts, and
+`krit run` remains the broader direct evaluator.
 
 ## Workspace
 
@@ -58,7 +58,7 @@ crates/
   krit-semantics/    names, types, effects, HIR
   krit-ir/           normalized Core IR
   krit-wasm/         Core IR to WebAssembly component lowering
-  krit-host/         component runtime, limits, and capability handles
+  krit-runtime/      component runtime, limits, and capability handles
   krit-package/      manifests, lockfiles, resolver, store
   krit-cli/          user command and orchestration
   krit-lsp/          deterministic compiler facts and editor operations
@@ -233,11 +233,27 @@ effects and world selection from the exact component and core import surfaces,
 then requires embedded and adjacent metadata to match. Components contain
 bounded standard/custom metadata without source text or machine paths.
 
-Wasmtime is still only the initial reference host candidate and is not a
-dependency. The future host will enforce fuel or
-epoch interruption, memory, stack, host-call, output, and wall-time limits.
-Untrusted multi-tenant execution adds a restricted OS process or container.
-`spec/WASM-SANDBOX.md` defines the security contract.
+The reference host uses Wasmtime with only the component-model, Cranelift,
+runtime, and std features. One Engine is reusable, while every invocation gets
+a fresh Store, StoreLimits, host state, component instance, fuel budget, epoch
+deadline, and output buffer. The linker provides either no imports or exactly
+the checked stdout WIT interface; it never adds WASI.
+
+Validation, digest checking, authorization, input-size checks, and static
+component resource inspection precede Wasmtime compilation. Component
+compilation occurs outside the one-second default execution deadline. Epoch
+scheduling is serialized per Runtime because increments affect all Stores
+using an Engine; each cancellable deadline worker is joined before returning.
+Output remains buffered until success, so failed invocations publish no
+partial stdout.
+
+Wasmtime 47 is a short-supported non-LTS line. `Cargo.toml` accepts security
+patches compatible with 47.0.4, and `Cargo.lock` records the exact tested
+patch. The project plans an audited move to Wasmtime 48 LTS before 47 support
+ends on 2026-09-20. Runtime-major and MSRV changes require explicit CI,
+documentation, and changelog updates. Untrusted multi-tenant execution still
+adds a restricted OS process or container. `spec/WASM-SANDBOX.md` defines the
+exact limits and security contract.
 
 A custom bytecode VM and native backend are deferred. They add a second
 security and artifact surface without helping prove the initial agent product.
@@ -265,8 +281,10 @@ not assumed linked lists.
 
 Core evaluation cannot call operating-system APIs directly. Effect
 instructions call a `Host` interface containing opaque capability handles.
-The CLI constructs a host from manifest declarations, user policy, and OS
-sandbox support.
+The current policy-1 CLI constructs only the exact stdout grant set from the
+local manifest. Future deployment hosts will additionally intersect user or
+deployment policy and OS sandbox support; artifact permission reports label
+that layer `not-evaluated` today.
 
 The runtime never inherits the entire process environment. Capability data is
 not serializable into components or cache artifacts.
@@ -293,6 +311,13 @@ and cache configuration.
 Human output goes to standard output; diagnostics and progress go to standard
 error. `--json` or command-specific JSON options emit stable schemas with no
 decorative text.
+
+`krit sandbox [--manifest PATH] [--artifact PATH]` loads only an existing
+component and adjacent schema-1 metadata, authorizes it against the manifest,
+and writes buffered guest output after success. It never builds or invokes
+the direct evaluator. `krit permissions --artifact PATH [--json] [MANIFEST]`
+uses the same bounded loader and runtime validation, prints the complete
+effective report even when denied, and exits 4 for local authorization denial.
 
 `krit fmt [--check] FILE...` validates and formats files in argument order.
 Normal mode reads and formats the complete batch before creating

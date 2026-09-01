@@ -15,6 +15,12 @@ Option, Result, JSON, and lexical captures pass some source checks but do not
 yet have policy-1 guest layouts; say that limitation instead of generating an
 artifact claim.
 
+For a requested buildable-and-runnable package, require this deterministic
+workflow: `krit check`, `krit build`, `krit permissions --artifact PATH`, then
+`krit sandbox`. Never claim that `sandbox` builds source, falls back to
+interpretation, grants HTTP/agent capabilities, or supports values outside the
+policy-1 artifact subset.
+
 ## Output contract
 
 - When the task is supported, return one `krit` fenced code block.

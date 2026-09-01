@@ -1,16 +1,16 @@
 # WebAssembly sandbox
 
-**Status:** Artifact pipeline implemented; runtime host draft
+**Status:** Policy-1 artifact pipeline and bounded reference host implemented
 **Artifact metadata schema:** 1
 **Validation policy:** 1
 
 ## Decision
 
 The primary deployable Krit artifact is a small WebAssembly component. The
-implemented policy-1 artifact has no ambient filesystem, network, process,
-environment, clock, randomness, secret, AI, or WASI access. A component host
-is not implemented yet, so this milestone builds and inspects artifacts but
-does not execute them in a sandbox.
+implemented policy-1 artifact and reference host have no ambient filesystem,
+network, process, environment, clock, randomness, secret, AI, inherited
+standard output, or WASI access. `krit sandbox` executes only a separately
+built component whose adjacent metadata validates against its exact bytes.
 
 All external operations cross typed host interfaces backed by explicit
 capability handles.
@@ -117,8 +117,10 @@ slots. It supports:
 - `print` and `println` for `Int`, `Bool`, and `Unit`
 
 Overflow, division by zero, and remainder by zero produce deterministic Wasm
-traps. Mapping traps to stable runtime diagnostics belongs to the host
-milestone.
+traps. Compiler-generated checked-overflow branches deliberately execute a
+genuine Wasm integer-overflow operation; arbitrary guest `unreachable`
+instructions remain generic `K4001` traps rather than being misclassified as
+K4005.
 
 Builds fail with `K7001` for residual parametric layouts and `K7002` for
 unsupported semantics. Policy 1 rejects strings, lists, records, options,
@@ -146,44 +148,88 @@ import surfaces: zero imports mean no effects and `pure-program`; the exact
 stdout component interface and canonical core imports mean `io.stdout` and
 `program`. Embedded and adjacent claims must match those derived facts.
 
-## Host runtime (not implemented)
+## Host runtime
 
-The planned Rust host runtime will:
+`krit-runtime` uses one reusable Wasmtime engine and creates a fresh Store,
+host state, component instance, and output buffer for every invocation. It
+revalidates metadata, digest, component shape, exact WIT world, imports, and
+resource shape before compiling. The pure world links no imports. The stdout
+world links only the three checked-in typed stdout functions; it does not
+inherit the CLI process stdout or add WASI.
 
-- validates component structure and imports
-- constructs capability handles
-- enforces memory, execution, and output limits
-- maps typed exports to HTTP, webhook, schedule, queue, and tool entry points
-- records structured effect and denial events
-- controls deadlines, cancellation, and shutdown
-- prevents environment and credential inheritance
+The stdout implementation buffers bytes in host memory. Output is returned to
+the CLI only after successful guest completion. A guest trap, host-call limit,
+output limit, deadline, fuel exhaustion, or authorization failure discards the
+entire invocation buffer. Each host write reserves and checks its complete
+addition before changing the buffer or accounting counters.
 
-Wasmtime is the initial reference runtime candidate because it supports the
-component model, fuel/epoch interruption, and mature Rust embedding. Krit
-keeps its host interfaces runtime-neutral so another conforming runtime can be
-used when footprint or platform requirements justify it.
+The wall deadline uses Wasmtime epoch interruption. Because an engine epoch is
+shared across Stores, each `Runtime` serializes component compilation and
+execution behind one scheduler lock. The deadline worker is cancellable and
+always joined before the invocation returns, so a completed invocation cannot
+interrupt a later one. Component validation and compilation happen before the
+execution deadline starts; this limitation is explicit and compilation is
+still bounded by component and metadata input limits.
+
+Under the [upstream release
+policy](https://docs.wasmtime.dev/stability-release.html), Wasmtime 47 is a
+non-LTS monthly release with a two-month support window (through 2026-09-20
+for version 47). The dependency requirement is compatible `47.0.4`, while
+`Cargo.lock` pins the exact tested patch. Security patches within 47 may be
+adopted with `cargo update` plus the complete host test suite. Krit plans an
+audited move to the Wasmtime 48 LTS line before 47 leaves support. A runtime
+major or Rust MSRV increase is never implicit: it requires CI validation,
+documentation, and a changelog entry.
 
 ## Resource limits
 
-Every invocation receives explicit maximums:
+Policy 1 uses these exact default and hard host limits:
 
-- linear memory
-- table elements
-- stack depth
-- execution fuel or equivalent instruction budget
-- wall-clock deadline
-- host calls
-- concurrent tasks
-- request and response bytes
-- log bytes
-- outbound requests
-- AI tokens and calls
+| Resource | Default | Hard maximum |
+|---|---:|---:|
+| Component bytes before compilation | 4 MiB | 16 MiB |
+| Adjacent metadata bytes | 64 KiB | 1 MiB |
+| Linear memory | 16 MiB | 64 MiB |
+| Function-table elements | 4,096 | 65,536 |
+| Instances | 16 | 64 |
+| Tables | 8 | 32 |
+| Memories | 1 | 8 |
+| Wasm stack | 512 KiB | 8 MiB |
+| Fuel | 10,000,000 | 1,000,000,000 |
+| Wall deadline | 1 second | 30 seconds |
+| Host calls | 1,024 | 1,000,000 |
+| Buffered output | 1 MiB | 16 MiB |
 
-Limits are set by the host and may be narrowed by the package. An application
-cannot raise them.
+The host configuration may narrow defaults or explicitly select the hard
+maximum policy, but guest code and package metadata cannot raise the selected
+limits. Policy 1 currently emits no guest linear memory and exactly one
+bounded function table; StoreLimits and preflight shape checks remain enabled
+so future or adversarial components fail closed.
+
+Every invocation runs on a dedicated native thread whose stack is the selected
+Wasm stack limit plus 2 MiB of fixed host headroom. This prevents guest
+recursion from reaching the caller thread's native guard page before Wasmtime
+converts the configured Wasm stack limit into `K5103`. The runtime joins this
+thread before returning, including after traps and deadline interruption.
 
 Exhaustion produces a stable resource diagnostic distinct from capability
 denial and application failure.
+
+## CLI execution and inspection
+
+```text
+krit build [--manifest PATH] [--output PATH]
+krit sandbox [--manifest PATH] [--artifact PATH]
+krit permissions --artifact PATH [--json] [MANIFEST]
+```
+
+`sandbox` defaults to `krit.pkg` and
+`target/krit/<package-name>.wasm`, with metadata at `<artifact>.json`. It never
+builds, interprets source, or searches for a fallback artifact. Missing files
+are K7003 errors. Artifact-aware `permissions` validates the component and
+prints complete requested, required, effective, denied, import, local-grant,
+and deployment-grant facts. A denied local manifest exits 4 after printing
+the report; deployment remains `not-evaluated`.
 
 ## Instance lifecycle
 

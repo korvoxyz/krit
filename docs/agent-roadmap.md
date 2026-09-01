@@ -50,7 +50,7 @@ errors can be represented without untyped maps or hidden exceptions.
 
 ## Phase 3: WebAssembly boundary
 
-**Status:** In progress; deterministic artifact milestone complete
+**Status:** Complete for the policy-1 scalar/stdout host
 
 - typed Core IR (complete)
 - deterministic `krit explain` compiler facts (complete)
@@ -62,12 +62,17 @@ errors can be represented without untyped maps or hidden exceptions.
   functions, control flow, checked operators, and scalar stdout (complete)
 - explicit feature/import validation, schema-1 metadata, and exact-byte BLAKE3
   hashing (complete)
-- one Rust component host
-- memory, fuel, stack, host-call, output, and deadline limits
-- effective `krit permissions`
+- one reusable-engine Rust component host with a fresh Store/instance per call
+  (complete)
+- memory, fuel, stack, host-call, output, and deadline limits (complete)
+- effective artifact-aware `krit permissions` (complete)
+- `krit sandbox` with no build or evaluator fallback (complete)
+- direct-evaluator/component differential tests for the policy-1 subset
+  (complete)
 
-The host and differential execution gate remain open. No current command
-executes a component.
+The phase is complete only for the current Int/Bool/Unit, non-capturing
+function, control-flow, checked-arithmetic, and scalar-stdout subset. Full
+language layouts and the HTTP/agent host belong to later phases.
 
 ## Phase 4: stateless reference agent
 

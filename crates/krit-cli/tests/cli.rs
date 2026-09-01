@@ -49,6 +49,12 @@ fn krit() -> Command {
     command
 }
 
+fn krit_in(directory: &TestDirectory) -> Command {
+    let mut command = krit();
+    command.current_dir(&directory.path);
+    command
+}
+
 #[test]
 fn runs_an_example() {
     let output = krit()
@@ -672,6 +678,346 @@ stdout = true
 }
 
 #[test]
+fn builds_and_sandboxes_a_package_without_implicit_fallbacks() {
+    let directory = TestDirectory::new("sandbox-factorial");
+    directory.file(
+        "main.krit",
+        r#"
+fn factorial(value) {
+    if value == 0 {
+        1
+    } else {
+        value * factorial(value - 1)
+    }
+}
+println(factorial(6));
+"#,
+    );
+    directory.file("krit.pkg", &package_manifest(true));
+
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("Krit should build");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let sandbox = krit_in(&directory)
+        .arg("sandbox")
+        .output()
+        .expect("Krit should sandbox");
+    assert!(sandbox.status.success());
+    assert_eq!(sandbox.stdout, b"720\n");
+    assert!(sandbox.stderr.is_empty());
+}
+
+#[test]
+fn sandbox_reports_missing_component_and_sidecar_actionably() {
+    let directory = TestDirectory::new("sandbox-missing");
+    directory.file("main.krit", "println(1);\n");
+    directory.file("krit.pkg", &package_manifest(true));
+
+    let missing_component = krit_in(&directory)
+        .arg("sandbox")
+        .output()
+        .expect("Krit should start");
+    assert_eq!(missing_component.status.code(), Some(1));
+    assert!(missing_component.stdout.is_empty());
+    let diagnostic =
+        String::from_utf8(missing_component.stderr).expect("diagnostic should be UTF-8");
+    assert!(diagnostic.contains("error[K7003]"));
+    assert!(diagnostic.contains("run `krit build` first"));
+
+    let missing_permissions = krit_in(&directory)
+        .args(["permissions", "--artifact"])
+        .arg(directory.path.join("missing.wasm"))
+        .output()
+        .expect("Krit should start");
+    assert_eq!(missing_permissions.status.code(), Some(1));
+    assert!(missing_permissions.stdout.is_empty());
+    assert!(
+        String::from_utf8(missing_permissions.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K7003]")
+    );
+
+    let artifact = directory.path.join("program.wasm");
+    fs::write(&artifact, b"not wasm").expect("placeholder artifact should be written");
+    let missing_sidecar = krit_in(&directory)
+        .args(["sandbox", "--artifact"])
+        .arg(&artifact)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(missing_sidecar.status.code(), Some(1));
+    assert!(missing_sidecar.stdout.is_empty());
+    let diagnostic = String::from_utf8(missing_sidecar.stderr).expect("diagnostic should be UTF-8");
+    assert!(diagnostic.contains("error[K7003]"));
+    assert!(diagnostic.contains("adjacent artifact metadata"));
+}
+
+#[test]
+fn sandbox_rejects_tampering_and_manifest_grant_denial() {
+    let directory = TestDirectory::new("sandbox-denial");
+    directory.file("main.krit", "println(42);\n");
+    let manifest = directory.file("krit.pkg", &package_manifest(true));
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("Krit should build");
+    assert!(build.status.success());
+    let artifact = directory.path.join("target/krit/program.wasm");
+
+    let mut tampered = fs::read(&artifact).expect("artifact should be readable");
+    *tampered.last_mut().expect("artifact should not be empty") ^= 1;
+    fs::write(&artifact, tampered).expect("artifact should be tampered");
+    let rejected = krit_in(&directory)
+        .arg("sandbox")
+        .output()
+        .expect("Krit should start");
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(
+        String::from_utf8(rejected.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K7004]")
+    );
+
+    let rebuild = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("Krit should rebuild");
+    assert!(rebuild.status.success());
+    let sidecar = metadata_path(&artifact);
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&sidecar).expect("metadata should be readable"))
+            .expect("metadata should be JSON");
+    metadata["unexpected"] = serde_json::json!(true);
+    fs::write(
+        &sidecar,
+        serde_json::to_vec(&metadata).expect("metadata should serialize"),
+    )
+    .expect("metadata should be tampered");
+    let rejected_metadata = krit_in(&directory)
+        .arg("sandbox")
+        .output()
+        .expect("Krit should start");
+    assert_eq!(rejected_metadata.status.code(), Some(1));
+    assert!(rejected_metadata.stdout.is_empty());
+    assert!(
+        String::from_utf8(rejected_metadata.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K7003]")
+    );
+
+    let rebuild = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("Krit should rebuild");
+    assert!(rebuild.status.success());
+    fs::write(&manifest, package_manifest(false)).expect("manifest should be narrowed");
+    let denied = krit_in(&directory)
+        .arg("sandbox")
+        .output()
+        .expect("Krit should start");
+    assert_eq!(denied.status.code(), Some(4));
+    assert!(denied.stdout.is_empty());
+    assert!(
+        String::from_utf8(denied.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K5001]")
+    );
+}
+
+#[test]
+fn sandbox_supports_pure_and_repeated_buffered_output() {
+    let pure = TestDirectory::new("sandbox-pure");
+    pure.file("main.krit", "let answer = 6 * 7;\n");
+    pure.file("krit.pkg", &package_manifest(false));
+    assert!(
+        krit_in(&pure)
+            .arg("build")
+            .output()
+            .expect("Krit should build")
+            .status
+            .success()
+    );
+    let pure_run = krit_in(&pure)
+        .arg("sandbox")
+        .output()
+        .expect("Krit should start");
+    assert!(pure_run.status.success());
+    assert!(pure_run.stdout.is_empty());
+    assert!(pure_run.stderr.is_empty());
+
+    let repeated = TestDirectory::new("sandbox-repeated");
+    repeated.file("main.krit", "print(1);\nprintln(true);\nprintln({});\n");
+    repeated.file("krit.pkg", &package_manifest(true));
+    assert!(
+        krit_in(&repeated)
+            .arg("build")
+            .output()
+            .expect("Krit should build")
+            .status
+            .success()
+    );
+    for _ in 0..2 {
+        let run = krit_in(&repeated)
+            .arg("sandbox")
+            .output()
+            .expect("Krit should start");
+        assert!(run.status.success());
+        assert_eq!(run.stdout, b"1true\n()\n");
+        assert!(run.stderr.is_empty());
+    }
+}
+
+#[test]
+fn sandbox_rolls_back_buffered_output_when_the_guest_fails() {
+    let directory = TestDirectory::new("sandbox-output-rollback");
+    directory.file("main.krit", "println(1);\nprintln(1 / 0);\n");
+    directory.file("krit.pkg", &package_manifest(true));
+    assert!(
+        krit_in(&directory)
+            .arg("build")
+            .output()
+            .expect("Krit should build")
+            .status
+            .success()
+    );
+
+    let failed = krit_in(&directory)
+        .arg("sandbox")
+        .output()
+        .expect("Krit should start");
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+    assert!(
+        String::from_utf8(failed.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K4004]")
+    );
+}
+
+#[test]
+fn artifact_permissions_report_allowed_and_denied_human_and_json() {
+    let directory = TestDirectory::new("artifact-permissions");
+    directory.file("main.krit", "println(42);\n");
+    let manifest = directory.file("krit.pkg", &package_manifest(true));
+    assert!(
+        krit_in(&directory)
+            .arg("build")
+            .output()
+            .expect("Krit should build")
+            .status
+            .success()
+    );
+    let artifact = directory.path.join("target/krit/program.wasm");
+
+    let allowed_human = krit_in(&directory)
+        .args(["permissions", "--artifact"])
+        .arg(&artifact)
+        .output()
+        .expect("Krit should start");
+    assert!(allowed_human.status.success());
+    assert!(allowed_human.stderr.is_empty());
+    let allowed_human = String::from_utf8(allowed_human.stdout).expect("report should be UTF-8");
+    assert!(allowed_human.contains("Required:\n  io.stdout\n"));
+    assert!(allowed_human.contains("Effective:\n  io.stdout\n"));
+    assert!(allowed_human.contains("Local manifest grants: allowed\n"));
+    assert!(allowed_human.contains("Deployment grants: not evaluated\n"));
+
+    let allowed_json = krit_in(&directory)
+        .args(["permissions", "--json", "--artifact"])
+        .arg(&artifact)
+        .output()
+        .expect("Krit should start");
+    assert!(allowed_json.status.success());
+    let report: serde_json::Value =
+        serde_json::from_slice(&allowed_json.stdout).expect("report should be JSON");
+    assert_eq!(report["localGrantStatus"], "allowed");
+    assert_eq!(report["deploymentGrantStatus"], "not-evaluated");
+    assert_eq!(report["effective"][0]["capability"], "io.stdout");
+
+    fs::write(&manifest, package_manifest(false)).expect("manifest should be narrowed");
+    let denied_human = krit_in(&directory)
+        .args(["permissions", "--artifact"])
+        .arg(&artifact)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(denied_human.status.code(), Some(4));
+    assert!(denied_human.stderr.is_empty());
+    let denied_human = String::from_utf8(denied_human.stdout).expect("report should be UTF-8");
+    assert!(denied_human.contains("Denied:\n  io.stdout\n"));
+    assert!(denied_human.contains("Local manifest grants: denied\n"));
+    assert!(denied_human.contains("Deployment grants: not evaluated\n"));
+
+    let denied_json = krit_in(&directory)
+        .args(["permissions", "--json", "--artifact"])
+        .arg(&artifact)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(denied_json.status.code(), Some(4));
+    assert!(denied_json.stderr.is_empty());
+    let report: serde_json::Value =
+        serde_json::from_slice(&denied_json.stdout).expect("report should be JSON");
+    assert_eq!(report["localGrantStatus"], "denied");
+    assert_eq!(report["denied"][0]["capability"], "io.stdout");
+    assert_eq!(report["deploymentGrantStatus"], "not-evaluated");
+}
+
+#[test]
+fn sandbox_and_artifact_permissions_use_documented_usage_and_manifest_exits() {
+    for arguments in [
+        vec!["sandbox", "--artifact"],
+        vec!["sandbox", "--unknown"],
+        vec!["sandbox", "unexpected"],
+        vec!["permissions", "--artifact"],
+        vec!["permissions", "--artifact=a", "--artifact=b"],
+    ] {
+        let output = krit().args(arguments).output().expect("Krit should start");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .expect("diagnostic should be UTF-8")
+                .starts_with("krit: ")
+        );
+    }
+
+    let directory = TestDirectory::new("sandbox-manifest-exit");
+    let missing = directory.path.join("missing.pkg");
+    for arguments in [
+        vec![
+            "sandbox".to_owned(),
+            "--manifest".to_owned(),
+            missing.to_string_lossy().into_owned(),
+        ],
+        vec![
+            "permissions".to_owned(),
+            "--artifact".to_owned(),
+            directory
+                .path
+                .join("missing.wasm")
+                .to_string_lossy()
+                .into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ],
+    ] {
+        let output = krit().args(arguments).output().expect("Krit should start");
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .expect("diagnostic should be UTF-8")
+                .contains("error[K6001]")
+        );
+    }
+}
+
+#[test]
 fn build_fails_closed_for_capabilities_and_unsupported_layouts() {
     let directory = TestDirectory::new("build-fail-closed");
     directory.file("main.krit", "println(1);\n");
@@ -872,4 +1218,22 @@ fn metadata_path(path: &Path) -> PathBuf {
     let mut metadata = path.as_os_str().to_os_string();
     metadata.push(".json");
     PathBuf::from(metadata)
+}
+
+fn package_manifest(stdout: bool) -> String {
+    format!(
+        r#"
+schema = 1
+
+[package]
+name = "test/program"
+version = "1.2.3"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+stdout = {stdout}
+"#
+    )
 }

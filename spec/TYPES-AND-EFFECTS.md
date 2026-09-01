@@ -126,9 +126,10 @@ Effects and capabilities answer different questions:
 - **Capability:** what the host permits this execution to do.
 
 A program can type-check while lacking a runtime grant. The analyzer reports
-the inferred effect set to compiler clients. `krit permissions` currently
-reports manifest requests; comparison with inferred effects and host grants is
-future work.
+the inferred effect set to compiler clients. `krit permissions` without an
+artifact reports manifest requests. With `--artifact PATH`, it validates the
+component and compares the artifact's exact required effects/imports with the
+local manifest; deployment grants remain `not-evaluated`.
 
 A dependency may declare required effects but cannot grant capabilities.
 

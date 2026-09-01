@@ -83,7 +83,7 @@ Initial required codes:
 | `K3004` | Invalid record field access |
 | `K3005` | Invalid match subject, family, or exhaustiveness |
 | `K3006` | Type is not comparable or JSON-encodable |
-| `K4001` | Wrong runtime value kind |
+| `K4001` | Generic guest trap or wrong runtime value kind |
 | `K4002` | Calling a non-function |
 | `K4003` | Function argument count mismatch |
 | `K4004` | Division or remainder by zero |
@@ -93,11 +93,17 @@ Initial required codes:
 | `K4008` | Value cannot be encoded as JSON |
 | `K4009` | Invalid or unsupported JSON input |
 | `K5001` | Required capability not granted |
+| `K5002` | Artifact import/world does not match the authorized host interface |
+| `K5101` | Wasm fuel budget exhausted |
+| `K5102` | Wasm wall-clock deadline exceeded |
+| `K5103` | Wasm memory, table, instance, stack, or host resource limit exceeded |
+| `K5104` | Host-call limit exceeded |
+| `K5105` | Buffered output-byte limit exceeded |
 | `K6001` | Invalid package manifest |
 | `K6002` | Lockfile is stale or invalid |
 | `K7001` | Residual or unresolved type requires specialization before layout |
 | `K7002` | Core semantics or concrete layout is unsupported by the artifact target |
-| `K7003` | WebAssembly emission, validation, metadata attachment, or output failed |
+| `K7003` | WebAssembly emission, validation, metadata attachment, artifact loading, or output failed |
 | `K7004` | Artifact metadata, byte size, or content digest mismatch |
 | `K8001` | Source is not canonically formatted in formatter check mode |
 
@@ -109,7 +115,7 @@ Initial required codes:
 | `1` | Source, compile, runtime, test, or conformance failure |
 | `2` | Invalid CLI usage |
 | `3` | Package resolution, lockfile, registry, or build-plan failure |
-| `4` | Capability grant or sandbox setup failure, including `krit build` K5001 |
+| `4` | Capability or import authorization denial (`K5001` or `K5002`); artifact-aware permission reports are still printed |
 | `101` | Internal compiler error |
 
 An internal compiler error is always a Krit bug. It must include a stable crash

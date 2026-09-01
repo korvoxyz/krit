@@ -52,6 +52,7 @@ fn factorial_builds_as_a_valid_deterministic_component() {
     assert_eq!(inspection.exports, ["run"]);
     assert_eq!(inspection.core_module_count, 1);
     assert_eq!(inspection.table_count, 1);
+    assert!(inspection.table_elements > 0);
     assert_eq!(inspection.memory_count, 0);
 }
 
