@@ -24,6 +24,12 @@ pub enum StatementKind {
         return_type: Option<TypeAnnotation>,
         body: Block,
     },
+    Webhook {
+        name: String,
+        parameters: Vec<Parameter>,
+        return_type: Option<TypeAnnotation>,
+        body: Block,
+    },
     Expression(Expression),
 }
 
@@ -153,6 +159,10 @@ pub enum TypeKind {
     Bool,
     String,
     Unit,
+    HttpHeader,
+    HttpRequest,
+    HttpResponse,
+    Secret,
     List(Box<TypeAnnotation>),
     Option(Box<TypeAnnotation>),
     Result(Box<TypeAnnotation>, Box<TypeAnnotation>),

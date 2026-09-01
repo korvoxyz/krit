@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/krit",
+    "crates/krit-capability",
     "crates/krit-cli",
     "crates/krit-package",
     "crates/krit-runtime",
@@ -18,6 +19,7 @@ repository = "https://github.com/akshay-bhardwaj/Krit"
 
 [workspace.dependencies]
 krit = { path = "crates/krit" }
+krit-capability = { path = "crates/krit-capability" }
 krit-package = { path = "crates/krit-package" }
 krit-runtime = { path = "crates/krit-runtime" }
 krit-wasm = { path = "crates/krit-wasm" }

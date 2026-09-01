@@ -76,7 +76,35 @@ language layouts and the HTTP/agent host belong to later phases.
 
 ## Phase 4: stateless reference agent
 
-- typed inbound HTTP/webhook interface
+**Status:** In progress
+
+### `phase4-agent-contracts`
+
+**Status:** Complete
+
+- explicit top-level typed `webhook fn` declaration
+- fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` contracts
+- deterministic draft-2020-12 request and response JSON Schemas
+- literal-resource `config.read` and `secret.read` compiler facts
+- opaque `Secret` type and checked non-disclosure restrictions
+- checked-in inbound HTTP, config, and secret WIT contracts
+- deterministic human/JSON explain facts and fail-closed run/build boundaries
+
+This milestone is compiler contracts only. It does not listen on sockets,
+perform outbound HTTP/TLS, load configuration or secret values, or call an AI
+provider.
+
+### `phase4-http-runtime`
+
+**Status:** Next
+
+- inbound socket/HTTP serving and request limits
+- component layouts for the webhook request/response boundary
+- host configuration and opaque secret providers
+- bounded outbound HTTP/TLS connector operations
+
+### Remaining Phase 4 work
+
 - bounded outbound HTTP client
 - host-managed secret handles
 - provider-neutral AI call

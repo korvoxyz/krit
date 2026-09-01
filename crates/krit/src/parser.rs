@@ -26,14 +26,36 @@ impl Parser {
 
     fn program(mut self) -> Result<Program, Diagnostic> {
         let mut statements = Vec::new();
+        let mut webhook = None;
         while !self.check(&TokenKind::Eof) {
-            statements.push(self.statement()?);
+            let statement = if self.check(&TokenKind::Webhook) {
+                self.webhook_declaration()?
+            } else {
+                self.statement()?
+            };
+            if matches!(statement.kind, StatementKind::Webhook { .. }) {
+                if webhook.is_some() {
+                    return Err(Diagnostic::new(
+                        "K2002",
+                        "a source module may declare at most one webhook",
+                        statement.span,
+                    ));
+                }
+                webhook = Some(statement.span);
+            }
+            statements.push(statement);
         }
         Ok(Program { statements })
     }
 
     fn statement(&mut self) -> Result<Statement, Diagnostic> {
-        if self.check(&TokenKind::Let) {
+        if self.check(&TokenKind::Webhook) {
+            Err(Diagnostic::new(
+                "K1004",
+                "`webhook` declarations are only allowed at the top level",
+                self.current().span,
+            ))
+        } else if self.check(&TokenKind::Let) {
             self.let_declaration()
         } else if self.check(&TokenKind::Fn)
             && matches!(
@@ -96,6 +118,29 @@ impl Parser {
         })
     }
 
+    fn webhook_declaration(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.expect(TokenKind::Webhook)?.span;
+        self.expect(TokenKind::Fn)?;
+        let (name, _) = self.binding_name()?;
+        let parameters = self.parameters()?;
+        let return_type = if self.consume(&TokenKind::ThinArrow) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
+        let body = self.block()?;
+        let span = start.join(body.span);
+        Ok(Statement {
+            kind: StatementKind::Webhook {
+                name,
+                parameters,
+                return_type,
+                body,
+            },
+            span,
+        })
+    }
+
     fn parameters(&mut self) -> Result<Vec<Parameter>, Diagnostic> {
         self.expect(TokenKind::LeftParen)?;
         let mut parameters = Vec::new();
@@ -143,6 +188,13 @@ impl Parser {
         while !self.check(&TokenKind::RightBrace) {
             if self.check(&TokenKind::Eof) {
                 return Err(self.expected("`}`"));
+            }
+            if self.check(&TokenKind::Webhook) {
+                return Err(Diagnostic::new(
+                    "K1004",
+                    "`webhook` declarations are only allowed at the top level",
+                    self.current().span,
+                ));
             }
 
             if self.check(&TokenKind::Let)
@@ -697,6 +749,10 @@ impl Parser {
             "Bool" => TypeKind::Bool,
             "String" => TypeKind::String,
             "Unit" => TypeKind::Unit,
+            "HttpHeader" => TypeKind::HttpHeader,
+            "HttpRequest" => TypeKind::HttpRequest,
+            "HttpResponse" => TypeKind::HttpResponse,
+            "Secret" => TypeKind::Secret,
             "List" => {
                 self.expect(TokenKind::Less)?;
                 let element = self.type_annotation()?;
@@ -770,7 +826,16 @@ impl Parser {
         let (name, span) = self.identifier()?;
         if matches!(
             name.as_str(),
-            "print" | "println" | "Some" | "None" | "Ok" | "Err" | "json_encode" | "json_decode"
+            "print"
+                | "println"
+                | "Some"
+                | "None"
+                | "Ok"
+                | "Err"
+                | "json_encode"
+                | "json_decode"
+                | "config_string"
+                | "secret"
         ) {
             return Err(Diagnostic::new(
                 "K2002",

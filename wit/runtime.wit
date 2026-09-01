@@ -6,6 +6,39 @@ interface stdout {
     write-unit: func(newline: bool);
 }
 
+interface webhook {
+    record header {
+        name: string,
+        value: string,
+    }
+
+    record request {
+        method: string,
+        path: string,
+        query: string,
+        headers: list<header>,
+        body: string,
+    }
+
+    record response {
+        status: s64,
+        headers: list<header>,
+        body: string,
+    }
+
+    handle: func(request: request) -> response;
+}
+
+interface config {
+    get-string: func(key: string) -> result<string, string>;
+}
+
+interface secrets {
+    resource secret;
+
+    acquire: func(name: string) -> result<secret, string>;
+}
+
 world pure-program {
     export run: func();
 }
@@ -13,4 +46,8 @@ world pure-program {
 world program {
     import stdout;
     export run: func();
+}
+
+world webhook-program {
+    export webhook;
 }

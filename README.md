@@ -37,6 +37,11 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - value annotations enforced by `krit check` and deterministic JSON conversion
 - lexical name resolution and deterministic static type inference/checking
 - sorted `io.stdout` effect inference with function and call propagation
+- one explicit typed `webhook fn` source entrypoint with fixed HTTP contract
+  aliases and deterministic request/response JSON Schemas
+- literal-resource `config.read` and `secret.read` effects plus separate
+  sorted capability requirements
+- opaque `Secret` compiler/Core identity with static non-disclosure rules
 - name-resolved, inferred typed Core IR with deterministic IDs and explicit
   evaluation order
 - verified closures, recursive self bindings, captures, branches, and matches
@@ -56,11 +61,13 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - implementation-neutral conformance cases
 - strict package manifest validation
 
-Type/effect generalization beyond the bootstrap checker, composite Wasm
-layouts, HTTP/agent host APIs, guided authoring, modules, dependency
-resolution, build caching, and production multi-tenant OS isolation are
-specified directions, not yet implemented features. Krit is not
-production-ready.
+The `phase4-agent-contracts` milestone is complete, but it is contracts only.
+There is no socket serving, outbound HTTP/TLS, configuration or secret value
+provider, AI invocation, or webhook component layout. Those remain in the
+separate `phase4-http-runtime` and later Phase 4 milestones. Type/effect
+generalization, other composite Wasm layouts, guided authoring, modules,
+dependency resolution, build caching, and production multi-tenant OS
+isolation are also future work. Krit is not production-ready.
 
 ## Requirements
 
@@ -107,8 +114,10 @@ krit explain examples/factorial.krit
 krit explain --json examples/factorial.krit
 ```
 
-The explanation shows the synthetic `module-init` entrypoint, its inferred
-effects, top-level binding/function types, and deterministic typed Core IR.
+The explanation shows the synthetic `module-init` entrypoint, any source
+webhook contract, inferred effects and literal-resource capability
+requirements, top-level binding/function types, and deterministic typed Core
+IR. Webhook JSON includes exact draft-2020-12 request and response schemas.
 Core executable references use numeric IDs; source names appear only as debug
 metadata. Explanation JSON schema 1 is serialized with `serde_json` and does
 not include absolute compiler or cache paths.
@@ -192,8 +201,10 @@ Wasmtime engine with a fresh Store and instance, no WASI or inherited stdout,
 and buffered output released only on success. The exact default and hard
 limits plus the serialized epoch-scheduling and pre-deadline compilation
 limitations are documented in [the sandbox specification](spec/WASM-SANDBOX.md).
-`krit run` remains the full-language direct evaluator; the policy-1 component
-subset is intentionally narrower.
+`krit run` remains the full-language direct evaluator for pure/stdout source;
+it fails with `K5003` for webhook, configuration, and secret host contracts
+rather than fabricating values. The policy-1 component subset is intentionally
+narrower.
 
 Request JSON Lines diagnostics for tools and AI agents:
 
@@ -221,6 +232,29 @@ krit prompt
 See [ai/README.md](ai/README.md) for the generation and diagnostic-repair
 workflow. Prompt material contains only currently implemented syntax so models
 cannot confuse draft agent APIs with compilable Krit 0.2 code.
+
+### Agent contract authoring
+
+Krit can check and explain a minimal webhook agent boundary:
+
+```krit
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let model = config_string("agent.model");
+    let token = secret("github-token");
+    record {
+        status: 200,
+        headers: [record { name: "content-type", value: "text/plain" }],
+        body: request.path,
+    }
+}
+```
+
+`config_string` returns `Result<String, String>` and `secret` returns
+`Result<Secret, String>`. Both names must be direct string literals so
+`krit explain` can report exact resources. `Secret` cannot be printed,
+compared, JSON-encoded, or stored in ordinary records/lists/variants.
+`krit check` and `krit explain` accept this contract. `krit run` and
+`krit build` deliberately fail closed until the next HTTP runtime milestone.
 
 ## Language tour
 
@@ -316,9 +350,12 @@ The specification is the semantic authority:
 - [Language charter](spec/CHARTER.md)
 - [Krit 0.2 language](spec/LANGUAGE.md)
 - [Diagnostic contract](spec/DIAGNOSTICS.md)
+- [Webhook agent contracts](spec/WEBHOOK-CONTRACTS.md) — compiler contracts
+  only
 - [Agent application model](spec/AGENT-APPLICATIONS.md) — draft
 - [Types and effects](spec/TYPES-AND-EFFECTS.md) — implemented baseline
-- [Capabilities](spec/CAPABILITIES.md) — draft
+- [Capabilities](spec/CAPABILITIES.md) — compiler contracts implemented,
+  runtime hosts draft
 - [Modules and packages](spec/PACKAGES.md) — draft
 - [WebAssembly sandbox](spec/WASM-SANDBOX.md) — policy-1 artifact and bounded
   host implemented
@@ -359,7 +396,8 @@ The accepted implementation path is:
 4. typed verified Core IR and deterministic explanations (complete)
 5. Core layout diagnostics, validated WebAssembly component artifacts, and one
    bounded host (complete for policy 1)
-6. HTTP/webhook interfaces with outbound HTTP, secrets, and AI calls
+6. webhook/config/secret compiler contracts (complete), then the separate
+   HTTP runtime, outbound HTTP, secret providers, and AI calls
 7. optional provider-neutral inline prediction with visible checked edits
 8. broader connectors and packaging only after the reference agent succeeds
 

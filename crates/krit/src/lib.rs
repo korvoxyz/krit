@@ -11,8 +11,9 @@ mod source;
 mod token;
 
 pub use analysis::{
-    Analysis, BindingAnalysis, BlockAnalysis, Effect, EffectSet, ExpressionAnalysis, FunctionType,
-    RecordType, ResolvedName, SymbolAnalysis, SymbolId, SymbolKind, Type, analyze,
+    Analysis, BindingAnalysis, BlockAnalysis, CapabilityRequirement, Effect, EffectSet,
+    ExpressionAnalysis, FunctionType, RecordType, RequirementSet, ResolvedName, SymbolAnalysis,
+    SymbolId, SymbolKind, Type, analyze,
 };
 pub use ast::{
     BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program, RecordField,

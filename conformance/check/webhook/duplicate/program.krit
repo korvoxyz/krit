@@ -1,0 +1,7 @@
+webhook fn first(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.path }
+}
+
+webhook fn second(request: HttpRequest) -> HttpResponse {
+    record { status: 204, headers: [], body: request.path }
+}

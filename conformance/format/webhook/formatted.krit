@@ -1,0 +1,10 @@
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record {
+        status: 200,
+        headers: [
+            record { name: "x-request-id", value: "one" },
+            record { name: "x-request-id", value: "two" },
+        ],
+        body: request.path,
+    }
+}

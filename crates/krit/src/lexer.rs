@@ -144,6 +144,7 @@ impl<'a> Lexer<'a> {
         let kind = match value {
             "let" => TokenKind::Let,
             "fn" => TokenKind::Fn,
+            "webhook" => TokenKind::Webhook,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "match" => TokenKind::Match,
@@ -388,5 +389,17 @@ mod tests {
                 .iter()
                 .any(|token| token.kind == TokenKind::ThinArrow)
         );
+    }
+
+    #[test]
+    fn reserves_the_webhook_keyword() {
+        let source = Source::new(
+            "test.krit",
+            "webhook fn handle(request: HttpRequest) -> HttpResponse {}",
+        );
+        let tokens = lex(&source).expect("webhook declaration should lex");
+
+        assert!(matches!(tokens[0].kind, TokenKind::Webhook));
+        assert!(matches!(tokens[1].kind, TokenKind::Fn));
     }
 }

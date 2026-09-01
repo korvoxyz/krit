@@ -5,6 +5,8 @@ use std::{
     sync::Arc,
 };
 
+use krit_capability::is_valid_resource_name;
+
 use crate::{
     Builtin, Diagnostic, Span,
     ast::{
@@ -18,6 +20,7 @@ use crate::{
 pub struct Analysis {
     bindings: Vec<BindingAnalysis>,
     effects: EffectSet,
+    requirements: RequirementSet,
     symbols: Vec<SymbolAnalysis>,
     symbol_index: Vec<u32>,
     expressions: Vec<ExpressionAnalysis>,
@@ -31,6 +34,10 @@ impl Analysis {
 
     pub const fn effects(&self) -> &EffectSet {
         &self.effects
+    }
+
+    pub const fn requirements(&self) -> &RequirementSet {
+        &self.requirements
     }
 
     pub fn symbols(&self) -> &[SymbolAnalysis] {
@@ -122,6 +129,7 @@ impl SymbolId {
 pub enum SymbolKind {
     Let,
     Function,
+    Webhook,
     Parameter,
     Match,
 }
@@ -177,6 +185,7 @@ pub struct ExpressionAnalysis {
     span: Span,
     ty: Arc<Type>,
     effects: EffectSet,
+    requirements: RequirementSet,
     resolved_name: Option<ResolvedName>,
 }
 
@@ -197,6 +206,10 @@ impl ExpressionAnalysis {
         &self.effects
     }
 
+    pub const fn requirements(&self) -> &RequirementSet {
+        &self.requirements
+    }
+
     pub const fn resolved_name(&self) -> Option<ResolvedName> {
         self.resolved_name
     }
@@ -207,6 +220,7 @@ pub struct BlockAnalysis {
     span: Span,
     ty: Arc<Type>,
     effects: EffectSet,
+    requirements: RequirementSet,
 }
 
 impl BlockAnalysis {
@@ -225,6 +239,10 @@ impl BlockAnalysis {
     pub const fn effects(&self) -> &EffectSet {
         &self.effects
     }
+
+    pub const fn requirements(&self) -> &RequirementSet {
+        &self.requirements
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -233,6 +251,10 @@ pub enum Type {
     Bool,
     String,
     Unit,
+    HttpHeader,
+    HttpRequest,
+    HttpResponse,
+    Secret,
     List(Arc<Self>),
     Record(Vec<RecordType>),
     Option(Arc<Self>),
@@ -248,6 +270,10 @@ impl fmt::Display for Type {
             Self::Bool => formatter.write_str("Bool"),
             Self::String => formatter.write_str("String"),
             Self::Unit => formatter.write_str("Unit"),
+            Self::HttpHeader => formatter.write_str("HttpHeader"),
+            Self::HttpRequest => formatter.write_str("HttpRequest"),
+            Self::HttpResponse => formatter.write_str("HttpResponse"),
+            Self::Secret => formatter.write_str("Secret"),
             Self::List(element) => write!(formatter, "List<{element}>"),
             Self::Record(fields) => {
                 formatter.write_str("Record { ")?;
@@ -288,6 +314,7 @@ pub struct FunctionType {
     parameters: Vec<Arc<Type>>,
     return_type: Arc<Type>,
     effects: EffectSet,
+    requirements: RequirementSet,
 }
 
 impl FunctionType {
@@ -295,11 +322,13 @@ impl FunctionType {
         parameters: Vec<Arc<Type>>,
         return_type: Arc<Type>,
         effects: EffectSet,
+        requirements: RequirementSet,
     ) -> Self {
         Self {
             parameters,
             return_type,
             effects,
+            requirements,
         }
     }
 
@@ -318,6 +347,10 @@ impl FunctionType {
     pub const fn effects(&self) -> &EffectSet {
         &self.effects
     }
+
+    pub const fn requirements(&self) -> &RequirementSet {
+        &self.requirements
+    }
 }
 
 impl fmt::Display for FunctionType {
@@ -333,20 +366,28 @@ impl fmt::Display for FunctionType {
             formatter,
             ") -> {} effects {}",
             self.return_type, self.effects
-        )
+        )?;
+        if !self.requirements.is_empty() {
+            write!(formatter, " requirements {}", self.requirements)?;
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum Effect {
+    ConfigRead,
     IoStdout,
+    SecretRead,
 }
 
 impl Effect {
     pub const fn as_str(&self) -> &'static str {
         match self {
+            Self::ConfigRead => "config.read",
             Self::IoStdout => "io.stdout",
+            Self::SecretRead => "secret.read",
         }
     }
 }
@@ -401,6 +442,88 @@ impl fmt::Display for EffectSet {
     }
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CapabilityRequirement {
+    capability: Effect,
+    resource: String,
+}
+
+impl CapabilityRequirement {
+    pub fn new(capability: Effect, resource: impl Into<String>) -> Self {
+        Self {
+            capability,
+            resource: resource.into(),
+        }
+    }
+
+    pub const fn capability(&self) -> &Effect {
+        &self.capability
+    }
+
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+}
+
+impl fmt::Display for CapabilityRequirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}({:?})", self.capability, self.resource)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RequirementSet {
+    requirements: Vec<CapabilityRequirement>,
+}
+
+impl RequirementSet {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &CapabilityRequirement> {
+        self.requirements.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.requirements.is_empty()
+    }
+
+    pub fn contains(&self, requirement: &CapabilityRequirement) -> bool {
+        self.requirements.binary_search(requirement).is_ok()
+    }
+
+    pub fn is_superset(&self, other: &Self) -> bool {
+        other
+            .requirements
+            .iter()
+            .all(|requirement| self.contains(requirement))
+    }
+
+    pub(crate) fn union<'a>(sets: impl IntoIterator<Item = &'a Self>) -> Self {
+        let mut requirements = BTreeSet::new();
+        for set in sets {
+            requirements.extend(set.requirements.iter().cloned());
+        }
+        requirement_set(requirements)
+    }
+
+    pub(crate) fn from_requirements(
+        requirements: impl IntoIterator<Item = CapabilityRequirement>,
+    ) -> Self {
+        requirement_set(requirements.into_iter().collect())
+    }
+}
+
+impl fmt::Display for RequirementSet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("{")?;
+        for (index, requirement) in self.requirements.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            requirement.fmt(formatter)?;
+        }
+        formatter.write_str("}")
+    }
+}
+
 pub fn analyze(program: &Program) -> Result<Analysis, Diagnostic> {
     Analyzer::new().program(program)
 }
@@ -411,6 +534,10 @@ enum InferType {
     Bool,
     String,
     Unit,
+    HttpHeader,
+    HttpRequest,
+    HttpResponse,
+    Secret,
     List(Box<Self>),
     Record {
         fields: BTreeMap<String, Self>,
@@ -432,12 +559,14 @@ type EffectVariable = u32;
 #[derive(Clone, Debug, Default)]
 struct InferEffects {
     direct: BTreeSet<Effect>,
+    direct_requirements: BTreeSet<CapabilityRequirement>,
     dependencies: BTreeSet<EffectVariable>,
 }
 
 impl InferEffects {
     fn union(&mut self, other: Self) {
         self.direct.extend(other.direct);
+        self.direct_requirements.extend(other.direct_requirements);
         self.dependencies.extend(other.dependencies);
     }
 }
@@ -488,6 +617,8 @@ enum ConstraintKind {
     Addable,
     Comparable,
     JsonValue,
+    Printable,
+    StructuralValue,
 }
 
 struct Analyzer {
@@ -502,6 +633,8 @@ struct Analyzer {
     expressions: Vec<PendingExpression>,
     blocks: Vec<PendingBlock>,
     constraints: Vec<TypeConstraint>,
+    host_builtin_references: Vec<(Span, Builtin)>,
+    direct_host_builtin_references: BTreeSet<Span>,
 }
 
 #[derive(Clone)]
@@ -524,6 +657,8 @@ impl Analyzer {
             expressions: Vec::new(),
             blocks: Vec::new(),
             constraints: Vec::new(),
+            host_builtin_references: Vec::new(),
+            direct_host_builtin_references: BTreeSet::new(),
         }
     }
 
@@ -532,10 +667,12 @@ impl Analyzer {
         for statement in &program.statements {
             effects.union(self.statement(statement)?);
         }
+        self.validate_host_builtin_references()?;
         self.validate_constraints()?;
 
         let expanded_effects = self.expanded_effects();
-        let mut normalizer = TypeNormalizer::new(&self, &expanded_effects);
+        let expanded_requirements = self.expanded_requirements();
+        let mut normalizer = TypeNormalizer::new(&self, &expanded_effects, &expanded_requirements);
         let bindings = self
             .bindings
             .iter()
@@ -547,6 +684,8 @@ impl Analyzer {
                 top_level: binding.top_level,
             })
             .collect();
+        let requirements =
+            requirement_set(self.resolve_requirements(&effects, &expanded_requirements));
         let effects = effect_set(self.resolve_effects(&effects, &expanded_effects));
         let symbols = self
             .symbols
@@ -581,6 +720,9 @@ impl Analyzer {
                 span: expression.span,
                 ty: normalizer.normalize(&expression.ty),
                 effects: effect_set(self.resolve_effects(&expression.effects, &expanded_effects)),
+                requirements: requirement_set(
+                    self.resolve_requirements(&expression.effects, &expanded_requirements),
+                ),
                 resolved_name: expression.resolved_name,
             })
             .collect::<Vec<_>>();
@@ -598,6 +740,9 @@ impl Analyzer {
                 span: block.span,
                 ty: normalizer.normalize(&block.ty),
                 effects: effect_set(self.resolve_effects(&block.effects, &expanded_effects)),
+                requirements: requirement_set(
+                    self.resolve_requirements(&block.effects, &expanded_requirements),
+                ),
             })
             .collect::<Vec<_>>();
         blocks.sort_by_key(|block| block.span);
@@ -611,6 +756,7 @@ impl Analyzer {
         Ok(Analysis {
             bindings,
             effects,
+            requirements,
             symbols,
             symbol_index,
             expressions,
@@ -663,7 +809,39 @@ impl Analyzer {
                 parameters,
                 return_type,
                 body,
+            }
+            | StatementKind::Webhook {
+                name,
+                parameters,
+                return_type,
+                body,
             } => {
+                let symbol_kind = if matches!(statement.kind, StatementKind::Webhook { .. }) {
+                    if self.scopes.len() != 1 {
+                        return Err(Diagnostic::new(
+                            "K1004",
+                            "`webhook` declarations are only allowed at the top level",
+                            statement.span,
+                        ));
+                    }
+                    let valid_parameter = parameters.len() == 1
+                        && parameters[0].annotation.as_ref().is_some_and(|annotation| {
+                            matches!(annotation.kind, TypeKind::HttpRequest)
+                        });
+                    let valid_return = return_type.as_ref().is_some_and(|annotation| {
+                        matches!(annotation.kind, TypeKind::HttpResponse)
+                    });
+                    if !valid_parameter || !valid_return {
+                        return Err(Diagnostic::new(
+                            "K3007",
+                            "webhook signature must be exactly `(request: HttpRequest) -> HttpResponse`",
+                            statement.span,
+                        ));
+                    }
+                    SymbolKind::Webhook
+                } else {
+                    SymbolKind::Function
+                };
                 self.ensure_name_available(name, statement.span)?;
                 let parameter_types = parameters
                     .iter()
@@ -687,7 +865,7 @@ impl Analyzer {
                     name,
                     function_type.clone(),
                     statement.span,
-                    SymbolKind::Function,
+                    symbol_kind,
                     top_level,
                 );
 
@@ -751,6 +929,16 @@ impl Analyzer {
             }),
             ExpressionKind::Variable(name) => {
                 let (ty, resolution) = self.lookup(name, expression.span)?;
+                if matches!(
+                    resolution,
+                    ResolvedName::Builtin(Builtin::ConfigString | Builtin::Secret)
+                ) {
+                    let ResolvedName::Builtin(builtin) = resolution else {
+                        unreachable!("matched a built-in resolution")
+                    };
+                    self.host_builtin_references
+                        .push((expression.span, builtin));
+                }
                 resolved_name = Some(resolution);
                 Ok(ExpressionInfo {
                     ty,
@@ -763,6 +951,11 @@ impl Analyzer {
                 let mut effects = InferEffects::default();
                 for field in fields {
                     let value = self.expression(&field.value)?;
+                    self.constraints.push(TypeConstraint {
+                        ty: value.ty.clone(),
+                        span: field.value.span,
+                        kind: ConstraintKind::StructuralValue,
+                    });
                     if types.insert(field.name.clone(), value.ty).is_some() {
                         return Err(Diagnostic::new(
                             "K2002",
@@ -858,6 +1051,11 @@ impl Analyzer {
         let mut effects = InferEffects::default();
         for element in elements {
             let value = self.expression(element)?;
+            self.constraints.push(TypeConstraint {
+                ty: value.ty.clone(),
+                span: element.span,
+                kind: ConstraintKind::StructuralValue,
+            });
             self.unify(element_type.clone(), value.ty, element.span, "list element")?;
             effects.union(value.effects);
         }
@@ -914,6 +1112,34 @@ impl Analyzer {
         arguments: &[Expression],
         span: Span,
     ) -> Result<ExpressionInfo, Diagnostic> {
+        let direct_resource = if let Some(builtin) = direct_host_builtin(callee) {
+            self.direct_host_builtin_references.insert(callee.span);
+            if arguments.len() == 1 {
+                let ExpressionKind::Literal(ValueLiteral::String(resource)) = &arguments[0].kind
+                else {
+                    return Err(Diagnostic::new(
+                        "K3008",
+                        format!(
+                            "`{}` requires a direct string-literal resource",
+                            builtin.as_str()
+                        ),
+                        arguments[0].span,
+                    ));
+                };
+                if !is_valid_resource_name(resource) {
+                    return Err(Diagnostic::new(
+                        "K3008",
+                        "capability resource must use 1-64 lowercase letters, digits, `.` or `-`, without leading/trailing punctuation or `..`/`--`",
+                        arguments[0].span,
+                    ));
+                }
+                Some((builtin, resource.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let callee_info = self.expression(callee)?;
         let mut effects = callee_info.effects;
         let mut argument_types = Vec::with_capacity(arguments.len());
@@ -967,6 +1193,17 @@ impl Analyzer {
                 ),
                 span,
             ));
+        }
+        if let Some((builtin, resource)) = direct_resource {
+            let capability = match builtin {
+                Builtin::ConfigString => Effect::ConfigRead,
+                Builtin::Secret => Effect::SecretRead,
+                _ => unreachable!("only resource host built-ins are returned"),
+            };
+            effects.direct.insert(capability.clone());
+            effects
+                .direct_requirements
+                .insert(CapabilityRequirement::new(capability, resource));
         }
         for (parameter, argument) in parameters.into_iter().zip(argument_types) {
             self.unify(parameter, argument, span, "function argument")?;
@@ -1152,6 +1389,10 @@ impl Analyzer {
             TypeKind::Bool => InferType::Bool,
             TypeKind::String => InferType::String,
             TypeKind::Unit => InferType::Unit,
+            TypeKind::HttpHeader => InferType::HttpHeader,
+            TypeKind::HttpRequest => InferType::HttpRequest,
+            TypeKind::HttpResponse => InferType::HttpResponse,
+            TypeKind::Secret => InferType::Secret,
             TypeKind::List(element) => InferType::List(Box::new(self.annotation(element))),
             TypeKind::Option(element) => InferType::Option(Box::new(self.annotation(element))),
             TypeKind::Result(value, error) => InferType::Result(
@@ -1300,6 +1541,12 @@ impl Analyzer {
                 let field_type = self.require_field(InferType::Variable(variable), field, span)?;
                 Ok((field_type, InferType::Variable(variable)))
             }
+            nominal
+            @ (InferType::HttpHeader | InferType::HttpRequest | InferType::HttpResponse) => {
+                let (field_type, _) =
+                    self.require_field_and_widen(contract_record(&nominal), field, span)?;
+                Ok((field_type, nominal))
+            }
             InferType::Record { mut fields, open } => {
                 if let Some(field_type) = fields.get(field) {
                     return Ok((field_type.clone(), InferType::Record { fields, open }));
@@ -1368,6 +1615,26 @@ impl Analyzer {
             (InferType::Bool, InferType::Bool) => Ok(InferType::Bool),
             (InferType::String, InferType::String) => Ok(InferType::String),
             (InferType::Unit, InferType::Unit) => Ok(InferType::Unit),
+            (InferType::HttpHeader, InferType::HttpHeader) => Ok(InferType::HttpHeader),
+            (InferType::HttpRequest, InferType::HttpRequest) => Ok(InferType::HttpRequest),
+            (InferType::HttpResponse, InferType::HttpResponse) => Ok(InferType::HttpResponse),
+            (InferType::Secret, InferType::Secret) => Ok(InferType::Secret),
+            (
+                nominal
+                @ (InferType::HttpHeader | InferType::HttpRequest | InferType::HttpResponse),
+                record @ InferType::Record { .. },
+            ) => {
+                self.unify_inner(contract_record(&nominal), record, span)?;
+                Ok(nominal)
+            }
+            (
+                record @ InferType::Record { .. },
+                nominal
+                @ (InferType::HttpHeader | InferType::HttpRequest | InferType::HttpResponse),
+            ) => {
+                self.unify_inner(record, contract_record(&nominal), span)?;
+                Ok(nominal)
+            }
             (InferType::List(left), InferType::List(right)) => self
                 .unify_inner(*left, *right, span)
                 .map(|element| InferType::List(Box::new(element))),
@@ -1610,7 +1877,14 @@ impl Analyzer {
                     .any(|ty| self.occurs_inner(variable, ty, visited))
                     || self.occurs_inner(variable, return_type, visited)
             }
-            InferType::Int | InferType::Bool | InferType::String | InferType::Unit => false,
+            InferType::Int
+            | InferType::Bool
+            | InferType::String
+            | InferType::Unit
+            | InferType::HttpHeader
+            | InferType::HttpRequest
+            | InferType::HttpResponse
+            | InferType::Secret => false,
         }
     }
 
@@ -1645,8 +1919,25 @@ impl Analyzer {
                 ),
                 ConstraintKind::Comparable => self.is_comparable(&constraint.ty),
                 ConstraintKind::JsonValue => self.is_json_value(&constraint.ty),
+                ConstraintKind::Printable | ConstraintKind::StructuralValue => {
+                    !self.contains_secret(&constraint.ty, &mut BTreeSet::new())
+                }
             };
             if !valid {
+                if self.contains_secret(&constraint.ty, &mut BTreeSet::new()) {
+                    let operation = match constraint.kind {
+                        ConstraintKind::Comparable => "compared",
+                        ConstraintKind::JsonValue => "encoded as JSON",
+                        ConstraintKind::Printable => "printed",
+                        ConstraintKind::StructuralValue => "placed into ordinary structural data",
+                        ConstraintKind::Addable => "used by `+`",
+                    };
+                    return Err(Diagnostic::new(
+                        "K3009",
+                        format!("opaque `Secret` values cannot be {operation}"),
+                        constraint.span,
+                    ));
+                }
                 let (code, message) = match constraint.kind {
                     ConstraintKind::Addable => (
                         "K3001",
@@ -1669,8 +1960,27 @@ impl Analyzer {
                             self.render_type(&constraint.ty)
                         ),
                     ),
+                    ConstraintKind::Printable | ConstraintKind::StructuralValue => {
+                        unreachable!("these constraints reject only Secret")
+                    }
                 };
                 return Err(Diagnostic::new(code, message, constraint.span));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_host_builtin_references(&self) -> Result<(), Diagnostic> {
+        for (span, builtin) in &self.host_builtin_references {
+            if !self.direct_host_builtin_references.contains(span) {
+                return Err(Diagnostic::new(
+                    "K3008",
+                    format!(
+                        "`{}` must be called directly with a string-literal resource",
+                        builtin.as_str()
+                    ),
+                    *span,
+                ));
             }
         }
         Ok(())
@@ -1706,7 +2016,55 @@ impl Analyzer {
                     .get(&variable)
                     .is_none_or(|ty| self.contains_no_function(ty, visited))
             }
-            InferType::Int | InferType::Bool | InferType::String | InferType::Unit => true,
+            InferType::Int
+            | InferType::Bool
+            | InferType::String
+            | InferType::Unit
+            | InferType::HttpHeader
+            | InferType::HttpRequest
+            | InferType::HttpResponse => true,
+            InferType::Secret => false,
+        }
+    }
+
+    fn contains_secret(&self, ty: &InferType, visited: &mut BTreeSet<TypeVariable>) -> bool {
+        match ty {
+            InferType::Secret => true,
+            InferType::List(element) | InferType::Option(element) => {
+                self.contains_secret(element, visited)
+            }
+            InferType::Record { fields, .. } => {
+                fields.values().any(|ty| self.contains_secret(ty, visited))
+            }
+            InferType::Result(value, error) => {
+                self.contains_secret(value, visited) || self.contains_secret(error, visited)
+            }
+            InferType::Function {
+                parameters,
+                return_type,
+                ..
+            } => {
+                parameters
+                    .iter()
+                    .any(|ty| self.contains_secret(ty, visited))
+                    || self.contains_secret(return_type, visited)
+            }
+            InferType::Variable(variable) => {
+                let variable = self.root_variable(*variable);
+                if !visited.insert(variable) {
+                    return false;
+                }
+                self.substitutions
+                    .get(&variable)
+                    .is_some_and(|ty| self.contains_secret(ty, visited))
+            }
+            InferType::Int
+            | InferType::Bool
+            | InferType::String
+            | InferType::Unit
+            | InferType::HttpHeader
+            | InferType::HttpRequest
+            | InferType::HttpResponse => false,
         }
     }
 
@@ -1724,18 +2082,29 @@ impl Analyzer {
         let builtin = Builtin::from_name(name)?;
         let ty = match builtin {
             Builtin::Print | Builtin::Println => {
+                let value = self.fresh_type();
+                self.constraints.push(TypeConstraint {
+                    ty: value.clone(),
+                    span,
+                    kind: ConstraintKind::Printable,
+                });
                 let effect = self.fresh_effect();
                 self.effect_definitions[effect as usize]
                     .direct
                     .insert(Effect::IoStdout);
                 InferType::Function {
-                    parameters: vec![self.fresh_type()],
+                    parameters: vec![value],
                     return_type: Box::new(InferType::Unit),
                     effect,
                 }
             }
             Builtin::Some => {
                 let value = self.fresh_type();
+                self.constraints.push(TypeConstraint {
+                    ty: value.clone(),
+                    span,
+                    kind: ConstraintKind::StructuralValue,
+                });
                 InferType::Function {
                     parameters: vec![value.clone()],
                     return_type: Box::new(InferType::Option(Box::new(value))),
@@ -1745,6 +2114,11 @@ impl Analyzer {
             Builtin::None => InferType::Option(Box::new(self.fresh_type())),
             Builtin::Ok => {
                 let value = self.fresh_type();
+                self.constraints.push(TypeConstraint {
+                    ty: value.clone(),
+                    span,
+                    kind: ConstraintKind::StructuralValue,
+                });
                 InferType::Function {
                     parameters: vec![value.clone()],
                     return_type: Box::new(InferType::Result(
@@ -1756,6 +2130,11 @@ impl Analyzer {
             }
             Builtin::Err => {
                 let error = self.fresh_type();
+                self.constraints.push(TypeConstraint {
+                    ty: error.clone(),
+                    span,
+                    kind: ConstraintKind::StructuralValue,
+                });
                 InferType::Function {
                     parameters: vec![error.clone()],
                     return_type: Box::new(InferType::Result(
@@ -1778,11 +2157,47 @@ impl Analyzer {
                     effect: self.fresh_effect(),
                 }
             }
-            Builtin::JsonDecode => InferType::Function {
-                parameters: vec![InferType::String],
-                return_type: Box::new(self.fresh_type()),
-                effect: self.fresh_effect(),
-            },
+            Builtin::JsonDecode => {
+                let value = self.fresh_type();
+                self.constraints.push(TypeConstraint {
+                    ty: value.clone(),
+                    span,
+                    kind: ConstraintKind::JsonValue,
+                });
+                InferType::Function {
+                    parameters: vec![InferType::String],
+                    return_type: Box::new(value),
+                    effect: self.fresh_effect(),
+                }
+            }
+            Builtin::ConfigString => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::ConfigRead);
+                InferType::Function {
+                    parameters: vec![InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::String),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::Secret => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::SecretRead);
+                InferType::Function {
+                    parameters: vec![InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Secret),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
         };
         Some((ty, ResolvedName::Builtin(builtin)))
     }
@@ -1880,6 +2295,25 @@ impl Analyzer {
         }
     }
 
+    fn expanded_requirements(&self) -> Vec<BTreeSet<CapabilityRequirement>> {
+        let mut expanded = self
+            .effect_definitions
+            .iter()
+            .map(|definition| definition.direct_requirements.clone())
+            .collect::<Vec<_>>();
+        loop {
+            let previous = expanded.clone();
+            for (index, definition) in self.effect_definitions.iter().enumerate() {
+                for dependency in &definition.dependencies {
+                    expanded[index].extend(previous[*dependency as usize].iter().cloned());
+                }
+            }
+            if expanded == previous {
+                return expanded;
+            }
+        }
+    }
+
     fn resolve_effects(
         &self,
         effects: &InferEffects,
@@ -1892,9 +2326,22 @@ impl Analyzer {
         resolved
     }
 
+    fn resolve_requirements(
+        &self,
+        effects: &InferEffects,
+        expanded: &[BTreeSet<CapabilityRequirement>],
+    ) -> BTreeSet<CapabilityRequirement> {
+        let mut resolved = effects.direct_requirements.clone();
+        for dependency in &effects.dependencies {
+            resolved.extend(expanded[*dependency as usize].iter().cloned());
+        }
+        resolved
+    }
+
     fn render_type(&self, ty: &InferType) -> String {
-        let expanded = self.expanded_effects();
-        let mut normalizer = TypeNormalizer::new(self, &expanded);
+        let expanded_effects = self.expanded_effects();
+        let expanded_requirements = self.expanded_requirements();
+        let mut normalizer = TypeNormalizer::new(self, &expanded_effects, &expanded_requirements);
         normalizer.normalize(ty).to_string()
     }
 }
@@ -1902,15 +2349,21 @@ impl Analyzer {
 struct TypeNormalizer<'a> {
     analyzer: &'a Analyzer,
     expanded_effects: &'a [BTreeSet<Effect>],
+    expanded_requirements: &'a [BTreeSet<CapabilityRequirement>],
     variables: BTreeMap<TypeVariable, u32>,
     normalized: HashMap<TypeVariable, Arc<Type>>,
 }
 
 impl<'a> TypeNormalizer<'a> {
-    fn new(analyzer: &'a Analyzer, expanded_effects: &'a [BTreeSet<Effect>]) -> Self {
+    fn new(
+        analyzer: &'a Analyzer,
+        expanded_effects: &'a [BTreeSet<Effect>],
+        expanded_requirements: &'a [BTreeSet<CapabilityRequirement>],
+    ) -> Self {
         Self {
             analyzer,
             expanded_effects,
+            expanded_requirements,
             variables: BTreeMap::new(),
             normalized: HashMap::new(),
         }
@@ -1922,6 +2375,10 @@ impl<'a> TypeNormalizer<'a> {
             InferType::Bool => Arc::new(Type::Bool),
             InferType::String => Arc::new(Type::String),
             InferType::Unit => Arc::new(Type::Unit),
+            InferType::HttpHeader => Arc::new(Type::HttpHeader),
+            InferType::HttpRequest => Arc::new(Type::HttpRequest),
+            InferType::HttpResponse => Arc::new(Type::HttpResponse),
+            InferType::Secret => Arc::new(Type::Secret),
             InferType::List(element) => Arc::new(Type::List(self.normalize(element))),
             InferType::Record { fields, .. } => Arc::new(Type::Record(
                 fields
@@ -1947,6 +2404,7 @@ impl<'a> TypeNormalizer<'a> {
                     .collect(),
                 return_type: self.normalize(return_type),
                 effects: effect_set(self.expanded_effects[*effect as usize].clone()),
+                requirements: requirement_set(self.expanded_requirements[*effect as usize].clone()),
             })),
             InferType::Variable(variable) => {
                 let variable = self.analyzer.root_variable(*variable);
@@ -1967,9 +2425,57 @@ impl<'a> TypeNormalizer<'a> {
     }
 }
 
+fn contract_record(nominal: &InferType) -> InferType {
+    let fields = match nominal {
+        InferType::HttpHeader => BTreeMap::from([
+            ("name".to_owned(), InferType::String),
+            ("value".to_owned(), InferType::String),
+        ]),
+        InferType::HttpRequest => BTreeMap::from([
+            ("body".to_owned(), InferType::String),
+            (
+                "headers".to_owned(),
+                InferType::List(Box::new(InferType::HttpHeader)),
+            ),
+            ("method".to_owned(), InferType::String),
+            ("path".to_owned(), InferType::String),
+            ("query".to_owned(), InferType::String),
+        ]),
+        InferType::HttpResponse => BTreeMap::from([
+            ("body".to_owned(), InferType::String),
+            (
+                "headers".to_owned(),
+                InferType::List(Box::new(InferType::HttpHeader)),
+            ),
+            ("status".to_owned(), InferType::Int),
+        ]),
+        _ => unreachable!("only HTTP contract types have structural aliases"),
+    };
+    InferType::Record {
+        fields,
+        open: false,
+    }
+}
+
+fn direct_host_builtin(callee: &Expression) -> Option<Builtin> {
+    let ExpressionKind::Variable(name) = &callee.kind else {
+        return None;
+    };
+    match Builtin::from_name(name) {
+        Some(builtin @ (Builtin::ConfigString | Builtin::Secret)) => Some(builtin),
+        _ => None,
+    }
+}
+
 fn effect_set(effects: BTreeSet<Effect>) -> EffectSet {
     EffectSet {
         effects: effects.into_iter().collect(),
+    }
+}
+
+fn requirement_set(requirements: BTreeSet<CapabilityRequirement>) -> RequirementSet {
+    RequirementSet {
+        requirements: requirements.into_iter().collect(),
     }
 }
 

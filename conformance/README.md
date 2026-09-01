@@ -75,8 +75,13 @@ network service, or nondeterministic value.
 | `check/valid/inference` | recursion, closures, empty lists, None, and effects infer together |
 | `check/name/*` | lexical undefined and duplicate name diagnostics |
 | `check/type/*` | stable static operator, condition, field, call, annotation, and match errors |
+| `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
+| `check/capability/*` | literal-resource host capability contracts |
+| `check/secret/*` | opaque secret non-disclosure restrictions |
+| `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `format/comments` | exact standalone and end-of-line comment preservation |
 | `format/edition-2026` | canonical layout for all currently implemented syntax families |
+| `format/webhook` | canonical typed webhook and ordered duplicate-header layout |
 
 ## Adding a case
 

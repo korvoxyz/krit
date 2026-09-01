@@ -12,4 +12,5 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+krit-capability.workspace = true
 serde_json.workspace = true

@@ -28,12 +28,20 @@ List<T>
 Option<T>
 Result<T, E>
 Record { field: Type, ... }
+HttpHeader
+HttpRequest
+HttpResponse
+Secret
 fn(A, B) -> C
 ```
 
 The public Rust analysis API represents unresolved inference variables as
 `Type::Variable` and renders them as stable lowercase names such as `'a`.
-Source-level generic declaration syntax is not yet accepted.
+Source-level generic declaration syntax is not yet accepted. `HttpHeader`,
+`HttpRequest`, and `HttpResponse` are stable built-in aliases for the closed
+record structures in `LANGUAGE.md`; they retain their nominal names at public
+entrypoint and Core boundaries while participating in structural record
+checking. `Secret` is a distinct opaque type, never a `String` alias.
 
 There are no implicit numeric, string, boolean, or collection conversions.
 Union types, subtyping, null, exceptions, and user-defined mutable objects are
@@ -63,8 +71,10 @@ fn total(items: List<Int>) -> Int {
 The exact implemented annotation grammar is normative in `LANGUAGE.md`.
 `krit check` enforces annotations without evaluating source. `krit run`
 continues to use the direct dynamic evaluator in this milestone, so runtime
-conformance diagnostics remain unchanged. Public declarations, source-level
-generic declarations, and effect annotation syntax are still future work.
+conformance diagnostics remain unchanged. Ordinary public declarations,
+source-level generic declarations, and effect annotation syntax are still
+future work. A webhook declaration is the one implemented public boundary and
+requires the exact annotated `(HttpRequest) -> HttpResponse` signature.
 
 The bootstrap checker uses deterministic constraints and unification. It
 supports recursive functions, closures, empty lists, `None`, structural
@@ -95,16 +105,23 @@ secret.read
 ai.invoke
 ```
 
-The implemented effect is `io.stdout`, inferred for `print` and `println`.
-Pure functions have an empty effect set. Calling a function adds its effects
-to the caller, including recursive and higher-order propagation. Branch and
-match effects are conservative unions. JSON conversion is pure.
+Implemented analysis recognizes `io.stdout`, `config.read`, and `secret.read`.
+Only `io.stdout` has an executable host in this milestone. Pure functions
+have an empty effect set. Calling a function adds its effects to the caller,
+including recursive and higher-order propagation. Branch and match effects
+are conservative unions. JSON conversion is pure.
 
 The Rust API returns effects in sorted deterministic order through
 `Analysis::effects`; function types expose their inferred latent effects.
-`Analysis` also exposes normalized symbol, expression, and block type/effect
-facts plus resolved symbol or built-in identities. Core lowering consumes
-those facts and does not run an independent inference algorithm.
+`Analysis` separately exposes sorted, deduplicated literal-resource
+requirements through `Analysis::requirements`; function, expression, and
+block facts expose the same transitive requirement summaries. A requirement
+is the ordered pair `(capability, resource)`, currently
+`config.read`/configuration-key or `secret.read`/secret-name. Coarse effects
+never erase or replace these resource identities. `Analysis` also exposes
+normalized symbol facts and resolved symbol or built-in identities. Core
+lowering consumes those facts and does not run an independent inference
+algorithm.
 
 Core name resolution and type inference do not imply that every type has a
 concrete backend layout. Valid generic Core may retain constrained
@@ -114,9 +131,12 @@ artifact stage must specialize or monomorphize those boundaries, or emit a
 stable source diagnostic, before layout selection and code emission.
 
 `krit check` preserves its existing success line while lowering and verifying
-typed Core IR. `krit explain FILE` renders module-init effects, top-level
-binding types, and stable Core facts; `krit explain --json FILE` emits
-versioned schema 1 JSON.
+typed Core IR. `krit explain FILE` renders module-init effects, top-level binding types,
+stable Core facts, and a compact webhook contract when present.
+`krit explain --json FILE` keeps schema 1 compatibility and adds a versioned
+entrypoint-contract fact containing source name, kind, normalized signature,
+sorted effects, sorted capability requirements, and exact draft-2020-12
+request/response JSON Schemas.
 
 ## Effects versus capabilities
 
@@ -126,12 +146,31 @@ Effects and capabilities answer different questions:
 - **Capability:** what the host permits this execution to do.
 
 A program can type-check while lacking a runtime grant. The analyzer reports
-the inferred effect set to compiler clients. `krit permissions` without an
-artifact reports manifest requests. With `--artifact PATH`, it validates the
-component and compares the artifact's exact required effects/imports with the
-local manifest; deployment grants remain `not-evaluated`.
+the inferred effect and requirement sets to compiler clients. Source-only
+checking and explanation do not need a manifest. Package build orchestration
+rejects a missing matching literal resource before backend emission.
+`krit permissions` without an artifact reports manifest requests. With
+`--artifact PATH`, it validates the component and compares the artifact's
+exact required effects/imports with the local manifest; deployment grants
+remain `not-evaluated`.
 
 A dependency may declare required effects but cannot grant capabilities.
+
+## Opaque-secret restrictions
+
+The checker rejects `Secret` anywhere an operation could reveal, duplicate,
+serialize, or turn the handle into ordinary application data:
+
+- `print` and `println`
+- equality or inequality
+- `json_encode`
+- list and record construction
+- `Some`, `Ok`, or `Err` construction
+
+`Result<Secret, String>` produced by `secret("literal")` is an explicit host
+operation result, not permission to construct arbitrary secret-containing
+data. Binding or pattern-matching the opaque handle is allowed so a future
+approved connector can consume it without revealing its contents.
 
 ## Inference algorithm
 

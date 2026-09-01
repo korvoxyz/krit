@@ -1,0 +1,51 @@
+core module
+entry f0 module-init effects {}
+entry f3 webhook handle effects {config.read, secret.read} requirements {config.read("agent.model"), secret.read("github-token")}
+bindings
+  b0 function read_model: fn() -> Result<String, String> effects {config.read} requirements {config.read("agent.model")}
+  b1 function read_token: fn() -> Result<Secret, String> effects {secret.read} requirements {secret.read("github-token")}
+  b2 webhook handle: fn(HttpRequest) -> HttpResponse effects {config.read, secret.read} requirements {config.read("agent.model"), secret.read("github-token")}
+  b3 parameter request: HttpRequest
+  b4 let model: Result<String, String>
+  b5 let token: Result<Secret, String>
+function f0 $module_init () -> Unit effects {}
+  block bb0 -> Unit effects {}
+    v4: fn() -> Result<String, String> effects {config.read} requirements {config.read("agent.model")} = closure cl0 f1 []
+    v5: Unit = bind b0 = v4
+    v10: fn() -> Result<Secret, String> effects {secret.read} requirements {secret.read("github-token")} = closure cl1 f2 []
+    v11: Unit = bind b1 = v10
+    v27: fn(HttpRequest) -> HttpResponse effects {config.read, secret.read} requirements {config.read("agent.model"), secret.read("github-token")} = closure cl2 f3 [c0:b0=v4, c1:b1=v10]
+    v28: Unit = bind b2 = v27
+    v29: Unit = unit
+    return v29
+function f1 read_model () -> Result<String, String> effects {config.read} requirements {config.read("agent.model")}
+  self b0 v0: fn() -> Result<String, String> effects {config.read} requirements {config.read("agent.model")}
+  block bb1 -> Result<String, String> effects {config.read} requirements {config.read("agent.model")}
+    v1: fn(String) -> Result<String, String> effects {config.read} = builtin config_string [host-effect]
+    v2: String = string "agent.model"
+    v3: Result<String, String> = call v1(v2) effects {config.read} requirements {config.read("agent.model")}
+    return v3
+function f2 read_token () -> Result<Secret, String> effects {secret.read} requirements {secret.read("github-token")}
+  self b1 v6: fn() -> Result<Secret, String> effects {secret.read} requirements {secret.read("github-token")}
+  block bb2 -> Result<Secret, String> effects {secret.read} requirements {secret.read("github-token")}
+    v7: fn(String) -> Result<Secret, String> effects {secret.read} = builtin secret [host-effect]
+    v8: String = string "github-token"
+    v9: Result<Secret, String> = call v7(v8) effects {secret.read} requirements {secret.read("github-token")}
+    return v9
+function f3 handle (p0 b3 v13: HttpRequest) -> HttpResponse effects {config.read, secret.read} requirements {config.read("agent.model"), secret.read("github-token")}
+  self b2 v12: fn(HttpRequest) -> HttpResponse effects {config.read, secret.read} requirements {config.read("agent.model"), secret.read("github-token")}
+  capture c0 b0 v14: fn() -> Result<String, String> effects {config.read} requirements {config.read("agent.model")}
+  capture c1 b1 v17: fn() -> Result<Secret, String> effects {secret.read} requirements {secret.read("github-token")}
+  block bb3 -> Record { body: String, headers: List<HttpHeader>, status: Int } effects {config.read, secret.read} requirements {config.read("agent.model"), secret.read("github-token")}
+    v15: Result<String, String> = call v14() effects {config.read} requirements {config.read("agent.model")}
+    v16: Unit = bind b4 = v15
+    v18: Result<Secret, String> = call v17() effects {secret.read} requirements {secret.read("github-token")}
+    v19: Unit = bind b5 = v18
+    v20: Int = int 200
+    v21: String = string "content-type"
+    v22: String = string "text/plain"
+    v23: Record { name: String, value: String } = record {name: v21, value: v22}
+    v24: List<HttpHeader> = list [v23]
+    v25: String = field v13.path
+    v26: Record { body: String, headers: List<HttpHeader>, status: Int } = record {status: v20, headers: v24, body: v25}
+    return v26

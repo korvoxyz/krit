@@ -523,8 +523,13 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "krit"
 version = "0.2.0"
 dependencies = [
+ "krit-capability",
  "serde_json",
 ]
+
+[[package]]
+name = "krit-capability"
+version = "0.2.0"
 
 [[package]]
 name = "krit-cli"
@@ -542,6 +547,7 @@ dependencies = [
 name = "krit-package"
 version = "0.2.0"
 dependencies = [
+ "krit-capability",
  "semver",
  "serde",
  "serde_json",

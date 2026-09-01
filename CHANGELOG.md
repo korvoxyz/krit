@@ -83,6 +83,22 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Stable host diagnostics `K5002` and `K5101` through `K5105`
 - Genuine Wasm integer-overflow traps for compiler checked arithmetic so an
   adversarial `unreachable` remains generic `K4001`
+- Explicit top-level `webhook fn` declarations with stable duplicate,
+  placement, and exact-signature diagnostics
+- Fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` built-in contract
+  aliases with exact closed response checking and ordered duplicate headers
+- Deterministic draft-2020-12 webhook request/response JSON Schemas in
+  versioned human and schema-1 JSON explanation facts
+- `config_string` and `secret` host-operation identities with direct
+  string-literal resource enforcement, sorted `config.read`/`secret.read`
+  effects, and separate resource-specific capability requirements
+- Opaque `Secret` analysis/Core type and static rejection of printing,
+  comparison, JSON encoding, and ordinary structural storage
+- Stable `K1004`, `K3007` through `K3009`, and `K5003` diagnostics
+- Checked-in HTTP, config, and WIT-resource secret contracts plus the future
+  typed `webhook-program` base world
+- Conformance, formatter, Core golden, explain-schema, WIT parseability,
+  direct-run denial, build fail-closed, and unchanged policy-1 artifact tests
 
 ### Changed
 
@@ -107,6 +123,12 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Changed the Wasmtime requirement from an exact 47.0.4 pin to compatible
   47.0.4 while retaining the tested patch in `Cargo.lock`; documented the
   short non-LTS support window and planned audited migration to 48 LTS
+- Made direct `krit run` fail with `K5003` when source requires an unavailable
+  webhook/config/secret host, without changing existing dynamic conformance
+- Marked only the `phase4-agent-contracts` milestone complete; Phase 4 and the
+  `phase4-http-runtime` milestone remain in progress/unimplemented
+- Updated the provider-neutral generation prompt to version 0.2.7 for typed
+  webhook, configuration, opaque-secret, and fail-closed runtime contracts
 
 ## [0.2.0] - 2026-09-01
 

@@ -23,7 +23,10 @@ pub use validation::{
     ComponentInspection, EMBEDDED_METADATA_SECTION, digest_bytes, validate_artifact,
     validate_component,
 };
-pub use wit::{PROGRAM_WORLD, PURE_PROGRAM_WORLD, STDOUT_INTERFACE};
+pub use wit::{
+    CONFIG_INTERFACE, PROGRAM_WORLD, PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STDOUT_INTERFACE,
+    WEBHOOK_INTERFACE, WEBHOOK_PROGRAM_WORLD,
+};
 
 use compiler::encode_core;
 use metadata::EmbeddedMetadata;

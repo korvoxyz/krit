@@ -1,0 +1,17 @@
+fn read_model() -> Result<String, String> {
+    config_string("agent.model")
+}
+
+fn read_token() -> Result<Secret, String> {
+    secret("github-token")
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let model = read_model();
+    let token = read_token();
+    record {
+        status: 200,
+        headers: [record { name: "content-type", value: "text/plain" }],
+        body: request.path,
+    }
+}

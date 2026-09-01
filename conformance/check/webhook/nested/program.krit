@@ -1,0 +1,5 @@
+fn invalid() {
+    webhook fn nested(request: HttpRequest) -> HttpResponse {
+        record { status: 200, headers: [], body: request.path }
+    }
+}

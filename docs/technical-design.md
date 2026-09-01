@@ -52,6 +52,7 @@ emits validated artifacts, `krit sandbox` executes only those artifacts, and
 
 ```text
 crates/
+  krit-capability/   shared capability resource-name policy
   krit-source/       source files, spans, line maps
   krit-syntax/       tokens, lexer, AST, parser
   krit-diagnostics/  codes, rendering, JSON schema
@@ -124,9 +125,10 @@ source-name lookup. Original names survive only as optional debug metadata.
 ### Types and effects
 
 The checker emits public analysis facts from the AST: inferred binding,
-symbol, expression, and block types; resolved name facts; source spans; and
-sorted effects. Core lowering consumes these normalized facts instead of
-re-running inference. Types retain shared `Arc` substructure so repeated Core
+symbol, expression, and block types; resolved name facts; source spans; sorted
+effects; and separate sorted `(capability, literal-resource)` requirements.
+Core lowering consumes these normalized facts instead of re-running
+inference. Types retain shared `Arc` substructure so repeated Core
 boundaries do not expand the inference DAG. A normalized inference type can
 still contain a constrained parametric variable; name resolution does not
 imply a concrete backend layout. Public signature cache boundaries remain
@@ -149,12 +151,15 @@ expression-oriented and in administrative normal form:
   explicit typed capture parameters and closure arguments
 - built-ins identify stdout host effects, pure variant constructors, and pure
   JSON conversions separately
-- every operation, block, function boundary, and module-init entrypoint exposes
-  a normalized inferred type and sorted conservative effects
+- every operation, block, function boundary, and entrypoint exposes a
+  normalized inferred type plus sorted conservative effects and capability
+  requirements
 - source spans survive lowering without becoming executable names
 
 Standalone source lowers to the stable synthetic `module-init` entrypoint.
-Future package exports can add entrypoint kinds without inventing agent APIs.
+An optional top-level webhook lowers to a second named `webhook` entrypoint
+with the exact `HttpRequest -> HttpResponse` boundary. It is a compiler/export
+fact, not an ambient listener.
 
 Built-in identity defines intrinsic behavior. Constructing any built-in
 function value is pure; stdout built-ins require `io.stdout` when called, while
@@ -166,7 +171,7 @@ creation effectful.
 The Core verifier rejects duplicate or out-of-range IDs, unavailable uses,
 leaked branch values, inconsistent branch and match results, invalid call
 signatures or arity, mismatched operation types, malformed captures, and
-understated effect summaries. `krit check` and `krit explain` lower and verify
+understated effect or capability-requirement summaries. `krit check` and `krit explain` lower and verify
 successfully analyzed source; a failure after valid analysis is an internal
 compiler error.
 
@@ -179,9 +184,10 @@ at source level. Open structural record requirements similarly state required
 fields without selecting a closed physical record layout.
 
 `CoreModule::render_text` is deterministic and is covered by checked golden
-files. `krit explain [--json] FILE` exposes module-init effects, top-level
-types, and the same Core facts. Its JSON schema is versioned independently and
-serialized through `serde_json`.
+files. `krit explain [--json] FILE` exposes module-init and webhook entrypoints,
+top-level types, and the same Core facts. The schema-1 JSON has a versioned
+entrypoint-contract fact with normalized signatures, literal resources, and
+deterministic draft-2020-12 webhook schemas.
 
 Optimization never changes overflow, effect order, capability checks,
 diagnostic category, or deterministic rendering.
@@ -201,8 +207,10 @@ selects one of two checked-in `krit:runtime@0.2.0` worlds from checked effects.
 `krit:runtime/pure-program@0.2.0` exports `run: func()` with no imports.
 `krit:runtime/program@0.2.0` exports the same function and imports the typed
 `krit:runtime/stdout@0.2.0` interface. Unused manifest grants do not widen the
-selected world. HTTP, webhook, schedule, queue, and agent-tool entry points
-remain future worlds.
+selected world. The checked-in WIT also contains contracts-only HTTP, config,
+opaque-secret resource, and typed `webhook-program` definitions. The current
+backend never selects them; exact component layouts and host composition
+belong to `phase4-http-runtime`.
 
 Krit does not grant a general WASI environment. Files, sockets, processes,
 environment variables, clocks, randomness, secrets, state, and AI calls are

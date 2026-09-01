@@ -49,9 +49,10 @@ Krit targets the WebAssembly Component Model and canonical typed interfaces.
 The exact supported version is recorded in the compiler and artifact metadata.
 Unknown component features fail closed.
 
-The checked-in package `krit:runtime@0.2.0` defines two versioned policy-1
-worlds. `pure-program` exports `run: func()` with no imports. `program` exports
-the same function and imports only `krit:runtime/stdout@0.2.0`:
+The checked-in package `krit:runtime@0.2.0` defines two buildable versioned
+policy-1 worlds. `pure-program` exports `run: func()` with no imports.
+`program` exports the same function and imports only
+`krit:runtime/stdout@0.2.0`:
 
 ```wit
 interface stdout {
@@ -78,6 +79,52 @@ from the selected parsed WIT and verifies the expected scalar contract. It
 does not maintain a second unchecked ABI declaration or add optional dummy
 imports. Krit does not grant a general WASI environment; Preview 1 inheritance
 is not a compatibility path.
+
+The same checked-in WIT package also defines contracts-only `webhook`,
+`config`, and `secrets` interfaces plus a future `webhook-program` base
+world.
+Its HTTP records preserve header order and duplicate names. `secrets.secret`
+is a WIT `resource`, never bytes or string. The webhook base world exports the
+canonical typed `handle` operation through its exported `webhook` interface
+and has no world imports.
+
+```wit
+interface webhook {
+    record header { name: string, value: string }
+    record request {
+        method: string,
+        path: string,
+        query: string,
+        headers: list<header>,
+        body: string,
+    }
+    record response {
+        status: s64,
+        headers: list<header>,
+        body: string,
+    }
+
+    handle: func(request: request) -> response;
+}
+
+interface config {
+    get-string: func(key: string) -> result<string, string>;
+}
+
+interface secrets {
+    resource secret;
+    acquire: func(name: string) -> result<secret, string>;
+}
+
+```
+
+These interfaces are parsed in tests but are not selected by the policy-1
+backend. The future HTTP backend deterministically derives an exact world from
+the base webhook export plus only interfaces named by checked effects. Worlds
+are keyed by the sorted interface-identity list, so optional dummy imports
+and source-order variation cannot widen or change a component. This avoids a
+hand-maintained combinatorial set of world variants while retaining exact
+component imports.
 
 ## Build pipeline
 
@@ -127,6 +174,12 @@ unsupported semantics. Policy 1 rejects strings, lists, records, options,
 results, JSON conversion, lexical captures, matches, unsupported print
 values, and any operation without a correct lowering. It never substitutes a
 trapping placeholder or direct-evaluator fallback.
+
+Webhook entrypoints and config/secret calls are explicitly contracts-only.
+`krit build` rejects them with `K7002` even when their manifest resources
+match. No artifact may claim the future `webhook-program` world until request,
+response, string, list, record, result, and resource-handle layouts are
+implemented and validated by the separate `phase4-http-runtime` milestone.
 
 ## Artifact policy
 
@@ -285,8 +338,10 @@ explicit authority.
 
 ## Secrets
 
-Applications refer to secrets by manifest-approved logical name. Connectors
-receive opaque authentication handles where possible.
+Applications refer to secrets by manifest-approved logical name. The
+contracts milestone represents them as both a dedicated Core `Secret` type
+and a WIT resource handle. Connectors will receive opaque authentication
+handles; no current host acquires or consumes one.
 
 Secret data is excluded from:
 

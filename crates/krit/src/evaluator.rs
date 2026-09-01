@@ -41,6 +41,8 @@ pub enum BuiltinFunction {
     Err,
     JsonEncode,
     JsonDecode,
+    ConfigString,
+    Secret,
 }
 
 impl fmt::Debug for Value {
@@ -90,6 +92,8 @@ impl Value {
             Self::Builtin(BuiltinFunction::Err) => "<function Err>".to_owned(),
             Self::Builtin(BuiltinFunction::JsonEncode) => "<function json_encode>".to_owned(),
             Self::Builtin(BuiltinFunction::JsonDecode) => "<function json_decode>".to_owned(),
+            Self::Builtin(BuiltinFunction::ConfigString) => "<function config_string>".to_owned(),
+            Self::Builtin(BuiltinFunction::Secret) => "<function secret>".to_owned(),
         }
     }
 
@@ -195,6 +199,12 @@ impl Evaluator<'_> {
                 parameters,
                 body,
                 ..
+            }
+            | StatementKind::Webhook {
+                name,
+                parameters,
+                body,
+                ..
             } => {
                 let function = Value::Function(Rc::new(FunctionValue {
                     name: Some(Rc::from(name.as_str())),
@@ -245,6 +255,8 @@ impl Evaluator<'_> {
                 "Err" => Ok(Value::Builtin(BuiltinFunction::Err)),
                 "json_encode" => Ok(Value::Builtin(BuiltinFunction::JsonEncode)),
                 "json_decode" => Ok(Value::Builtin(BuiltinFunction::JsonDecode)),
+                "config_string" => Ok(Value::Builtin(BuiltinFunction::ConfigString)),
+                "secret" => Ok(Value::Builtin(BuiltinFunction::Secret)),
                 _ => environment.lookup(name).ok_or_else(|| {
                     Diagnostic::new("K2001", format!("undefined name `{name}`"), expression.span)
                 }),
@@ -462,6 +474,16 @@ impl Evaluator<'_> {
                     }),
                     BuiltinFunction::JsonEncode => json_encode(&value, span),
                     BuiltinFunction::JsonDecode => json_decode(value, span),
+                    BuiltinFunction::ConfigString => Err(Diagnostic::new(
+                        "K5003",
+                        "configuration host operations are unavailable in direct source execution",
+                        span,
+                    )),
+                    BuiltinFunction::Secret => Err(Diagnostic::new(
+                        "K5003",
+                        "secret host operations are unavailable in direct source execution",
+                        span,
+                    )),
                 }
             }
             value => Err(Diagnostic::new(

@@ -12,12 +12,14 @@ not part of the compiler or runtime.
 
 The prompt contains only implemented Krit 0.2 syntax, including records,
 built-in Option and Result values, checked annotations, JSON conversion,
-canonical formatting, and the static rules enforced by `krit check`. Draft
-HTTP/agent and future capability APIs are intentionally excluded so a model
-does not generate code the current compiler cannot accept. The compiler can
-explain checked source, build the narrower policy-1 artifact subset, inspect
-its effective local permissions, and execute it in the bounded sandbox, but
-those commands do not add source-language APIs.
+canonical formatting, and the static rules enforced by `krit check`. It also
+contains the implemented contracts-only typed webhook, literal configuration
+read, and opaque secret acquisition forms. Socket serving, outbound HTTP/TLS,
+host value providers, connectors, and AI calls remain explicitly unavailable
+so a model does not invent Phase 4 runtime APIs. The compiler can explain
+checked contracts, build the narrower policy-1 scalar/stdout artifact subset,
+inspect its effective local permissions, and execute that subset in the
+bounded sandbox.
 
 ## Use
 
@@ -51,10 +53,24 @@ krit sandbox
 accepts only Int, Bool, Unit, non-capturing functions, primitive control flow
 and operators, and scalar stdout. A model asked for a buildable artifact must
 avoid strings, lists, records, Option/Result, JSON, and lexical captures until
-their guest layouts exist. A K7001 or K7002 build diagnostic must be repaired
-in source rather than bypassed with host interpretation.
+their guest layouts exist. It must also avoid webhook/config/secret contracts:
+they intentionally fail build until `phase4-http-runtime`. A K7001 or K7002
+build diagnostic must be repaired in source rather than bypassed with host
+interpretation.
 `krit sandbox` never builds or falls back to the full direct evaluator, so the
 artifact must already exist and validate with its adjacent metadata.
+
+For an AI-authored webhook contract, use:
+
+```sh
+krit fmt agent.krit
+krit fmt --check agent.krit
+krit check agent.krit
+krit explain --json agent.krit
+```
+
+Do not run or build that source yet. `krit run` returns K5003 and `krit build`
+returns K7002 rather than simulating configuration, secrets, or HTTP.
 
 For a failed check, send the model:
 

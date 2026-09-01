@@ -446,8 +446,13 @@ impl SyntaxMap {
         }
 
         fn top_level_break(current: &Statement, next: &Statement) -> usize {
-            let has_function_declaration = matches!(current.kind, StatementKind::Function { .. })
-                || matches!(next.kind, StatementKind::Function { .. });
+            let has_function_declaration = matches!(
+                current.kind,
+                StatementKind::Function { .. } | StatementKind::Webhook { .. }
+            ) || matches!(
+                next.kind,
+                StatementKind::Function { .. } | StatementKind::Webhook { .. }
+            );
             let changes_between_declaration_and_expression = !matches!(
                 (&current.kind, &next.kind),
                 (StatementKind::Let { .. }, StatementKind::Let { .. })
@@ -497,6 +502,12 @@ impl SyntaxCollector {
                 self.expression(value);
             }
             StatementKind::Function {
+                parameters,
+                return_type,
+                body,
+                ..
+            }
+            | StatementKind::Webhook {
                 parameters,
                 return_type,
                 body,
@@ -615,7 +626,14 @@ impl SyntaxCollector {
                     self.annotation(&field.annotation);
                 }
             }
-            TypeKind::Int | TypeKind::Bool | TypeKind::String | TypeKind::Unit => {}
+            TypeKind::Int
+            | TypeKind::Bool
+            | TypeKind::String
+            | TypeKind::Unit
+            | TypeKind::HttpHeader
+            | TypeKind::HttpRequest
+            | TypeKind::HttpResponse
+            | TypeKind::Secret => {}
         }
     }
 }
@@ -771,6 +789,7 @@ fn canonical_token_text(token: &Token) -> String {
         TokenKind::String(value) => canonical_string(value),
         TokenKind::Let => "let".to_owned(),
         TokenKind::Fn => "fn".to_owned(),
+        TokenKind::Webhook => "webhook".to_owned(),
         TokenKind::If => "if".to_owned(),
         TokenKind::Else => "else".to_owned(),
         TokenKind::Match => "match".to_owned(),
@@ -963,6 +982,7 @@ fn is_word(kind: &TokenKind) -> bool {
             | TokenKind::String(_)
             | TokenKind::Let
             | TokenKind::Fn
+            | TokenKind::Webhook
             | TokenKind::If
             | TokenKind::Else
             | TokenKind::Match

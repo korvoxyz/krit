@@ -153,6 +153,13 @@ The first end-to-end acceptance application:
 The source should remain short enough to review as application policy rather
 than infrastructure code.
 
+The `phase4-agent-contracts` milestone implements only the readable,
+checkable boundary needed to author that application: one typed `webhook fn`,
+fixed HTTP record aliases and JSON Schemas, literal-resource config/secret
+facts, and an opaque secret identity. It intentionally does not listen on a
+socket, perform HTTP/TLS, load values, invoke AI, or satisfy this end-to-end
+acceptance application.
+
 ## Success measures
 
 Representative agent tasks compare Krit with generated Rust:

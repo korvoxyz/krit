@@ -10,6 +10,8 @@ pub enum Builtin {
     Err,
     JsonEncode,
     JsonDecode,
+    ConfigString,
+    Secret,
 }
 
 impl Builtin {
@@ -23,6 +25,8 @@ impl Builtin {
             "Err" => Some(Self::Err),
             "json_encode" => Some(Self::JsonEncode),
             "json_decode" => Some(Self::JsonDecode),
+            "config_string" => Some(Self::ConfigString),
+            "secret" => Some(Self::Secret),
             _ => None,
         }
     }
@@ -37,6 +41,8 @@ impl Builtin {
             Self::Err => "Err",
             Self::JsonEncode => "json_encode",
             Self::JsonDecode => "json_decode",
+            Self::ConfigString => "config_string",
+            Self::Secret => "secret",
         }
     }
 
@@ -45,6 +51,7 @@ impl Builtin {
             Self::Print | Self::Println => BuiltinCategory::HostEffect,
             Self::Some | Self::None | Self::Ok | Self::Err => BuiltinCategory::Constructor,
             Self::JsonEncode | Self::JsonDecode => BuiltinCategory::Conversion,
+            Self::ConfigString | Self::Secret => BuiltinCategory::HostEffect,
         }
     }
 }

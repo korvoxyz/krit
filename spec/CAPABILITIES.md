@@ -1,6 +1,6 @@
 # Capability model
 
-**Status:** Draft  
+**Status:** Implemented contracts with draft hosts
 **Target:** Krit 0.3
 
 ## Rule
@@ -46,9 +46,12 @@ http = ["https://api.github.com", "https://slack.com"]
 secrets = ["github-token", "slack-token"]
 ```
 
-The phase-1 manifest implements only `stdout`, `config`, `http`, and
-`secrets`. Files, generic sockets, processes, environment variables, clocks,
-randomness, state, queues, storage, and AI invocation remain unavailable.
+The schema-1 manifest implements requests for `stdout`, `config`, `http`, and
+`secrets`. The language now emits literal-resource facts for `config.read`
+and `secret.read`, but no configuration/secret value provider or outbound
+HTTP host exists yet. Files, generic sockets, processes, environment
+variables, clocks, randomness, state, queues, storage, and AI invocation
+remain unavailable.
 
 Paths are package-root-relative and resolved before execution. A lexical path
 that escapes the granted root is rejected. Symlink and platform-specific path
@@ -59,6 +62,26 @@ pattern. DNS rebinding and redirects cannot expand the original grant.
 
 Secret grants expose opaque handles where possible. Secrets must not appear in
 debug output, diagnostics, cache keys, lockfiles, or telemetry.
+
+## Contract-only host operations
+
+The edition-2026 source contracts are:
+
+```krit
+config_string("agent.model") // Result<String, String>
+secret("github-token")       // Result<Secret, String>
+```
+
+The string must be a direct literal so analysis can emit one exact sorted
+requirement pair. `config_string` emits `config.read` plus its key.
+`secret` emits `secret.read` plus its logical name. The opaque `Secret` handle
+cannot be printed, compared, JSON-encoded, structurally stored, or revealed.
+No host value is read during checking or explanation.
+
+Package build orchestration intersects these requirements with manifest
+resources and reports `K5001` for an absent match. A matching manifest does
+not make a component buildable in this contracts milestone: unsupported
+webhook/config/secret backend layouts still fail closed with `K7002`.
 
 ## Grant authority
 
@@ -91,9 +114,9 @@ Artifact-aware JSON uses schema 1 and includes `world`, `required`,
 
 ## Development mode
 
-Standalone source execution may receive `io.stdout` only. Every other
-capability remains denied unless explicitly passed through an `--allow`
-option.
+Standalone source execution may receive `io.stdout` only. A source containing
+a webhook entrypoint or configuration/secret host call fails with `K5003`;
+there is no fallback value and no `--allow` escape hatch in this milestone.
 
 Package execution reads grants from the root manifest and may still require
 interactive or host approval. CI should use a non-interactive explicit policy.

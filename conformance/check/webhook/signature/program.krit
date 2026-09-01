@@ -1,0 +1,3 @@
+webhook fn invalid(request: Record { path: String }) -> HttpResponse {
+    record { status: 200, headers: [], body: request.path }
+}

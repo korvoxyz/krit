@@ -48,7 +48,7 @@ fn analysis_code(source: &Source) -> Result<(), &'static str> {
 #[test]
 fn formatting_fixtures_are_canonical_and_idempotent() {
     let root = repository_root().join("conformance/format");
-    for fixture in ["comments", "edition-2026"] {
+    for fixture in ["comments", "edition-2026", "webhook"] {
         let directory = root.join(fixture);
         let input = fs::read_to_string(directory.join("input.krit"))
             .expect("formatter input should be readable");
@@ -183,6 +183,11 @@ fn deterministic_generated_corpus_preserves_formatting_properties() {
         (
             "grouped-record-value".to_owned(),
             "let item = record { value: (1 + 2), nested: record { answer: (3 + 4) } };\n"
+                .to_owned(),
+        ),
+        (
+            "webhook-contract".to_owned(),
+            "webhook fn handle(request:HttpRequest)->HttpResponse{record{status:200,headers:[],body:request.path}}\n"
                 .to_owned(),
         ),
     ];

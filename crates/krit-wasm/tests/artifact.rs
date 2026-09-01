@@ -43,6 +43,11 @@ fn factorial_builds_as_a_valid_deterministic_component() {
     assert_eq!(first.metadata.imports, [STDOUT_INTERFACE]);
     assert_eq!(first.metadata.effects, ["io.stdout"]);
     assert_eq!(first.metadata.byte_size, first.bytes.len() as u64);
+    assert_eq!(first.bytes.len(), 1393);
+    assert_eq!(
+        first.metadata.digest,
+        "blake3:6b3c8591c1e82b520f5551a9440405e2f3433864c9f43b04ebf9169e21e8001b"
+    );
 
     let inspection =
         validate_artifact(&first.bytes, &first.metadata).expect("artifact should validate");

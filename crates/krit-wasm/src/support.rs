@@ -30,6 +30,29 @@ pub(crate) fn check_module(module: &CoreModule) -> Result<CheckedModule, BuildEr
         .verify()
         .map_err(|error| BuildError::invalid_core(format!("Core verification failed: {error}")))?;
 
+    if let Some(webhook) = module
+        .entrypoints()
+        .iter()
+        .find(|entrypoint| entrypoint.kind == krit::EntrypointKind::Webhook)
+    {
+        return Err(BuildError::unsupported(
+            "webhook entrypoints are contracts-only until the phase4-http-runtime milestone",
+            module.functions()[webhook.function.as_u32() as usize].source,
+        ));
+    }
+    if module.functions().iter().any(|function| {
+        function
+            .signature
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, krit::Effect::ConfigRead | krit::Effect::SecretRead))
+    }) {
+        return Err(BuildError::unsupported(
+            "configuration and secret host operations are contracts-only until the phase4-http-runtime milestone",
+            first_effect_span(module),
+        ));
+    }
+
     if module.has_residual_types() {
         return Err(BuildError::residual(
             "WebAssembly layout requires specialization of residual parametric types",
@@ -251,6 +274,10 @@ fn check_type_inner(
             span,
         )),
         Type::String => Err(unsupported_layout("String", span)),
+        Type::HttpHeader => Err(unsupported_layout("HttpHeader", span)),
+        Type::HttpRequest => Err(unsupported_layout("HttpRequest", span)),
+        Type::HttpResponse => Err(unsupported_layout("HttpResponse", span)),
+        Type::Secret => Err(unsupported_layout("Secret", span)),
         Type::List(_) => Err(unsupported_layout("List", span)),
         Type::Record(_) => Err(unsupported_layout("Record", span)),
         Type::Option(_) => Err(unsupported_layout("Option", span)),
@@ -356,7 +383,14 @@ fn contains_residual(ty: &Type) -> bool {
                 .any(|parameter| contains_residual(parameter))
                 || contains_residual(function.return_type())
         }
-        Type::Int | Type::Bool | Type::String | Type::Unit => false,
+        Type::Int
+        | Type::Bool
+        | Type::String
+        | Type::Unit
+        | Type::HttpHeader
+        | Type::HttpRequest
+        | Type::HttpResponse
+        | Type::Secret => false,
     }
 }
 

@@ -17,9 +17,10 @@ infer semantics from historical interpreter behavior.
 | [CHARTER.md](CHARTER.md) | Normative | Product and language principles |
 | [LANGUAGE.md](LANGUAGE.md) | Normative | Krit 0.2 source syntax and runtime semantics |
 | [DIAGNOSTICS.md](DIAGNOSTICS.md) | Normative | Human and machine diagnostic contract |
+| [WEBHOOK-CONTRACTS.md](WEBHOOK-CONTRACTS.md) | Normative compiler contract | Typed webhook, schema, config, and opaque-secret facts |
 | [AGENT-APPLICATIONS.md](AGENT-APPLICATIONS.md) | Draft | Agent, bot, backend, and integration application model |
 | [TYPES-AND-EFFECTS.md](TYPES-AND-EFFECTS.md) | Implemented baseline | Static types and effect checking |
-| [CAPABILITIES.md](CAPABILITIES.md) | Draft | Runtime authority and sandbox boundaries |
+| [CAPABILITIES.md](CAPABILITIES.md) | Implemented contracts / draft hosts | Runtime authority and sandbox boundaries |
 | [PACKAGES.md](PACKAGES.md) | Draft | Modules, manifests, lockfiles, and registries |
 | [WASM-SANDBOX.md](WASM-SANDBOX.md) | Implemented baseline | Policy-1 component artifacts and bounded host |
 | [GUIDED-AUTHORING.md](GUIDED-AUTHORING.md) | Draft | Deterministic and optional LLM coding guidance |

@@ -12,8 +12,12 @@ pub(crate) const WIT_SOURCE: &str = include_str!("../../../wit/runtime.wit");
 const WIT_PACKAGE: &str = "krit:runtime@0.2.0";
 pub(crate) const STDOUT_EFFECT: &str = "io.stdout";
 pub const STDOUT_INTERFACE: &str = "krit:runtime/stdout@0.2.0";
+pub const CONFIG_INTERFACE: &str = "krit:runtime/config@0.2.0";
+pub const SECRETS_INTERFACE: &str = "krit:runtime/secrets@0.2.0";
+pub const WEBHOOK_INTERFACE: &str = "krit:runtime/webhook@0.2.0";
 pub const PROGRAM_WORLD: &str = "krit:runtime/program@0.2.0";
 pub const PURE_PROGRAM_WORLD: &str = "krit:runtime/pure-program@0.2.0";
+pub const WEBHOOK_PROGRAM_WORLD: &str = "krit:runtime/webhook-program@0.2.0";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct WitFunction {
@@ -275,6 +279,7 @@ fn verify_stdout_signatures(imports: &[WitFunction]) -> Result<(), BuildError> {
             "built-in WIT stdout interface has an unexpected function count",
         ));
     }
+
     for (name, parameters) in expected {
         let Some(function) = imports.iter().find(|function| function.name == name) else {
             return Err(BuildError::artifact(format!(
@@ -288,4 +293,46 @@ fn verify_stdout_signatures(imports: &[WitFunction]) -> Result<(), BuildError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_versioned_webhook_config_and_secret_contracts() {
+        let mut resolve = Resolve::default();
+        let package = resolve
+            .push_str("krit-runtime.wit", WIT_SOURCE)
+            .expect("checked-in WIT should parse");
+        let world = resolve
+            .select_world(&[package], Some("webhook-program"))
+            .expect("webhook world should exist");
+
+        assert_eq!(
+            resolve.id_of_name(package, &resolve.worlds[world].name),
+            WEBHOOK_PROGRAM_WORLD
+        );
+        assert!(resolve.worlds[world].imports.is_empty());
+        assert_eq!(resolve.worlds[world].exports.len(), 1);
+        let Some(WorldItem::Interface { id, .. }) = resolve.worlds[world].exports.values().next()
+        else {
+            panic!("webhook world should export an interface");
+        };
+        assert_eq!(resolve.id_of(*id).as_deref(), Some(WEBHOOK_INTERFACE));
+        assert!(resolve.interfaces[*id].functions.contains_key("handle"));
+        let source = WIT_SOURCE;
+        for contract in [
+            "interface webhook",
+            "interface config",
+            "interface secrets",
+            "resource secret",
+            "handle: func",
+        ] {
+            assert!(
+                source.contains(contract),
+                "missing WIT contract `{contract}`"
+            );
+        }
+    }
 }

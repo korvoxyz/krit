@@ -40,6 +40,10 @@ fn stable_core_rendering_matches_golden_cases() {
             "conformance/cases/variants/option-match/program.krit",
             "crates/krit/tests/snapshots/core-branches-matches.snap",
         ),
+        (
+            "conformance/check/valid/webhook-contract/program.krit",
+            "crates/krit/tests/snapshots/core-webhook-contract.snap",
+        ),
     ] {
         let source_path = repository.join(source_path);
         let text = fs::read_to_string(&source_path).expect("snapshot source should be readable");
@@ -278,7 +282,7 @@ fn every_valid_repository_program_lowers_and_verifies() {
         count += 1;
         remaining = &code[end + "\n```".len()..];
     }
-    assert_eq!(count, 6);
+    assert_eq!(count, 7);
 }
 
 #[test]
@@ -358,7 +362,9 @@ fn assert_statement_names_resolved(statement: &krit::Statement, analysis: &Analy
         StatementKind::Let { value, .. } | StatementKind::Expression(value) => {
             assert_expression_names_resolved(value, analysis);
         }
-        StatementKind::Function { body, .. } => assert_block_names_resolved(body, analysis),
+        StatementKind::Function { body, .. } | StatementKind::Webhook { body, .. } => {
+            assert_block_names_resolved(body, analysis)
+        }
     }
 }
 

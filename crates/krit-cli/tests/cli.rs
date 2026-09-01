@@ -249,6 +249,194 @@ fn explanation_json_uses_serde_escaping_and_json_diagnostics() {
 }
 
 #[test]
+fn explains_exact_versioned_webhook_contracts_deterministically() {
+    let directory = TestDirectory::new("explain-webhook-contract");
+    let source = directory.file(
+        "agent.krit",
+        r#"
+fn read_model() -> Result<String, String> {
+    config_string("agent.model")
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let model = read_model();
+    record {
+        status: 200,
+        headers: [record { name: "x-note", value: "\"quoted\"" }],
+        body: request.path,
+    }
+}
+"#,
+    );
+    let first = krit()
+        .args(["explain", "--json"])
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+    let second = krit()
+        .args(["explain", "--json"])
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+
+    assert!(first.status.success());
+    assert!(first.stderr.is_empty());
+    assert_eq!(first.stdout, second.stdout);
+    let explanation: serde_json::Value =
+        serde_json::from_slice(&first.stdout).expect("explanation should be valid JSON");
+    assert_eq!(explanation["entrypoints"]["schema"], 1);
+    let webhook = &explanation["entrypoints"]["items"][1];
+    assert_eq!(webhook["name"], "handle");
+    assert_eq!(webhook["kind"], "webhook");
+    assert_eq!(
+        webhook["signature"],
+        "webhook fn handle(request: HttpRequest) -> HttpResponse"
+    );
+    assert_eq!(webhook["effects"], serde_json::json!(["config.read"]));
+    assert_eq!(
+        webhook["capabilityRequirements"],
+        serde_json::json!([{
+            "capability": "config.read",
+            "resource": "agent.model"
+        }])
+    );
+    let contract = &webhook["contract"];
+    assert_eq!(contract["schema"], 1);
+    assert_eq!(contract["requestType"], "HttpRequest");
+    assert_eq!(contract["responseType"], "HttpResponse");
+    assert_eq!(
+        contract["requestSchema"],
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://krit.dev/schemas/webhook/request-1.json",
+            "title": "Krit HttpRequest contract v1",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["method", "path", "query", "headers", "body"],
+            "properties": {
+                "body": {"type": "string"},
+                "headers": {"type": "array", "items": {"$ref": "#/$defs/HttpHeader"}},
+                "method": {"type": "string"},
+                "path": {"type": "string"},
+                "query": {"type": "string"}
+            },
+            "$defs": {
+                "HttpHeader": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "value"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "value": {"type": "string"}
+                    }
+                }
+            }
+        })
+    );
+    assert_eq!(
+        contract["responseSchema"],
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://krit.dev/schemas/webhook/response-1.json",
+            "title": "Krit HttpResponse contract v1",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["status", "headers", "body"],
+            "properties": {
+                "body": {"type": "string"},
+                "headers": {"type": "array", "items": {"$ref": "#/$defs/HttpHeader"}},
+                "status": {"type": "integer"}
+            },
+            "$defs": {
+                "HttpHeader": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "value"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "value": {"type": "string"}
+                    }
+                }
+            }
+        })
+    );
+    assert!(
+        explanation["core"]
+            .as_str()
+            .expect("Core rendering should be a string")
+            .contains(r#"string "\"quoted\"""#)
+    );
+
+    let human = krit()
+        .arg("explain")
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).expect("explanation should be UTF-8");
+    assert!(human.contains("webhook contract (schema 1):\n"));
+    assert!(human.contains("signature: webhook fn handle(request: HttpRequest) -> HttpResponse"));
+    assert!(human.contains("JSON Schema: draft 2020-12 request/response contract v1"));
+}
+
+#[test]
+fn direct_run_fails_closed_for_unavailable_agent_hosts() {
+    let directory = TestDirectory::new("run-agent-host-unavailable");
+    let config = directory.file(
+        "config.krit",
+        "let model = config_string(\"agent.model\");\n",
+    );
+    let config_output = krit()
+        .args(["run", "--diagnostic-format=json"])
+        .arg(&config)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(config_output.status.code(), Some(4));
+    assert!(config_output.stdout.is_empty());
+    let config_diagnostic: serde_json::Value =
+        serde_json::from_slice(&config_output.stderr).expect("diagnostic should be valid JSON");
+    assert_eq!(config_diagnostic["code"], "K5003");
+    assert_eq!(config_diagnostic["span"]["start"]["column"], 13);
+
+    let mixed = directory.file(
+        "mixed.krit",
+        "let model = config_string(\"agent.model\");\nlet bad = 1 + true;\n",
+    );
+    let mixed_output = krit()
+        .arg("run")
+        .arg(&mixed)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(mixed_output.status.code(), Some(4));
+    assert!(mixed_output.stdout.is_empty());
+    assert!(
+        String::from_utf8(mixed_output.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K5003]")
+    );
+
+    let webhook = directory.file(
+        "webhook.krit",
+        r#"webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.path }
+}
+"#,
+    );
+    let webhook_output = krit()
+        .arg("run")
+        .arg(&webhook)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(webhook_output.status.code(), Some(4));
+    assert!(webhook_output.stdout.is_empty());
+    assert!(
+        String::from_utf8(webhook_output.stderr)
+            .expect("diagnostic should be UTF-8")
+            .contains("error[K5003]: webhook entrypoints are unavailable")
+    );
+}
+
+#[test]
 fn explain_rejects_invalid_usage() {
     for arguments in [
         vec!["explain"],
@@ -1076,6 +1264,89 @@ license = "Apache-2.0"
             .expect("diagnostic should be UTF-8")
             .contains("error[K7002]")
     );
+    assert!(!output.exists());
+    assert!(!metadata_path(&output).exists());
+}
+
+#[test]
+fn build_checks_agent_resources_then_rejects_contract_only_layouts() {
+    let directory = TestDirectory::new("build-agent-contracts");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let model = config_string("agent.model");
+    let token = secret("github-token");
+    record { status: 200, headers: [], body: request.path }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/agent"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+config = ["agent.model"]
+"#,
+    );
+    let output = directory.path.join("agent.wasm");
+    let missing = krit()
+        .arg("build")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(missing.status.code(), Some(4));
+    assert!(missing.stdout.is_empty());
+    let missing = String::from_utf8(missing.stderr).expect("diagnostic should be UTF-8");
+    assert!(missing.contains("error[K5001]"));
+    assert!(missing.contains("secret.read"));
+    assert!(missing.contains("github-token"));
+    assert!(!output.exists());
+    assert!(!metadata_path(&output).exists());
+
+    fs::write(
+        &manifest,
+        r#"
+schema = 1
+
+[package]
+name = "test/agent"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+config = ["agent.model"]
+secrets = ["github-token"]
+"#,
+    )
+    .expect("manifest should be widened");
+    let unsupported = krit()
+        .arg("build")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("Krit should start");
+    assert_eq!(unsupported.status.code(), Some(1));
+    assert!(unsupported.stdout.is_empty());
+    let unsupported = String::from_utf8(unsupported.stderr).expect("diagnostic should be UTF-8");
+    assert!(unsupported.contains("error[K7002]"));
+    assert!(unsupported.contains("contracts-only"));
+    assert!(unsupported.contains("phase4-http-runtime"));
     assert!(!output.exists());
     assert!(!metadata_path(&output).exists());
 }

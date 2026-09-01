@@ -7,8 +7,8 @@ use std::{
 
 use crate::{
     Analysis, BinaryOperator, Block, Builtin, EffectSet, Expression, ExpressionKind, FunctionType,
-    MatchKind, Parameter, Program, ResolvedName, Span, Statement, StatementKind, SymbolId,
-    SymbolKind, Type, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+    MatchKind, Parameter, Program, RequirementSet, ResolvedName, Span, Statement, StatementKind,
+    SymbolId, SymbolKind, Type, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
 };
 
 macro_rules! id_type {
@@ -43,6 +43,7 @@ id_type!(MatchBindingId, "m");
 #[non_exhaustive]
 pub enum EntrypointKind {
     ModuleInit,
+    Webhook,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +56,7 @@ impl EntrypointKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ModuleInit => "module-init",
+            Self::Webhook => "webhook",
         }
     }
 }
@@ -63,6 +65,7 @@ impl EntrypointKind {
 pub enum BindingKind {
     Let,
     Function,
+    Webhook,
     Parameter,
     Match,
 }
@@ -72,6 +75,7 @@ impl BindingKind {
         match self {
             Self::Let => "let",
             Self::Function => "function",
+            Self::Webhook => "webhook",
             Self::Parameter => "parameter",
             Self::Match => "match",
         }
@@ -83,6 +87,7 @@ impl From<SymbolKind> for BindingKind {
         match kind {
             SymbolKind::Let => Self::Let,
             SymbolKind::Function => Self::Function,
+            SymbolKind::Webhook => Self::Webhook,
             SymbolKind::Parameter => Self::Parameter,
             SymbolKind::Match => Self::Match,
         }
@@ -104,6 +109,7 @@ pub struct FunctionSignature {
     pub parameters: Vec<Arc<Type>>,
     pub result: Arc<Type>,
     pub effects: EffectSet,
+    pub requirements: RequirementSet,
 }
 
 impl FunctionSignature {
@@ -117,6 +123,7 @@ impl FunctionSignature {
             parameters: function.parameters().to_vec(),
             result: function.shared_return_type(),
             effects: function.effects().clone(),
+            requirements: function.requirements().clone(),
         })
     }
 }
@@ -176,6 +183,7 @@ pub struct CoreBlock {
     pub result: ValueId,
     pub ty: Arc<Type>,
     pub effects: EffectSet,
+    pub requirements: RequirementSet,
     pub source: Option<Span>,
 }
 
@@ -184,6 +192,7 @@ pub struct CoreOperation {
     pub result: ValueId,
     pub ty: Arc<Type>,
     pub effects: EffectSet,
+    pub requirements: RequirementSet,
     pub source: Option<Span>,
     pub kind: OperationKind,
 }
@@ -318,13 +327,28 @@ impl CoreModule {
     pub fn render_text(&self) -> String {
         let mut output = String::new();
         output.push_str("core module\n");
-        let entrypoint = self.entrypoint_function();
-        output.push_str(&format!(
-            "entry {} {} effects {}\n",
-            entrypoint.id,
-            self.entrypoints[0].kind.as_str(),
-            entrypoint.signature.effects
-        ));
+        for entrypoint in &self.entrypoints {
+            let function = &self.functions[entrypoint.function.0 as usize];
+            output.push_str(&format!(
+                "entry {} {}",
+                function.id,
+                entrypoint.kind.as_str()
+            ));
+            if entrypoint.kind == EntrypointKind::Webhook {
+                output.push_str(&format!(
+                    " {}",
+                    function.debug_name.as_deref().unwrap_or("<anonymous>")
+                ));
+            }
+            output.push_str(&format!(" effects {}", function.signature.effects));
+            if !function.signature.requirements.is_empty() {
+                output.push_str(&format!(
+                    " requirements {}",
+                    function.signature.requirements
+                ));
+            }
+            output.push('\n');
+        }
         if !self.bindings.is_empty() {
             output.push_str("bindings\n");
             for binding in &self.bindings {
@@ -410,6 +434,12 @@ impl FunctionContext {
     }
 }
 
+struct BlockFacts {
+    ty: Arc<Type>,
+    effects: EffectSet,
+    requirements: RequirementSet,
+}
+
 struct Lowerer<'a> {
     analysis: &'a Analysis,
     bindings: Vec<CoreBinding>,
@@ -422,6 +452,7 @@ struct Lowerer<'a> {
     next_capture: u32,
     next_closure: u32,
     next_match_binding: u32,
+    webhook_entrypoint: Option<CoreEntrypoint>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -455,6 +486,7 @@ impl<'a> Lowerer<'a> {
             next_capture: 0,
             next_closure: 0,
             next_match_binding: 0,
+            webhook_entrypoint: None,
         })
     }
 
@@ -467,8 +499,11 @@ impl<'a> Lowerer<'a> {
             block_id,
             &program.statements,
             None,
-            Arc::new(Type::Unit),
-            self.analysis.effects().clone(),
+            BlockFacts {
+                ty: Arc::new(Type::Unit),
+                effects: self.analysis.effects().clone(),
+                requirements: self.analysis.requirements().clone(),
+            },
             None,
         )?;
         let context = self
@@ -486,6 +521,7 @@ impl<'a> Lowerer<'a> {
                 parameters: Vec::new(),
                 result: Arc::new(Type::Unit),
                 effects: self.analysis.effects().clone(),
+                requirements: self.analysis.requirements().clone(),
             },
             parameters: Vec::new(),
             captures: Vec::new(),
@@ -494,6 +530,13 @@ impl<'a> Lowerer<'a> {
         };
         self.set_function(function)?;
 
+        let mut entrypoints = vec![CoreEntrypoint {
+            kind: EntrypointKind::ModuleInit,
+            function: entrypoint,
+        }];
+        if let Some(webhook) = self.webhook_entrypoint.take() {
+            entrypoints.push(webhook);
+        }
         let functions = self
             .functions
             .into_iter()
@@ -503,10 +546,7 @@ impl<'a> Lowerer<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(CoreModule {
-            entrypoints: vec![CoreEntrypoint {
-                kind: EntrypointKind::ModuleInit,
-                function: entrypoint,
-            }],
+            entrypoints,
             bindings: self.bindings,
             functions,
         })
@@ -517,8 +557,7 @@ impl<'a> Lowerer<'a> {
         id: BlockId,
         statements: &[Statement],
         tail: Option<&Expression>,
-        ty: Arc<Type>,
-        effects: EffectSet,
+        facts: BlockFacts,
         source: Option<Span>,
     ) -> Result<CoreBlock, IrError> {
         self.push_scope();
@@ -543,8 +582,9 @@ impl<'a> Lowerer<'a> {
             parameters: Vec::new(),
             operations,
             result,
-            ty,
-            effects,
+            ty: facts.ty,
+            effects: facts.effects,
+            requirements: facts.requirements,
             source,
         })
     }
@@ -559,8 +599,11 @@ impl<'a> Lowerer<'a> {
             id,
             &block.statements,
             block.tail.as_deref(),
-            fact.shared_type(),
-            fact.effects().clone(),
+            BlockFacts {
+                ty: fact.shared_type(),
+                effects: fact.effects().clone(),
+                requirements: fact.requirements().clone(),
+            },
             Some(block.span),
         )
     }
@@ -573,6 +616,7 @@ impl<'a> Lowerer<'a> {
         let fact = self.expression_fact(expression)?;
         let ty = fact.shared_type();
         let effects = fact.effects().clone();
+        let requirements = fact.requirements().clone();
         let id = self.allocate_block();
         self.push_scope();
         for parameter in &parameters {
@@ -589,6 +633,7 @@ impl<'a> Lowerer<'a> {
             result,
             ty,
             effects,
+            requirements,
             source: Some(expression.span),
         })
     }
@@ -620,7 +665,7 @@ impl<'a> Lowerer<'a> {
                 let binding =
                     self.declaration_binding(statement.span, name, SymbolKind::Function)?;
                 let ty = self.binding_type(binding)?;
-                let value = self.lower_function(
+                let (value, _) = self.lower_function(
                     Some((binding, name.as_str())),
                     parameters,
                     body,
@@ -636,6 +681,44 @@ impl<'a> Lowerer<'a> {
                     OperationKind::Bind { binding, value },
                 );
                 self.current_context_mut().define(binding, value);
+            }
+            StatementKind::Webhook {
+                name,
+                parameters,
+                body,
+                ..
+            } => {
+                let binding =
+                    self.declaration_binding(statement.span, name, SymbolKind::Webhook)?;
+                let ty = self.binding_type(binding)?;
+                let (value, function) = self.lower_function(
+                    Some((binding, name.as_str())),
+                    parameters,
+                    body,
+                    ty,
+                    Some(statement.span),
+                    operations,
+                )?;
+                self.emit(
+                    operations,
+                    Arc::new(Type::Unit),
+                    EffectSet::default(),
+                    Some(statement.span),
+                    OperationKind::Bind { binding, value },
+                );
+                self.current_context_mut().define(binding, value);
+                if self
+                    .webhook_entrypoint
+                    .replace(CoreEntrypoint {
+                        kind: EntrypointKind::Webhook,
+                        function,
+                    })
+                    .is_some()
+                {
+                    return Err(IrError::new(
+                        "multiple webhook entrypoints reached Core lowering",
+                    ));
+                }
             }
             StatementKind::Expression(expression) => {
                 let value = self.lower_expression(expression, operations)?;
@@ -658,6 +741,7 @@ impl<'a> Lowerer<'a> {
     ) -> Result<ValueId, IrError> {
         let fact = self.expression_fact(expression)?;
         let ty = fact.shared_type();
+        let expression_requirements = fact.requirements().clone();
         let source = Some(expression.span);
         match &expression.kind {
             ExpressionKind::Literal(literal) => Ok(self.emit(
@@ -746,10 +830,12 @@ impl<'a> Lowerer<'a> {
             ExpressionKind::Block(block) => {
                 let block = self.lower_block(block)?;
                 let effects = block.effects.clone();
-                Ok(self.emit(
+                let requirements = block.requirements.clone();
+                Ok(self.emit_with_requirements(
                     operations,
                     ty,
                     effects,
+                    requirements,
                     source,
                     OperationKind::Block { block },
                 ))
@@ -763,10 +849,13 @@ impl<'a> Lowerer<'a> {
                 let consequent = self.lower_block(consequent)?;
                 let alternative = self.lower_expression_block(alternative, Vec::new())?;
                 let effects = EffectSet::union([&consequent.effects, &alternative.effects]);
-                Ok(self.emit(
+                let requirements =
+                    RequirementSet::union([&consequent.requirements, &alternative.requirements]);
+                Ok(self.emit_with_requirements(
                     operations,
                     ty,
                     effects,
+                    requirements,
                     source,
                     OperationKind::If {
                         condition,
@@ -777,7 +866,9 @@ impl<'a> Lowerer<'a> {
             }
             ExpressionKind::Function {
                 parameters, body, ..
-            } => self.lower_function(None, parameters, body, ty, source, operations),
+            } => self
+                .lower_function(None, parameters, body, ty, source, operations)
+                .map(|(value, _)| value),
             ExpressionKind::Call { callee, arguments } => {
                 let callee_value = self.lower_expression(callee, operations)?;
                 let arguments = arguments
@@ -790,10 +881,11 @@ impl<'a> Lowerer<'a> {
                         "analyzed call target has non-function type `{callee_type}`"
                     )));
                 };
-                Ok(self.emit(
+                Ok(self.emit_with_requirements(
                     operations,
                     ty,
                     function_type.effects().clone(),
+                    expression_requirements,
                     source,
                     OperationKind::Call {
                         callee: callee_value,
@@ -827,10 +919,13 @@ impl<'a> Lowerer<'a> {
                         let tail_id = tail.match_binding;
                         let cons = self.lower_expression_block(cons_case, vec![head, tail])?;
                         let effects = EffectSet::union([&empty.effects, &cons.effects]);
-                        Ok(self.emit(
+                        let requirements =
+                            RequirementSet::union([&empty.requirements, &cons.requirements]);
+                        Ok(self.emit_with_requirements(
                             operations,
                             ty,
                             effects,
+                            requirements,
                             source,
                             OperationKind::MatchList {
                                 subject: subject_value,
@@ -860,10 +955,14 @@ impl<'a> Lowerer<'a> {
                         }
                         let effects =
                             EffectSet::union(lowered_arms.iter().map(|arm| &arm.block.effects));
-                        Ok(self.emit(
+                        let requirements = RequirementSet::union(
+                            lowered_arms.iter().map(|arm| &arm.block.requirements),
+                        );
+                        Ok(self.emit_with_requirements(
                             operations,
                             ty,
                             effects,
+                            requirements,
                             source,
                             OperationKind::MatchVariant {
                                 subject: subject_value,
@@ -936,11 +1035,14 @@ impl<'a> Lowerer<'a> {
             (right_block, constant_block)
         };
         let effects = EffectSet::union([&consequent.effects, &alternative.effects]);
+        let requirements =
+            RequirementSet::union([&consequent.requirements, &alternative.requirements]);
         let ty = self.expression_fact(expression)?.shared_type();
-        Ok(self.emit(
+        Ok(self.emit_with_requirements(
             operations,
             ty,
             effects,
+            requirements,
             Some(expression.span),
             OperationKind::If {
                 condition,
@@ -968,6 +1070,7 @@ impl<'a> Lowerer<'a> {
             result,
             ty,
             effects: EffectSet::default(),
+            requirements: RequirementSet::default(),
             source: Some(span),
         }
     }
@@ -980,7 +1083,7 @@ impl<'a> Lowerer<'a> {
         ty: Arc<Type>,
         source: Option<Span>,
         operations: &mut Vec<CoreOperation>,
-    ) -> Result<ValueId, IrError> {
+    ) -> Result<(ValueId, FunctionId), IrError> {
         let signature = FunctionSignature::from_type(ty.as_ref())?;
         if signature.parameters.len() != parameters.len() {
             return Err(IrError::new(
@@ -1051,7 +1154,7 @@ impl<'a> Lowerer<'a> {
             body: core_body,
         };
         self.set_function(function)?;
-        Ok(self.emit(
+        let value = self.emit(
             operations,
             ty,
             EffectSet::default(),
@@ -1061,7 +1164,8 @@ impl<'a> Lowerer<'a> {
                 function: function_id,
                 captures: capture_arguments,
             },
-        ))
+        );
+        Ok((value, function_id))
     }
 
     fn block_parameter(&mut self, binding: BindingId) -> Result<BlockParameter, IrError> {
@@ -1189,11 +1293,31 @@ impl<'a> Lowerer<'a> {
         source: Option<Span>,
         kind: OperationKind,
     ) -> ValueId {
+        self.emit_with_requirements(
+            operations,
+            ty,
+            effects,
+            RequirementSet::default(),
+            source,
+            kind,
+        )
+    }
+
+    fn emit_with_requirements(
+        &mut self,
+        operations: &mut Vec<CoreOperation>,
+        ty: Arc<Type>,
+        effects: EffectSet,
+        requirements: RequirementSet,
+        source: Option<Span>,
+        kind: OperationKind,
+    ) -> ValueId {
         let result = self.allocate_value();
         operations.push(CoreOperation {
             result,
             ty,
             effects,
+            requirements,
             source,
             kind,
         });
@@ -1261,6 +1385,8 @@ impl<'a> Lowerer<'a> {
 struct Verifier<'a> {
     module: &'a CoreModule,
     value_types: BTreeMap<ValueId, Arc<Type>>,
+    builtin_values: BTreeMap<ValueId, Builtin>,
+    string_literals: BTreeMap<ValueId, String>,
     block_ids: BTreeSet<BlockId>,
     parameter_ids: BTreeSet<ParameterId>,
     capture_ids: BTreeSet<CaptureId>,
@@ -1273,6 +1399,8 @@ impl<'a> Verifier<'a> {
         Self {
             module,
             value_types: BTreeMap::new(),
+            builtin_values: BTreeMap::new(),
+            string_literals: BTreeMap::new(),
             block_ids: BTreeSet::new(),
             parameter_ids: BTreeSet::new(),
             capture_ids: BTreeSet::new(),
@@ -1283,12 +1411,24 @@ impl<'a> Verifier<'a> {
 
     fn verify(mut self) -> Result<(), IrError> {
         self.verify_contiguous_bindings()?;
-        if self.module.entrypoints.len() != 1
+        if self.module.entrypoints.is_empty()
+            || self.module.entrypoints.len() > 2
             || self.module.entrypoints[0].kind != EntrypointKind::ModuleInit
             || self.module.entrypoints[0].function != FunctionId(0)
             || self.module.entrypoints[0].function.0 as usize >= self.module.functions.len()
         {
             return Err(IrError::new("invalid module-init entrypoint identity"));
+        }
+        if let Some(webhook) = self.module.entrypoints.get(1)
+            && (webhook.kind != EntrypointKind::Webhook
+                || webhook.function == FunctionId(0)
+                || webhook.function.0 as usize >= self.module.functions.len()
+                || self.module.functions[webhook.function.0 as usize]
+                    .debug_name
+                    .as_deref()
+                    .is_none_or(str::is_empty))
+        {
+            return Err(IrError::new("invalid webhook entrypoint identity"));
         }
         for (index, function) in self.module.functions.iter().enumerate() {
             if function.id.0 as usize != index {
@@ -1310,6 +1450,15 @@ impl<'a> Verifier<'a> {
             || *entrypoint.signature.result != Type::Unit
         {
             return Err(IrError::new("invalid module-init entrypoint boundary"));
+        }
+        if let Some(webhook) = self.module.entrypoints.get(1) {
+            let function = self.function(webhook.function)?;
+            if function.signature.parameters.len() != 1
+                || function.signature.parameters[0].as_ref() != &Type::HttpRequest
+                || function.signature.result.as_ref() != &Type::HttpResponse
+            {
+                return Err(IrError::new("invalid webhook entrypoint boundary"));
+            }
         }
         for function in &self.module.functions {
             self.verify_function(function)?;
@@ -1357,7 +1506,14 @@ impl<'a> Verifier<'a> {
         if let Some(recursive) = &function.recursive {
             self.insert_value(recursive.value, Arc::clone(&recursive.ty))?;
             self.binding_type_matches(recursive.binding, &recursive.ty)?;
-            self.expect_binding_kind(recursive.binding, BindingKind::Function)?;
+            let binding = self.binding(recursive.binding)?;
+            if !matches!(binding.kind, BindingKind::Function | BindingKind::Webhook) {
+                return Err(IrError::new(format!(
+                    "{} recursive binding has invalid kind {}",
+                    function.id,
+                    binding.kind.as_str()
+                )));
+            }
             let expected = function_type(&function.signature);
             if recursive.ty.as_ref() != &expected {
                 return Err(IrError::new(format!(
@@ -1383,6 +1539,16 @@ impl<'a> Verifier<'a> {
         }
         for operation in &block.operations {
             self.insert_value(operation.result, Arc::clone(&operation.ty))?;
+            match &operation.kind {
+                OperationKind::Builtin(builtin) => {
+                    self.builtin_values.insert(operation.result, *builtin);
+                }
+                OperationKind::Literal(ValueLiteral::String(value)) => {
+                    self.string_literals
+                        .insert(operation.result, value.to_owned());
+                }
+                _ => {}
+            }
             match &operation.kind {
                 OperationKind::Block { block } => self.collect_block(block)?,
                 OperationKind::Closure { closure, .. } => {
@@ -1421,7 +1587,7 @@ impl<'a> Verifier<'a> {
 
     fn binding_type_matches(&self, id: BindingId, ty: &Type) -> Result<(), IrError> {
         let binding = self.binding(id)?;
-        if binding.ty.as_ref() == ty {
+        if type_equivalent(binding.ty.as_ref(), ty) {
             Ok(())
         } else {
             Err(IrError::new(format!(
@@ -1463,7 +1629,20 @@ impl<'a> Verifier<'a> {
                 function.id
             )));
         }
-        if function.body.ty.as_ref() != function.signature.result.as_ref() {
+        if !function
+            .signature
+            .requirements
+            .is_superset(&function.body.requirements)
+        {
+            return Err(IrError::new(format!(
+                "{} capability requirement summary is not conservative",
+                function.id
+            )));
+        }
+        if !type_equivalent(
+            function.body.ty.as_ref(),
+            function.signature.result.as_ref(),
+        ) {
             return Err(IrError::new(format!(
                 "{} body result type does not match its signature",
                 function.id
@@ -1528,9 +1707,11 @@ impl<'a> Verifier<'a> {
             }
         }
         let mut operation_effects = Vec::new();
+        let mut operation_requirements = Vec::new();
         for operation in &block.operations {
             self.verify_operation(operation, &available, &bindings)?;
             operation_effects.push(&operation.effects);
+            operation_requirements.push(&operation.requirements);
             available.insert(operation.result);
             if let OperationKind::Bind { binding, value } = &operation.kind
                 && bindings.insert(*binding, *value).is_some()
@@ -1548,6 +1729,13 @@ impl<'a> Verifier<'a> {
             return Err(IrError::new(format!(
                 "{} effect summary {} does not cover {}",
                 block.id, block.effects, required
+            )));
+        }
+        let required = RequirementSet::union(operation_requirements);
+        if !block.requirements.is_superset(&required) {
+            return Err(IrError::new(format!(
+                "{} capability requirement summary {} does not cover {}",
+                block.id, block.requirements, required
             )));
         }
         Ok(())
@@ -1581,6 +1769,9 @@ impl<'a> Verifier<'a> {
             OperationKind::Variant { variant, payload } => {
                 if let Some(payload) = payload {
                     require_available(*payload, available, operation.result)?;
+                    if type_contains_secret(self.value_type(*payload)?) {
+                        return Err(IrError::new("opaque Secret cannot be placed in a variant"));
+                    }
                 }
                 verify_variant_type(*variant, *payload, &operation.ty, &self.value_types)?;
                 expect_effects(operation, &pure)?;
@@ -1594,6 +1785,9 @@ impl<'a> Verifier<'a> {
                 };
                 for element in elements {
                     require_available(*element, available, operation.result)?;
+                    if type_contains_secret(self.value_type(*element)?) {
+                        return Err(IrError::new("opaque Secret cannot be placed in a list"));
+                    }
                     self.expect_value_type(*element, element_type)?;
                 }
                 expect_effects(operation, &pure)?;
@@ -1605,6 +1799,12 @@ impl<'a> Verifier<'a> {
                         operation.result
                     )));
                 };
+                if record_types
+                    .iter()
+                    .any(|field| type_contains_secret(field.ty()))
+                {
+                    return Err(IrError::new("opaque Secret cannot be placed in a record"));
+                }
                 if fields.len() != record_types.len() {
                     return Err(IrError::new(format!(
                         "{} record field count does not match its type",
@@ -1635,22 +1835,14 @@ impl<'a> Verifier<'a> {
             }
             OperationKind::Field { value, field } => {
                 require_available(*value, available, operation.result)?;
-                let Type::Record(fields) = self.value_type(*value)? else {
-                    return Err(IrError::new(format!(
-                        "{} field source is not a record",
-                        operation.result
-                    )));
-                };
-                let expected = fields
-                    .iter()
-                    .find(|record_type| record_type.name() == field)
-                    .ok_or_else(|| {
+                let expected =
+                    record_field_type(self.value_type(*value)?, field).ok_or_else(|| {
                         IrError::new(format!(
                             "{} accesses missing field `{field}`",
                             operation.result
                         ))
                     })?;
-                expect_type(operation, expected.ty())?;
+                expect_type(operation, expected.as_ref())?;
                 expect_effects(operation, &pure)?;
             }
             OperationKind::Block { block } => {
@@ -1718,7 +1910,9 @@ impl<'a> Verifier<'a> {
                 self.expect_value_type(*condition, &Type::Bool)?;
                 self.verify_block(consequent, available, bindings)?;
                 self.verify_block(alternative, available, bindings)?;
-                if consequent.ty != alternative.ty || consequent.ty != operation.ty {
+                if !type_equivalent(&consequent.ty, &alternative.ty)
+                    || !type_equivalent(&consequent.ty, &operation.ty)
+                {
                     return Err(IrError::new(format!(
                         "{} if branch result types are inconsistent",
                         operation.result
@@ -1743,7 +1937,9 @@ impl<'a> Verifier<'a> {
                 };
                 self.verify_block(empty, available, bindings)?;
                 self.verify_block(cons, available, bindings)?;
-                if empty.ty != cons.ty || empty.ty != operation.ty {
+                if !type_equivalent(&empty.ty, &cons.ty)
+                    || !type_equivalent(&empty.ty, &operation.ty)
+                {
                     return Err(IrError::new(format!(
                         "{} list match arm types are inconsistent",
                         operation.result
@@ -1812,7 +2008,7 @@ impl<'a> Verifier<'a> {
                         }
                     }
                     self.verify_block(&arm.block, available, bindings)?;
-                    if arm.block.ty != operation.ty {
+                    if !type_equivalent(&arm.block.ty, &operation.ty) {
                         return Err(IrError::new(format!(
                             "{} variant arm result type is inconsistent",
                             operation.result
@@ -1847,7 +2043,7 @@ impl<'a> Verifier<'a> {
                 self.binding_type_matches(*binding, self.value_type(*value)?)?;
                 if !matches!(
                     self.binding(*binding)?.kind,
-                    BindingKind::Let | BindingKind::Function
+                    BindingKind::Let | BindingKind::Function | BindingKind::Webhook
                 ) {
                     return Err(IrError::new(format!(
                         "{} binds non-declaration {}",
@@ -1863,7 +2059,79 @@ impl<'a> Verifier<'a> {
                 expect_effects(operation, &pure)?;
             }
         }
+        self.verify_operation_requirements(operation)?;
         Ok(())
+    }
+
+    fn verify_operation_requirements(&self, operation: &CoreOperation) -> Result<(), IrError> {
+        match &operation.kind {
+            OperationKind::Block { block } => require_requirements(operation, &block.requirements),
+            OperationKind::Call { callee, arguments } => {
+                let Type::Function(function) = self.value_type(*callee)? else {
+                    return Err(IrError::new(format!(
+                        "{} call target is not a function",
+                        operation.result
+                    )));
+                };
+                let mut requirements = function.requirements().iter().cloned().collect::<Vec<_>>();
+                if let Some(builtin) = self.builtin_values.get(callee)
+                    && matches!(builtin, Builtin::ConfigString | Builtin::Secret)
+                {
+                    let argument = arguments.first().ok_or_else(|| {
+                        IrError::new(format!(
+                            "{} resource host call has no argument",
+                            operation.result
+                        ))
+                    })?;
+                    let resource = self.string_literals.get(argument).ok_or_else(|| {
+                        IrError::new(format!(
+                            "{} resource host call argument is not a string literal",
+                            operation.result
+                        ))
+                    })?;
+                    let capability = match builtin {
+                        Builtin::ConfigString => crate::Effect::ConfigRead,
+                        Builtin::Secret => crate::Effect::SecretRead,
+                        _ => unreachable!("matched resource host built-ins"),
+                    };
+                    requirements.push(crate::CapabilityRequirement::new(
+                        capability,
+                        resource.clone(),
+                    ));
+                }
+                require_requirements(operation, &RequirementSet::from_requirements(requirements))
+            }
+            OperationKind::If {
+                consequent,
+                alternative,
+                ..
+            } => require_requirements(
+                operation,
+                &RequirementSet::union([&consequent.requirements, &alternative.requirements]),
+            ),
+            OperationKind::MatchList { empty, cons, .. } => require_requirements(
+                operation,
+                &RequirementSet::union([&empty.requirements, &cons.requirements]),
+            ),
+            OperationKind::MatchVariant { arms, .. } => require_requirements(
+                operation,
+                &RequirementSet::union(arms.iter().map(|arm| &arm.block.requirements)),
+            ),
+            OperationKind::Literal(_)
+            | OperationKind::Unit
+            | OperationKind::Builtin(_)
+            | OperationKind::Variant { .. }
+            | OperationKind::List(_)
+            | OperationKind::Record(_)
+            | OperationKind::Field { .. }
+            | OperationKind::Closure { .. }
+            | OperationKind::Unary { .. }
+            | OperationKind::Binary { .. }
+            | OperationKind::Bind { .. }
+            | OperationKind::Discard { .. } => {
+                expect_requirements(operation, &RequirementSet::default())
+            }
+        }
     }
 
     fn verify_builtin_type(&self, builtin: Builtin, ty: &Type) -> Result<(), IrError> {
@@ -1878,6 +2146,7 @@ impl<'a> Verifier<'a> {
                 if function.parameters().len() == 1
                     && function.return_type() == &Type::Unit
                     && function.effects().contains(&crate::Effect::IoStdout)
+                    && !type_contains_secret(function.parameters()[0].as_ref())
                 {
                     Ok(())
                 } else {
@@ -1906,10 +2175,39 @@ impl<'a> Verifier<'a> {
                 };
                 if function.parameters().len() == 1
                     && function.parameters()[0].as_ref() == &Type::String
+                    && type_contains_no_function(function.return_type())
                 {
                     Ok(())
                 } else {
                     Err(IrError::new("json_decode has invalid signature"))
+                }
+            }
+            Builtin::ConfigString => {
+                let Type::Function(function) = ty else {
+                    return Err(IrError::new("config_string has non-function type"));
+                };
+                let expected = Type::Result(Arc::new(Type::String), Arc::new(Type::String));
+                if function.parameters() == [Arc::new(Type::String)]
+                    && function.return_type() == &expected
+                    && function.effects().contains(&crate::Effect::ConfigRead)
+                {
+                    Ok(())
+                } else {
+                    Err(IrError::new("config_string has invalid signature"))
+                }
+            }
+            Builtin::Secret => {
+                let Type::Function(function) = ty else {
+                    return Err(IrError::new("secret has non-function type"));
+                };
+                let expected = Type::Result(Arc::new(Type::Secret), Arc::new(Type::String));
+                if function.parameters() == [Arc::new(Type::String)]
+                    && function.return_type() == &expected
+                    && function.effects().contains(&crate::Effect::SecretRead)
+                {
+                    Ok(())
+                } else {
+                    Err(IrError::new("secret has invalid signature"))
                 }
             }
         }
@@ -1993,7 +2291,7 @@ impl<'a> Verifier<'a> {
 
     fn expect_value_type(&self, value: ValueId, expected: &Type) -> Result<(), IrError> {
         let actual = self.value_type(value)?;
-        if actual == expected {
+        if type_equivalent(actual, expected) {
             Ok(())
         } else {
             Err(IrError::new(format!(
@@ -2016,6 +2314,7 @@ fn function_type(signature: &FunctionSignature) -> Type {
         signature.parameters.clone(),
         Arc::clone(&signature.result),
         signature.effects.clone(),
+        signature.requirements.clone(),
     ))
 }
 
@@ -2031,6 +2330,11 @@ fn verify_constructor_function(
         return Err(IrError::new("constructor has invalid function boundary"));
     }
     let parameter = function.parameters()[0].as_ref();
+    if type_contains_secret(parameter) {
+        return Err(IrError::new(
+            "opaque Secret cannot be placed in a constructed variant",
+        ));
+    }
     let valid = match (family, function.return_type()) {
         (VariantFamily::Option, Type::Option(element)) => element.as_ref() == parameter,
         (VariantFamily::Result, Type::Result(value, _)) if first_payload => {
@@ -2076,6 +2380,100 @@ fn verify_variant_type(
     }
 }
 
+fn type_equivalent(left: &Type, right: &Type) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left, right) {
+        (Type::HttpHeader, Type::Record(fields)) | (Type::Record(fields), Type::HttpHeader) => {
+            record_matches(fields, &[("name", Type::String), ("value", Type::String)])
+        }
+        (Type::HttpRequest, Type::Record(fields)) | (Type::Record(fields), Type::HttpRequest) => {
+            record_matches(
+                fields,
+                &[
+                    ("body", Type::String),
+                    ("headers", Type::List(Arc::new(Type::HttpHeader))),
+                    ("method", Type::String),
+                    ("path", Type::String),
+                    ("query", Type::String),
+                ],
+            )
+        }
+        (Type::HttpResponse, Type::Record(fields)) | (Type::Record(fields), Type::HttpResponse) => {
+            record_matches(
+                fields,
+                &[
+                    ("body", Type::String),
+                    ("headers", Type::List(Arc::new(Type::HttpHeader))),
+                    ("status", Type::Int),
+                ],
+            )
+        }
+        (Type::List(left), Type::List(right)) | (Type::Option(left), Type::Option(right)) => {
+            type_equivalent(left, right)
+        }
+        (Type::Result(left_value, left_error), Type::Result(right_value, right_error)) => {
+            type_equivalent(left_value, right_value) && type_equivalent(left_error, right_error)
+        }
+        (Type::Record(left_fields), Type::Record(right_fields)) => {
+            left_fields.len() == right_fields.len()
+                && left_fields.iter().all(|left| {
+                    right_fields.iter().any(|right| {
+                        left.name() == right.name() && type_equivalent(left.ty(), right.ty())
+                    })
+                })
+        }
+        (Type::Function(left), Type::Function(right)) => {
+            left.parameters().len() == right.parameters().len()
+                && left
+                    .parameters()
+                    .iter()
+                    .zip(right.parameters())
+                    .all(|(left, right)| type_equivalent(left, right))
+                && type_equivalent(left.return_type(), right.return_type())
+                && left.effects() == right.effects()
+                && left.requirements() == right.requirements()
+        }
+        _ => false,
+    }
+}
+
+fn record_matches(fields: &[crate::RecordType], expected: &[(&str, Type)]) -> bool {
+    fields.len() == expected.len()
+        && expected.iter().all(|(name, ty)| {
+            fields
+                .iter()
+                .find(|field| field.name() == *name)
+                .is_some_and(|field| type_equivalent(field.ty(), ty))
+        })
+}
+
+fn record_field_type(ty: &Type, name: &str) -> Option<Arc<Type>> {
+    match ty {
+        Type::Record(fields) => fields
+            .iter()
+            .find(|field| field.name() == name)
+            .map(|field| Arc::new(field.ty().clone())),
+        Type::HttpHeader => match name {
+            "name" | "value" => Some(Arc::new(Type::String)),
+            _ => None,
+        },
+        Type::HttpRequest => match name {
+            "method" | "path" | "query" | "body" => Some(Arc::new(Type::String)),
+            "headers" => Some(Arc::new(Type::List(Arc::new(Type::HttpHeader)))),
+            _ => None,
+        },
+        Type::HttpResponse => match name {
+            "status" => Some(Arc::new(Type::Int)),
+            "headers" => Some(Arc::new(Type::List(Arc::new(Type::HttpHeader)))),
+            "body" => Some(Arc::new(Type::String)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn type_contains_no_function(ty: &Type) -> bool {
     match ty {
         Type::Function(_) => false,
@@ -2086,7 +2484,39 @@ fn type_contains_no_function(ty: &Type) -> bool {
         Type::Result(value, error) => {
             type_contains_no_function(value) && type_contains_no_function(error)
         }
-        Type::Int | Type::Bool | Type::String | Type::Unit | Type::Variable(_) => true,
+        Type::Int
+        | Type::Bool
+        | Type::String
+        | Type::Unit
+        | Type::HttpHeader
+        | Type::HttpRequest
+        | Type::HttpResponse
+        | Type::Variable(_) => true,
+        Type::Secret => false,
+    }
+}
+
+fn type_contains_secret(ty: &Type) -> bool {
+    match ty {
+        Type::Secret => true,
+        Type::List(element) | Type::Option(element) => type_contains_secret(element),
+        Type::Record(fields) => fields.iter().any(|field| type_contains_secret(field.ty())),
+        Type::Result(value, error) => type_contains_secret(value) || type_contains_secret(error),
+        Type::Function(function) => {
+            function
+                .parameters()
+                .iter()
+                .any(|parameter| type_contains_secret(parameter))
+                || type_contains_secret(function.return_type())
+        }
+        Type::Int
+        | Type::Bool
+        | Type::String
+        | Type::Unit
+        | Type::HttpHeader
+        | Type::HttpRequest
+        | Type::HttpResponse
+        | Type::Variable(_) => false,
     }
 }
 
@@ -2173,7 +2603,14 @@ fn type_has_residual(ty: &Type, visited: &mut HashSet<*const Type>) -> bool {
                 .any(|parameter| type_has_residual(parameter.as_ref(), visited))
                 || type_has_residual(function.return_type(), visited)
         }
-        Type::Int | Type::Bool | Type::String | Type::Unit => false,
+        Type::Int
+        | Type::Bool
+        | Type::String
+        | Type::Unit
+        | Type::HttpHeader
+        | Type::HttpRequest
+        | Type::HttpResponse
+        | Type::Secret => false,
     }
 }
 
@@ -2211,7 +2648,7 @@ fn require_available(
 }
 
 fn expect_type(operation: &CoreOperation, expected: &Type) -> Result<(), IrError> {
-    if operation.ty.as_ref() == expected {
+    if type_equivalent(operation.ty.as_ref(), expected) {
         Ok(())
     } else {
         Err(IrError::new(format!(
@@ -2239,6 +2676,34 @@ fn require_effects(operation: &CoreOperation, required: &EffectSet) -> Result<()
         Err(IrError::new(format!(
             "{} effects {} do not cover {}",
             operation.result, operation.effects, required
+        )))
+    }
+}
+
+fn expect_requirements(
+    operation: &CoreOperation,
+    expected: &RequirementSet,
+) -> Result<(), IrError> {
+    if &operation.requirements == expected {
+        Ok(())
+    } else {
+        Err(IrError::new(format!(
+            "{} has capability requirements {}, expected {}",
+            operation.result, operation.requirements, expected
+        )))
+    }
+}
+
+fn require_requirements(
+    operation: &CoreOperation,
+    required: &RequirementSet,
+) -> Result<(), IrError> {
+    if operation.requirements.is_superset(required) {
+        Ok(())
+    } else {
+        Err(IrError::new(format!(
+            "{} capability requirements {} do not cover {}",
+            operation.result, operation.requirements, required
         )))
     }
 }
@@ -2311,9 +2776,16 @@ fn render_function(output: &mut String, function: &CoreFunction) {
         ));
     }
     output.push_str(&format!(
-        ") -> {} effects {}\n",
+        ") -> {} effects {}",
         function.signature.result, function.signature.effects
     ));
+    if !function.signature.requirements.is_empty() {
+        output.push_str(&format!(
+            " requirements {}",
+            function.signature.requirements
+        ));
+    }
+    output.push('\n');
     if let Some(recursive) = &function.recursive {
         output.push_str(&format!(
             "  self {} {}: {}\n",
@@ -2349,7 +2821,11 @@ fn render_block(output: &mut String, block: &CoreBlock, indent: usize) {
         }
         output.push(')');
     }
-    output.push_str(&format!(" -> {} effects {}\n", block.ty, block.effects));
+    output.push_str(&format!(" -> {} effects {}", block.ty, block.effects));
+    if !block.requirements.is_empty() {
+        output.push_str(&format!(" requirements {}", block.requirements));
+    }
+    output.push('\n');
     for operation in &block.operations {
         render_operation(output, operation, indent + 1);
     }
@@ -2492,6 +2968,9 @@ fn render_operation(output: &mut String, operation: &CoreOperation, indent: usiz
     }
     if !operation.effects.is_empty() {
         output.push_str(&format!(" effects {}", operation.effects));
+    }
+    if !operation.requirements.is_empty() {
+        output.push_str(&format!(" requirements {}", operation.requirements));
     }
     output.push('\n');
 }
@@ -2815,6 +3294,22 @@ mod tests {
                 .expect_err("missing effects should fail")
                 .to_string()
                 .contains("do not cover")
+        );
+
+        let mut requirements = lowered("config_string(\"agent.model\");");
+        let call = requirements.functions[0]
+            .body
+            .operations
+            .iter_mut()
+            .find(|operation| matches!(operation.kind, OperationKind::Call { .. }))
+            .expect("program should contain a call");
+        call.requirements = RequirementSet::default();
+        assert!(
+            requirements
+                .verify()
+                .expect_err("missing capability requirement should fail")
+                .to_string()
+                .contains("capability requirements")
         );
     }
 

@@ -5,6 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use krit_capability::is_valid_resource_name;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
@@ -302,20 +303,9 @@ fn validate_unique_names(kind: &str, values: &[String]) -> Result<(), ManifestEr
 }
 
 fn validate_resource_name(kind: &str, name: &str) -> Result<(), ManifestError> {
-    let valid = !name.is_empty()
-        && name.len() <= 64
-        && !name.starts_with('.')
-        && !name.starts_with('-')
-        && !name.ends_with('.')
-        && !name.ends_with('-')
-        && !name.contains("..")
-        && !name.contains("--")
-        && name.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
-        });
-    if !valid {
+    if !is_valid_resource_name(name) {
         return Err(ManifestError::new(format!(
-            "{kind} `{name}` must use 1-64 lowercase letters, digits, `.` or `-`"
+            "{kind} `{name}` must use 1-64 lowercase letters, digits, `.` or `-`, without leading/trailing punctuation or `..`/`--`"
         )));
     }
     Ok(())

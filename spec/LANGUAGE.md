@@ -8,10 +8,12 @@
 This document defines the syntax and runtime behavior required by the initial
 Rust implementation. The bootstrap static checker is specified in
 `TYPES-AND-EFFECTS.md`, and the evaluator-independent typed Core form is
-described in `docs/technical-design.md`. Modules, package resolution, external
-capabilities beyond scalar stdout and full-language WebAssembly layouts remain
-draft. Policy-1 component generation and bounded sandbox execution are
-implemented for the documented subset.
+described in `docs/technical-design.md`. This milestone also defines
+contracts-only webhook entrypoints, configuration reads, and opaque secret
+acquisition. Their HTTP host and WebAssembly layouts are deliberately not
+implemented until the `phase4-http-runtime` milestone. Policy-1 component
+generation and bounded sandbox execution remain implemented only for the
+documented scalar/stdout subset.
 
 The historical Racket S-expression syntax is not accepted by Krit 0.2.
 
@@ -30,13 +32,13 @@ A source file is UTF-8 and conventionally ends in `.krit`.
 Reserved keywords:
 
 ```text
-else false fn if let match record true
+else false fn if let match record true webhook
 ```
 
 Reserved built-in names:
 
 ```text
-Err None Ok Some json_decode json_encode print println
+Err None Ok Some config_string json_decode json_encode print println secret
 ```
 
 A binding cannot use a keyword or reserved built-in name.
@@ -71,12 +73,17 @@ program         = item* ;
 
 item            = let-declaration
                 | function-declaration
+                | webhook-declaration
                 | expression, ";" ;
 
 let-declaration = "let", identifier, (":", type)?, "=", expression, ";" ;
 
 function-declaration
                 = "fn", identifier, "(", parameters?, ")",
+                  ("->", type)?, block ;
+
+webhook-declaration
+                = "webhook", "fn", identifier, "(", parameters?, ")",
                   ("->", type)?, block ;
 
 parameters      = parameter, (",", parameter)*, ","? ;
@@ -143,6 +150,7 @@ result-arm      = "Ok", "(", identifier, ")", "=>", expression
                 | "Err", "(", identifier, ")", "=>", expression ;
 
 type            = "Int" | "Bool" | "String" | "Unit"
+                | "HttpHeader" | "HttpRequest" | "HttpResponse" | "Secret"
                 | "List", "<", type, ">"
                 | "Option", "<", type, ">"
                 | "Result", "<", type, ",", type, ">"
@@ -154,6 +162,21 @@ record-type-field
 ```
 
 Assignments and mutable bindings do not exist in edition 2026.
+
+A `webhook` declaration is valid only as a direct program item. A source
+module contains zero or one webhook. Nested or duplicate webhook declarations
+are errors. The parser retains its written parameter and result annotations;
+the static checker requires exactly:
+
+```krit
+webhook fn name(request: HttpRequest) -> HttpResponse {
+    // ...
+}
+```
+
+The source name is a compiler fact. A future host exports the declaration
+through the canonical `krit:runtime/webhook@0.2.0` interface's `handle`
+operation; the name does not create an ambient network listener.
 
 ## 5. Program and block values
 
@@ -180,6 +203,7 @@ The normative runtime value kinds are:
 - immutable record
 - built-in `Option` variant (`Some` or `None`)
 - built-in `Result` variant (`Ok` or `Err`)
+- opaque host secret handle
 - function closure
 
 Integer overflow is a runtime error. Division truncates toward zero. Division
@@ -193,7 +217,12 @@ record type cannot repeat a field name. Record equality is structural by field
 name and value, independent of field order.
 
 `Some(value)`, `None`, `Ok(value)`, and `Err(value)` are ordinary immutable
-runtime values. Their payloads may contain any runtime value.
+runtime values. An opaque `Secret` is the exception to ordinary structural
+composition: it cannot be printed, compared, JSON-encoded, or placed in a
+list, record, `Option`, or user-constructed `Result`. The host operation
+`secret` returns `Result<Secret, String>` so acquisition failure remains
+visible; matching that result may bind the handle for a future approved host
+connector operation.
 
 ## 7. Bindings and scope
 
@@ -210,6 +239,11 @@ constraint for both human- and AI-authored code.
 Function declarations are visible from their declaration to the end of their
 containing scope and may call themselves recursively. Mutually recursive
 declarations are not supported in the dynamic baseline.
+
+Webhook declarations introduce a function binding with the same lexical
+visibility and recursion rules as an ordinary function declaration. The
+`webhook` modifier additionally marks that function as the source module's
+single exported host entrypoint.
 
 Krit uses lexical scope. A function expression captures bindings from the
 environment where it is created, not where it is called.
@@ -231,8 +265,8 @@ let add_one = fn(value) {
 Arguments evaluate from left to right. The argument count must equal the
 parameter count. Calling a non-function is a runtime error.
 
-Function values cannot be compared, including when nested in a list, record,
-`Option`, or `Result`.
+Function values and opaque `Secret` values cannot be compared, including when
+nested in an ordinary structural value.
 
 Annotations may be written on let bindings, parameters, and function return
 values:
@@ -248,10 +282,37 @@ fn attempt(value: Int) -> Result<Int, String> {
 
 Annotations are parsed and retained by the compiler. `krit check` enforces
 them through static analysis without executing the program. `krit run`
-remains the transitional direct dynamic evaluator in this milestone: it does
-not yet enforce annotations or other static-checker rules, including
-same-scope duplicate declarations. Runtime conformance therefore remains
-separate. Static checking is specified in `TYPES-AND-EFFECTS.md`.
+remains the transitional direct dynamic evaluator and preserves runtime
+conformance behavior, but preflights valid webhook/configuration/secret
+contracts so unavailable hosts fail explicitly rather than fabricating a
+value. Static checking is specified in `TYPES-AND-EFFECTS.md`.
+
+## 8.1 Webhook contract types
+
+The edition-2026 built-in names below are fixed aliases with stable public
+names and closed structural shapes:
+
+```text
+HttpHeader   = Record { name: String, value: String }
+HttpRequest  = Record {
+    method: String,
+    path: String,
+    query: String,
+    headers: List<HttpHeader>,
+    body: String,
+}
+HttpResponse = Record {
+    status: Int,
+    headers: List<HttpHeader>,
+    body: String,
+}
+```
+
+Header order is preserved and duplicate header names are representable.
+`HttpResponse` is exact: a response with a missing or additional field is a
+type error. Status-range validation belongs to the future HTTP host, not the
+static type checker. These built-ins do not add general user-defined type
+alias syntax.
 
 ## 9. Operators
 
@@ -372,9 +433,10 @@ Output rendering is deterministic:
 - variants: `Some(value)`, `None`, `Ok(value)`, or `Err(value)`
 - functions: `<function>` or `<function name>`
 
-Output is the only effect in the normative 0.2 runtime. Package execution will
-model it as the `io.stdout` capability when the capability specification
-becomes normative.
+Output is the only host effect executable by the direct evaluator and the
+policy-1 WebAssembly runtime. It is modeled as `io.stdout`. Contract-only
+`config.read` and `secret.read` operations are statically visible but have no
+value provider in this milestone.
 
 ## 13. JSON conversion
 
@@ -399,7 +461,27 @@ Consequently, those four single-key shapes are reserved as JSON variant tags.
 
 JSON numbers must be signed 64-bit integers; floating-point and out-of-range
 numbers are rejected. Encoding a function directly or inside another value is
-`K4008`. Invalid JSON or JSON without a Krit representation is `K4009`.
+`K4008`. `Secret` is rejected statically and can never reach JSON conversion.
+Invalid JSON or JSON without a Krit representation is `K4009`.
+
+## 13.1 Configuration and secret host contracts
+
+```krit
+config_string("agent.model") // Result<String, String>
+secret("github-token")       // Result<Secret, String>
+```
+
+Both operations require exactly one direct string-literal resource argument.
+Indirect use of either host operation as a first-class function and calls
+with computed names are rejected because capability requirements would not be
+statically knowable. A configuration read has effect `config.read` and
+requirement pair `("config.read", "agent.model")`. Secret acquisition has
+effect `secret.read` and the corresponding literal-resource requirement.
+
+The source checker does not require a manifest. Package build orchestration
+checks requirements against the schema-1 manifest. The direct evaluator emits
+`K5003` because these host operations are unavailable; it never substitutes
+an empty string, environment variable, or secret bytes.
 
 ## 14. Evaluation failure
 
@@ -416,6 +498,9 @@ The following are errors rather than implementation-defined behavior:
 - function comparison
 - missing record field
 - JSON encoding of a function
+- non-literal configuration or secret resource
+- printing, comparing, encoding, or structurally storing an opaque secret
+- unavailable webhook, configuration, or secret direct-run host contract
 - invalid or unsupported JSON
 
 Evaluation stops at the first error. Errors follow `DIAGNOSTICS.md`.

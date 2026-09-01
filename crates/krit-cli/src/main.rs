@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     fs::OpenOptions,
     io::{self, Read, Write},
@@ -7,8 +8,8 @@ use std::{
 };
 
 use krit::{
-    Analysis, CoreModule, Diagnostic, Source, Span, analyze, format_source, lower, parse_source,
-    run_source,
+    Analysis, CoreModule, Diagnostic, Effect, EntrypointKind, RequirementSet, Source, Span,
+    analyze, execute, format_source, lower, parse_source,
 };
 use krit_package::Manifest;
 use krit_runtime::{GrantSet, Runtime, RuntimeError, RuntimeErrorKind, RuntimeLimits};
@@ -109,6 +110,19 @@ fn build_command(arguments: &[String]) -> u8 {
         Ok(module) => module,
         Err(error) => return internal_error("KICE0001", "lowering Core IR", &error),
     };
+    if let Some((requirement, span)) = first_missing_requirement(&analysis, &manifest) {
+        let diagnostic = Diagnostic::new(
+            "K5001",
+            format!(
+                "required capability `{}` for resource `{}` is not granted by the package",
+                requirement.capability().as_str(),
+                requirement.resource()
+            ),
+            span,
+        );
+        eprintln!("{}", diagnostic.render_human(&source));
+        return 4;
+    }
 
     let mut options = BuildOptions::new(
         &manifest.package.edition,
@@ -368,6 +382,7 @@ fn restore_build_outputs(files: &mut [BuildOutputFile]) {
 struct JsonExplanation {
     schema: u8,
     entrypoint: JsonEntrypoint,
+    entrypoints: JsonEntrypointFacts,
     bindings: Vec<JsonBinding>,
     core: String,
 }
@@ -388,6 +403,76 @@ struct JsonBinding {
     name: String,
     kind: &'static str,
     r#type: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonEntrypointFacts {
+    schema: u8,
+    items: Vec<JsonEntrypointFact>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonEntrypointFact {
+    name: String,
+    kind: &'static str,
+    function_id: u32,
+    signature: String,
+    effects: Vec<&'static str>,
+    capability_requirements: Vec<JsonCapabilityRequirement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contract: Option<JsonWebhookContract>,
+}
+
+#[derive(Serialize)]
+struct JsonCapabilityRequirement {
+    capability: &'static str,
+    resource: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonWebhookContract {
+    schema: u8,
+    request_type: &'static str,
+    response_type: &'static str,
+    request_schema: JsonSchemaDocument,
+    response_schema: JsonSchemaDocument,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonSchemaDocument {
+    #[serde(rename = "$schema")]
+    dialect: &'static str,
+    #[serde(rename = "$id")]
+    id: &'static str,
+    title: &'static str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    additional_properties: bool,
+    required: Vec<&'static str>,
+    properties: BTreeMap<&'static str, JsonSchemaNode>,
+    #[serde(rename = "$defs")]
+    definitions: BTreeMap<&'static str, JsonSchemaNode>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonSchemaNode {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    #[serde(rename = "$ref", skip_serializing_if = "Option::is_none")]
+    reference: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    items: Option<Box<Self>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_properties: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    required: Vec<&'static str>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    properties: BTreeMap<&'static str, Self>,
 }
 
 fn explain_command(arguments: &[String]) -> u8 {
@@ -469,6 +554,28 @@ fn render_explanation_human(analysis: &Analysis, module: &CoreModule) {
     );
     println!("result: {}", entrypoint.signature.result);
     println!("effects: {}", entrypoint.signature.effects);
+    if let Some(webhook) = module
+        .entrypoints()
+        .iter()
+        .find(|entrypoint| entrypoint.kind == EntrypointKind::Webhook)
+    {
+        let function = &module.functions()[webhook.function.as_u32() as usize];
+        let name = function.debug_name.as_deref().unwrap_or("<anonymous>");
+        println!("webhook contract (schema 1):");
+        println!(
+            "  signature: webhook fn {}(request: HttpRequest) -> HttpResponse",
+            name
+        );
+        println!("  effects: {}", function.signature.effects);
+        println!("  capabilities: {}", function.signature.requirements);
+        println!(
+            "  request: HttpRequest {{ method: String, path: String, query: String, headers: List<HttpHeader>, body: String }}"
+        );
+        println!(
+            "  response: HttpResponse {{ status: Int, headers: List<HttpHeader>, body: String }}"
+        );
+        println!("  JSON Schema: draft 2020-12 request/response contract v1");
+    }
     println!("top-level bindings:");
     let mut found = false;
     for binding in analysis
@@ -502,6 +609,43 @@ fn render_explanation_json(analysis: &Analysis, module: &CoreModule) -> u8 {
                 .map(|effect| effect.as_str())
                 .collect(),
         },
+        entrypoints: JsonEntrypointFacts {
+            schema: 1,
+            items: module
+                .entrypoints()
+                .iter()
+                .map(|entrypoint| {
+                    let function = &module.functions()[entrypoint.function.as_u32() as usize];
+                    JsonEntrypointFact {
+                        name: function
+                            .debug_name
+                            .clone()
+                            .unwrap_or_else(|| "<anonymous>".to_owned()),
+                        kind: entrypoint.kind.as_str(),
+                        function_id: entrypoint.function.as_u32(),
+                        signature: normalized_entrypoint_signature(entrypoint, function),
+                        effects: function
+                            .signature
+                            .effects
+                            .iter()
+                            .map(|effect| effect.as_str())
+                            .collect(),
+                        capability_requirements: json_requirements(
+                            &function.signature.requirements,
+                        ),
+                        contract: (entrypoint.kind == EntrypointKind::Webhook).then(|| {
+                            JsonWebhookContract {
+                                schema: 1,
+                                request_type: "HttpRequest",
+                                response_type: "HttpResponse",
+                                request_schema: webhook_request_schema(),
+                                response_schema: webhook_response_schema(),
+                            }
+                        }),
+                    }
+                })
+                .collect(),
+        },
         bindings: analysis
             .bindings()
             .iter()
@@ -524,6 +668,124 @@ fn render_explanation_json(analysis: &Analysis, module: &CoreModule) -> u8 {
             0
         }
         Err(error) => internal_error("KICE0002", "rendering an explanation", &error),
+    }
+}
+
+fn normalized_entrypoint_signature(
+    entrypoint: &krit::CoreEntrypoint,
+    function: &krit::CoreFunction,
+) -> String {
+    match entrypoint.kind {
+        EntrypointKind::ModuleInit => format!("fn() -> {}", function.signature.result),
+        EntrypointKind::Webhook => format!(
+            "webhook fn {}(request: HttpRequest) -> HttpResponse",
+            function.debug_name.as_deref().unwrap_or("<anonymous>")
+        ),
+        _ => format!("fn(...) -> {}", function.signature.result),
+    }
+}
+
+fn json_requirements(requirements: &RequirementSet) -> Vec<JsonCapabilityRequirement> {
+    requirements
+        .iter()
+        .map(|requirement| JsonCapabilityRequirement {
+            capability: requirement.capability().as_str(),
+            resource: requirement.resource().to_owned(),
+        })
+        .collect()
+}
+
+fn webhook_request_schema() -> JsonSchemaDocument {
+    JsonSchemaDocument {
+        dialect: "https://json-schema.org/draft/2020-12/schema",
+        id: "https://krit.dev/schemas/webhook/request-1.json",
+        title: "Krit HttpRequest contract v1",
+        kind: "object",
+        additional_properties: false,
+        required: vec!["method", "path", "query", "headers", "body"],
+        properties: BTreeMap::from([
+            ("body", string_schema()),
+            (
+                "headers",
+                array_schema(reference_schema("#/$defs/HttpHeader")),
+            ),
+            ("method", string_schema()),
+            ("path", string_schema()),
+            ("query", string_schema()),
+        ]),
+        definitions: BTreeMap::from([("HttpHeader", http_header_schema())]),
+    }
+}
+
+fn webhook_response_schema() -> JsonSchemaDocument {
+    JsonSchemaDocument {
+        dialect: "https://json-schema.org/draft/2020-12/schema",
+        id: "https://krit.dev/schemas/webhook/response-1.json",
+        title: "Krit HttpResponse contract v1",
+        kind: "object",
+        additional_properties: false,
+        required: vec!["status", "headers", "body"],
+        properties: BTreeMap::from([
+            ("body", string_schema()),
+            (
+                "headers",
+                array_schema(reference_schema("#/$defs/HttpHeader")),
+            ),
+            ("status", integer_schema()),
+        ]),
+        definitions: BTreeMap::from([("HttpHeader", http_header_schema())]),
+    }
+}
+
+fn http_header_schema() -> JsonSchemaNode {
+    JsonSchemaNode {
+        kind: Some("object"),
+        reference: None,
+        items: None,
+        additional_properties: Some(false),
+        required: vec!["name", "value"],
+        properties: BTreeMap::from([("name", string_schema()), ("value", string_schema())]),
+    }
+}
+
+fn string_schema() -> JsonSchemaNode {
+    scalar_schema("string")
+}
+
+fn integer_schema() -> JsonSchemaNode {
+    scalar_schema("integer")
+}
+
+fn scalar_schema(kind: &'static str) -> JsonSchemaNode {
+    JsonSchemaNode {
+        kind: Some(kind),
+        reference: None,
+        items: None,
+        additional_properties: None,
+        required: Vec::new(),
+        properties: BTreeMap::new(),
+    }
+}
+
+fn reference_schema(reference: &'static str) -> JsonSchemaNode {
+    JsonSchemaNode {
+        kind: None,
+        reference: Some(reference),
+        items: None,
+        additional_properties: None,
+        required: Vec::new(),
+        properties: BTreeMap::new(),
+    }
+}
+
+fn array_schema(items: JsonSchemaNode) -> JsonSchemaNode {
+    JsonSchemaNode {
+        kind: Some("array"),
+        reference: None,
+        items: Some(Box::new(items)),
+        additional_properties: None,
+        required: Vec::new(),
+        properties: BTreeMap::new(),
     }
 }
 
@@ -758,10 +1020,88 @@ fn source_command(arguments: &[String], action: SourceAction) -> u8 {
 }
 
 fn execute_source(source: &Source, format: DiagnosticFormat) -> u8 {
+    let program = match parse_source(source) {
+        Ok(program) => program,
+        Err(diagnostic) => return report(&diagnostic, source, format),
+    };
+    if let Some(statement) = program
+        .statements
+        .iter()
+        .find(|statement| matches!(statement.kind, krit::StatementKind::Webhook { .. }))
+    {
+        let diagnostic = Diagnostic::new(
+            "K5003",
+            "webhook entrypoints are unavailable in direct source execution",
+            statement.span,
+        );
+        let _ = report(&diagnostic, source, format);
+        return 4;
+    }
+    if let Ok(analysis) = analyze(&program)
+        && let Some((requirement, span)) = first_analysis_requirement(&analysis)
+    {
+        let diagnostic = Diagnostic::new(
+            "K5003",
+            format!(
+                "host capability `{}` for resource `{}` is unavailable in direct source execution",
+                requirement.capability().as_str(),
+                requirement.resource()
+            ),
+            span,
+        );
+        let _ = report(&diagnostic, source, format);
+        return 4;
+    }
     let mut output = io::stdout().lock();
-    match run_source(source, &mut output) {
+    match execute(&program, &mut output) {
         Ok(_) => 0,
-        Err(diagnostic) => report(&diagnostic, source, format),
+        Err(diagnostic) => {
+            let _ = report(&diagnostic, source, format);
+            if diagnostic.code() == "K5003" { 4 } else { 1 }
+        }
+    }
+}
+
+fn first_missing_requirement<'a>(
+    analysis: &'a Analysis,
+    manifest: &Manifest,
+) -> Option<(&'a krit::CapabilityRequirement, Span)> {
+    analysis.expressions().iter().find_map(|expression| {
+        expression
+            .requirements()
+            .iter()
+            .find(|requirement| !manifest_grants_requirement(manifest, requirement))
+            .map(|requirement| (requirement, expression.span()))
+    })
+}
+
+fn first_analysis_requirement(analysis: &Analysis) -> Option<(&krit::CapabilityRequirement, Span)> {
+    analysis.expressions().iter().find_map(|expression| {
+        expression
+            .requirements()
+            .iter()
+            .next()
+            .map(|requirement| (requirement, expression.span()))
+    })
+}
+
+fn manifest_grants_requirement(
+    manifest: &Manifest,
+    requirement: &krit::CapabilityRequirement,
+) -> bool {
+    match requirement.capability() {
+        Effect::ConfigRead => manifest
+            .capabilities
+            .config
+            .iter()
+            .any(|resource| resource == requirement.resource()),
+        Effect::SecretRead => manifest
+            .capabilities
+            .secrets
+            .iter()
+            .any(|resource| resource == requirement.resource()),
+        Effect::IoStdout => manifest.capabilities.stdout,
+        _ => false,
     }
 }
 
@@ -1223,6 +1563,6 @@ mod tests {
             count += 1;
             remaining = &code[end + "\n```".len()..];
         }
-        assert_eq!(count, 6, "prompt should contain six canonical examples");
+        assert_eq!(count, 7, "prompt should contain seven canonical examples");
     }
 }
