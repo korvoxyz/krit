@@ -140,7 +140,7 @@ evaluation remains outside the local artifact report.
 
 ## Phase 5: guided authoring
 
-**Status:** In progress
+**Status:** Complete
 
 ### `phase5-language-server`
 
@@ -166,11 +166,34 @@ evaluation remains outside the local artifact report.
 
 ### `phase5-guided-assistance`
 
-**Status:** Not started
+**Status:** Complete
 
-- optional provider-neutral inline prediction
-- accepted suggestions checked immediately
-- semantic cleanup shown as a reviewable diff
+- isolated `krit-assist` layer consuming schema-1 language-server compiler
+  facts without adding authoring dependencies to compiler, package, Wasm,
+  runtime, or LSP layers
+- strict authoring protocol 1 for one digest/version-preconditioned package
+  entry document and bounded UTF-16/byte text edits
+- disabled-by-default explicit provider configuration with one generic
+  HTTPS/loopback HTTP JSON adapter, no branded SDK, inherited proxy, redirect,
+  embedded credential, runtime artifact, or provider-specific language rule
+- explicit `krit assist inspect`, `suggest`, `review`, and `accept` workflow;
+  generation never writes source and acceptance requires `--reviewed`
+- package-root containment, canonical entry validation, `.kritignore`,
+  descriptor-relative no-follow source reads, generated/non-Krit exclusion,
+  bounded user-selected context, and capability/secret-like literal plus
+  compiler-type/diagnostic resource redaction
+- strict malformed, overlapping, stale, ignored, out-of-root, symlink,
+  oversized, non-canonical, invalid, or cross-document proposal rejection
+- deterministic unified diffs plus before/after diagnostics, top-level types,
+  effects, required/requested/granted permission facts, and exact authority
+  deltas
+- canonical formatting, parse/analyze/Core checking, exact added-permission
+  approval, manifest grant enforcement, and permission-preserving atomic
+  exchange acceptance with displaced-source digest validation and rollback
+- completion, diagnostic-repair, and semantic-cleanup intents all use the same
+  visible untrusted proposal pipeline
+- loopback fake-provider/reference-webhook acceptance coverage and AI-off
+  compiler/runtime availability invariants
 
 Gate: disabling AI changes neither source semantics nor build/runtime
 availability.

@@ -376,9 +376,48 @@ structured-fact/type rendering, retains at most 128 documents, reads at most
 facts only after the normal canonical entry-containment validation. It has no
 dependency on `krit-runtime` or `krit-wasm`. Standard output is reserved for
 LSP framing.
-`krit-assist` may ask a configured model for small structured edits, but those
-edits remain provisional until accepted and rechecked. Builds and deployments
-never require an LLM.
+
+`krit-assist` is one layer above `krit-lsp`. It consumes the public bounded
+schema-1 document-facts API and never changes parser, analyzer, formatter,
+package, backend, or runtime behavior. Assistance is disabled unless a command
+names an enabled strict schema-1 provider config. The implemented generic
+`http-json` transport accepts HTTPS or loopback HTTP, disables inherited
+proxies and redirects, bounds timeouts/request/response bytes, and optionally
+reads one named host environment credential solely for an Authorization
+header. Credentials never enter requests, proposals, compiler facts, source,
+runtime artifacts, or logs.
+
+`krit assist inspect` builds and prints the exact provider-neutral request
+without transport. `suggest` prints and flushes that inspection before calling
+the provider, validates one document's structured edits, and writes only a
+bounded proposal JSON artifact. Package-root-relative `.krit` context must be
+explicitly selected, pass canonical containment and `.kritignore`, and is
+redacted for capability resources and secret-like literals. Host config,
+runtime data, generated artifacts, ignored files, non-Krit files, and paths
+outside the package are unavailable. On Unix, source reads traverse from an
+opened canonical package-root descriptor with `NOFOLLOW` on every component,
+binding containment validation to the file handle that is read. Provider facts
+also redact resource-bearing rendered types and diagnostic messages. Real
+full-source digests remain host-local; provider preconditions hash only the
+redacted representation.
+
+`review` rechecks source, manifest, context, request, response, proposal
+identity, compiler facts, canonical candidate, unified diff, and permission
+delta against current digests. `accept` requires an explicit human
+`--reviewed` flag plus exact approval for every newly required permission.
+All required permissions must already be manifest-granted. It prints the
+review before a permission-preserving same-directory atomic replacement and
+uses an atomic staged/target exchange on macOS and Linux. Krit validates the
+displaced source digest, commits by removing it only on a match, and otherwise
+exchanges it back before reporting a stale proposal. Staged source permissions
+are applied before bytes are written. The protocol is single-document, so
+multi-file partial application is impossible. Completion, diagnostic repair,
+and semantic cleanup share this path. Builds, runs, tests, and deployments
+never require or invoke an LLM.
+
+On platforms without the audited exchange primitive, inspection, suggestion,
+and review remain available, but acceptance returns `K8107` before changing
+source rather than using a race-prone overwrite fallback.
 
 ## Testing
 

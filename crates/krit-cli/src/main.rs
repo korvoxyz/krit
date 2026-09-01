@@ -1,3 +1,4 @@
+mod assist;
 mod host_config;
 
 use std::{
@@ -53,6 +54,7 @@ fn run(arguments: Vec<String>) -> u8 {
         "run" => source_command(&arguments[1..], SourceAction::Run),
         "check" => source_command(&arguments[1..], SourceAction::Check),
         "build" => build_command(&arguments[1..]),
+        "assist" => assist::run(&arguments[1..]),
         "explain" => explain_command(&arguments[1..]),
         "fmt" => fmt_command(&arguments[1..]),
         "lsp" => lsp_command(&arguments[1..]),
@@ -2013,6 +2015,10 @@ Krit {VERSION}
 An open, human-auditable language for the age of AI.
 
 USAGE:
+    krit assist inspect --provider-config PATH --manifest PATH --file FILE --range RANGE --intent TEXT [--kind completion|repair|cleanup] [--context FILE@RANGE] [--json]
+    krit assist suggest --provider-config PATH --manifest PATH --file FILE --range RANGE --intent TEXT --proposal PATH.json [--kind completion|repair|cleanup] [--context FILE@RANGE] [--json]
+    krit assist review --manifest PATH --proposal PATH.json [--json]
+    krit assist accept --manifest PATH --proposal PATH.json --reviewed [--approve-permission CAPABILITY[=RESOURCE]] [--json]
     krit run [--diagnostic-format human|json] FILE
     krit check [--diagnostic-format human|json] FILE
     krit build [--manifest PATH] [--output PATH]

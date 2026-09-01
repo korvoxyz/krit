@@ -113,6 +113,13 @@ Initial required codes:
 | `K7004` | Artifact metadata, byte size, or content digest mismatch |
 | `K8001` | Source is not canonically formatted in formatter check mode |
 | `K8002` | Language-server input or open-document state exceeds a bounded limit |
+| `K8101` | Authoring assistance is disabled or provider configuration is invalid |
+| `K8102` | Authoring context, range, path, ignore, redaction, or privacy validation failed |
+| `K8103` | Authoring provider transport or strict response decoding failed |
+| `K8104` | Authoring request, response, edit, proposal, digest, or stale precondition is invalid |
+| `K8105` | Proposed source failed canonical formatting or compiler checking |
+| `K8106` | Required authority expansion lacks exact review approval or a manifest grant |
+| `K8107` | Proposal or accepted-source atomic I/O failed |
 
 ## Exit statuses
 

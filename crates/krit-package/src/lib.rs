@@ -9,7 +9,7 @@ use krit_capability::{HttpOrigin, is_valid_resource_name};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema: u32,
@@ -20,7 +20,7 @@ pub struct Manifest {
     pub capabilities: Capabilities,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Package {
     pub name: String,
@@ -32,7 +32,7 @@ pub struct Package {
     pub target: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capabilities {
     #[serde(default)]

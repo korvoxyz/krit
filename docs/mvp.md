@@ -56,15 +56,15 @@ async-runtime, TLS, SDK, or memory-management infrastructure.
 ## Required authoring work
 
 - canonical formatter (implemented in the 0.2 bootstrap)
-- parser, name, type, effect, and capability diagnostics
-- `krit check`
+- parser, name, type, effect, and capability diagnostics (implemented)
+- `krit check` (implemented)
 - `krit explain` (typed Core/type/effect/resource facts implemented)
 - `krit permissions` (requested and artifact-effective reports implemented)
 - `krit sandbox` (policy-1 execution implemented)
-- language-server compiler facts
-- one optional inline prediction provider
-- accepted suggestions formatted and checked immediately
-- semantic cleanup shown as a diff and explicitly approved
+- language-server compiler facts (implemented)
+- one optional provider-neutral HTTP-JSON prediction path (implemented)
+- accepted suggestions formatted and checked immediately (implemented)
+- semantic cleanup shown as a diff and explicitly approved (implemented)
 
 The MVP does not train or host its own model.
 
@@ -109,7 +109,8 @@ object storage, database access, then cache and search. See
   claims are made.
 
 The stateless runtime portion of this MVP is complete at the Phase 4 gate, and
-the deterministic `phase5-language-server` milestone is complete. Optional
-inline prediction and reviewable semantic cleanup remain in Phase 5.
+Phase 5 guided authoring is complete through the deterministic language server
+and explicit inspect/suggest/review/accept assistance workflow. Assistance
+remains optional and disabled without explicit provider configuration.
 Process-local rate and idempotency policy is intentionally not durable or
 distributed; Phase 6 owns transactional replay and state.

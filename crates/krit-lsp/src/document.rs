@@ -84,6 +84,27 @@ impl ServerState {
         diagnostics
     }
 
+    pub(crate) fn open_with_manifest(
+        &mut self,
+        uri: Uri,
+        version: i32,
+        text: String,
+        manifest_path: &Path,
+        manifest: &Manifest,
+    ) -> Result<PublishDiagnosticsParams, String> {
+        if uri.as_str().len() > MAX_DOCUMENT_URI_BYTES {
+            return Err("document URI exceeds the language-server limit".to_owned());
+        }
+        if !self.documents.contains_key(&uri) && self.documents.len() >= MAX_OPEN_DOCUMENTS {
+            return Err("language server has too many open documents".to_owned());
+        }
+        let package = PackageContext::load_exact(&uri, manifest_path, manifest)?;
+        let document = Document::with_package(uri.clone(), version, text, Some(package));
+        let diagnostics = document.publish_diagnostics();
+        self.documents.insert(uri, document);
+        Ok(diagnostics)
+    }
+
     fn rejected_document_diagnostics(
         uri: Uri,
         version: i32,
@@ -186,6 +207,11 @@ struct Document {
 
 impl Document {
     fn new(uri: Uri, version: i32, text: String, workspace_roots: &[PathBuf]) -> Self {
+        let package = PackageContext::discover(&uri, workspace_roots);
+        Self::with_package(uri, version, text, package)
+    }
+
+    fn with_package(uri: Uri, version: i32, text: String, package: Option<PackageContext>) -> Self {
         if text.len() > MAX_DOCUMENT_BYTES {
             let source = Source::new(document_name(&uri), "");
             return Self {
@@ -210,7 +236,6 @@ impl Document {
             };
         }
 
-        let package = PackageContext::discover(&uri, workspace_roots);
         let source = Source::new(document_name(&uri), text);
         let lines = LineIndex::new(source.text());
         let formatted = krit::format_source(&source);
@@ -1416,6 +1441,22 @@ struct PackageContext {
 }
 
 impl PackageContext {
+    fn load_exact(uri: &Uri, manifest_path: &Path, manifest: &Manifest) -> Result<Self, String> {
+        let file = uri_to_file_path(uri)
+            .ok_or_else(|| "document is not a file URI".to_owned())?
+            .canonicalize()
+            .map_err(|_| "document path is not accessible".to_owned())?;
+        let entry = manifest
+            .resolve_entry(manifest_path)
+            .map_err(|_| "explicit package entry is invalid".to_owned())?;
+        if file != entry {
+            return Err("document is not the explicit package entry".to_owned());
+        }
+        Ok(Self {
+            manifest: manifest.clone(),
+        })
+    }
+
     fn discover(uri: &Uri, workspace_roots: &[PathBuf]) -> Option<Self> {
         let file = uri_to_file_path(uri)?;
         let boundary = workspace_roots

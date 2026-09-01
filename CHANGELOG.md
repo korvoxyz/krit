@@ -177,6 +177,31 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - In-memory protocol and real `krit lsp` stdio coverage for malformed
   requests/documents, UTF-16 ranges, deterministic facts, formatting
   idempotence, no-execution behavior, framing purity, and graceful shutdown
+- `krit-assist`, an isolated authoring layer consuming the public bounded
+  language-server compiler-facts API with no dependency leakage into compiler,
+  package, Wasm, runtime, or LSP layers
+- Strict provider-neutral authoring protocol 1 request, response, proposal,
+  review, and acceptance schemas for one digest-preconditioned package entry
+- Disabled-by-default explicit provider configuration and one generic bounded
+  HTTPS/loopback HTTP JSON adapter with host-managed optional environment
+  credentials, disabled inherited proxies/redirects, and no branded SDK
+- `krit assist inspect|suggest|review|accept` with exact pre-provider context
+  inspection, JSON Lines output, untrusted proposal artifacts, explicit
+  `--reviewed`, and exact added-permission approval
+- Canonical package containment, `.kritignore`, generated/non-Krit exclusion,
+  descriptor-relative no-follow source reads, bounded UTF-16 source ranges,
+  source/type/diagnostic resource redaction, host-local real digests, and
+  strict stale/overlap/path/symlink/size validation
+- Deterministic canonical unified diffs and before/after diagnostics, types,
+  effects, requested/required/granted permissions, usage, missing grants, and
+  authority deltas
+- Canonical format/parse/analyze/Core validation plus permission-preserving
+  atomic exchange single-source acceptance with pre-write staged permissions,
+  displaced-source digest validation, stale rollback, and fail-closed
+  acceptance on platforms without the audited exchange primitive
+- Fake provider, loopback HTTP provider, malicious response/context, prompt
+  injection, redaction, stale/atomic failure, permission escalation, semantic
+  cleanup, AI-off, and reference webhook guided-edit coverage
 
 ### Changed
 
@@ -220,6 +245,10 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   `phase5-guided-assistance` milestone
 - Updated the provider-neutral generation prompt to version 0.2.10 for the
   offline language-server compiler-facts and editor workflow
+- Completed `phase5-guided-assistance` and the Phase 5 gate without adding an
+  LLM dependency to source checking, builds, runtime execution, or deployment
+- Updated the provider-neutral generation prompt to version 0.2.11 for strict
+  authoring protocol 1, review-gated edits, and permission-delta approval
 
 ## [0.2.0] - 2026-09-01
 

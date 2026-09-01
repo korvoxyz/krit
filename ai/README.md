@@ -23,6 +23,9 @@ local permissions, and execute them through the sandbox, fixture invocation,
 or loopback server paths. `krit lsp` exposes the same deterministic compiler,
 package, permission, completion, and formatting facts offline without
 executing source or granting runtime/network authority.
+`krit assist` optionally sends only explicit bounded redacted context and
+range-filtered compiler facts to a configured provider, then treats the
+response as an untrusted review-gated source proposal.
 
 ## Use
 
@@ -48,6 +51,9 @@ krit fmt --check generated.krit
 krit check generated.krit
 krit explain --json generated.krit
 krit lsp # editor stdio integration
+krit assist inspect --provider-config assist-provider.json --manifest krit.pkg --file generated.krit --range all --intent "Repair the current diagnostics."
+krit assist suggest --provider-config assist-provider.json --manifest krit.pkg --file generated.krit --range all --intent "Repair the current diagnostics." --proposal target/assist-proposal.json
+krit assist review --manifest krit.pkg --proposal target/assist-proposal.json
 krit build
 krit permissions --artifact target/krit/<package>.wasm
 krit sandbox # module-init artifacts
@@ -120,6 +126,35 @@ change language rules. Each request includes:
 The response is untrusted text. Krit parses and checks it exactly like
 handwritten source.
 
+The implemented authoring-protocol response is stricter than free-form
+generation: it is one schema-1 JSON object containing sorted non-overlapping
+edits for the selected package-entry document. `inspect` prints the exact
+request without a provider call. `suggest` prints that request before invoking
+the provider and writes only a proposal JSON file. `review` recomputes the
+canonical diff and compiler/permission facts. `accept --reviewed` writes only
+after fresh checks and exact approval of newly required permissions.
+
+The generic provider config is explicit and disabled by default:
+
+```json
+{
+  "schema": 1,
+  "enabled": true,
+  "provider": {
+    "kind": "http-json",
+    "endpoint": "https://authoring.example.test/krit/suggest",
+    "credentialEnv": "KRIT_ASSIST_TOKEN",
+    "connectTimeoutMs": 5000,
+    "timeoutMs": 20000
+  }
+}
+```
+
+The endpoint is provider-neutral. Remote transport requires HTTPS; loopback
+HTTP supports local models and deterministic test providers. Redirects and
+inherited proxies are disabled. The named environment credential is used only
+as an HTTP bearer header and is never model context or proposal data.
+
 ## Updating the pack
 
 Every prompt pack is tied to a compiler/language version. A change must:
@@ -142,3 +177,11 @@ editor configures a local or remote model and explicitly selects context.
 Secrets, capability values, ignored files, and runtime data are excluded from
 prompt context. Runtime AI adapter prompts and responses are not telemetry,
 permission facts, cache keys, diagnostics, or default structured logs.
+
+`.kritignore` is enforced relative to the canonical package root. Only
+explicit `.krit` ranges may be included; generated paths, non-source files,
+symlink escapes, host config, runtime data, and paths outside the package are
+rejected. Capability-resource/event literals and recognized secret-like
+strings are replaced with visible redaction markers. Comments and strings that
+contain prompt-injection text remain inert untrusted text and cannot alter the
+protocol or mark a proposal reviewed.

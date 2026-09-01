@@ -5,7 +5,7 @@ use std::{
     error::Error,
     fmt, io,
     io::{BufRead, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
 };
 
@@ -26,6 +26,90 @@ const SERVER_NAME: &str = "krit-lsp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_PROTOCOL_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROTOCOL_HEADER_BYTES: usize = 8 * 1024;
+
+#[derive(Debug)]
+pub enum CompilerFactsError {
+    InvalidDocumentPath,
+    InvalidWorkspaceRoot,
+    Facts(String),
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for CompilerFactsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDocumentPath => {
+                formatter.write_str("document path cannot be represented as a file URI")
+            }
+            Self::InvalidWorkspaceRoot => {
+                formatter.write_str("workspace root cannot be represented as a file URI")
+            }
+            Self::Facts(message) => formatter.write_str(message),
+            Self::Json(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for CompilerFactsError {}
+
+pub fn compiler_facts_for_document(
+    path: &Path,
+    workspace_root: &Path,
+    text: &str,
+) -> Result<serde_json::Value, CompilerFactsError> {
+    let document_url =
+        url::Url::from_file_path(path).map_err(|()| CompilerFactsError::InvalidDocumentPath)?;
+    let document_uri: lsp_types::Uri = document_url
+        .as_str()
+        .parse()
+        .map_err(|_| CompilerFactsError::InvalidDocumentPath)?;
+    let workspace_url = url::Url::from_directory_path(workspace_root)
+        .map_err(|()| CompilerFactsError::InvalidWorkspaceRoot)?;
+    let workspace_uri: lsp_types::Uri = workspace_url
+        .as_str()
+        .parse()
+        .map_err(|_| CompilerFactsError::InvalidWorkspaceRoot)?;
+    let workspace_root =
+        uri_to_file_path(&workspace_uri).ok_or(CompilerFactsError::InvalidWorkspaceRoot)?;
+    let mut state = ServerState::new(vec![workspace_root]);
+    state.open(document_uri.clone(), 1, text.to_owned());
+    let facts = state
+        .compiler_facts(&document_uri)
+        .map_err(CompilerFactsError::Facts)?;
+    serde_json::to_value(facts).map_err(CompilerFactsError::Json)
+}
+
+pub fn compiler_facts_for_document_with_manifest(
+    path: &Path,
+    manifest_path: &Path,
+    manifest: &krit_package::Manifest,
+    text: &str,
+) -> Result<serde_json::Value, CompilerFactsError> {
+    let document_url =
+        url::Url::from_file_path(path).map_err(|()| CompilerFactsError::InvalidDocumentPath)?;
+    let document_uri: lsp_types::Uri = document_url
+        .as_str()
+        .parse()
+        .map_err(|_| CompilerFactsError::InvalidDocumentPath)?;
+    let root = manifest_path
+        .parent()
+        .ok_or(CompilerFactsError::InvalidWorkspaceRoot)?
+        .to_owned();
+    let mut state = ServerState::new(vec![root]);
+    state
+        .open_with_manifest(
+            document_uri.clone(),
+            1,
+            text.to_owned(),
+            manifest_path,
+            manifest,
+        )
+        .map_err(CompilerFactsError::Facts)?;
+    let facts = state
+        .compiler_facts(&document_uri)
+        .map_err(CompilerFactsError::Facts)?;
+    serde_json::to_value(facts).map_err(CompilerFactsError::Json)
+}
 
 #[derive(Debug)]
 pub enum ServerError {

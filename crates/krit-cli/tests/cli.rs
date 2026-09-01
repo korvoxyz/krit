@@ -4,12 +4,16 @@ use std::{
     net::TcpStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
 
 use krit_wasm::{ArtifactMetadata, validate_artifact};
+use tiny_http::{Header, Response, Server};
 
 static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -92,7 +96,16 @@ fn parse_lsp_frames(bytes: &[u8]) -> Vec<serde_json::Value> {
         );
         cursor = body_end;
     }
+
     messages
+}
+
+fn parse_json_lines(bytes: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8(bytes.to_vec())
+        .expect("JSON Lines output should be UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("line should be valid JSON"))
+        .collect()
 }
 
 #[test]
@@ -349,6 +362,347 @@ fn language_server_rejects_cli_arguments_without_starting_protocol_io() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert_eq!(output.stderr, b"krit: `lsp` does not accept arguments\n");
+}
+
+#[test]
+fn assist_reference_webhook_inspects_suggests_reviews_and_accepts_explicitly() {
+    let directory = TestDirectory::new("assist-reference");
+    let source = r#"webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.path }
+}
+"#;
+    directory.file("main.krit", source);
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/assist"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+config = ["agent.model"]
+"#,
+    );
+    let server = Server::http("127.0.0.1:0").expect("fake provider should bind");
+    let endpoint = format!("http://{}/suggest", server.server_addr());
+    directory.file(
+        "provider.json",
+        &format!(
+            r#"{{
+  "schema": 1,
+  "enabled": true,
+  "provider": {{
+    "kind": "http-json",
+    "endpoint": "{endpoint}",
+    "credentialEnv": null,
+    "connectTimeoutMs": 1000,
+    "timeoutMs": 5000
+  }}
+}}"#
+        ),
+    );
+
+    let inspect = krit_in(&directory)
+        .args([
+            "assist",
+            "inspect",
+            "--provider-config",
+            "provider.json",
+            "--manifest",
+            "krit.pkg",
+            "--file",
+            "main.krit",
+            "--range",
+            "all",
+            "--intent",
+            "Read the configured model explicitly.",
+            "--json",
+        ])
+        .output()
+        .expect("assist inspection should run");
+    assert!(inspect.status.success());
+    assert!(inspect.stderr.is_empty());
+    let inspect = parse_json_lines(&inspect.stdout);
+    assert_eq!(inspect.len(), 1);
+    assert_eq!(inspect[0]["event"], "inspection");
+    assert_eq!(
+        fs::read_to_string(directory.path.join("main.krit")).unwrap(),
+        source
+    );
+
+    let insertion_byte = source.find("    record").expect("record line") + 4;
+    let (release_sender, release_receiver) = mpsc::channel();
+    let provider = thread::spawn(move || {
+        let mut incoming = server.recv().expect("provider should receive request");
+        let mut body = Vec::new();
+        incoming
+            .as_reader()
+            .read_to_end(&mut body)
+            .expect("provider request should be readable");
+        let request: serde_json::Value =
+            serde_json::from_slice(&body).expect("provider request should be JSON");
+        release_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test should release provider response");
+        let response = serde_json::json!({
+            "schema": 1,
+            "authoringProtocol": 1,
+            "requestId": request["requestId"],
+            "document": {
+                "path": request["target"]["document"]["path"],
+                "baseDigest": request["target"]["document"]["digest"]
+            },
+            "summary": "add an explicit config read",
+            "edits": [{
+                "range": {
+                    "startByte": insertion_byte,
+                    "endByte": insertion_byte,
+                    "start": {"line": 1, "character": 4},
+                    "end": {"line": 1, "character": 4}
+                },
+                "newText": "let model=config_string(\"agent.model\");\n    "
+            }]
+        });
+        let content_type =
+            Header::from_bytes("Content-Type", "application/json").expect("header should be valid");
+        incoming
+            .respond(
+                Response::from_data(serde_json::to_vec(&response).unwrap())
+                    .with_header(content_type),
+            )
+            .expect("provider should respond");
+    });
+
+    let mut child = krit_in(&directory)
+        .args([
+            "assist",
+            "suggest",
+            "--provider-config",
+            "provider.json",
+            "--manifest",
+            "krit.pkg",
+            "--file",
+            "main.krit",
+            "--range",
+            "all",
+            "--intent",
+            "Read the configured model explicitly.",
+            "--proposal",
+            "proposal.json",
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("assist suggestion should start");
+    let mut stdout = BufReader::new(
+        child
+            .stdout
+            .take()
+            .expect("assist suggestion stdout should be piped"),
+    );
+    let mut inspection_line = String::new();
+    stdout
+        .read_line(&mut inspection_line)
+        .expect("inspection should be written before provider completion");
+    let inspection: serde_json::Value =
+        serde_json::from_str(inspection_line.trim_end()).expect("inspection should be JSON");
+    assert_eq!(inspection["event"], "inspection");
+    release_sender
+        .send(())
+        .expect("provider response should be released after inspection");
+    let mut remaining_stdout = Vec::new();
+    stdout
+        .read_to_end(&mut remaining_stdout)
+        .expect("remaining assist output should be readable");
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .expect("assist suggestion stderr should be piped")
+        .read_to_end(&mut stderr)
+        .expect("assist stderr should be readable");
+    let status = child.wait().expect("assist suggestion should finish");
+    assert!(status.success());
+    assert!(stderr.is_empty());
+    let proposal_lines = parse_json_lines(&remaining_stdout);
+    assert_eq!(proposal_lines.len(), 1);
+    assert_eq!(proposal_lines[0]["event"], "proposal");
+    provider.join().expect("provider should finish");
+    assert_eq!(
+        fs::read_to_string(directory.path.join("main.krit")).unwrap(),
+        source
+    );
+    assert!(directory.path.join("proposal.json").is_file());
+
+    let review = krit_in(&directory)
+        .args([
+            "assist",
+            "review",
+            "--manifest",
+            "krit.pkg",
+            "--proposal",
+            "proposal.json",
+            "--json",
+        ])
+        .output()
+        .expect("proposal review should run");
+    assert!(review.status.success());
+    let review = parse_json_lines(&review.stdout);
+    assert_eq!(review[0]["event"], "review");
+    assert_eq!(
+        review[0]["review"]["permissions"]["approvalRequired"][0],
+        serde_json::json!({
+            "capability": "config.read",
+            "resource": "agent.model"
+        })
+    );
+
+    let unreviewed = krit_in(&directory)
+        .args([
+            "assist",
+            "accept",
+            "--manifest",
+            "krit.pkg",
+            "--proposal",
+            "proposal.json",
+            "--json",
+        ])
+        .output()
+        .expect("unreviewed acceptance should report usage");
+    assert_eq!(unreviewed.status.code(), Some(2));
+    assert!(unreviewed.stdout.is_empty());
+    assert_eq!(
+        fs::read_to_string(directory.path.join("main.krit")).unwrap(),
+        source
+    );
+
+    let denied = krit_in(&directory)
+        .args([
+            "assist",
+            "accept",
+            "--manifest",
+            "krit.pkg",
+            "--proposal",
+            "proposal.json",
+            "--reviewed",
+            "--json",
+        ])
+        .output()
+        .expect("unapproved acceptance should run");
+    assert_eq!(denied.status.code(), Some(4));
+    assert_eq!(parse_json_lines(&denied.stdout)[0]["event"], "review");
+    assert_eq!(parse_json_lines(&denied.stderr)[0]["code"], "K8106");
+    assert_eq!(
+        fs::read_to_string(directory.path.join("main.krit")).unwrap(),
+        source
+    );
+
+    let accepted = krit_in(&directory)
+        .args([
+            "assist",
+            "accept",
+            "--manifest",
+            "krit.pkg",
+            "--proposal",
+            "proposal.json",
+            "--reviewed",
+            "--approve-permission",
+            "config.read=agent.model",
+            "--json",
+        ])
+        .output()
+        .expect("approved acceptance should run");
+    assert!(accepted.status.success());
+    assert!(accepted.stderr.is_empty());
+    let accepted_lines = parse_json_lines(&accepted.stdout);
+    assert_eq!(accepted_lines.len(), 2);
+    assert_eq!(accepted_lines[0]["event"], "review");
+    assert_eq!(accepted_lines[1]["event"], "accepted");
+    let accepted_source =
+        fs::read_to_string(directory.path.join("main.krit")).expect("source should be readable");
+    assert!(accepted_source.contains("let model = config_string(\"agent.model\");"));
+    let checked = krit_in(&directory)
+        .args(["check", "main.krit"])
+        .output()
+        .expect("accepted source should check");
+    assert!(checked.status.success());
+}
+
+#[test]
+fn help_lists_the_complete_assist_workflow() {
+    let output = krit().arg("--help").output().expect("Krit should start");
+
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("help should be UTF-8");
+    for command in [
+        "krit assist inspect",
+        "krit assist suggest",
+        "krit assist review",
+        "krit assist accept",
+    ] {
+        assert!(help.contains(command));
+    }
+}
+
+#[test]
+fn disabled_assistance_does_not_change_offline_compiler_availability() {
+    let directory = TestDirectory::new("assist-disabled");
+    directory.file("main.krit", "let answer = 6 * 7;\n");
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/offline"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+"#,
+    );
+    let before = krit_in(&directory)
+        .args(["check", "main.krit"])
+        .output()
+        .expect("offline check should run");
+    let assist = krit_in(&directory)
+        .args([
+            "assist",
+            "inspect",
+            "--provider-config",
+            "missing.json",
+            "--manifest",
+            "krit.pkg",
+            "--file",
+            "main.krit",
+            "--range",
+            "all",
+            "--intent",
+            "No provider is configured.",
+            "--json",
+        ])
+        .output()
+        .expect("disabled assist should report");
+    assert_eq!(assist.status.code(), Some(1));
+    assert!(assist.stdout.is_empty());
+    assert_eq!(parse_json_lines(&assist.stderr)[0]["code"], "K8101");
+    let after = krit_in(&directory)
+        .args(["check", "main.krit"])
+        .output()
+        .expect("offline check should still run");
+    assert_eq!(before.status.code(), after.status.code());
+    assert_eq!(before.stdout, after.stdout);
+    assert_eq!(before.stderr, after.stderr);
+    assert_eq!(
+        fs::read_to_string(directory.path.join("main.krit")).unwrap(),
+        "let answer = 6 * 7;\n"
+    );
 }
 
 #[test]

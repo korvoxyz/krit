@@ -77,14 +77,17 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - deterministic human and JSON diagnostics
 - offline `krit lsp` diagnostics, formatting, hover, completion, symbols, and
   schema-1 compiler/package/permission facts
+- optional `krit assist` provider-neutral suggestions with explicit context
+  inspection, canonical diff review, compiler checks, permission approval, and
+  atomic acceptance
 - implementation-neutral conformance cases
 - strict package manifest validation
 
 Phase 4 is complete for the bounded stateless reference agent. The checked
 reference flow calls a GitHub-like origin, one neutral AI adapter, and one
 messaging-like origin with exact permissions and approval requirements.
-General composite Wasm layouts beyond the documented webhook subset,
-model-assisted authoring, modules, dependency resolution, build caching, and
+General composite Wasm layouts beyond the documented webhook subset, modules,
+dependency resolution, build caching, broader autonomous editing, and
 production multi-tenant OS isolation are also future work. Krit is not
 production-ready.
 
@@ -346,6 +349,69 @@ bounded, and package facts require the normal canonical entry-containment
 check. Standard output contains LSP frames only; operational failures use
 standard error.
 
+### Review-gated authoring assistance
+
+Assistance is optional and disabled without an explicit provider config. The
+implemented provider-neutral adapter sends strict authoring-protocol JSON to
+an HTTPS or loopback HTTP endpoint; it uses no branded SDK. An optional
+`credentialEnv` value names a host-managed bearer credential. Credential
+values never enter requests, source, proposals, compiler facts, artifacts, or
+logs.
+
+Inspect the exact redacted request without contacting the provider:
+
+```sh
+krit assist inspect \
+  --provider-config assist-provider.json \
+  --manifest krit.pkg \
+  --file src/main.krit \
+  --range all \
+  --intent "Add explicit error handling."
+```
+
+Generate a proposal artifact without writing source:
+
+```sh
+krit assist suggest \
+  --provider-config assist-provider.json \
+  --manifest krit.pkg \
+  --file src/main.krit \
+  --range all \
+  --intent "Add explicit error handling." \
+  --proposal target/assist-proposal.json
+```
+
+Revalidate and review its exact canonical diff, diagnostics, type/effect facts,
+and requested/required/granted permission delta:
+
+```sh
+krit assist review --manifest krit.pkg --proposal target/assist-proposal.json
+```
+
+Acceptance is a separate explicit command. It prints the same review before
+writing, requires `--reviewed`, requires exact approval for every newly
+required permission, and cannot add a manifest grant:
+
+```sh
+krit assist accept \
+  --manifest krit.pkg \
+  --proposal target/assist-proposal.json \
+  --reviewed \
+  --approve-permission config.read=agent.model
+```
+
+Only the package entry source may be edited. Model context must be explicitly
+selected, remain under the canonical package root, use `.krit` files, and pass
+`.kritignore`. Generated/non-Krit files, host/runtime data, capability literal
+values, secret-like strings, and credentials are excluded or redacted.
+Provider edits are untrusted: stale, overlapping, cross-document,
+out-of-selection, malformed, oversized, non-canonical, ill-typed, ungranted,
+or unapproved changes fail closed. Completion, diagnostic repair
+(`--kind repair`), and semantic cleanup (`--kind cleanup`) use the same visible
+proposal pipeline. Stale-detecting atomic acceptance is implemented on macOS
+and Linux; other platforms fail acceptance with `K8107` before changing
+source. `--json` emits stable JSON Lines events.
+
 Generate Krit with Claude, ChatGPT, Gemini, or a local model using the exact
 provider-neutral instruction shipped with this compiler:
 
@@ -492,8 +558,8 @@ The specification is the semantic authority:
 - [Modules and packages](spec/PACKAGES.md) — draft
 - [WebAssembly sandbox](spec/WASM-SANDBOX.md) — policy-1 artifact and bounded
   host implemented
-- [Guided AI authoring](spec/GUIDED-AUTHORING.md) — deterministic LSP baseline
-  implemented; predictive assistance draft
+- [Guided AI authoring](spec/GUIDED-AUTHORING.md) — implemented deterministic
+  LSP and review-gated provider-neutral assistance baseline
 - [Narrow product MVP](docs/mvp.md)
 - [Agent platform roadmap](docs/agent-roadmap.md)
 - [Rust technical design](docs/technical-design.md)
@@ -535,7 +601,7 @@ The accepted implementation path is:
 7. offline language-server compiler, package, permission, completion, and
    formatting facts (complete)
 8. optional provider-neutral inline prediction with visible checked edits
-   (Phase 5; not started here)
+   and separately approved semantic cleanup (complete)
 9. durable state and replay only after the stateless reference gate (Phase 6)
 
 Performance claims follow [docs/performance.md](docs/performance.md), not
