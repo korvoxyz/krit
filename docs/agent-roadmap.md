@@ -140,9 +140,34 @@ evaluation remains outside the local artifact report.
 
 ## Phase 5: guided authoring
 
-- language-server compiler facts
-- parser/type/effect/capability completion
-- deterministic fixes and formatting
+**Status:** In progress
+
+### `phase5-language-server`
+
+**Status:** Complete
+
+- synchronous stdio Language Server Protocol transport with UTF-16 positions
+- push diagnostics using the stable compiler codes and spans
+- canonical whole-document formatting and a deterministic format code action
+- hover facts for inferred/declared types, effects, resources, symbols, and
+  webhook/package context
+- parser/type/field/symbol/built-in and manifest-resource completion for the
+  implemented edition-2026 language
+- top-level document symbols and schema-1 `krit/compilerFacts` responses with
+  expressions, entrypoints, package metadata, requested/required permissions,
+  grant status, reference status, and formatting edits
+- bounded 16 MiB protocol frames, 1 MiB documents, 128-document state,
+  256 KiB validated manifests, type rendering, completion/fact outputs, and
+  fail-closed malformed update handling
+- no evaluator/runtime invocation, package installation, provider call, or
+  socket/network operation in the language-server code path
+- `krit lsp` stdio integration with stdout reserved exclusively for protocol
+  frames and operational failures on stderr
+
+### `phase5-guided-assistance`
+
+**Status:** Not started
+
 - optional provider-neutral inline prediction
 - accepted suggestions checked immediately
 - semantic cleanup shown as a reviewable diff

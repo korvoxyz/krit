@@ -75,15 +75,18 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - exhaustive empty/cons list matching
 - deterministic comment-preserving canonical source formatting
 - deterministic human and JSON diagnostics
+- offline `krit lsp` diagnostics, formatting, hover, completion, symbols, and
+  schema-1 compiler/package/permission facts
 - implementation-neutral conformance cases
 - strict package manifest validation
 
 Phase 4 is complete for the bounded stateless reference agent. The checked
 reference flow calls a GitHub-like origin, one neutral AI adapter, and one
 messaging-like origin with exact permissions and approval requirements.
-General composite Wasm layouts beyond the documented webhook subset, guided
-authoring, modules, dependency resolution, build caching, and production
-multi-tenant OS isolation are also future work. Krit is not production-ready.
+General composite Wasm layouts beyond the documented webhook subset,
+model-assisted authoring, modules, dependency resolution, build caching, and
+production multi-tenant OS isolation are also future work. Krit is not
+production-ready.
 
 ## Requirements
 
@@ -315,6 +318,34 @@ Show all commands:
 krit --help
 ```
 
+### Editor integration
+
+Start the offline language server over stdio:
+
+```sh
+krit lsp
+```
+
+The server publishes stable parser/type/effect diagnostics and supports
+canonical whole-document formatting, a deterministic format code action,
+UTF-16-correct hover, parser/type/field/symbol/built-in completion, manifest
+resource completion, and top-level document symbols. It uses only compiler and
+local package facts: source is never executed, components are never built or
+run, packages are never installed, and no runtime, provider, secret, or
+network authority is available.
+
+Editors and deterministic authoring tools can request
+`krit/compilerFacts` with a standard `textDocument` identifier. Schema 1
+returns stable byte/LSP spans, inferred and declared types, resolved names,
+effects, literal-resource requirements, entrypoints, package metadata,
+requested/required permissions and grant status, reference status, and
+canonical formatting edits. Protocol frames are limited to 16 MiB, open
+documents to 1 MiB, the open set to 128 documents, and applicable manifest
+reads to 256 KiB. Recursive type rendering and response collections are also
+bounded, and package facts require the normal canonical entry-containment
+check. Standard output contains LSP frames only; operational failures use
+standard error.
+
 Generate Krit with Claude, ChatGPT, Gemini, or a local model using the exact
 provider-neutral instruction shipped with this compiler:
 
@@ -461,7 +492,8 @@ The specification is the semantic authority:
 - [Modules and packages](spec/PACKAGES.md) — draft
 - [WebAssembly sandbox](spec/WASM-SANDBOX.md) — policy-1 artifact and bounded
   host implemented
-- [Guided AI authoring](spec/GUIDED-AUTHORING.md) — draft
+- [Guided AI authoring](spec/GUIDED-AUTHORING.md) — deterministic LSP baseline
+  implemented; predictive assistance draft
 - [Narrow product MVP](docs/mvp.md)
 - [Agent platform roadmap](docs/agent-roadmap.md)
 - [Rust technical design](docs/technical-design.md)
@@ -500,9 +532,11 @@ The accepted implementation path is:
    bounded host (complete for policy 1)
 6. stateless webhook/config/secret/HTTP/AI/log host and reliability policy
    (complete)
-7. optional provider-neutral inline prediction with visible checked edits
+7. offline language-server compiler, package, permission, completion, and
+   formatting facts (complete)
+8. optional provider-neutral inline prediction with visible checked edits
    (Phase 5; not started here)
-8. durable state and replay only after the stateless reference gate (Phase 6)
+9. durable state and replay only after the stateless reference gate (Phase 6)
 
 Performance claims follow [docs/performance.md](docs/performance.md), not
 implementation-language assumptions.

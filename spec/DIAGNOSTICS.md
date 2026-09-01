@@ -112,6 +112,7 @@ Initial required codes:
 | `K7003` | WebAssembly emission, validation, metadata attachment, artifact loading, or output failed |
 | `K7004` | Artifact metadata, byte size, or content digest mismatch |
 | `K8001` | Source is not canonically formatted in formatter check mode |
+| `K8002` | Language-server input or open-document state exceeds a bounded limit |
 
 ## Exit statuses
 

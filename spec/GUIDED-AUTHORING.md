@@ -2,6 +2,7 @@
 
 **Status:** Draft
 **Target:** Krit 0.4
+**Deterministic language-server status:** Implemented
 
 ## Goal
 
@@ -46,9 +47,13 @@ Always available and offline:
 
 This layer supplies facts to both people and models.
 
-The 0.2 bootstrap already provides the comment-preserving canonical formatter
-and `krit fmt --check`. Parser-aware completion, fixes, language-server edits,
-and broader compiler-facts APIs remain part of the 0.4 authoring milestone.
+The 0.2 bootstrap provides the comment-preserving canonical formatter,
+`krit fmt --check`, and the first deterministic language-server milestone.
+`krit lsp` now supplies compiler diagnostics, canonical document edits, a
+format fix action, type/effect/resource hover, bounded completion, document
+symbols, and versioned compiler facts. Import completion remains unavailable
+because edition 2026 has no implemented import syntax. Broader deterministic
+refactors and provider-neutral prediction remain later authoring milestones.
 
 ### 2. Predictive completion
 
@@ -111,6 +116,32 @@ The language server exposes versioned structured facts:
 - package interface documentation
 - diagnostic codes, spans, and applicable deterministic fixes
 - canonical formatting edits
+
+The implemented protocol is synchronous LSP over stdio. It uses full-document
+synchronization and UTF-16 positions, publishes compiler diagnostics, and
+supports standard hover, completion, document symbols, formatting, and code
+actions. `krit/compilerFacts` accepts a standard `textDocument` identifier and
+returns schema 1 with:
+
+- language and authoring-protocol versions
+- stable diagnostics with byte spans and UTF-16 ranges
+- module effects, literal-resource requirements, and entrypoints
+- symbols with inferred/declared types, reference status, and visibility
+- expression syntax kinds, inferred types, effects, requirements, and
+  resolved symbol/built-in identities
+- applicable package metadata, requested/required permissions, usage, and
+  local manifest grant status
+- canonical whole-document formatting edits
+
+The server limits each protocol frame to 16 MiB, each open document to 1 MiB,
+the open set to 128 documents, and the applicable manifest read to 256 KiB.
+Completion, document symbols, recursive type rendering, and compiler-fact
+responses are separately bounded. Package facts are attached only when the
+nearest `krit.pkg` passes the normal canonical entry-containment validation.
+The server reads only local source supplied by the editor and that validated
+manifest. It does not invoke the evaluator, lower/build components, install
+packages, open sockets, perform network requests, read host
+configuration/secrets, or call a model.
 
 The LLM consumes these facts instead of guessing from text alone.
 
@@ -226,8 +257,9 @@ remain explicit about effects, failures, authority, and external contracts.
 
 ## Initial milestone
 
-The first guided workflow should help an author build the reference webhook
-agent from `AGENT-APPLICATIONS.md`:
+The deterministic language-server portion of the first guided workflow is
+implemented. The later predictive workflow should help an author build the
+reference webhook agent from `AGENT-APPLICATIONS.md`:
 
 1. complete a typed route and request schema
 2. suggest approved connector operations

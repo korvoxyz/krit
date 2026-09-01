@@ -108,7 +108,8 @@ object storage, database access, then cache and search. See
 - Startup, memory, and request overhead are measured before optimization
   claims are made.
 
-The stateless runtime portion of this MVP is complete at the Phase 4 gate.
-Language-server/inline authoring belongs to Phase 5. Process-local rate and
-idempotency policy is intentionally not durable or distributed; Phase 6 owns
-transactional replay and state.
+The stateless runtime portion of this MVP is complete at the Phase 4 gate, and
+the deterministic `phase5-language-server` milestone is complete. Optional
+inline prediction and reviewable semantic cleanup remain in Phase 5.
+Process-local rate and idempotency policy is intentionally not durable or
+distributed; Phase 6 owns transactional replay and state.

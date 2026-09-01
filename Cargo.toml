@@ -3,6 +3,7 @@ members = [
     "crates/krit",
     "crates/krit-capability",
     "crates/krit-cli",
+    "crates/krit-lsp",
     "crates/krit-package",
     "crates/krit-runtime",
     "crates/krit-wasm",
@@ -20,15 +21,19 @@ repository = "https://github.com/akshay-bhardwaj/Krit"
 [workspace.dependencies]
 krit = { path = "crates/krit" }
 krit-capability = { path = "crates/krit-capability" }
+krit-lsp = { path = "crates/krit-lsp" }
 krit-package = { path = "crates/krit-package" }
 krit-runtime = { path = "crates/krit-runtime" }
 krit-wasm = { path = "crates/krit-wasm" }
 blake3 = "1.8.7"
+crossbeam-channel = "=0.5.16"
 curl = { version = "=0.4.50", default-features = false, features = [
     "rustls",
     "static-curl",
 ] }
 http = { version = "=1.5.0", default-features = false, features = ["std"] }
+lsp-server = "=0.10.0"
+lsp-types = "=0.97.0"
 rustix = { version = "=1.1.4", default-features = false, features = ["fs"] }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }

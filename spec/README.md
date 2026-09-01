@@ -24,7 +24,7 @@ infer semantics from historical interpreter behavior.
 | [CAPABILITIES.md](CAPABILITIES.md) | Implemented bounded HTTP host | Runtime authority and sandbox boundaries |
 | [PACKAGES.md](PACKAGES.md) | Draft | Modules, manifests, lockfiles, and registries |
 | [WASM-SANDBOX.md](WASM-SANDBOX.md) | Implemented Phase 4 | Policy-1 scalar and bounded stateless webhook components |
-| [GUIDED-AUTHORING.md](GUIDED-AUTHORING.md) | Draft | Deterministic and optional LLM coding guidance |
+| [GUIDED-AUTHORING.md](GUIDED-AUTHORING.md) | Implemented deterministic baseline; predictive draft | Offline LSP facts and optional LLM coding guidance |
 
 `LANGUAGE.md` deliberately defines a new readable syntax for the Rust
 implementation. The S-expression syntax in the archived Racket prototype is

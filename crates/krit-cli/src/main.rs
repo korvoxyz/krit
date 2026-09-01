@@ -11,8 +11,8 @@ use std::{
 };
 
 use krit::{
-    Analysis, CoreModule, Diagnostic, Effect, EntrypointKind, RequirementSet, Source, Span,
-    analyze, execute, format_source, lower, parse_source,
+    Analysis, CoreModule, Diagnostic, EntrypointKind, RequirementSet, Source, Span, analyze,
+    execute, format_source, lower, parse_source,
 };
 use krit_package::Manifest;
 use krit_runtime::{
@@ -55,6 +55,7 @@ fn run(arguments: Vec<String>) -> u8 {
         "build" => build_command(&arguments[1..]),
         "explain" => explain_command(&arguments[1..]),
         "fmt" => fmt_command(&arguments[1..]),
+        "lsp" => lsp_command(&arguments[1..]),
         "prompt" => prompt_command(&arguments[1..]),
         "permissions" => permissions_command(&arguments[1..]),
         "sandbox" => sandbox_command(&arguments[1..]),
@@ -1112,31 +1113,10 @@ fn manifest_grants_requirement(
     manifest: &Manifest,
     requirement: &krit::CapabilityRequirement,
 ) -> bool {
-    match requirement.capability() {
-        Effect::ConfigRead => manifest
-            .capabilities
-            .config
-            .iter()
-            .any(|resource| resource == requirement.resource()),
-        Effect::SecretRead => manifest
-            .capabilities
-            .secrets
-            .iter()
-            .any(|resource| resource == requirement.resource()),
-        Effect::HttpRequest => manifest
-            .capabilities
-            .http
-            .iter()
-            .any(|resource| resource == requirement.resource()),
-        Effect::AiInvoke => manifest
-            .capabilities
-            .ai
-            .iter()
-            .any(|resource| resource == requirement.resource()),
-        Effect::ObserveLog => manifest.capabilities.logs,
-        Effect::IoStdout => manifest.capabilities.stdout,
-        _ => false,
-    }
+    manifest.grants_permission(
+        requirement.capability().as_str(),
+        Some(requirement.resource()),
+    )
 }
 
 fn parse_source_options(arguments: &[String]) -> Result<(DiagnosticFormat, Vec<String>), String> {
@@ -1213,6 +1193,20 @@ fn package_command(arguments: &[String]) -> u8 {
         Err(error) => {
             eprintln!("{}:1:1: error[K6001]: {error}", path.to_string_lossy());
             3
+        }
+    }
+}
+
+fn lsp_command(arguments: &[String]) -> u8 {
+    if !arguments.is_empty() {
+        eprintln!("krit: `lsp` does not accept arguments");
+        return 2;
+    }
+    match krit_lsp::run_stdio() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("krit: language server failed: {error}");
+            1
         }
     }
 }
@@ -2024,6 +2018,7 @@ USAGE:
     krit build [--manifest PATH] [--output PATH]
     krit explain [--json] FILE
     krit fmt [--check] FILE...
+    krit lsp
     krit prompt
     krit permissions [--artifact PATH] [--json] [MANIFEST]
     krit sandbox [--manifest PATH] [--artifact PATH]

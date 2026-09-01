@@ -364,6 +364,11 @@ subjects have the right family, and no unsupported feature appears. Generated
 source must pass `krit check` without being executed. For a source-only
 agent-contract request, stop after formatting, checking, and explanation; do
 not claim that a deployment host or approval policy was evaluated.
+`krit lsp` is an optional offline editor interface to the same parser,
+analyzer, formatter, package, and permission facts. It never executes source,
+builds or runs components, installs packages, opens network connections, or
+calls a model. Its schema-1 `krit/compilerFacts` output may be used as bounded
+structured context, but it does not grant authority or replace a fresh check.
 The user can inspect its inferred types, effects, and resolved compiler form
 with `krit explain --json`, including literal-resource capability requirements
 and exact webhook JSON Schemas. This explanation does not make unsupported

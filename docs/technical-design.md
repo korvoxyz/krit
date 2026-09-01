@@ -44,9 +44,10 @@ source database -> lexer -> parser -> AST
 The Rust bootstrap implements source, lexer, parser, AST, diagnostics, name
 resolution, type/effect analysis, a verified typed Core IR, a direct evaluator
 that establishes runtime semantics, and `krit-wasm`, a strict Core-to-component
-artifact backend, plus `krit-runtime`, a bounded component host. `krit build`
-emits validated artifacts, `krit sandbox` executes only those artifacts, and
-`krit run` remains the broader direct evaluator.
+artifact backend, plus `krit-runtime`, a bounded component host and `krit-lsp`,
+a deterministic editor boundary. `krit build` emits validated artifacts,
+`krit sandbox` executes only those artifacts, `krit run` remains the broader
+direct evaluator, and `krit lsp` never executes source.
 
 ## Workspace
 
@@ -365,6 +366,16 @@ each non-canonical source.
 
 Editor integration is separate from compilation. `krit-lsp` exposes
 deterministic syntax, type, effect, formatting, and permission facts.
+It uses synchronous LSP over stdio with full-document synchronization and
+UTF-16 positions. Standard diagnostics, hover, completion, document symbols,
+formatting, and format code actions are supplemented by the versioned
+schema-1 `krit/compilerFacts` request. The server accepts at most 16 MiB per
+protocol frame and 1 MiB per open document, bounds completion and
+structured-fact/type rendering, retains at most 128 documents, reads at most
+256 KiB from the nearest applicable local `krit.pkg`, and attaches package
+facts only after the normal canonical entry-containment validation. It has no
+dependency on `krit-runtime` or `krit-wasm`. Standard output is reserved for
+LSP framing.
 `krit-assist` may ask a configured model for small structured edits, but those
 edits remain provisional until accepted and rechecked. Builds and deployments
 never require an LLM.

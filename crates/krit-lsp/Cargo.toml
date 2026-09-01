@@ -1,6 +1,6 @@
 [package]
-name = "krit-cli"
-description = "Command-line interface for the Krit programming language"
+name = "krit-lsp"
+description = "Deterministic Language Server Protocol support for Krit"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,20 +8,15 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "krit"
-path = "src/main.rs"
-
 [dependencies]
+crossbeam-channel.workspace = true
 krit.workspace = true
-krit-lsp.workspace = true
 krit-package.workspace = true
-krit-runtime.workspace = true
-krit-wasm.workspace = true
-rustix.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tiny_http.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

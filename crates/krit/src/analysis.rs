@@ -1,7 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
-    fmt,
+    fmt::{self, Write as _},
     sync::Arc,
 };
 
@@ -264,6 +264,144 @@ pub enum Type {
     Variable(u32),
 }
 
+impl Type {
+    pub fn record_fields(&self) -> Option<Vec<RecordType>> {
+        match self {
+            Self::Record(fields) => Some(fields.clone()),
+            Self::HttpHeader => Some(public_contract_fields(&InferType::HttpHeader)),
+            Self::HttpRequest => Some(public_contract_fields(&InferType::HttpRequest)),
+            Self::HttpResponse => Some(public_contract_fields(&InferType::HttpResponse)),
+            Self::LogField => Some(public_contract_fields(&InferType::LogField)),
+            Self::Int
+            | Self::Bool
+            | Self::String
+            | Self::Unit
+            | Self::Secret
+            | Self::List(_)
+            | Self::Option(_)
+            | Self::Result(_, _)
+            | Self::Function(_)
+            | Self::Variable(_) => None,
+        }
+    }
+
+    pub fn render_bounded(&self, max_bytes: usize) -> Option<String> {
+        let mut writer = BoundedTypeWriter::new(max_bytes);
+        render_type_bounded(self, &mut writer, 0).ok()?;
+        Some(writer.finish())
+    }
+}
+
+const MAX_TYPE_RENDER_DEPTH: usize = 256;
+
+struct BoundedTypeWriter {
+    output: String,
+    max_bytes: usize,
+}
+
+impl BoundedTypeWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            output: String::new(),
+            max_bytes,
+        }
+    }
+
+    fn finish(self) -> String {
+        self.output
+    }
+}
+
+impl fmt::Write for BoundedTypeWriter {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.output.len().saturating_add(value.len()) > self.max_bytes {
+            return Err(fmt::Error);
+        }
+        self.output.push_str(value);
+        Ok(())
+    }
+}
+
+fn render_type_bounded(ty: &Type, writer: &mut BoundedTypeWriter, depth: usize) -> fmt::Result {
+    if depth > MAX_TYPE_RENDER_DEPTH {
+        return Err(fmt::Error);
+    }
+    match ty {
+        Type::Int => writer.write_str("Int"),
+        Type::Bool => writer.write_str("Bool"),
+        Type::String => writer.write_str("String"),
+        Type::Unit => writer.write_str("Unit"),
+        Type::HttpHeader => writer.write_str("HttpHeader"),
+        Type::HttpRequest => writer.write_str("HttpRequest"),
+        Type::HttpResponse => writer.write_str("HttpResponse"),
+        Type::LogField => writer.write_str("LogField"),
+        Type::Secret => writer.write_str("Secret"),
+        Type::List(element) => {
+            writer.write_str("List<")?;
+            render_type_bounded(element, writer, depth + 1)?;
+            writer.write_str(">")
+        }
+        Type::Record(fields) => {
+            writer.write_str("Record { ")?;
+            for (index, field) in fields.iter().enumerate() {
+                if index > 0 {
+                    writer.write_str(", ")?;
+                }
+                writer.write_str(field.name())?;
+                writer.write_str(": ")?;
+                render_type_bounded(field.ty(), writer, depth + 1)?;
+            }
+            writer.write_str(" }")
+        }
+        Type::Option(element) => {
+            writer.write_str("Option<")?;
+            render_type_bounded(element, writer, depth + 1)?;
+            writer.write_str(">")
+        }
+        Type::Result(value, error) => {
+            writer.write_str("Result<")?;
+            render_type_bounded(value, writer, depth + 1)?;
+            writer.write_str(", ")?;
+            render_type_bounded(error, writer, depth + 1)?;
+            writer.write_str(">")
+        }
+        Type::Function(function) => {
+            writer.write_str("fn(")?;
+            for (index, parameter) in function.parameters().iter().enumerate() {
+                if index > 0 {
+                    writer.write_str(", ")?;
+                }
+                render_type_bounded(parameter, writer, depth + 1)?;
+            }
+            writer.write_str(") -> ")?;
+            render_type_bounded(function.return_type(), writer, depth + 1)?;
+            writer.write_str(" effects {")?;
+            for (index, effect) in function.effects().iter().enumerate() {
+                if index > 0 {
+                    writer.write_str(", ")?;
+                }
+                writer.write_str(effect.as_str())?;
+            }
+            writer.write_str("}")?;
+            if !function.requirements().is_empty() {
+                writer.write_str(" requirements {")?;
+                for (index, requirement) in function.requirements().iter().enumerate() {
+                    if index > 0 {
+                        writer.write_str(", ")?;
+                    }
+                    writer.write_str(requirement.capability().as_str())?;
+                    writer.write_str("(")?;
+                    write!(writer, "{:?}", requirement.resource())?;
+                    writer.write_str(")")?;
+                }
+                writer.write_str("}")?;
+            }
+            Ok(())
+        }
+        Type::Variable(id) => write!(writer, "'{}", type_variable_name(*id)),
+    }
+}
+
 impl fmt::Display for Type {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -302,6 +440,13 @@ pub struct RecordType {
 }
 
 impl RecordType {
+    fn new(name: impl Into<String>, ty: Type) -> Self {
+        Self {
+            name: name.into(),
+            ty: Arc::new(ty),
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -2659,6 +2804,26 @@ fn contract_record(nominal: &InferType) -> InferType {
     }
 }
 
+fn public_contract_fields(nominal: &InferType) -> Vec<RecordType> {
+    let InferType::Record { fields, .. } = contract_record(nominal) else {
+        unreachable!("built-in record contracts normalize to records")
+    };
+    fields
+        .into_iter()
+        .map(|(name, ty)| RecordType::new(name, public_contract_type(ty)))
+        .collect()
+}
+
+fn public_contract_type(ty: InferType) -> Type {
+    match ty {
+        InferType::Int => Type::Int,
+        InferType::String => Type::String,
+        InferType::HttpHeader => Type::HttpHeader,
+        InferType::List(element) => Type::List(Arc::new(public_contract_type(*element))),
+        _ => unreachable!("built-in record fields use concrete public contract types"),
+    }
+}
+
 fn direct_host_builtin(callee: &Expression) -> Option<Builtin> {
     let ExpressionKind::Variable(name) = &callee.kind else {
         return None;
@@ -3021,5 +3186,29 @@ mod tests {
 
         let error = analyze(&program).expect_err("invalid AST should fail defensively");
         assert_eq!(error.code(), "K3005");
+    }
+
+    #[test]
+    fn bounded_type_rendering_stops_shared_dag_expansion() {
+        let mut source = "let value0 = record { leaf: 0 };\n".to_owned();
+        for level in 1..=20 {
+            source.push_str(&format!(
+                "let value{level} = record {{ left: value{}, right: value{} }};\n",
+                level - 1,
+                level - 1
+            ));
+        }
+        let source = Source::new("<bounded-type-render>", source);
+        let program = crate::parse_source(&source).expect("source should parse");
+        let analysis = analyze(&program).expect("source should analyze");
+        let small = analysis.bindings()[0].ty();
+        let large = analysis.bindings().last().expect("last binding").ty();
+        let expected = small.to_string();
+
+        assert_eq!(
+            small.render_bounded(1024).as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(large.render_bounded(16 * 1024).is_none());
     }
 }

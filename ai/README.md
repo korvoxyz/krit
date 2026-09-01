@@ -20,7 +20,9 @@ host values, secret revelation, broad network grants, provider SDKs, and
 self-approval remain explicitly unavailable. The compiler can explain exact
 requirements, build scalar or bounded webhook artifacts, inspect effective
 local permissions, and execute them through the sandbox, fixture invocation,
-or loopback server paths.
+or loopback server paths. `krit lsp` exposes the same deterministic compiler,
+package, permission, completion, and formatting facts offline without
+executing source or granting runtime/network authority.
 
 ## Use
 
@@ -45,6 +47,7 @@ krit fmt generated.krit
 krit fmt --check generated.krit
 krit check generated.krit
 krit explain --json generated.krit
+krit lsp # editor stdio integration
 krit build
 krit permissions --artifact target/krit/<package>.wasm
 krit sandbox # module-init artifacts

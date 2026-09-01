@@ -161,6 +161,22 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Local-only reference integration coverage proving GitHub-like -> neutral AI
   -> messaging-like order, retry/auth boundaries, output/log/stats facts, and
   exact permissions without Internet access or real credentials
+- `krit-lsp`, a synchronous stdio language server with full-document sync,
+  UTF-16 position handling, stable compiler diagnostics, canonical formatting,
+  a deterministic format code action, hover, completion, and document symbols
+- Schema-1 `krit/compilerFacts` responses for module/entrypoint effects,
+  literal-resource requirements, resolved symbols and expressions, inferred
+  and declared types, package metadata, requested/required permission status,
+  reference status, and canonical edits
+- Package-aware configuration, secret, exact-origin HTTP, and AI adapter
+  completion plus compiler-owned built-in signatures and built-in record field
+  facts
+- Bounded 16 MiB protocol frames, 1 MiB documents, 128-document state,
+  256 KiB validated manifests, recursive type rendering, and bounded
+  completion/symbol/compiler-fact output with fail-closed malformed handling
+- In-memory protocol and real `krit lsp` stdio coverage for malformed
+  requests/documents, UTF-16 ranges, deterministic facts, formatting
+  idempotence, no-execution behavior, framing purity, and graceful shutdown
 
 ### Changed
 
@@ -199,6 +215,11 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Updated the provider-neutral generation prompt to version 0.2.9 for neutral
   AI calls, structured logs, explicit model-output validation, and bounded
   reliability/approval policy
+- Completed `phase5-language-server` while keeping provider-neutral prediction,
+  accepted-suggestion checking, and semantic cleanup in the later
+  `phase5-guided-assistance` milestone
+- Updated the provider-neutral generation prompt to version 0.2.10 for the
+  offline language-server compiler-facts and editor workflow
 
 ## [0.2.0] - 2026-09-01
 

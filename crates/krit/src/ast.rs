@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::Span;
 
 #[derive(Clone, Debug)]
@@ -168,6 +170,41 @@ pub enum TypeKind {
     Option(Box<TypeAnnotation>),
     Result(Box<TypeAnnotation>, Box<TypeAnnotation>),
     Record(Vec<RecordTypeField>),
+}
+
+impl fmt::Display for TypeAnnotation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)
+    }
+}
+
+impl fmt::Display for TypeKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Int => formatter.write_str("Int"),
+            Self::Bool => formatter.write_str("Bool"),
+            Self::String => formatter.write_str("String"),
+            Self::Unit => formatter.write_str("Unit"),
+            Self::HttpHeader => formatter.write_str("HttpHeader"),
+            Self::HttpRequest => formatter.write_str("HttpRequest"),
+            Self::HttpResponse => formatter.write_str("HttpResponse"),
+            Self::LogField => formatter.write_str("LogField"),
+            Self::Secret => formatter.write_str("Secret"),
+            Self::List(element) => write!(formatter, "List<{element}>"),
+            Self::Option(element) => write!(formatter, "Option<{element}>"),
+            Self::Result(value, error) => write!(formatter, "Result<{value}, {error}>"),
+            Self::Record(fields) => {
+                formatter.write_str("Record { ")?;
+                for (index, field) in fields.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{}: {}", field.name, field.annotation)?;
+                }
+                formatter.write_str(" }")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

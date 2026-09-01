@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "promptVersion": "0.2.9",
+  "promptVersion": "0.2.10",
   "languageVersion": "0.2.0",
   "edition": "2026",
   "status": "implemented",
@@ -10,6 +10,8 @@
   "artifactMetadataSchema": 1,
   "artifactPolicyVersion": 1,
   "runtimeHostPolicyVersion": 1,
+  "authoringProtocolVersion": 1,
+  "languageServerStatus": "implemented-deterministic-offline",
   "sandboxStatus": "implemented-policy-1-and-phase4-bounded-webhook-subsets",
   "agentContractStatus": "implemented-phase4-runtime",
   "httpRuntimeStatus": "implemented-bounded",

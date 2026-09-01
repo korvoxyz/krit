@@ -242,6 +242,38 @@ impl Manifest {
             grant_status: "not-evaluated",
         }
     }
+
+    pub fn grants_permission(&self, capability: &str, resource: Option<&str>) -> bool {
+        match capability {
+            "io.stdout" => resource.is_none() && self.capabilities.stdout,
+            "config.read" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .config
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "http.request" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .http
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "secret.read" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .secrets
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "ai.invoke" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .ai
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "observe.log" => resource.is_none() && self.capabilities.logs,
+            _ => false,
+        }
+    }
 }
 
 fn default_target() -> String {
@@ -395,6 +427,12 @@ mod tests {
         assert_eq!(manifest.package.name, "akshay/krit");
         assert!(manifest.capabilities.stdout);
         assert_eq!(manifest.permission_plan().requested.len(), 7);
+        assert!(manifest.grants_permission("io.stdout", None));
+        assert!(manifest.grants_permission("config.read", Some("agent.model")));
+        assert!(manifest.grants_permission("http.request", Some("https://api.github.com")));
+        assert!(manifest.grants_permission("secret.read", Some("github-token")));
+        assert!(!manifest.grants_permission("config.read", Some("missing")));
+        assert!(!manifest.grants_permission("unknown", None));
     }
 
     #[test]

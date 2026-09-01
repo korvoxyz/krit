@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::Duration,
 };
 
 use krit_wasm::{ArtifactMetadata, validate_artifact};
@@ -57,6 +59,42 @@ fn krit_in(directory: &TestDirectory) -> Command {
     command
 }
 
+fn lsp_frame(value: &serde_json::Value) -> Vec<u8> {
+    let body = serde_json::to_vec(value).expect("LSP message should serialize");
+    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    frame.extend_from_slice(&body);
+    frame
+}
+
+fn parse_lsp_frames(bytes: &[u8]) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let separator = bytes[cursor..]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| cursor + position)
+            .expect("LSP frame should contain a header separator");
+        let headers =
+            std::str::from_utf8(&bytes[cursor..separator]).expect("LSP headers should be UTF-8");
+        let length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .expect("LSP frame should contain Content-Length")
+            .parse::<usize>()
+            .expect("Content-Length should be numeric");
+        let body_start = separator + 4;
+        let body_end = body_start + length;
+        assert!(body_end <= bytes.len(), "LSP frame body should be complete");
+        messages.push(
+            serde_json::from_slice(&bytes[body_start..body_end])
+                .expect("LSP frame body should be JSON"),
+        );
+        cursor = body_end;
+    }
+    messages
+}
+
 #[test]
 fn runs_an_example() {
     let output = krit()
@@ -67,6 +105,250 @@ fn runs_an_example() {
     assert!(output.status.success());
     assert_eq!(output.stdout, b"720\n");
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn language_server_uses_pure_stdio_framing_and_shuts_down_cleanly() {
+    let directory = TestDirectory::new("lsp-stdio");
+    let source = directory.file("main.krit", "let answer=6*7;\n");
+    let uri = format!("file://{}", source.display());
+    let root_uri = format!("file://{}", directory.path.display());
+    let messages = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "capabilities": {},
+                "rootUri": root_uri,
+                "workspaceFolders": null
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "krit",
+                    "version": 1,
+                    "text": "let answer=6*7;\n"
+                }
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {"uri": uri},
+                "position": {"line": 0, "character": 5}
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "textDocument/formatting",
+            "params": {
+                "textDocument": {"uri": uri},
+                "options": {"tabSize": 4, "insertSpaces": true}
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "krit/compilerFacts",
+            "params": {"textDocument": {"uri": uri}}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "shutdown",
+            "params": null
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "exit",
+            "params": null
+        }),
+    ];
+    let mut input = Vec::new();
+    for message in &messages {
+        input.extend_from_slice(&lsp_frame(message));
+    }
+
+    let mut child = krit_in(&directory)
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Krit language server should start");
+    child
+        .stdin
+        .take()
+        .expect("language server stdin should be piped")
+        .write_all(&input)
+        .expect("LSP input should be written");
+    let output = child
+        .wait_with_output()
+        .expect("language server should finish");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let frames = parse_lsp_frames(&output.stdout);
+    assert_eq!(frames.len(), 6);
+    assert_eq!(frames[0]["id"], 1);
+    assert_eq!(
+        frames[0]["result"]["capabilities"]["positionEncoding"],
+        "utf-16"
+    );
+    assert_eq!(frames[1]["method"], "textDocument/publishDiagnostics");
+    assert_eq!(frames[1]["params"]["diagnostics"], serde_json::json!([]));
+    assert_eq!(frames[2]["id"], 2);
+    assert!(
+        frames[2]["result"]["contents"]["value"]
+            .as_str()
+            .expect("hover should contain markdown")
+            .contains("answer: Int")
+    );
+    assert_eq!(frames[3]["result"][0]["newText"], "let answer = 6 * 7;\n");
+    assert_eq!(frames[4]["result"]["schema"], 1);
+    assert_eq!(frames[4]["result"]["formatting"]["canonical"], false);
+    assert_eq!(frames[5]["id"], 5);
+    assert_eq!(frames[5]["result"], serde_json::Value::Null);
+}
+
+#[test]
+fn language_server_routes_malformed_payload_failures_to_stderr() {
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "processId": null,
+            "capabilities": {},
+            "workspaceFolders": null
+        }
+    });
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {}
+    });
+    let mut input = lsp_frame(&initialize);
+    input.extend_from_slice(&lsp_frame(&initialized));
+    input.extend_from_slice(b"Content-Length: 1\r\n\r\n{");
+
+    let mut child = krit()
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Krit language server should start");
+    child
+        .stdin
+        .take()
+        .expect("language server stdin should be piped")
+        .write_all(&input)
+        .expect("malformed LSP input should be written");
+    let output = child
+        .wait_with_output()
+        .expect("language server should finish");
+
+    assert_eq!(output.status.code(), Some(1));
+    let frames = parse_lsp_frames(&output.stdout);
+    assert_eq!(
+        frames.len(),
+        1,
+        "stdout must contain only the initialize frame"
+    );
+    assert_eq!(frames[0]["id"], 1);
+    assert!(
+        String::from_utf8(output.stderr)
+            .expect("stderr should be UTF-8")
+            .contains("language server failed")
+    );
+}
+
+#[test]
+fn language_server_rejects_invalid_initialization_without_waiting_for_stdin_eof() {
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "processId": null,
+            "capabilities": "SUPERSECRET",
+            "workspaceFolders": null
+        }
+    });
+    let mut child = krit()
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Krit language server should start");
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("language server stdin should be piped");
+    stdin
+        .write_all(&lsp_frame(&initialize))
+        .expect("invalid initialize request should be written");
+    stdin.flush().expect("initialize request should be flushed");
+
+    let mut exited = false;
+    for _ in 0..50 {
+        if child
+            .try_wait()
+            .expect("language server status should be readable")
+            .is_some()
+        {
+            exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    if !exited {
+        child
+            .kill()
+            .expect("stuck language server should be stopped");
+    }
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .expect("language server output should be collected");
+
+    assert!(exited, "invalid initialization must terminate promptly");
+    assert_eq!(output.status.code(), Some(1));
+    let frames = parse_lsp_frames(&output.stdout);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["error"]["code"], -32602);
+    assert_eq!(frames[0]["error"]["message"], "invalid initialize params");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("invalid initialize request"));
+    assert!(!stderr.contains("SUPERSECRET"));
+}
+
+#[test]
+fn language_server_rejects_cli_arguments_without_starting_protocol_io() {
+    let output = krit()
+        .args(["lsp", "--tcp"])
+        .output()
+        .expect("Krit should start");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"krit: `lsp` does not accept arguments\n");
 }
 
 #[test]
