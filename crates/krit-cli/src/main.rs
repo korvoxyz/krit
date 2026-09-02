@@ -160,6 +160,9 @@ fn build_command(arguments: &[String]) -> u8 {
     if manifest.capabilities.logs {
         options.grant_effect("observe.log");
     }
+    if !manifest.capabilities.state.is_empty() {
+        options.grant_effect("state.transaction");
+    }
     let artifact = match build_component(&module, &options) {
         Ok(artifact) => artifact,
         Err(error) => {
@@ -410,7 +413,35 @@ struct JsonExplanation {
     entrypoint: JsonEntrypoint,
     entrypoints: JsonEntrypointFacts,
     bindings: Vec<JsonBinding>,
+    durable_state: JsonDurableFacts,
     core: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonDurableFacts {
+    schema: u8,
+    operations: Vec<JsonDurableOperation>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonDurableOperation {
+    kind: &'static str,
+    store: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_capability: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_resource: Option<String>,
+    span: JsonByteSpan,
+}
+
+#[derive(Serialize)]
+struct JsonByteSpan {
+    start: usize,
+    end: usize,
 }
 
 #[derive(Serialize)]
@@ -563,14 +594,14 @@ fn explain_command(arguments: &[String]) -> u8 {
         Err(error) => return internal_error("KICE0001", "lowering Core IR", &error),
     };
     if json {
-        render_explanation_json(&analysis, &module)
+        render_explanation_json(&program, &analysis, &module)
     } else {
-        render_explanation_human(&analysis, &module);
+        render_explanation_human(&program, &analysis, &module);
         0
     }
 }
 
-fn render_explanation_human(analysis: &Analysis, module: &CoreModule) {
+fn render_explanation_human(program: &krit::Program, analysis: &Analysis, module: &CoreModule) {
     let entrypoint = module.entrypoint_function();
     println!("Krit explanation (schema 1)");
     println!(
@@ -602,6 +633,29 @@ fn render_explanation_human(analysis: &Analysis, module: &CoreModule) {
         );
         println!("  JSON Schema: draft 2020-12 request/response contract v1");
     }
+    println!("durable operations:");
+    let durable = krit::durable_operations(program);
+    if durable.is_empty() {
+        println!("  (none)");
+    } else {
+        for operation in durable {
+            print!(
+                "  {} store={}",
+                operation.kind().as_str(),
+                operation.store()
+            );
+            if let Some(identity) = operation.identity() {
+                print!(" identity={identity}");
+            }
+            if let (Some(capability), Some(resource)) = (
+                operation.external_capability(),
+                operation.external_resource(),
+            ) {
+                print!(" external={capability}({resource})");
+            }
+            println!();
+        }
+    }
     println!("top-level bindings:");
     let mut found = false;
     for binding in analysis
@@ -620,7 +674,11 @@ fn render_explanation_human(analysis: &Analysis, module: &CoreModule) {
     print!("{}", module.render_text());
 }
 
-fn render_explanation_json(analysis: &Analysis, module: &CoreModule) -> u8 {
+fn render_explanation_json(
+    program: &krit::Program,
+    analysis: &Analysis,
+    module: &CoreModule,
+) -> u8 {
     let entrypoint = module.entrypoint_function();
     let explanation = JsonExplanation {
         schema: 1,
@@ -686,6 +744,26 @@ fn render_explanation_json(analysis: &Analysis, module: &CoreModule) -> u8 {
                 }
             })
             .collect(),
+        durable_state: JsonDurableFacts {
+            schema: 1,
+            operations: krit::durable_operations(program)
+                .into_iter()
+                .map(|operation| {
+                    let span = operation.span();
+                    JsonDurableOperation {
+                        kind: operation.kind().as_str(),
+                        store: operation.store().to_owned(),
+                        identity: operation.identity().map(str::to_owned),
+                        external_capability: operation.external_capability(),
+                        external_resource: operation.external_resource().map(str::to_owned),
+                        span: JsonByteSpan {
+                            start: span.start,
+                            end: span.end,
+                        },
+                    }
+                })
+                .collect(),
+        },
         core: module.render_text(),
     };
     match serde_json::to_string(&explanation) {
@@ -1266,11 +1344,7 @@ fn invoke_command(arguments: &[String]) -> u8 {
     let agent_host = match host_config::load(options.host_config.as_deref(), &manifest, limits) {
         Ok(host) => host,
         Err(error) => {
-            let code = if error.kind() == host_config::HostConfigErrorKind::Authorization {
-                "K5001"
-            } else {
-                "K7003"
-            };
+            let code = error.code();
             eprintln!(
                 "{}:1:1: error[{code}]: {}",
                 options
@@ -1371,7 +1445,7 @@ fn serve_command(arguments: &[String]) -> u8 {
         Ok(host) => host,
         Err(error) => {
             let authorization = error.kind() == host_config::HostConfigErrorKind::Authorization;
-            let code = if authorization { "K5001" } else { "K7003" };
+            let code = error.code();
             eprintln!(
                 "{}:1:1: error[{code}]: {}",
                 options
@@ -2123,6 +2197,6 @@ mod tests {
             count += 1;
             remaining = &code[end + "\n```".len()..];
         }
-        assert_eq!(count, 7, "prompt should contain seven canonical examples");
+        assert_eq!(count, 8, "prompt should contain eight canonical examples");
     }
 }

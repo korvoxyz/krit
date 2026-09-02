@@ -16,9 +16,11 @@ checked integer operators, comparisons, and scalar `print`/`println`. The
 bounded webhook path additionally supports strings, fixed HTTP records,
 header lists, Result/Option matching, static non-capturing helpers,
 `config_string`, `secret`, `http_request`, `ai_invoke`, `log_info`, and
-`log_error`. It also supports unescaped JSON-string decoding when the inferred
-result is `String`. General composites, general JSON shapes, escaped JSON
-strings, data captures, and dynamic string operators still fail closed.
+`log_error`, bounded string state/checkpoint operations, and durable
+`replay_http`/`replay_ai`. It also supports unescaped JSON-string decoding when
+the inferred result is `String`. General composites, general JSON shapes,
+escaped JSON strings, data captures, and dynamic string operators still fail
+closed.
 
 For a requested buildable-and-runnable package, require this deterministic
 workflow: `krit check`, `krit build`, `krit permissions --artifact PATH`, then
@@ -168,6 +170,28 @@ webhook and apply only to GET/HEAD or a request with a valid ordinary
 `idempotency-key`. AI and bearer HTTP are default-deny until the embedding
 policy explicitly approves their exact resources. Source and manifests cannot
 approve themselves.
+
+Schema-1 manifests may request `state = ["agent-work"]`. The schema-3 host
+chooses the owner-only SQLite path and limits; source never sees a path or SQL.
+The direct canonical store, checkpoint, replay-operation, HTTP-origin, and
+AI-adapter literals are compiler facts.
+
+`state_get(store, key)` returns `Result<Option<String>, String>`.
+`state_put(store, key, value)`, `state_delete(store, key)`, and
+`checkpoint_put(store, name, value)` return `Result<Unit, String>`.
+`checkpoint_get(store, name)` returns `Result<Option<String>, String>`.
+State and checkpoint writes commit only after successful invocation completion.
+Do not place credentials or sensitive external values in ordinary durable
+strings.
+
+`replay_http(store, operation, origin, request)` returns
+`Result<HttpResponse, String>` and is anonymous. It requires GET/HEAD or one
+valid ordinary `Idempotency-Key`. `replay_ai(store, operation, adapter, input)`
+returns `Result<String, String>`. Completed bounded results may be reused after
+process restart, but current grants and AI approval are rechecked. Krit does
+not claim distributed exactly once: a provider can complete an effect before
+the local replay record commits, so stable provider idempotency remains
+necessary.
 
 ## Expressions
 
@@ -355,6 +379,23 @@ let message = match decoded {
 };
 
 println(json_encode(record { message: message, delivered: true }));
+```
+
+Durable checkpoint:
+
+```krit
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match checkpoint_get("agent-work", "processed-request") {
+        Ok(previous) => match previous {
+            Some(value) => record { status: 200, headers: [], body: value },
+            None => match checkpoint_put("agent-work", "processed-request", request.body) {
+                Ok(saved) => record { status: 200, headers: [], body: request.body },
+                Err(error) => record { status: 500, headers: [], body: error },
+            },
+        },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}
 ```
 
 Before responding, verify mentally that every identifier is bound, every call

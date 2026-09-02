@@ -37,6 +37,9 @@ The baseline suite contains:
 - no-change cached build
 - lockfile resolution from warm metadata
 - capability dispatch overhead
+- SQLite state read and one-mutation FULL/NORMAL commits
+- checkpoint read/commit and replay hit/miss overhead
+- durable idempotency reservation/completion/replay across process restart
 
 Inputs and expected checksums are versioned. Benchmarks do not print large
 results during timing.
@@ -121,6 +124,11 @@ Startup cases distinguish:
 The compiler exposes tracing in development builds so aggregate timing can be
 attributed without changing normal user output.
 
+Durable-state measurements separate SQLite open/integrity validation, indexed
+read, busy wait, WAL commit/fsync, replay serialization, and component/runtime
+overhead. FULL and NORMAL synchronization are reported separately. Replay-hit
+latency is never compared directly with provider/network latency.
+
 ## Cache measurement
 
 For every cache:
@@ -145,3 +153,8 @@ environment. These are local reference measurements, not cross-machine
 targets or steady-state runtime throughput. The host file preserves every raw
 sample and states that process startup, validation, JIT compilation,
 instantiation, execution, and cleanup are included.
+
+No Phase 6 latency baseline is published yet. Correctness tests cover bounded
+local transaction/replay behavior without introducing noisy wall-clock CI
+thresholds; representative 30-sample release measurements remain a dedicated
+benchmark-runner task.

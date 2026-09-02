@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use krit_package::Manifest;
 use krit_wasm::{
     AI_INTERFACE, ArtifactMetadata, CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE,
-    LOGGING_INTERFACE, PROGRAM_WORLD, PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STDOUT_INTERFACE,
-    WEBHOOK_PROGRAM_WORLD,
+    LOGGING_INTERFACE, PROGRAM_WORLD, PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STATE_INTERFACE,
+    STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD,
 };
 use serde::Serialize;
 
@@ -91,6 +91,10 @@ impl GrantSet {
             effects.insert("observe.log".to_owned());
             imports.insert(LOGGING_INTERFACE.to_owned());
         }
+        if !manifest.capabilities.state.is_empty() {
+            effects.insert("state.transaction".to_owned());
+            imports.insert(STATE_INTERFACE.to_owned());
+        }
         requested.extend(
             manifest
                 .capabilities
@@ -102,6 +106,12 @@ impl GrantSet {
                     resource: Some(resource),
                 }),
         );
+        requested.extend(manifest.capabilities.state.iter().cloned().map(|resource| {
+            PermissionFact {
+                capability: "state.transaction".to_owned(),
+                resource: Some(resource),
+            }
+        }));
         requested.extend(
             manifest
                 .capabilities
@@ -386,6 +396,7 @@ fn valid_policy_world(metadata: &ArtifactMetadata) -> bool {
             ),
             "ai.invoke" => Some(AI_INTERFACE.to_owned()),
             "observe.log" => Some(LOGGING_INTERFACE.to_owned()),
+            "state.transaction" => Some(STATE_INTERFACE.to_owned()),
             _ => None,
         })
         .collect::<Vec<_>>();

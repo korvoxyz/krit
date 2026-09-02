@@ -47,6 +47,13 @@ pub enum BuiltinFunction {
     HttpRequest,
     LogInfo,
     LogError,
+    StateGet,
+    StatePut,
+    StateDelete,
+    CheckpointGet,
+    CheckpointPut,
+    ReplayHttp,
+    ReplayAi,
 }
 
 impl fmt::Debug for Value {
@@ -102,6 +109,13 @@ impl Value {
             Self::Builtin(BuiltinFunction::HttpRequest) => "<function http_request>".to_owned(),
             Self::Builtin(BuiltinFunction::LogInfo) => "<function log_info>".to_owned(),
             Self::Builtin(BuiltinFunction::LogError) => "<function log_error>".to_owned(),
+            Self::Builtin(BuiltinFunction::StateGet) => "<function state_get>".to_owned(),
+            Self::Builtin(BuiltinFunction::StatePut) => "<function state_put>".to_owned(),
+            Self::Builtin(BuiltinFunction::StateDelete) => "<function state_delete>".to_owned(),
+            Self::Builtin(BuiltinFunction::CheckpointGet) => "<function checkpoint_get>".to_owned(),
+            Self::Builtin(BuiltinFunction::CheckpointPut) => "<function checkpoint_put>".to_owned(),
+            Self::Builtin(BuiltinFunction::ReplayHttp) => "<function replay_http>".to_owned(),
+            Self::Builtin(BuiltinFunction::ReplayAi) => "<function replay_ai>".to_owned(),
         }
     }
 
@@ -269,6 +283,13 @@ impl Evaluator<'_> {
                 "http_request" => Ok(Value::Builtin(BuiltinFunction::HttpRequest)),
                 "log_info" => Ok(Value::Builtin(BuiltinFunction::LogInfo)),
                 "log_error" => Ok(Value::Builtin(BuiltinFunction::LogError)),
+                "state_get" => Ok(Value::Builtin(BuiltinFunction::StateGet)),
+                "state_put" => Ok(Value::Builtin(BuiltinFunction::StatePut)),
+                "state_delete" => Ok(Value::Builtin(BuiltinFunction::StateDelete)),
+                "checkpoint_get" => Ok(Value::Builtin(BuiltinFunction::CheckpointGet)),
+                "checkpoint_put" => Ok(Value::Builtin(BuiltinFunction::CheckpointPut)),
+                "replay_http" => Ok(Value::Builtin(BuiltinFunction::ReplayHttp)),
+                "replay_ai" => Ok(Value::Builtin(BuiltinFunction::ReplayAi)),
                 _ => environment.lookup(name).ok_or_else(|| {
                     Diagnostic::new("K2001", format!("undefined name `{name}`"), expression.span)
                 }),
@@ -455,9 +476,14 @@ impl Evaluator<'_> {
             Value::Builtin(builtin) => {
                 let expected_arity = match builtin {
                     BuiltinFunction::HttpRequest => 3,
+                    BuiltinFunction::ReplayHttp | BuiltinFunction::ReplayAi => 4,
+                    BuiltinFunction::StatePut | BuiltinFunction::CheckpointPut => 3,
                     BuiltinFunction::AiInvoke
                     | BuiltinFunction::LogInfo
-                    | BuiltinFunction::LogError => 2,
+                    | BuiltinFunction::LogError
+                    | BuiltinFunction::StateGet
+                    | BuiltinFunction::StateDelete
+                    | BuiltinFunction::CheckpointGet => 2,
                     _ => 1,
                 };
                 if arguments.len() != expected_arity {
@@ -492,6 +518,25 @@ impl Evaluator<'_> {
                     return Err(Diagnostic::new(
                         "K5003",
                         format!("{operation} is unavailable in direct source execution"),
+                        span,
+                    ));
+                }
+                if matches!(
+                    builtin,
+                    BuiltinFunction::StateGet
+                        | BuiltinFunction::StatePut
+                        | BuiltinFunction::StateDelete
+                        | BuiltinFunction::CheckpointGet
+                        | BuiltinFunction::CheckpointPut
+                        | BuiltinFunction::ReplayHttp
+                        | BuiltinFunction::ReplayAi
+                ) {
+                    for argument in arguments {
+                        self.expression(argument, environment)?;
+                    }
+                    return Err(Diagnostic::new(
+                        "K5003",
+                        "durable state and replay operations are unavailable in direct source execution",
                         span,
                     ));
                 }
@@ -540,7 +585,14 @@ impl Evaluator<'_> {
                     }
                     BuiltinFunction::AiInvoke
                     | BuiltinFunction::LogInfo
-                    | BuiltinFunction::LogError => {
+                    | BuiltinFunction::LogError
+                    | BuiltinFunction::StateGet
+                    | BuiltinFunction::StatePut
+                    | BuiltinFunction::StateDelete
+                    | BuiltinFunction::CheckpointGet
+                    | BuiltinFunction::CheckpointPut
+                    | BuiltinFunction::ReplayHttp
+                    | BuiltinFunction::ReplayAi => {
                         unreachable!("binary host operations return before unary builtin dispatch")
                     }
                 }

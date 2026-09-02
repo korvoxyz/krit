@@ -530,6 +530,7 @@ pub enum Effect {
     IoStdout,
     ObserveLog,
     SecretRead,
+    StateTransaction,
 }
 
 impl Effect {
@@ -541,6 +542,7 @@ impl Effect {
             Self::IoStdout => "io.stdout",
             Self::ObserveLog => "observe.log",
             Self::SecretRead => "secret.read",
+            Self::StateTransaction => "state.transaction",
         }
     }
 }
@@ -1095,6 +1097,13 @@ impl Analyzer {
                             | Builtin::HttpRequest
                             | Builtin::LogInfo
                             | Builtin::LogError
+                            | Builtin::StateGet
+                            | Builtin::StatePut
+                            | Builtin::StateDelete
+                            | Builtin::CheckpointGet
+                            | Builtin::CheckpointPut
+                            | Builtin::ReplayHttp
+                            | Builtin::ReplayAi
                     )
                 ) {
                     let ResolvedName::Builtin(builtin) = resolution else {
@@ -1277,7 +1286,7 @@ impl Analyzer {
         span: Span,
     ) -> Result<ExpressionInfo, Diagnostic> {
         let direct_builtin = direct_host_builtin(callee);
-        let direct_resource = if let Some(builtin) = direct_builtin {
+        let direct_requirements = if let Some(builtin) = direct_builtin {
             self.direct_host_builtin_references.insert(callee.span);
             match (builtin, arguments) {
                 (Builtin::AiInvoke, [adapter, _]) => {
@@ -1296,7 +1305,10 @@ impl Analyzer {
                             adapter.span,
                         ));
                     }
-                    Some((builtin, resource.clone()))
+                    vec![CapabilityRequirement::new(
+                        Effect::AiInvoke,
+                        resource.clone(),
+                    )]
                 }
                 (Builtin::ConfigString | Builtin::Secret, [argument]) => {
                     let ExpressionKind::Literal(ValueLiteral::String(resource)) = &argument.kind
@@ -1317,7 +1329,14 @@ impl Analyzer {
                             argument.span,
                         ));
                     }
-                    Some((builtin, resource.clone()))
+                    vec![CapabilityRequirement::new(
+                        if builtin == Builtin::ConfigString {
+                            Effect::ConfigRead
+                        } else {
+                            Effect::SecretRead
+                        },
+                        resource.clone(),
+                    )]
                 }
                 (Builtin::HttpRequest, [origin, _, bearer]) => {
                     let ExpressionKind::Literal(ValueLiteral::String(origin_value)) = &origin.kind
@@ -1356,7 +1375,10 @@ impl Analyzer {
                             ));
                         }
                     }
-                    Some((builtin, normalized.as_str().to_owned()))
+                    vec![CapabilityRequirement::new(
+                        Effect::HttpRequest,
+                        normalized.as_str(),
+                    )]
                 }
                 (Builtin::LogInfo | Builtin::LogError, [event, _]) => {
                     let ExpressionKind::Literal(ValueLiteral::String(name)) = &event.kind else {
@@ -1376,12 +1398,55 @@ impl Analyzer {
                             event.span,
                         ));
                     }
-                    None
+                    Vec::new()
                 }
-                _ => None,
+                (Builtin::StateGet | Builtin::StateDelete, [store, _])
+                | (Builtin::StatePut, [store, _, _]) => {
+                    let store = require_canonical_literal(store, builtin, "durable state store")?;
+                    vec![CapabilityRequirement::new(Effect::StateTransaction, store)]
+                }
+                (Builtin::CheckpointGet, [store, checkpoint])
+                | (Builtin::CheckpointPut, [store, checkpoint, _]) => {
+                    let store = require_canonical_literal(store, builtin, "durable state store")?;
+                    require_canonical_literal(checkpoint, builtin, "workflow checkpoint")?;
+                    vec![CapabilityRequirement::new(Effect::StateTransaction, store)]
+                }
+                (Builtin::ReplayHttp, [store, operation, origin, _]) => {
+                    let store = require_canonical_literal(store, builtin, "durable state store")?;
+                    require_canonical_literal(operation, builtin, "replay operation")?;
+                    let ExpressionKind::Literal(ValueLiteral::String(origin_value)) = &origin.kind
+                    else {
+                        return Err(Diagnostic::new(
+                            "K3008",
+                            "`replay_http` requires a direct normalized exact-origin literal",
+                            origin.span,
+                        ));
+                    };
+                    let normalized = HttpOrigin::parse_exact(origin_value).map_err(|error| {
+                        Diagnostic::new(
+                            "K3008",
+                            format!("invalid `replay_http` origin: {error}"),
+                            origin.span,
+                        )
+                    })?;
+                    vec![
+                        CapabilityRequirement::new(Effect::StateTransaction, store),
+                        CapabilityRequirement::new(Effect::HttpRequest, normalized.as_str()),
+                    ]
+                }
+                (Builtin::ReplayAi, [store, operation, adapter, _]) => {
+                    let store = require_canonical_literal(store, builtin, "durable state store")?;
+                    require_canonical_literal(operation, builtin, "replay operation")?;
+                    let adapter = require_canonical_literal(adapter, builtin, "AI adapter")?;
+                    vec![
+                        CapabilityRequirement::new(Effect::StateTransaction, store),
+                        CapabilityRequirement::new(Effect::AiInvoke, adapter),
+                    ]
+                }
+                _ => Vec::new(),
             }
         } else {
-            None
+            Vec::new()
         };
         let callee_info = self.expression(callee)?;
         let mut effects = callee_info.effects;
@@ -1437,18 +1502,15 @@ impl Analyzer {
                 span,
             ));
         }
-        if let Some((builtin, resource)) = direct_resource {
-            let capability = match builtin {
-                Builtin::AiInvoke => Effect::AiInvoke,
-                Builtin::ConfigString => Effect::ConfigRead,
-                Builtin::Secret => Effect::SecretRead,
-                Builtin::HttpRequest => Effect::HttpRequest,
-                _ => unreachable!("only resource host built-ins are returned"),
-            };
-            effects.direct.insert(capability.clone());
-            effects
-                .direct_requirements
-                .insert(CapabilityRequirement::new(capability, resource));
+        let replay_builtin = matches!(
+            direct_builtin,
+            Some(Builtin::ReplayHttp | Builtin::ReplayAi)
+        );
+        for requirement in direct_requirements {
+            if !replay_builtin || requirement.capability() == &Effect::StateTransaction {
+                effects.direct.insert(requirement.capability().clone());
+            }
+            effects.direct_requirements.insert(requirement);
         }
         for (index, (parameter, argument)) in parameters.into_iter().zip(argument_types).enumerate()
         {
@@ -2540,6 +2602,86 @@ impl Analyzer {
                     effect,
                 }
             }
+            Builtin::StateGet | Builtin::CheckpointGet => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::StateTransaction);
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Option(Box::new(InferType::String))),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::StatePut | Builtin::CheckpointPut => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::StateTransaction);
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Unit),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::StateDelete => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::StateTransaction);
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Unit),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::ReplayHttp => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::StateTransaction);
+                InferType::Function {
+                    parameters: vec![
+                        InferType::String,
+                        InferType::String,
+                        InferType::String,
+                        InferType::HttpRequest,
+                    ],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::HttpResponse),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::ReplayAi => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::StateTransaction);
+                InferType::Function {
+                    parameters: vec![
+                        InferType::String,
+                        InferType::String,
+                        InferType::String,
+                        InferType::String,
+                    ],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::String),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
         };
         Some((ty, ResolvedName::Builtin(builtin)))
     }
@@ -2835,10 +2977,44 @@ fn direct_host_builtin(callee: &Expression) -> Option<Builtin> {
             | Builtin::Secret
             | Builtin::HttpRequest
             | Builtin::LogInfo
-            | Builtin::LogError),
+            | Builtin::LogError
+            | Builtin::StateGet
+            | Builtin::StatePut
+            | Builtin::StateDelete
+            | Builtin::CheckpointGet
+            | Builtin::CheckpointPut
+            | Builtin::ReplayHttp
+            | Builtin::ReplayAi),
         ) => Some(builtin),
         _ => None,
     }
+}
+
+fn require_canonical_literal(
+    expression: &Expression,
+    builtin: Builtin,
+    kind: &str,
+) -> Result<String, Diagnostic> {
+    let ExpressionKind::Literal(ValueLiteral::String(value)) = &expression.kind else {
+        return Err(Diagnostic::new(
+            "K3008",
+            format!(
+                "`{}` requires a direct string-literal {kind}",
+                builtin.as_str()
+            ),
+            expression.span,
+        ));
+    };
+    if !is_valid_resource_name(value) {
+        return Err(Diagnostic::new(
+            "K3008",
+            format!(
+                "{kind} must use 1-64 lowercase letters, digits, `.` or `-`, without leading/trailing punctuation or `..`/`--`"
+            ),
+            expression.span,
+        ));
+    }
+    Ok(value.clone())
 }
 
 fn effect_set(effects: BTreeSet<Effect>) -> EffectSet {

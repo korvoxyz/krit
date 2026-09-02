@@ -1117,6 +1117,32 @@ fn direct_run_fails_closed_for_unavailable_agent_hosts() {
 }
 
 #[test]
+fn direct_run_fails_closed_for_durable_state_hosts() {
+    let directory = TestDirectory::new("run-state-host-unavailable");
+    let source = directory.file(
+        "state.krit",
+        "let value = state_get(\"agent-work\", \"key\");\n",
+    );
+    let output = krit()
+        .args(["run", "--diagnostic-format=json"])
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stdout.is_empty());
+    let diagnostic: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("diagnostic should be JSON");
+    assert_eq!(diagnostic["code"], "K5003");
+    assert!(
+        diagnostic["message"]
+            .as_str()
+            .unwrap()
+            .contains("state.transaction")
+    );
+}
+
+#[test]
 fn explain_rejects_invalid_usage() {
     for arguments in [
         vec!["explain"],
@@ -2870,6 +2896,345 @@ fn assert_valid_artifact(path: &Path) {
     )
     .expect("artifact metadata should be valid JSON");
     validate_artifact(&bytes, &metadata).expect("CLI artifact should validate");
+}
+
+#[test]
+fn schema_three_state_survives_invoke_process_restarts_and_reports_permissions() {
+    let directory = TestDirectory::new("schema-three-state");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+            .expect("test root should be owner-only");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(directory.path.join("state"))
+            .expect("state directory should be owner-only");
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(directory.path.join("state")).expect("state directory should exist");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match state_get("agent-work", "last") {
+        Ok(previous) => match state_put("agent-work", "last", request.body) {
+            Ok(done) => match previous {
+                Some(value) => record { status: 200, headers: [], body: value },
+                None => record { status: 200, headers: [], body: "none" },
+            },
+            Err(error) => record { status: 500, headers: [], body: error },
+        },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}
+"#,
+    );
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/state"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+state = ["agent-work"]
+"#,
+    );
+    directory.file(
+        "host.json",
+        r#"{
+  "schema": 3,
+  "state": {
+    "stores": {
+      "agent-work": {
+        "path": "state/agent-work.db",
+        "durability": "full",
+        "busyTimeoutMs": 250,
+        "maxOperations": 128,
+        "maxKeyBytes": 256,
+        "maxValueBytes": 65536,
+        "maxTransactionBytes": 1048576,
+        "maxDatabaseBytes": 67108864,
+        "maxReplayEntries": 1024,
+        "maxReplayBytes": 16777216,
+        "replayTtlSeconds": 604800,
+        "leaseSeconds": 30
+      }
+    },
+    "durableIdempotencyStore": "agent-work"
+  }
+}"#,
+    );
+    directory.file(
+        "request-one.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":"one"}"#,
+    );
+    directory.file(
+        "request-two.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":"two"}"#,
+    );
+
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("state package should build");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let explain = krit_in(&directory)
+        .args(["explain", "--json", "main.krit"])
+        .output()
+        .expect("state explanation should run");
+    assert!(explain.status.success());
+    let explain: serde_json::Value =
+        serde_json::from_slice(&explain.stdout).expect("explanation should be JSON");
+    assert_eq!(explain["durableState"]["schema"], 1);
+    assert_eq!(
+        explain["durableState"]["operations"][0]["kind"],
+        "state-get"
+    );
+    assert_eq!(
+        explain["durableState"]["operations"][0]["store"],
+        "agent-work"
+    );
+    let artifact = directory.path.join("target/krit/state.wasm");
+    let permissions = krit_in(&directory)
+        .args(["permissions", "--json", "--artifact"])
+        .arg(&artifact)
+        .output()
+        .expect("state permissions should run");
+    assert!(permissions.status.success());
+    let permissions: serde_json::Value =
+        serde_json::from_slice(&permissions.stdout).expect("permissions should be JSON");
+    assert_eq!(
+        permissions["required"][0],
+        serde_json::json!({
+            "capability": "state.transaction",
+            "resource": "agent-work"
+        })
+    );
+    assert_eq!(
+        permissions["imports"],
+        serde_json::json!(["krit:runtime/state@0.2.0"])
+    );
+
+    let first = krit_in(&directory)
+        .args([
+            "invoke",
+            "--host-config",
+            "host.json",
+            "--request",
+            "request-one.json",
+        ])
+        .output()
+        .expect("first state invocation should run");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value =
+        serde_json::from_slice(&first.stdout).expect("response should be JSON");
+    assert_eq!(first["body"], "none");
+
+    let second = krit_in(&directory)
+        .args([
+            "invoke",
+            "--host-config",
+            "host.json",
+            "--request",
+            "request-two.json",
+        ])
+        .output()
+        .expect("second state invocation should run");
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second: serde_json::Value =
+        serde_json::from_slice(&second.stdout).expect("response should be JSON");
+    assert_eq!(second["body"], "one");
+    let database = directory.path.join("state/agent-work.db");
+    assert!(database.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_three_rejects_insecure_state_directories_and_ungranted_stores() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TestDirectory::new("schema-three-state-denial");
+    fs::create_dir(directory.path.join("state")).expect("state directory should exist");
+    fs::set_permissions(
+        directory.path.join("state"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("state directory mode should be set");
+    directory.file(
+        "main.krit",
+        r#"webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.body }
+}
+"#,
+    );
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/state-denial"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+"#,
+    );
+    directory.file(
+        "host.json",
+        r#"{
+  "schema": 3,
+  "state": {
+    "stores": {
+      "agent-work": {
+        "path": "state/agent-work.db",
+        "durability": "full",
+        "busyTimeoutMs": 250,
+        "maxOperations": 128,
+        "maxKeyBytes": 256,
+        "maxValueBytes": 65536,
+        "maxTransactionBytes": 1048576,
+        "maxDatabaseBytes": 67108864,
+        "maxReplayEntries": 1024,
+        "maxReplayBytes": 16777216,
+        "replayTtlSeconds": 604800,
+        "leaseSeconds": 30
+      }
+    },
+    "durableIdempotencyStore": null
+  }
+}"#,
+    );
+    directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":""}"#,
+    );
+    assert!(
+        krit_in(&directory)
+            .arg("build")
+            .output()
+            .expect("pure webhook should build")
+            .status
+            .success()
+    );
+    let denied = krit_in(&directory)
+        .args([
+            "invoke",
+            "--host-config",
+            "host.json",
+            "--request",
+            "request.json",
+        ])
+        .output()
+        .expect("state denial should run");
+    assert_eq!(denied.status.code(), Some(4));
+    assert!(
+        String::from_utf8(denied.stderr)
+            .unwrap()
+            .contains("durable state store `agent-work` is not granted")
+    );
+
+    let granted = fs::read_to_string(directory.path.join("krit.pkg"))
+        .unwrap()
+        .replace(
+            "license = \"Apache-2.0\"",
+            "license = \"Apache-2.0\"\n\n[capabilities]\nstate = [\"agent-work\"]",
+        );
+    fs::write(directory.path.join("krit.pkg"), granted).unwrap();
+    let insecure = krit_in(&directory)
+        .args([
+            "invoke",
+            "--host-config",
+            "host.json",
+            "--request",
+            "request.json",
+        ])
+        .output()
+        .expect("insecure state path should run");
+    assert_eq!(insecure.status.code(), Some(1));
+    assert!(
+        String::from_utf8(insecure.stderr)
+            .unwrap()
+            .contains("owner-only")
+    );
+
+    fs::set_permissions(
+        directory.path.join("state"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let outside = directory.file("outside.db", "");
+    std::os::unix::fs::symlink(&outside, directory.path.join("state/agent-work.db"))
+        .expect("state symlink should be created");
+    let symlinked = krit_in(&directory)
+        .args([
+            "invoke",
+            "--host-config",
+            "host.json",
+            "--request",
+            "request.json",
+        ])
+        .output()
+        .expect("symlinked state path should run");
+    assert_eq!(symlinked.status.code(), Some(1));
+    assert!(
+        String::from_utf8(symlinked.stderr)
+            .unwrap()
+            .contains("unsafe")
+    );
+
+    fs::remove_file(directory.path.join("state/agent-work.db")).unwrap();
+    fs::write(directory.path.join("state/agent-work.db"), b"not sqlite").unwrap();
+    fs::set_permissions(
+        directory.path.join("state/agent-work.db"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let corrupt = krit_in(&directory)
+        .args([
+            "invoke",
+            "--host-config",
+            "host.json",
+            "--request",
+            "request.json",
+        ])
+        .output()
+        .expect("corrupt state path should run");
+    assert_eq!(corrupt.status.code(), Some(1));
+    assert!(
+        String::from_utf8(corrupt.stderr)
+            .unwrap()
+            .contains("error[K5201]")
+    );
 }
 
 fn metadata_path(path: &Path) -> PathBuf {

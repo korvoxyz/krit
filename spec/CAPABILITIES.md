@@ -1,6 +1,6 @@
 # Capability model
 
-**Status:** Implemented bounded Phase 4 host
+**Status:** Implemented bounded Phase 6 local host
 **Target:** Krit 0.4
 
 ## Rule
@@ -29,6 +29,7 @@ clock.read
 random.read
 secret.read
 ai.invoke
+state.transaction
 ```
 
 Unknown capability identifiers are errors. Names are versioned through the
@@ -46,14 +47,15 @@ http = ["https://api.github.com", "https://slack.com"]
 secrets = ["github-token", "slack-token"]
 ai = ["reviewer"]
 logs = true
+state = ["agent-work"]
 ```
 
 The schema-1 manifest implements requests for `stdout`, `config`, `http`,
-`secrets`, `ai`, and structured `logs`. The language emits literal-resource
+`secrets`, `ai`, structured `logs`, and durable `state`. The language emits literal-resource
 facts for `config.read`, `secret.read`, `http.request`, and `ai.invoke`;
 `observe.log` is resource-free. Files, generic sockets, processes,
-environment variables, clocks, randomness, durable state, queues, and storage
-remain unavailable.
+environment variables, clocks, randomness, queues, and object storage remain
+unavailable. Durable state is available only through exact named stores below.
 
 Paths are package-root-relative and resolved before execution. A lexical path
 that escapes the granted root is rejected. Symlink and platform-specific path
@@ -79,6 +81,9 @@ http_request(
 )                            // Result<HttpResponse, String>
 ai_invoke("reviewer", input) // Result<String, String>
 log_info("review.started", fields) // Result<Unit, String>
+state_get("agent-work", key) // Result<Option<String>, String>
+checkpoint_put("agent-work", "posted-message", value) // Result<Unit, String>
+replay_ai("agent-work", "summarize", "reviewer", input) // Result<String, String>
 ```
 
 The string must be a direct literal so analysis can emit one exact sorted
@@ -91,6 +96,13 @@ secret bytes. `ai_invoke` emits `ai.invoke` plus one named adapter.
 `log_info` and `log_error` emit `observe.log`; their event names are direct
 canonical literals and their ordered fields contain only ordinary strings.
 No host value is read during checking or explanation.
+
+Phase 6 adds exact `state.transaction("store")` requirements for bounded
+state, checkpoint, and replay operations. Replay also retains the exact
+external HTTP-origin or AI-adapter requirement. Store/checkpoint/replay names
+are direct canonical literals. Database paths and durability policy are
+host-owned schema-3 configuration and never source or manifest data. The
+normative contract is [DURABLE-STATE.md](DURABLE-STATE.md).
 
 Package build orchestration intersects these requirements with manifest
 resources and reports `K5001` for an absent exact match. A matching supported

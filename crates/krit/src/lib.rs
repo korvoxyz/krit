@@ -3,6 +3,7 @@ mod ast;
 mod builtin;
 mod core;
 mod diagnostic;
+mod durable;
 mod evaluator;
 mod formatter;
 mod lexer;
@@ -28,6 +29,7 @@ pub use core::{
     OperationKind, ParameterId, RecordOperand, RecursiveBinding, ValueId, VariantArmBlock, lower,
 };
 pub use diagnostic::Diagnostic;
+pub use durable::{DurableOperationFact, DurableOperationKind, durable_operations};
 pub use evaluator::{BuiltinFunction, FunctionValue, Value, execute};
 pub use formatter::{FORMAT_LINE_WIDTH, format_source};
 pub use parser::parse;

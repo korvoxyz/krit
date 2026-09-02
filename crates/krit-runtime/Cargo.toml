@@ -14,6 +14,7 @@ curl.workspace = true
 http.workspace = true
 krit-capability.workspace = true
 krit-package.workspace = true
+krit-state.workspace = true
 krit-wasm.workspace = true
 serde.workspace = true
 serde_json.workspace = true

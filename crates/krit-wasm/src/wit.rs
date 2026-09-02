@@ -16,6 +16,7 @@ pub(crate) const CONFIG_EFFECT: &str = "config.read";
 pub(crate) const HTTP_EFFECT: &str = "http.request";
 pub(crate) const LOGGING_EFFECT: &str = "observe.log";
 pub(crate) const SECRETS_EFFECT: &str = "secret.read";
+pub(crate) const STATE_EFFECT: &str = "state.transaction";
 pub const AI_INTERFACE: &str = "krit:runtime/ai@0.2.0";
 pub const STDOUT_INTERFACE: &str = "krit:runtime/stdout@0.2.0";
 pub const CONFIG_INTERFACE: &str = "krit:runtime/config@0.2.0";
@@ -23,12 +24,15 @@ pub const HTTP_INTERFACE: &str = "krit:runtime/http@0.2.0";
 pub const HTTP_ANONYMOUS_INTERFACE: &str = "krit:runtime/http-anonymous@0.2.0";
 pub const SECRETS_INTERFACE: &str = "krit:runtime/secrets@0.2.0";
 pub const LOGGING_INTERFACE: &str = "krit:runtime/logging@0.2.0";
+pub const STATE_INTERFACE: &str = "krit:runtime/state@0.2.0";
 pub const WEBHOOK_INTERFACE: &str = "krit:runtime/webhook@0.2.0";
 pub const PROGRAM_WORLD: &str = "krit:runtime/program@0.2.0";
 pub const PURE_PROGRAM_WORLD: &str = "krit:runtime/pure-program@0.2.0";
 pub const WEBHOOK_PROGRAM_WORLD: &str = "krit:runtime/webhook-program@0.2.0";
 pub const WEBHOOK_ALL_PROGRAM_WORLD: &str =
     "krit:runtime/webhook-stdout-config-secrets-http-ai-logs-program@0.2.0";
+pub const WEBHOOK_STATE_ALL_PROGRAM_WORLD: &str =
+    "krit:runtime/webhook-stdout-config-secrets-http-ai-logs-state-program@0.2.0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProgramKind {
@@ -94,8 +98,9 @@ pub(crate) fn load_contract(
 ) -> Result<(Resolve, WorldId, WitContract), BuildError> {
     let selection = select_world(kind, effects)?;
     let mut resolve = Resolve::default();
+    let source = complete_wit_source();
     let package = resolve
-        .push_str("krit-runtime.wit", WIT_SOURCE)
+        .push_str("krit-runtime.wit", &source)
         .map_err(|error| BuildError::artifact(format!("invalid built-in WIT package: {error}")))?;
     let world = resolve
         .select_world(&[package], Some(&selection.name))
@@ -318,7 +323,7 @@ fn select_world(kind: ProgramKind, effects: &[String]) -> Result<WorldSelection,
         };
     }
 
-    let mut mask = 0u8;
+    let mut mask = 0u16;
     for effect in effects {
         mask |= match effect.as_str() {
             STDOUT_EFFECT => 1 << 0,
@@ -327,6 +332,7 @@ fn select_world(kind: ProgramKind, effects: &[String]) -> Result<WorldSelection,
             HTTP_EFFECT => 1 << 3,
             AI_EFFECT => 1 << 4,
             LOGGING_EFFECT => 1 << 5,
+            STATE_EFFECT => 1 << 6,
             _ => {
                 return Err(BuildError::artifact(
                     "checked webhook effects contain an unknown host surface",
@@ -358,6 +364,7 @@ fn select_world(kind: ProgramKind, effects: &[String]) -> Result<WorldSelection,
         ),
         (1 << 4, "ai", AI_INTERFACE),
         (1 << 5, "logs", LOGGING_INTERFACE),
+        (1 << 6, "state", STATE_INTERFACE),
     ] {
         if mask & bit != 0 {
             tokens.push(token);
@@ -370,6 +377,48 @@ fn select_world(kind: ProgramKind, effects: &[String]) -> Result<WorldSelection,
         name,
         component_imports,
     })
+}
+
+fn complete_wit_source() -> String {
+    let mut source = WIT_SOURCE.to_owned();
+    for mask in 0u16..(1 << 6) {
+        let mut tokens = Vec::new();
+        let mut imports = Vec::new();
+        for (bit, token, interface) in [
+            (1 << 0, "stdout", "stdout"),
+            (1 << 1, "config", "config"),
+            (1 << 2, "secrets", "secrets"),
+            (
+                1 << 3,
+                "http",
+                if mask & (1 << 2) == 0 {
+                    "http-anonymous"
+                } else {
+                    "http"
+                },
+            ),
+            (1 << 4, "ai", "ai"),
+            (1 << 5, "logs", "logging"),
+        ] {
+            if mask & bit != 0 {
+                tokens.push(token);
+                imports.push(interface);
+            }
+        }
+        tokens.push("state");
+        imports.push("state");
+        let name = format!("webhook-{}-program", tokens.join("-"));
+        source.push_str("\nworld ");
+        source.push_str(&name);
+        source.push_str(" {\n");
+        for import in imports {
+            source.push_str("    import ");
+            source.push_str(import);
+            source.push_str(";\n");
+        }
+        source.push_str("    export webhook;\n}\n");
+    }
+    source
 }
 
 fn convert_signature(signature: WasmSignature) -> Result<Signature, BuildError> {
@@ -461,6 +510,7 @@ mod tests {
             "interface http-anonymous",
             "interface ai",
             "interface logging",
+            "interface state",
             "resource secret",
             "option<borrow<secret>>",
             "handle: func",
@@ -495,5 +545,17 @@ mod tests {
         let (_, _, logs_only) = load_contract(ProgramKind::Webhook, &[LOGGING_EFFECT.to_owned()])
             .expect("log-only world should load");
         assert_eq!(logs_only.component_imports, [LOGGING_INTERFACE]);
+
+        let (_, _, state_only) = load_contract(ProgramKind::Webhook, &[STATE_EFFECT.to_owned()])
+            .expect("state-only world should load");
+        assert_eq!(state_only.component_imports, [STATE_INTERFACE]);
+        assert_eq!(state_only.world, "krit:runtime/webhook-state-program@0.2.0");
+
+        let (_, _, state_ai) = load_contract(
+            ProgramKind::Webhook,
+            &[AI_EFFECT.to_owned(), STATE_EFFECT.to_owned()],
+        )
+        .expect("AI plus state world should load");
+        assert_eq!(state_ai.component_imports, [AI_INTERFACE, STATE_INTERFACE]);
     }
 }

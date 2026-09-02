@@ -16,10 +16,17 @@ pub enum Builtin {
     HttpRequest,
     LogInfo,
     LogError,
+    StateGet,
+    StatePut,
+    StateDelete,
+    CheckpointGet,
+    CheckpointPut,
+    ReplayHttp,
+    ReplayAi,
 }
 
 impl Builtin {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 21] = [
         Self::AiInvoke,
         Self::ConfigString,
         Self::Err,
@@ -34,6 +41,13 @@ impl Builtin {
         Self::Println,
         Self::Secret,
         Self::Some,
+        Self::StateDelete,
+        Self::StateGet,
+        Self::StatePut,
+        Self::CheckpointGet,
+        Self::CheckpointPut,
+        Self::ReplayAi,
+        Self::ReplayHttp,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -52,6 +66,13 @@ impl Builtin {
             "http_request" => Some(Self::HttpRequest),
             "log_info" => Some(Self::LogInfo),
             "log_error" => Some(Self::LogError),
+            "state_get" => Some(Self::StateGet),
+            "state_put" => Some(Self::StatePut),
+            "state_delete" => Some(Self::StateDelete),
+            "checkpoint_get" => Some(Self::CheckpointGet),
+            "checkpoint_put" => Some(Self::CheckpointPut),
+            "replay_http" => Some(Self::ReplayHttp),
+            "replay_ai" => Some(Self::ReplayAi),
             _ => None,
         }
     }
@@ -72,6 +93,13 @@ impl Builtin {
             Self::HttpRequest => "http_request",
             Self::LogInfo => "log_info",
             Self::LogError => "log_error",
+            Self::StateGet => "state_get",
+            Self::StatePut => "state_put",
+            Self::StateDelete => "state_delete",
+            Self::CheckpointGet => "checkpoint_get",
+            Self::CheckpointPut => "checkpoint_put",
+            Self::ReplayHttp => "replay_http",
+            Self::ReplayAi => "replay_ai",
         }
     }
 
@@ -84,7 +112,14 @@ impl Builtin {
             | Self::Secret
             | Self::HttpRequest
             | Self::LogInfo
-            | Self::LogError => BuiltinCategory::HostEffect,
+            | Self::LogError
+            | Self::StateGet
+            | Self::StatePut
+            | Self::StateDelete
+            | Self::CheckpointGet
+            | Self::CheckpointPut
+            | Self::ReplayHttp
+            | Self::ReplayAi => BuiltinCategory::HostEffect,
         }
     }
 
@@ -105,6 +140,21 @@ impl Builtin {
             }
             Self::LogInfo | Self::LogError => {
                 "fn(String, List<LogField>) -> Result<Unit, String> effects {observe.log}"
+            }
+            Self::StateGet | Self::CheckpointGet => {
+                "fn(String, String) -> Result<Option<String>, String> effects {state.transaction}"
+            }
+            Self::StatePut | Self::CheckpointPut => {
+                "fn(String, String, String) -> Result<Unit, String> effects {state.transaction}"
+            }
+            Self::StateDelete => {
+                "fn(String, String) -> Result<Unit, String> effects {state.transaction}"
+            }
+            Self::ReplayHttp => {
+                "fn(String, String, String, HttpRequest) -> Result<HttpResponse, String> effects {state.transaction}"
+            }
+            Self::ReplayAi => {
+                "fn(String, String, String, String) -> Result<String, String> effects {state.transaction}"
             }
         }
     }
@@ -137,6 +187,21 @@ impl Builtin {
             }
             Self::LogInfo => "Emits a bounded structured informational event.",
             Self::LogError => "Emits a bounded structured error event.",
+            Self::StateGet => "Reads one bounded string value from a named durable store.",
+            Self::StatePut => "Stages one bounded string value for successful invocation commit.",
+            Self::StateDelete => {
+                "Stages deletion of one durable key for successful invocation commit."
+            }
+            Self::CheckpointGet => "Reads one explicit named durable workflow checkpoint.",
+            Self::CheckpointPut => {
+                "Stages one named workflow checkpoint for successful invocation commit."
+            }
+            Self::ReplayHttp => {
+                "Performs or reuses one completed anonymous HTTP operation under a stable durable identity."
+            }
+            Self::ReplayAi => {
+                "Performs or reuses one completed AI operation under a stable durable identity."
+            }
         }
     }
 }

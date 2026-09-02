@@ -17,8 +17,8 @@ nondeterministic, private, and untrusted external input. The compiler and
 runtime remain useful without an AI adapter, provider SDK, credential, or
 network connection.
 
-Durable state, durable replay, queues, schedules, and language-server work are
-outside this milestone.
+Durable state/replay and language-server work are outside this Phase 4
+milestone and are specified by their later normative documents.
 
 ## Source contracts
 
@@ -339,8 +339,10 @@ the idempotency key itself. Only the BLAKE3 digest is retained; raw credential
 headers are not copied into the cache. Concurrent first use can execute more
 than once because no in-progress record is stored.
 
-This is best-effort single-process behavior, not durable exactly-once
-delivery. Phase 6 replaces it with transactional durable records.
+This remains the default best-effort single-process behavior. Host config
+schema 3 may instead select one manifest-granted SQLite store for durable
+leases and completed inbound responses as defined by `DURABLE-STATE.md`.
+Neither mode claims distributed exactly-once delivery.
 
 ## Approval policy
 
@@ -378,5 +380,5 @@ files. No test or default example requires Internet access or a real
 credential.
 
 Phase 4 does not make model output deterministic, make approval a deployment
-grant, provide distributed rate limiting, provide durable idempotency, or
-start Phase 5 authoring/LSP or Phase 6 durable state.
+grant, or provide distributed rate limiting. Later phases add optional
+authoring and durable local state without changing this AI/logging contract.

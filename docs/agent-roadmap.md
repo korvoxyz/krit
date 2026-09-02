@@ -200,9 +200,26 @@ availability.
 
 ## Phase 6: durable execution
 
+**Status:** In progress
+
+### `phase6-state`
+
+**Status:** Complete
+
 - transactional key/value state
 - workflow checkpoints
-- replay and idempotency records
+- replay and durable idempotency records
+
+Gate met for local single-host coordination: the checkpoint/replay integration
+test cancels an invocation after one completed HTTP effect, rolls back its
+checkpoint, restarts with a new `AgentHost`, reuses the durable result without
+a second mock call, and commits the checkpoint. Provider-side and distributed
+exactly-once behavior remain explicitly unclaimed.
+
+### `phase6-jobs-storage`
+
+**Status:** Not started
+
 - typed queues with retry and dead-letter outcomes
 - scheduled triggers
 - bounded object storage

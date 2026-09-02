@@ -1,0 +1,23 @@
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match checkpoint_get("agent-work", "processed-request") {
+        Ok(previous) => match previous {
+            Some(value) => record { status: 200, headers: [], body: value },
+            None => match state_put("agent-work", "last-body", request.body) {
+                Ok(saved) => match checkpoint_put(
+                    "agent-work",
+                    "processed-request",
+                    request.body,
+                ) {
+                    Ok(checkpointed) => record {
+                        status: 200,
+                        headers: [],
+                        body: request.body,
+                    },
+                    Err(error) => record { status: 500, headers: [], body: error },
+                },
+                Err(error) => record { status: 500, headers: [], body: error },
+            },
+        },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}

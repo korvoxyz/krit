@@ -4,8 +4,8 @@ use krit::{Source, analyze, lower, parse_source};
 use krit_wasm::{
     AI_INTERFACE, ArtifactMetadata, BuildErrorKind, BuildOptions, EMBEDDED_METADATA_SECTION,
     HTTP_ANONYMOUS_INTERFACE, LOGGING_INTERFACE, MAX_EMBEDDED_METADATA_BYTES, PROGRAM_WORLD,
-    PURE_PROGRAM_WORLD, STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD, build_component, digest_bytes,
-    validate_artifact, validate_component,
+    PURE_PROGRAM_WORLD, STATE_ARTIFACT_POLICY_VERSION, STATE_INTERFACE, STDOUT_INTERFACE,
+    WEBHOOK_PROGRAM_WORLD, build_component, digest_bytes, validate_artifact, validate_component,
 };
 use wasm_encoder::{
     Component, CustomSection, MemorySection, MemoryType, Module, ModuleSection, RawSection,
@@ -26,6 +26,87 @@ fn compile(
         options.grant_effect("io.stdout");
     }
     build_component(&module, &options)
+}
+
+fn compile_state(source_text: &str) -> Result<krit_wasm::BuiltComponent, krit_wasm::BuildError> {
+    let source = Source::new("state.krit", source_text);
+    let program = parse_source(&source).expect("state source should parse");
+    let analysis = analyze(&program).expect("state source should analyze");
+    let module = lower(&program, &analysis).expect("state source should lower");
+    let mut options = BuildOptions::new("2026", "test/state", "1.0.0", "src/main.krit");
+    options.grant_effect("state.transaction");
+    build_component(&module, &options)
+}
+
+#[test]
+fn state_webhooks_select_the_exact_state_interface_and_policy() {
+    let artifact = compile_state(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let saved = state_put("agent-work", "last-path", request.path);
+    let value = state_get("agent-work", "last-path");
+    record { status: 200, headers: [], body: request.path }
+}
+"#,
+    )
+    .expect("state webhook should compile");
+
+    assert_eq!(
+        artifact.metadata.world,
+        "krit:runtime/webhook-state-program@0.2.0"
+    );
+    assert_eq!(artifact.metadata.imports, [STATE_INTERFACE]);
+    assert_eq!(artifact.metadata.effects, ["state.transaction"]);
+    assert_eq!(
+        artifact.metadata.requirements[0].capability,
+        "state.transaction"
+    );
+    assert_eq!(artifact.metadata.requirements[0].resource, "agent-work");
+    assert_eq!(
+        artifact.metadata.policy_version,
+        STATE_ARTIFACT_POLICY_VERSION
+    );
+    validate_artifact(&artifact.bytes, &artifact.metadata).expect("state artifact should validate");
+}
+
+#[test]
+fn replay_artifacts_keep_external_authority_as_exact_requirements() {
+    let artifact = compile_state(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let http = replay_http(
+        "agent-work",
+        "fetch",
+        "https://api.example.com",
+        request,
+    );
+    let ai = replay_ai("agent-work", "summarize", "reviewer", request.body);
+    record { status: 200, headers: [], body: request.path }
+}
+"#,
+    )
+    .expect("replay webhook should compile");
+
+    assert_eq!(artifact.metadata.imports, [STATE_INTERFACE]);
+    assert_eq!(artifact.metadata.effects, ["state.transaction"]);
+    assert_eq!(
+        artifact
+            .metadata
+            .requirements
+            .iter()
+            .map(|requirement| (
+                requirement.capability.as_str(),
+                requirement.resource.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("ai.invoke", "reviewer"),
+            ("http.request", "https://api.example.com"),
+            ("state.transaction", "agent-work"),
+        ]
+    );
+    assert_eq!(artifact.metadata.approvals[0].operation, "ai.invoke");
+    assert_eq!(artifact.metadata.approvals[0].resource, "reviewer");
 }
 
 #[test]

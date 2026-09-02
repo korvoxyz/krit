@@ -1,0 +1,15 @@
+[package]
+name = "krit-state"
+description = "Transactional SQLite durable state and replay storage for Krit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+
+[lints]
+workspace = true

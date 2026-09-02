@@ -1,6 +1,6 @@
 # Modules and packages
 
-**Status:** Draft  
+**Status:** Draft package system; state grants implemented
 **Manifest schema:** 1  
 **Lockfile schema:** 1
 
@@ -50,6 +50,7 @@ http = ["https://api.github.com", "https://slack.com"]
 secrets = ["github-token", "slack-token"]
 ai = ["reviewer"]
 logs = true
+state = ["agent-work"]
 ```
 
 Package names contain a lowercase namespace and name separated by `/`.
@@ -141,6 +142,10 @@ emission. `config.read("agent.model")` requires an exact `config` entry and
 resources are `K5001`. `http.request("https://api.example.com")` likewise
 requires one exact normalized `http` entry, and `ai.invoke("reviewer")`
 requires one exact sorted `ai` entry. `observe.log` requires `logs = true`.
+`state.transaction("agent-work")` requires one exact `state` entry. Replay
+operations separately retain their exact HTTP/AI requirement. Manifest state
+names are logical authority only; database paths and durability settings are
+strict host configuration and never package data.
 Matching resources permit the bounded webhook backend only; unsupported
 general composite layouts still fail closed. Host-config adapter origins,
 secrets, retry/rate keys, and approval resources must also be manifest-granted

@@ -725,24 +725,37 @@ fn ast_sensitive_literal_spans(
             }
             ExpressionKind::Function { body, .. } => block_spans(source, body, spans),
             ExpressionKind::Call { callee, arguments } => {
-                if let ExpressionKind::Variable(name) = &callee.kind
-                    && let Some(argument) = arguments.first()
-                    && matches!(
-                        argument.kind,
-                        ExpressionKind::Literal(ValueLiteral::String(_))
-                    )
-                    && let Some((start, end)) =
-                        literal_content_span(source, argument.span.start, argument.span.end)
-                {
-                    let category = match name.as_str() {
+                if let ExpressionKind::Variable(name) = &callee.kind {
+                    let sensitive: &[(usize, &str)] = match name.as_str() {
                         "ai_invoke" | "config_string" | "http_request" | "secret" => {
-                            Some("capability-resource")
+                            &[(0, "capability-resource")]
                         }
-                        "log_error" | "log_info" => Some("event-name"),
-                        _ => None,
+                        "log_error" | "log_info" => &[(0, "event-name")],
+                        "state_delete" | "state_get" | "state_put" => {
+                            &[(0, "capability-resource"), (1, "state-key")]
+                        }
+                        "checkpoint_get" | "checkpoint_put" => {
+                            &[(0, "capability-resource"), (1, "checkpoint-name")]
+                        }
+                        "replay_ai" | "replay_http" => &[
+                            (0, "capability-resource"),
+                            (1, "replay-operation"),
+                            (2, "capability-resource"),
+                        ],
+                        _ => &[],
                     };
-                    if let Some(category) = category {
-                        spans.insert((start, end), category);
+                    for (index, category) in sensitive {
+                        let Some(argument) = arguments.get(*index) else {
+                            continue;
+                        };
+                        if matches!(
+                            argument.kind,
+                            ExpressionKind::Literal(ValueLiteral::String(_))
+                        ) && let Some((start, end)) =
+                            literal_content_span(source, argument.span.start, argument.span.end)
+                        {
+                            spans.insert((start, end), category);
+                        }
                     }
                 }
                 expression_spans(source, callee, spans);
@@ -979,6 +992,7 @@ pub(crate) fn provider_compiler_facts(
         "valid": facts.get("valid").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "diagnostics": filter_fact_array(facts.get("diagnostics"), selection),
         "module": facts.get("module").cloned().unwrap_or(serde_json::Value::Null),
+        "durableState": facts.get("durableState").cloned().unwrap_or(serde_json::Value::Null),
         "package": facts.get("package").cloned().unwrap_or(serde_json::Value::Null),
         "symbols": filter_fact_array(facts.get("symbols"), selection),
         "expressions": filter_fact_array(facts.get("expressions"), selection),
@@ -1046,7 +1060,11 @@ fn redact_fact_resources(value: &mut serde_json::Value) {
         }
         serde_json::Value::Object(fields) => {
             for (name, value) in fields {
-                if name == "resource" && value.is_string() {
+                if matches!(
+                    name.as_str(),
+                    "resource" | "store" | "identity" | "externalResource"
+                ) && value.is_string()
+                {
                     *value = serde_json::Value::String("<redacted:capability-resource>".to_owned());
                 } else if name == "inferredType"
                     && let Some(rendered) = value.as_str()

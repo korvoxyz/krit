@@ -201,6 +201,7 @@ struct Document {
     formatted: Result<String, CompilerDiagnostic>,
     declarations: Vec<DeclarationFact>,
     syntax_kinds: BTreeMap<Span, &'static str>,
+    durable_operations: Vec<krit::DurableOperationFact>,
     package: Option<PackageContext>,
     oversized: bool,
 }
@@ -231,6 +232,7 @@ impl Document {
                 )),
                 declarations: Vec::new(),
                 syntax_kinds: BTreeMap::new(),
+                durable_operations: Vec::new(),
                 package: None,
                 oversized: true,
             };
@@ -252,6 +254,10 @@ impl Document {
             }
             _ => (Vec::new(), BTreeMap::new()),
         };
+        let durable_operations = program
+            .as_ref()
+            .map(krit::durable_operations)
+            .unwrap_or_default();
 
         Self {
             uri,
@@ -263,6 +269,7 @@ impl Document {
             formatted,
             declarations,
             syntax_kinds,
+            durable_operations,
             package,
             oversized: false,
         }
@@ -389,6 +396,13 @@ impl Document {
             Builtin::ConfigString => &package.manifest.capabilities.config,
             Builtin::Secret => &package.manifest.capabilities.secrets,
             Builtin::HttpRequest => &package.manifest.capabilities.http,
+            Builtin::StateGet
+            | Builtin::StatePut
+            | Builtin::StateDelete
+            | Builtin::CheckpointGet
+            | Builtin::CheckpointPut
+            | Builtin::ReplayHttp
+            | Builtin::ReplayAi => &package.manifest.capabilities.state,
             _ => return Vec::new(),
         };
         let replacement = self.lines.range(
@@ -766,6 +780,22 @@ impl Document {
             valid: self.analysis.is_some() && !self.oversized,
             diagnostics,
             module,
+            durable_state: DurableStateFact {
+                schema: 1,
+                operations: self
+                    .durable_operations
+                    .iter()
+                    .map(|operation| DurableOperationFact {
+                        kind: operation.kind().as_str(),
+                        store: operation.store().to_owned(),
+                        identity: operation.identity().map(str::to_owned),
+                        external_capability: operation.external_capability(),
+                        external_resource: operation.external_resource().map(str::to_owned),
+                        range: self.lines.range(self.source.text(), operation.span()),
+                        span: operation.span().into(),
+                    })
+                    .collect(),
+            },
             package: analysis
                 .and_then(|analysis| self.package.as_ref().map(|package| package.facts(analysis))),
             symbols,
@@ -1057,6 +1087,13 @@ fn builtin_capability(builtin: Builtin) -> Option<&'static str> {
         Builtin::ConfigString => Some("config.read"),
         Builtin::Secret => Some("secret.read"),
         Builtin::HttpRequest => Some("http.request"),
+        Builtin::StateGet
+        | Builtin::StatePut
+        | Builtin::StateDelete
+        | Builtin::CheckpointGet
+        | Builtin::CheckpointPut
+        | Builtin::ReplayHttp
+        | Builtin::ReplayAi => Some("state.transaction"),
         _ => None,
     }
 }
@@ -2072,11 +2109,33 @@ pub(crate) struct CompilerFacts {
     diagnostics: Vec<CompilerDiagnosticFact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     module: Option<ModuleFact>,
+    durable_state: DurableStateFact,
     #[serde(skip_serializing_if = "Option::is_none")]
     package: Option<PackageFact>,
     symbols: Vec<SymbolFact>,
     expressions: Vec<ExpressionFact>,
     formatting: FormattingFact,
+}
+
+#[derive(Debug, Serialize)]
+struct DurableStateFact {
+    schema: u32,
+    operations: Vec<DurableOperationFact>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableOperationFact {
+    kind: &'static str,
+    store: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_capability: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_resource: Option<String>,
+    span: ByteSpan,
+    range: Range,
 }
 
 #[derive(Debug, Serialize)]
@@ -2352,6 +2411,7 @@ license = "Apache-2.0"
 
 [capabilities]
 config = ["agent.model", "agent.timeout-ms"]
+state = ["agent-work"]
 "#,
         )
         .expect("manifest should be written");
@@ -2406,6 +2466,31 @@ config = ["agent.model", "agent.timeout-ms"]
             panic!("completion should return a bounded list")
         };
         assert!(types.items.iter().any(|item| item.label == "String"));
+
+        state
+            .change(&uri, 4, "let value = state_get(\"ag\");\n".to_owned())
+            .expect("document change should succeed");
+        let CompletionResponse::List(resources) = state
+            .completion(&uri, Position::new(0, 25))
+            .expect("state resource completion should succeed")
+        else {
+            panic!("completion should return a bounded list")
+        };
+        assert_eq!(
+            resources
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["agent-work"]
+        );
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("state compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        assert_eq!(facts["durableState"]["operations"][0]["kind"], "state-get");
     }
 
     #[test]

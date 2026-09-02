@@ -580,6 +580,85 @@ fn check_builtin(
         {
             Ok(())
         }
+        Builtin::StateGet | Builtin::CheckpointGet
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if matches!(
+                            value.as_ref(),
+                            Type::Option(element) if element.as_ref() == &Type::String
+                        ) && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::StatePut | Builtin::CheckpointPut
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::Unit && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::StateDelete
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::Unit && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::ReplayHttp
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::HttpRequest),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::HttpResponse
+                            && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::ReplayAi
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::String && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
         Builtin::JsonDecode
             if function.parameters() == [std::sync::Arc::new(Type::String)]
                 && function.return_type() == &Type::String =>
@@ -885,13 +964,16 @@ fn is_supported_webhook_type(ty: &Type) -> bool {
         | Type::Secret => true,
         Type::List(_) => is_header_list(ty) || is_log_field_list(ty),
         Type::Record(_) => is_http_contract_type(ty) || is_log_field(ty),
-        Type::Option(element) => element.as_ref() == &Type::Secret,
+        Type::Option(element) => matches!(element.as_ref(), Type::Secret | Type::String),
         Type::Result(value, error) => {
             error.as_ref() == &Type::String
-                && matches!(
+                && (matches!(
                     value.as_ref(),
                     Type::Unit | Type::String | Type::Secret | Type::HttpResponse
-                )
+                ) || matches!(
+                    value.as_ref(),
+                    Type::Option(element) if element.as_ref() == &Type::String
+                ))
         }
         Type::Function(function) => {
             function
@@ -1230,4 +1312,26 @@ fn record_use(
     kind: ValueUse,
 ) {
     uses.entry(value).or_default().push(kind);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use krit::Type;
+
+    use super::is_supported_webhook_type;
+
+    #[test]
+    fn option_string_results_still_require_a_string_error() {
+        let value = Arc::new(Type::Option(Arc::new(Type::String)));
+        assert!(is_supported_webhook_type(&Type::Result(
+            Arc::clone(&value),
+            Arc::new(Type::String),
+        )));
+        assert!(!is_supported_webhook_type(&Type::Result(
+            value,
+            Arc::new(Type::Variable(0)),
+        )));
+    }
 }

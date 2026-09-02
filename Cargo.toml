@@ -7,6 +7,7 @@ members = [
     "crates/krit-lsp",
     "crates/krit-package",
     "crates/krit-runtime",
+    "crates/krit-state",
     "crates/krit-wasm",
 ]
 resolver = "2"
@@ -26,6 +27,7 @@ krit-capability = { path = "crates/krit-capability" }
 krit-lsp = { path = "crates/krit-lsp" }
 krit-package = { path = "crates/krit-package" }
 krit-runtime = { path = "crates/krit-runtime" }
+krit-state = { path = "crates/krit-state" }
 krit-wasm = { path = "crates/krit-wasm" }
 blake3 = "1.8.7"
 crossbeam-channel = "=0.5.16"
@@ -38,6 +40,7 @@ ignore = "=0.4.33"
 lsp-server = "=0.10.0"
 lsp-types = "=0.97.0"
 rustix = { version = "=1.1.4", default-features = false, features = ["fs"] }
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

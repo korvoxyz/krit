@@ -47,6 +47,8 @@ pub struct Capabilities {
     pub ai: Vec<String>,
     #[serde(default)]
     pub logs: bool,
+    #[serde(default)]
+    pub state: Vec<String>,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -161,6 +163,11 @@ impl Manifest {
         for name in &self.capabilities.ai {
             validate_resource_name("AI adapter", name)?;
         }
+        validate_sorted_unique_names("durable state store", &self.capabilities.state)?;
+        validate_capability_count("durable state store", &self.capabilities.state)?;
+        for name in &self.capabilities.state {
+            validate_resource_name("durable state store", name)?;
+        }
         Ok(())
     }
 
@@ -234,6 +241,12 @@ impl Manifest {
                 resource: None,
             });
         }
+        requested.extend(self.capabilities.state.iter().cloned().map(|resource| {
+            PermissionRequest {
+                capability: "state.transaction",
+                resource: Some(resource),
+            }
+        }));
         requested.sort();
         PermissionPlan {
             schema: 1,
@@ -271,6 +284,12 @@ impl Manifest {
                     .any(|granted| granted == resource)
             }),
             "observe.log" => resource.is_none() && self.capabilities.logs,
+            "state.transaction" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .state
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
             _ => false,
         }
     }
@@ -523,6 +542,27 @@ mod tests {
             "stdout = true\nai = [\"summarizer\", \"reviewer\"]",
         );
         let error = Manifest::parse(&unsorted).expect_err("AI names must be sorted");
+        assert!(error.to_string().contains("sorted and unique"));
+    }
+
+    #[test]
+    fn validates_sorted_durable_state_permissions() {
+        let manifest = Manifest::parse(&VALID.replace(
+            "secrets = [\"github-token\", \"slack-token\"]",
+            "secrets = [\"github-token\", \"slack-token\"]\nstate = [\"agent-work\", \"replay\"]",
+        ))
+        .expect("sorted state stores should validate");
+        assert!(manifest.grants_permission("state.transaction", Some("agent-work")));
+        assert!(manifest.permission_plan().requested.iter().any(|request| {
+            request.capability == "state.transaction"
+                && request.resource.as_deref() == Some("replay")
+        }));
+
+        let error = Manifest::parse(&VALID.replace(
+            "secrets = [\"github-token\", \"slack-token\"]",
+            "secrets = [\"github-token\", \"slack-token\"]\nstate = [\"replay\", \"agent-work\"]",
+        ))
+        .expect_err("unsorted state stores should fail");
         assert!(error.to_string().contains("sorted and unique"));
     }
 }

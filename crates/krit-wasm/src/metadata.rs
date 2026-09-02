@@ -4,6 +4,7 @@ use crate::{BuildError, WASM_COMPONENT_TARGET};
 
 pub const ARTIFACT_METADATA_SCHEMA: u32 = 1;
 pub const ARTIFACT_POLICY_VERSION: u32 = 1;
+pub const STATE_ARTIFACT_POLICY_VERSION: u32 = 2;
 pub const COMPILER_NAME: &str = "krit";
 pub const LANGUAGE_NAME: &str = "Krit";
 pub const LANGUAGE_VERSION: &str = "0.2.0";
@@ -168,6 +169,7 @@ impl EmbeddedMetadata {
         effects: Vec<String>,
         requirements: Vec<ResourceRequirementMetadata>,
         approvals: Vec<ApprovalRequirementMetadata>,
+        policy_version: u32,
     ) -> Self {
         Self {
             schema: ARTIFACT_METADATA_SCHEMA,
@@ -177,7 +179,7 @@ impl EmbeddedMetadata {
             effects,
             requirements,
             approvals,
-            policy_version: ARTIFACT_POLICY_VERSION,
+            policy_version,
         }
     }
 }

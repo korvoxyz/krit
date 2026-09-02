@@ -210,6 +210,45 @@ interface logging {
     error: func(event: string, fields: list<field>) -> result<_, string>;
 }
 
+interface state {
+    record header {
+        name: string,
+        value: string,
+    }
+
+    record request {
+        method: string,
+        path: string,
+        query: string,
+        headers: list<header>,
+        body: string,
+    }
+
+    record response {
+        status: s64,
+        headers: list<header>,
+        body: string,
+    }
+
+    get: func(store: string, key: string) -> result<option<string>, string>;
+    put: func(store: string, key: string, value: string) -> result<_, string>;
+    delete: func(store: string, key: string) -> result<_, string>;
+    checkpoint-get: func(store: string, name: string) -> result<option<string>, string>;
+    checkpoint-put: func(store: string, name: string, value: string) -> result<_, string>;
+    replay-http: func(
+        store: string,
+        operation: string,
+        origin: string,
+        request: request,
+    ) -> result<response, string>;
+    replay-ai: func(
+        store: string,
+        operation: string,
+        adapter: string,
+        input: string,
+    ) -> result<string, string>;
+}
+
 world webhook-ai-program {
     import ai;
     export webhook;
@@ -570,5 +609,6 @@ world webhook-host-program {
     import http-anonymous;
     import ai;
     import logging;
+    import state;
     export webhook;
 }

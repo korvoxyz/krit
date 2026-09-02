@@ -13,6 +13,79 @@ fn diagnostic_code(text: &str) -> &'static str {
 }
 
 #[test]
+fn durable_state_checkpoint_and_replay_facts_are_exact() {
+    let source = r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let current = state_get("agent-work", "issue");
+    let saved = state_put("agent-work", "issue", request.body);
+    let checkpoint = checkpoint_get("agent-work", "posted-message");
+    let marked = checkpoint_put("agent-work", "posted-message", "done");
+    let fetched = replay_http(
+        "agent-work",
+        "fetch-issue",
+        "https://api.example.com",
+        request,
+    );
+    let summary = replay_ai("agent-work", "summarize", "reviewer", request.body);
+    record { status: 200, headers: [], body: request.path }
+}
+"#;
+    let analysis = analyze_source(source).expect("durable source should analyze");
+    let webhook = analysis
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.kind() == SymbolKind::Webhook)
+        .expect("webhook should exist");
+    let Type::Function(function) = webhook.ty() else {
+        panic!("webhook should have function type")
+    };
+    assert_eq!(
+        function
+            .effects()
+            .iter()
+            .map(Effect::as_str)
+            .collect::<Vec<_>>(),
+        ["state.transaction"]
+    );
+    assert_eq!(
+        function
+            .requirements()
+            .iter()
+            .map(|requirement| (requirement.capability().as_str(), requirement.resource()))
+            .collect::<Vec<_>>(),
+        [
+            ("ai.invoke", "reviewer"),
+            ("http.request", "https://api.example.com"),
+            ("state.transaction", "agent-work"),
+        ]
+    );
+}
+
+#[test]
+fn durable_resource_identities_are_direct_canonical_literals() {
+    for source in [
+        r#"let store = "agent-work"; state_get(store, "key");"#,
+        r#"checkpoint_get("agent-work", "Invalid Name");"#,
+        r#"replay_ai("agent-work", "Invalid Name", "reviewer", "input");"#,
+        r#"replay_http("agent-work", "fetch", "https://example.com/path", record { method: "GET", path: "/", query: "", headers: [], body: "" });"#,
+    ] {
+        assert_eq!(diagnostic_code(source), "K3008");
+    }
+
+    assert_eq!(
+        diagnostic_code(
+            r#"
+match secret("github-token") {
+    Ok(token) => state_put("agent-work", "key", token),
+    Err(error) => Err(error),
+};
+"#
+        ),
+        "K3001"
+    );
+}
+
+#[test]
 fn webhook_contract_types_and_transitive_capabilities_are_stable() {
     let source = Source::new(
         "agent.krit",

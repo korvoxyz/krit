@@ -11,9 +11,10 @@ Rust implementation. The bootstrap static checker is specified in
 described in `docs/technical-design.md`. This milestone also defines
 typed webhook entrypoints, configuration reads, opaque secret acquisition,
 exact-origin outbound HTTP, provider-neutral AI invocation, and structured
-logging. The direct evaluator remains intentionally hostless; these operations
-execute only through the bounded Component Model runtime. General component
-generation remains narrower than the full dynamic language.
+logging, transactional durable string state, checkpoints, and explicit
+HTTP/AI replay. The direct evaluator remains intentionally hostless; these
+operations execute only through the bounded Component Model runtime. General
+component generation remains narrower than the full dynamic language.
 
 The historical Racket S-expression syntax is not accepted by Krit 0.2.
 
@@ -38,7 +39,7 @@ else false fn if let match record true webhook
 Reserved built-in names:
 
 ```text
-Err None Ok Some ai_invoke config_string http_request json_decode json_encode log_error log_info print println secret
+Err None Ok Some ai_invoke checkpoint_get checkpoint_put config_string http_request json_decode json_encode log_error log_info print println replay_ai replay_http secret state_delete state_get state_put
 ```
 
 A binding cannot use a keyword or reserved built-in name.
@@ -437,7 +438,7 @@ Output rendering is deterministic:
 Output is the only host effect executable by the direct evaluator. It is
 modeled as `io.stdout`. The component runtime additionally provides bounded
 `config.read`, `secret.read`, `http.request`, `ai.invoke`, and `observe.log`
-interfaces to typed webhook artifacts.
+interfaces plus `state.transaction` to typed webhook artifacts.
 
 ## 13. JSON conversion
 
@@ -471,7 +472,7 @@ is validated and decoded without importing a host interface. Escapes and all
 other component JSON shapes remain `K7002` or a bounded guest validation trap;
 there is no evaluator fallback.
 
-## 13.1 Configuration, secret, HTTP, AI, and logging host contracts
+## 13.1 Configuration, secret, HTTP, AI, logging, and durable-state host contracts
 
 ```krit
 config_string("agent.model") // Result<String, String>
@@ -484,6 +485,15 @@ http_request(
 ai_invoke("reviewer", input) // Result<String, String>
 log_info("review.started", fields) // Result<Unit, String>
 log_error("review.failed", fields) // Result<Unit, String>
+state_get("agent-work", key) // Result<Option<String>, String>
+state_put("agent-work", key, value) // Result<Unit, String>
+state_delete("agent-work", key) // Result<Unit, String>
+checkpoint_get("agent-work", "posted-message") // Result<Option<String>, String>
+checkpoint_put("agent-work", "posted-message", value) // Result<Unit, String>
+replay_http("agent-work", "fetch", "https://api.example.com", request)
+// Result<HttpResponse, String>
+replay_ai("agent-work", "summarize", "reviewer", input)
+// Result<String, String>
 ```
 
 Config and secret operations require exactly one direct string-literal
@@ -505,6 +515,16 @@ before structured use. The host never executes model output.
 ordered `List<LogField>`, add `observe.log`, and return a fallible unit result.
 No `Secret` can enter a log field. Host-side validation, redaction, buffering,
 and publication are defined in `AI-OBSERVABILITY.md`.
+
+State/checkpoint/replay store names, checkpoint names, replay operation names,
+HTTP origins, and AI adapters are direct canonical literals. State keys and
+values are bounded ordinary strings. State and checkpoint mutations commit
+only after successful invocation completion. Replay records completed bounded
+external results independently so a later retry can resume without repeating
+the recorded call. `replay_http` is anonymous and accepts only safe methods or
+one valid ordinary `Idempotency-Key`; authenticated replay HTTP is unavailable.
+`Secret` cannot enter any state, checkpoint, or replay value. The complete
+crash and durability semantics are normative in `DURABLE-STATE.md`.
 
 The source checker does not require a manifest. Package build orchestration
 checks requirements against the schema-1 manifest. The direct evaluator emits
@@ -528,8 +548,8 @@ The following are errors rather than implementation-defined behavior:
 - function comparison
 - missing record field
 - JSON encoding of a function
-- non-literal configuration, secret, HTTP-origin, AI-adapter, or log-event
-  resource
+- non-literal configuration, secret, HTTP-origin, AI-adapter, log-event,
+  state-store, checkpoint, or replay-operation resource
 - printing, comparing, encoding, or structurally storing an opaque secret
 - unavailable webhook, configuration, secret, HTTP, AI, or logging direct-run
   host contract

@@ -48,8 +48,10 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - ordered typed `log_info`/`log_error` events with bounded buffering,
   key/value redaction, and stderr-only JSON Lines publication
 - reusable stateful `AgentHost` policy for bounded retries, per-resource rate
-  limits, embedding cancellation, process-local idempotency, and default-deny
-  AI/bearer approval
+  limits, embedding cancellation, process-local or opt-in durable idempotency,
+  and default-deny AI/bearer approval
+- capability-scoped transactional SQLite state, named checkpoints, completed
+  HTTP/AI replay, and process-restart recovery
 - opaque `Secret` compiler/Core identity with static non-disclosure rules
 - name-resolved, inferred typed Core IR with deterministic IDs and explicit
   evaluation order
@@ -83,9 +85,11 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - implementation-neutral conformance cases
 - strict package manifest validation
 
-Phase 4 is complete for the bounded stateless reference agent. The checked
+Phase 6 state is complete for bounded local single-host coordination. The checked
 reference flow calls a GitHub-like origin, one neutral AI adapter, and one
-messaging-like origin with exact permissions and approval requirements.
+messaging-like origin with exact permissions and approval requirements; state
+and replay can now resume interrupted work without repeating recorded external
+operations.
 General composite Wasm layouts beyond the documented webhook subset, modules,
 dependency resolution, build caching, broader autonomous editing, and
 production multi-tenant OS isolation are also future work. Krit is not
@@ -298,12 +302,71 @@ remain rolled back.
 
 Retries never re-execute guest code. They apply only to connection/timeouts or
 429/502/503/504 for GET/HEAD or a request with a valid ordinary
-`idempotency-key`. AI and HTTP rate state and inbound response idempotency are
-bounded process-local memory only: restart and multi-process deployments reset
-them, concurrent first use can duplicate work, and Phase 6 will replace
-best-effort replay with durable transactional records. Model output remains
-nondeterministic raw UTF-8 and must be parsed or validated by source before
-structured use.
+`idempotency-key`. AI and HTTP rate state remain process-local. Inbound response
+idempotency remains process-local unless schema 3 explicitly selects a
+manifest-granted durable store. Model output remains nondeterministic raw UTF-8
+and must be parsed or validated by source before structured use.
+
+### Durable local state and replay
+
+Schema-1 manifests request logical stores:
+
+```toml
+[capabilities]
+state = ["agent-work"]
+```
+
+Edition 2026 provides bounded string operations:
+
+```krit
+let previous = state_get("agent-work", "last-body");
+let saved = state_put("agent-work", "last-body", request.body);
+let checkpoint = checkpoint_get("agent-work", "processed-request");
+let marked = checkpoint_put(
+    "agent-work",
+    "processed-request",
+    request.body,
+);
+```
+
+`state_delete` removes a key. State/checkpoint mutations are invocation-local
+and commit only after valid successful guest completion; traps, cancellation,
+deadline, response failure, or revision conflict roll them back.
+
+External work can use stable completed-operation replay:
+
+```krit
+let fetched = replay_http(
+    "agent-work",
+    "fetch-issue",
+    "https://api.example.com",
+    outbound_request,
+);
+let summary = replay_ai(
+    "agent-work",
+    "summarize-issue",
+    "reviewer",
+    input,
+);
+```
+
+`replay_http` is anonymous and requires GET/HEAD or one valid ordinary
+`Idempotency-Key`. Completed bounded results survive process restart and are
+reused after current grants and AI approval are rechecked. Krit cannot close
+the crash window between a remote effect and its local replay-record commit;
+provider idempotency remains necessary and distributed exactly once is not
+claimed.
+
+Host config schema 3 owns database paths and limits. No path is chosen by
+source or enabled by default. The complete schema is shown in
+[the durable-state specification](spec/DURABLE-STATE.md). On Unix the
+containing state directory must already be owner-only and database/WAL/SHM
+files are owner-only regular files without symlinks.
+
+The checked-in
+[`examples/stateful-webhook.krit`](examples/stateful-webhook.krit) uses
+transactional state and a named checkpoint. Create an owner-only
+`examples/state` directory before using its schema-3 host config.
 
 Request JSON Lines diagnostics for tools and AI agents:
 
@@ -560,6 +623,8 @@ The specification is the semantic authority:
   host implemented
 - [Guided AI authoring](spec/GUIDED-AUTHORING.md) — implemented deterministic
   LSP and review-gated provider-neutral assistance baseline
+- [Durable state and replay](spec/DURABLE-STATE.md) — transactional local
+  stores, checkpoints, replay, and durable idempotency
 - [Narrow product MVP](docs/mvp.md)
 - [Agent platform roadmap](docs/agent-roadmap.md)
 - [Rust technical design](docs/technical-design.md)
@@ -602,7 +667,9 @@ The accepted implementation path is:
    formatting facts (complete)
 8. optional provider-neutral inline prediction with visible checked edits
    and separately approved semantic cleanup (complete)
-9. durable state and replay only after the stateless reference gate (Phase 6)
+9. durable transactional state, checkpoints, replay, and idempotency
+   (complete for local single-host coordination)
+10. typed queues, schedules, and bounded object storage (Phase 6; next)
 
 Performance claims follow [docs/performance.md](docs/performance.md), not
 implementation-language assumptions.

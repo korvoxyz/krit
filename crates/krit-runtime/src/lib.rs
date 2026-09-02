@@ -7,6 +7,7 @@ mod network;
 mod observability;
 mod permissions;
 mod policy;
+mod state;
 mod webhook;
 
 use std::{
@@ -17,7 +18,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use krit_wasm::{
@@ -36,6 +37,7 @@ pub use error::{RuntimeError, RuntimeErrorKind};
 pub use host::{HostInputs, MAX_HOST_INPUT_ENTRIES, NetworkPolicy, SecretStore};
 pub use limits::{
     DEFAULT_LIMITS, HARD_MAX_LIMITS, HOST_POLICY_VERSION, HOST_STACK_HEADROOM_BYTES, RuntimeLimits,
+    STATE_HOST_POLICY_VERSION,
 };
 pub use observability::{LogEvent, LogField, LogLevel, MAX_LOG_NAME_BYTES, REDACTED_VALUE};
 pub use permissions::{ApprovalFact, EffectivePermissions, GrantSet, PermissionFact};
@@ -45,6 +47,10 @@ pub use policy::{
     HttpJsonAdapterConfig, IdempotencyPolicy, MAX_IDEMPOTENCY_BYTES, MAX_IDEMPOTENCY_ENTRIES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDEMPOTENCY_TTL, MAX_POLICY_RESOURCES, MAX_RATE_CAPACITY,
     MAX_RATE_WINDOW, MAX_RETRY_ATTEMPTS, MAX_RETRY_DELAY, RateLimitPolicy, RetryPolicy,
+};
+pub use state::{
+    Durability, DurableState, DurableStoreDefinition, RetentionPolicy,
+    StoreLimits as DurableStoreLimits,
 };
 pub use webhook::{HttpHeader, HttpRequest, HttpResponse};
 
@@ -77,6 +83,13 @@ pub struct ExecutionStats {
     pub retries: u64,
     pub rate_limit_denials: u64,
     pub idempotency_replayed: bool,
+    pub state_operations: u64,
+    pub state_reads: u64,
+    pub state_writes: u64,
+    pub checkpoint_reads: u64,
+    pub checkpoint_writes: u64,
+    pub replay_hits: u64,
+    pub replay_misses: u64,
     pub output_bytes: usize,
     pub elapsed_micros: u128,
 }
@@ -111,6 +124,18 @@ struct HostState {
     log_bytes: usize,
     invocation_deadline: Instant,
     active_dns_workers: Arc<AtomicUsize>,
+    artifact_identity: [u8; 32],
+    state: state::InvocationState,
+}
+
+struct HostStateConfig {
+    grants: Option<GrantSet>,
+    effects: BTreeSet<String>,
+    requirements: BTreeSet<(String, String)>,
+    agent_host: AgentHost,
+    cancellation: CancellationHandle,
+    started: Instant,
+    artifact_identity: [u8; 32],
 }
 
 pub struct SecretHandle {
@@ -285,8 +310,27 @@ impl Runtime {
                 "embedding cancellation requested before guest execution",
             ));
         }
+        let _epoch_guard = self
+            .epoch_lock
+            .lock()
+            .map_err(|_| RuntimeError::setup("runtime epoch scheduler lock is poisoned"))?;
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::cancelled(
+                "embedding cancellation requested before component instantiation",
+            ));
+        }
+        let component = Component::new(&self.engine, bytes).map_err(|error| {
+            RuntimeError::setup(format!(
+                "validated webhook component could not be compiled by Wasmtime 47.x: {error}"
+            ))
+        })?;
+        let worker_stack_bytes = self
+            .limits
+            .wasm_stack_bytes()
+            .checked_add(HOST_STACK_HEADROOM_BYTES)
+            .ok_or_else(|| RuntimeError::setup("Wasm execution worker stack size overflowed"))?;
         let idempotency = agent_host.idempotency_decision(metadata, &request)?;
-        let policy::IdempotencyDecision::Execute(idempotency_token) = idempotency else {
+        let policy::IdempotencyDecision::Execute(mut idempotency_token) = idempotency else {
             let (response, replayed) = match idempotency {
                 policy::IdempotencyDecision::Replay(response) => (response, true),
                 policy::IdempotencyDecision::Conflict => (
@@ -313,31 +357,11 @@ impl Runtime {
                 response,
                 output: Vec::new(),
                 events: Vec::new(),
-                stats: self.empty_stats(replayed),
+                stats: self.empty_stats(replayed, !agent_host.durable_state().is_empty()),
             });
         };
 
-        let _epoch_guard = self
-            .epoch_lock
-            .lock()
-            .map_err(|_| RuntimeError::setup("runtime epoch scheduler lock is poisoned"))?;
-        if cancellation.is_cancelled() {
-            return Err(RuntimeError::cancelled(
-                "embedding cancellation requested before component instantiation",
-            ));
-        }
-        let component = Component::new(&self.engine, bytes).map_err(|error| {
-            RuntimeError::setup(format!(
-                "validated webhook component could not be compiled by Wasmtime 47.x: {error}"
-            ))
-        })?;
-        let worker_stack_bytes = self
-            .limits
-            .wasm_stack_bytes()
-            .checked_add(HOST_STACK_HEADROOM_BYTES)
-            .ok_or_else(|| RuntimeError::setup("Wasm execution worker stack size overflowed"))?;
-
-        thread::scope(|scope| {
+        let execution = thread::scope(|scope| {
             let worker = thread::Builder::new()
                 .name("krit-webhook-execution".to_owned())
                 .stack_size(worker_stack_bytes)
@@ -356,14 +380,22 @@ impl Runtime {
                         "could not start isolated webhook execution worker: {error}"
                     ))
                 })?;
-            let result = worker
+            worker
                 .join()
-                .map_err(|_| RuntimeError::setup("isolated webhook execution worker panicked"))??;
-            agent_host
-                .complete_idempotency(idempotency_token, &result.response)
-                .map_err(|error| error.with_events(result.events.clone()))?;
-            Ok(result)
-        })
+                .map_err(|_| RuntimeError::setup("isolated webhook execution worker panicked"))?
+        });
+        match execution {
+            Ok(result) => {
+                agent_host
+                    .complete_idempotency(idempotency_token.take(), &result.response)
+                    .map_err(|error| error.with_events(result.events.clone()))?;
+                Ok(result)
+            }
+            Err(error) => match agent_host.abort_idempotency(idempotency_token.take()) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.with_cleanup_failure(&cleanup)),
+            },
+        }
     }
 
     fn invoke_webhook_component(
@@ -378,10 +410,10 @@ impl Runtime {
         let started = Instant::now();
         let mut store = Store::new(
             &self.engine,
-            self.new_host_state(
-                Some(grants),
-                metadata.effects.iter().cloned().collect(),
-                metadata
+            self.new_host_state(HostStateConfig {
+                grants: Some(grants),
+                effects: metadata.effects.iter().cloned().collect(),
+                requirements: metadata
                     .requirements
                     .iter()
                     .map(|requirement| {
@@ -391,7 +423,8 @@ impl Runtime {
                 agent_host,
                 cancellation,
                 started,
-            ),
+                artifact_identity: policy::artifact_identity(metadata),
+            }),
         );
         store.limiter(|state| &mut state.store_limits);
         store
@@ -416,6 +449,15 @@ impl Runtime {
         response
             .validate(self.limits)
             .map_err(|error| error.with_events(store.data().events.clone()))?;
+        if store.data().state.touched() && store.data().cancellation.is_cancelled() {
+            return Err(RuntimeError::cancelled(
+                "embedding cancellation requested before durable state commit",
+            )
+            .with_events(store.data().events.clone()));
+        }
+        if let Err(error) = store.data_mut().state.commit() {
+            return Err(error.with_events(store.data().events.clone()));
+        }
         let remaining = store.get_fuel().map_err(|error| {
             RuntimeError::setup(format!("could not read remaining fuel: {error}"))
                 .with_events(store.data().events.clone())
@@ -423,7 +465,11 @@ impl Runtime {
         let state = store.into_data();
         Ok(WebhookExecutionResult {
             stats: ExecutionStats {
-                policy_version: HOST_POLICY_VERSION,
+                policy_version: if state.agent_host.durable_state().is_empty() {
+                    HOST_POLICY_VERSION
+                } else {
+                    STATE_HOST_POLICY_VERSION
+                },
                 fuel_budget: self.limits.fuel(),
                 fuel_consumed: self.limits.fuel().saturating_sub(remaining),
                 fuel_remaining: remaining,
@@ -434,6 +480,13 @@ impl Runtime {
                 retries: state.retries,
                 rate_limit_denials: state.rate_limit_denials,
                 idempotency_replayed: false,
+                state_operations: state.state.operations(),
+                state_reads: state.state.reads(),
+                state_writes: state.state.writes(),
+                checkpoint_reads: state.state.checkpoint_reads(),
+                checkpoint_writes: state.state.checkpoint_writes(),
+                replay_hits: state.state.replay_hits(),
+                replay_misses: state.state.replay_misses(),
                 output_bytes: state.output.len(),
                 elapsed_micros: started.elapsed().as_micros(),
             },
@@ -452,14 +505,15 @@ impl Runtime {
         let started = Instant::now();
         let mut store = Store::new(
             &self.engine,
-            self.new_host_state(
-                None,
-                BTreeSet::new(),
-                BTreeSet::new(),
-                AgentHost::from_inputs(HostInputs::default())?,
+            self.new_host_state(HostStateConfig {
+                grants: None,
+                effects: BTreeSet::new(),
+                requirements: BTreeSet::new(),
+                agent_host: AgentHost::from_inputs(HostInputs::default())?,
                 cancellation,
                 started,
-            ),
+                artifact_identity: [0; 32],
+            }),
         );
         store.limiter(|state| &mut state.store_limits);
         store
@@ -503,6 +557,13 @@ impl Runtime {
                 retries: state.retries,
                 rate_limit_denials: state.rate_limit_denials,
                 idempotency_replayed: false,
+                state_operations: 0,
+                state_reads: 0,
+                state_writes: 0,
+                checkpoint_reads: 0,
+                checkpoint_writes: 0,
+                replay_hits: 0,
+                replay_misses: 0,
                 output_bytes: state.output.len(),
                 elapsed_micros: started.elapsed().as_micros(),
             },
@@ -523,9 +584,13 @@ impl Runtime {
         self.active_dns_workers.load(Ordering::Acquire)
     }
 
-    fn empty_stats(&self, idempotency_replayed: bool) -> ExecutionStats {
+    fn empty_stats(&self, idempotency_replayed: bool, durable_state: bool) -> ExecutionStats {
         ExecutionStats {
-            policy_version: HOST_POLICY_VERSION,
+            policy_version: if durable_state {
+                STATE_HOST_POLICY_VERSION
+            } else {
+                HOST_POLICY_VERSION
+            },
             fuel_budget: self.limits.fuel(),
             fuel_consumed: 0,
             fuel_remaining: self.limits.fuel(),
@@ -536,6 +601,13 @@ impl Runtime {
             retries: 0,
             rate_limit_denials: 0,
             idempotency_replayed,
+            state_operations: 0,
+            state_reads: 0,
+            state_writes: 0,
+            checkpoint_reads: 0,
+            checkpoint_writes: 0,
+            replay_hits: 0,
+            replay_misses: 0,
             output_bytes: 0,
             elapsed_micros: 0,
         }
@@ -613,6 +685,9 @@ impl Runtime {
         agent_host: &AgentHost,
     ) -> Result<(), RuntimeError> {
         agent_host.validate_for_limits(self.limits)?;
+        agent_host
+            .durable_state()
+            .validate_for_runtime(self.limits.deadline())?;
         let inputs = agent_host.inputs();
         let mut config_bytes = 0usize;
         for (name, value) in inputs.config() {
@@ -709,6 +784,20 @@ impl Runtime {
                 )));
             }
         }
+        for name in agent_host.durable_state().store_names() {
+            if !grants.grants("state.transaction", Some(name)) {
+                return Err(RuntimeError::authorization(format!(
+                    "durable state store `{name}` is not granted by the manifest"
+                )));
+            }
+        }
+        for requirement in metadata
+            .requirements
+            .iter()
+            .filter(|requirement| requirement.capability == "state.transaction")
+        {
+            agent_host.durable_state().binding(&requirement.resource)?;
+        }
         let rate_resources = metadata
             .requirements
             .iter()
@@ -735,15 +824,16 @@ impl Runtime {
         Ok(())
     }
 
-    fn new_host_state(
-        &self,
-        grants: Option<GrantSet>,
-        effects: BTreeSet<String>,
-        requirements: BTreeSet<(String, String)>,
-        agent_host: AgentHost,
-        cancellation: CancellationHandle,
-        started: Instant,
-    ) -> HostState {
+    fn new_host_state(&self, config: HostStateConfig) -> HostState {
+        let HostStateConfig {
+            grants,
+            effects,
+            requirements,
+            agent_host,
+            cancellation,
+            started,
+            artifact_identity,
+        } = config;
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(self.limits.memory_bytes())
             .table_elements(self.limits.table_elements())
@@ -774,6 +864,8 @@ impl Runtime {
             log_bytes: 0,
             invocation_deadline: started + self.limits.deadline(),
             active_dns_workers: Arc::clone(&self.active_dns_workers),
+            artifact_identity,
+            state: state::InvocationState::default(),
         }
     }
 
@@ -1117,6 +1209,318 @@ impl bindings::webhook::krit::runtime::logging::Host for HostState {
     }
 }
 
+impl bindings::webhook::krit::runtime::state::Host for HostState {
+    fn get(
+        &mut self,
+        store: String,
+        key: String,
+    ) -> wasmtime::Result<Result<Option<String>, String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("state.transaction", &store)?;
+        let durable = self.agent_host.durable_state().clone();
+        let value = self
+            .state
+            .get(&durable, &store, &key)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(value))
+    }
+
+    fn put(
+        &mut self,
+        store: String,
+        key: String,
+        value: String,
+    ) -> wasmtime::Result<Result<(), String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("state.transaction", &store)?;
+        let durable = self.agent_host.durable_state().clone();
+        self.state
+            .put(&durable, &store, key, value)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(()))
+    }
+
+    fn delete(&mut self, store: String, key: String) -> wasmtime::Result<Result<(), String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("state.transaction", &store)?;
+        let durable = self.agent_host.durable_state().clone();
+        self.state
+            .delete(&durable, &store, key)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(()))
+    }
+
+    fn checkpoint_get(
+        &mut self,
+        store: String,
+        name: String,
+    ) -> wasmtime::Result<Result<Option<String>, String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("state.transaction", &store)?;
+        if !krit_capability::is_valid_resource_name(&name) {
+            return Ok(Err("workflow checkpoint name is invalid".to_owned()));
+        }
+        let durable = self.agent_host.durable_state().clone();
+        let value = self
+            .state
+            .checkpoint_get(&durable, &store, &name)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(value))
+    }
+
+    fn checkpoint_put(
+        &mut self,
+        store: String,
+        name: String,
+        value: String,
+    ) -> wasmtime::Result<Result<(), String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("state.transaction", &store)?;
+        if !krit_capability::is_valid_resource_name(&name) {
+            return Ok(Err("workflow checkpoint name is invalid".to_owned()));
+        }
+        let durable = self.agent_host.durable_state().clone();
+        self.state
+            .checkpoint_put(&durable, &store, name, value)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(()))
+    }
+
+    fn replay_http(
+        &mut self,
+        store: String,
+        operation: String,
+        origin: String,
+        request: bindings::webhook::krit::runtime::state::Request,
+    ) -> wasmtime::Result<Result<bindings::webhook::krit::runtime::state::Response, String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("state.transaction", &store)?;
+        self.require_grant("http.request", &origin)?;
+        if !krit_capability::is_valid_resource_name(&operation) {
+            return Ok(Err("replay operation name is invalid".to_owned()));
+        }
+        let request = HttpRequest {
+            method: request.method,
+            path: request.path,
+            query: request.query,
+            headers: request
+                .headers
+                .into_iter()
+                .map(|header| HttpHeader {
+                    name: header.name,
+                    value: header.value,
+                })
+                .collect(),
+            body: request.body,
+        };
+        request
+            .validate(self.limits)
+            .map_err(wasmtime::Error::new)?;
+        if !replay_safe_http(&request, self.agent_host.policy().idempotency.max_key_bytes) {
+            return Err(wasmtime::Error::new(RuntimeError::replay(
+                "durable HTTP replay requires GET, HEAD, or one valid Idempotency-Key",
+            )));
+        }
+        let durable = self.agent_host.durable_state().clone();
+        let binding = self.state.replay_binding(&durable, &store)?;
+        let input_digest = replay_http_digest(&origin, &request);
+        let owner = self.agent_host.next_lease_owner();
+        let decision = binding
+            .store()
+            .replay_decision(
+                krit_state::ReplayRequest {
+                    artifact: &self.artifact_identity,
+                    kind: krit_state::ReplayKind::Http,
+                    operation: &operation,
+                    input_digest: &input_digest,
+                    owner: &owner,
+                    now_millis: wall_clock_millis()?,
+                },
+                binding.replay_policy(),
+            )
+            .map_err(state::map_state_error)?;
+        let response = match decision {
+            krit_state::ReplayDecision::Replay(bytes) => {
+                self.state.record_replay(true);
+                serde_json::from_slice::<HttpResponse>(&bytes).map_err(|_| {
+                    wasmtime::Error::new(RuntimeError::durable_state(
+                        "durable HTTP replay result is invalid",
+                    ))
+                })?
+            }
+            krit_state::ReplayDecision::Execute(lease) => {
+                self.state.record_replay(false);
+                let response = match self.perform_http_inner(origin, request, None)? {
+                    Ok(response) => response,
+                    Err(error) => {
+                        binding
+                            .store()
+                            .abort_replay(&lease)
+                            .map_err(state::map_state_error)?;
+                        return Ok(Err(error));
+                    }
+                };
+                let bytes = serde_json::to_vec(&response).map_err(|_| {
+                    wasmtime::Error::new(RuntimeError::durable_state(
+                        "could not encode durable HTTP replay result",
+                    ))
+                })?;
+                binding
+                    .store()
+                    .complete_replay(
+                        &lease,
+                        &bytes,
+                        wall_clock_millis()?,
+                        binding.replay_policy(),
+                    )
+                    .map_err(state::map_state_error)?;
+                response
+            }
+            krit_state::ReplayDecision::Conflict => {
+                return Err(wasmtime::Error::new(RuntimeError::replay(
+                    "durable HTTP replay input conflicts with its completed operation",
+                )));
+            }
+            krit_state::ReplayDecision::InProgress => {
+                return Err(wasmtime::Error::new(RuntimeError::replay(
+                    "durable HTTP replay operation is already in progress",
+                )));
+            }
+        };
+        response
+            .validate(self.limits)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(bindings::webhook::krit::runtime::state::Response {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(|header| bindings::webhook::krit::runtime::state::Header {
+                    name: header.name,
+                    value: header.value,
+                })
+                .collect(),
+            body: response.body,
+        }))
+    }
+
+    fn replay_ai(
+        &mut self,
+        store: String,
+        operation: String,
+        adapter: String,
+        input: String,
+    ) -> wasmtime::Result<Result<String, String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("state.transaction", &store)?;
+        self.require_grant("ai.invoke", &adapter)?;
+        if !krit_capability::is_valid_resource_name(&operation) {
+            return Ok(Err("replay operation name is invalid".to_owned()));
+        }
+        let Some(config) = self.agent_host.policy().ai_adapters.get(&adapter) else {
+            return Ok(Err(format!("AI adapter `{adapter}` is not configured")));
+        };
+        let configured = ai::Adapter::from_config(config).map_err(wasmtime::Error::new)?;
+        if input.len() > configured.max_input_bytes() || input.len() > self.limits.ai_input_bytes()
+        {
+            return Ok(Err("AI input exceeded the configured size limit".to_owned()));
+        }
+        if !self
+            .agent_host
+            .approve(ApprovalOperation::AiInvoke, &adapter)
+        {
+            return Ok(Err(format!("approval denied for AI adapter `{adapter}`")));
+        }
+        if configured
+            .secret_name()
+            .is_some_and(|name| self.agent_host.inputs().secrets().get(name).is_none())
+        {
+            return Ok(Err(format!(
+                "AI adapter `{adapter}` secret is not configured"
+            )));
+        }
+        let durable = self.agent_host.durable_state().clone();
+        let binding = self.state.replay_binding(&durable, &store)?;
+        let input_digest = replay_ai_digest(&adapter, &input);
+        let owner = self.agent_host.next_lease_owner();
+        let decision = binding
+            .store()
+            .replay_decision(
+                krit_state::ReplayRequest {
+                    artifact: &self.artifact_identity,
+                    kind: krit_state::ReplayKind::Ai,
+                    operation: &operation,
+                    input_digest: &input_digest,
+                    owner: &owner,
+                    now_millis: wall_clock_millis()?,
+                },
+                binding.replay_policy(),
+            )
+            .map_err(state::map_state_error)?;
+        match decision {
+            krit_state::ReplayDecision::Replay(bytes) => {
+                self.state.record_replay(true);
+                String::from_utf8(bytes).map(Ok).map_err(|_| {
+                    wasmtime::Error::new(RuntimeError::durable_state(
+                        "durable AI replay result is not UTF-8",
+                    ))
+                })
+            }
+            krit_state::ReplayDecision::Execute(lease) => {
+                self.state.record_replay(false);
+                let stable_key = stable_replay_idempotency_key(
+                    &self.artifact_identity,
+                    &store,
+                    &operation,
+                    &input_digest,
+                );
+                let result = match self.perform_ai_inner(adapter, input, Some(&stable_key))? {
+                    Ok(result) => result,
+                    Err(error) => {
+                        binding
+                            .store()
+                            .abort_replay(&lease)
+                            .map_err(state::map_state_error)?;
+                        return Ok(Err(error));
+                    }
+                };
+                binding
+                    .store()
+                    .complete_replay(
+                        &lease,
+                        result.as_bytes(),
+                        wall_clock_millis()?,
+                        binding.replay_policy(),
+                    )
+                    .map_err(state::map_state_error)?;
+                Ok(Ok(result))
+            }
+            krit_state::ReplayDecision::Conflict => {
+                Err(wasmtime::Error::new(RuntimeError::replay(
+                    "durable AI replay input conflicts with its completed operation",
+                )))
+            }
+            krit_state::ReplayDecision::InProgress => Err(wasmtime::Error::new(
+                RuntimeError::replay("durable AI replay operation is already in progress"),
+            )),
+        }
+    }
+}
+
 impl HostState {
     fn record_host_call(&mut self) -> wasmtime::Result<()> {
         let next = self
@@ -1179,6 +1583,15 @@ impl HostState {
         if let Some(error) = self.record_fallible_host_call()? {
             return Ok(Err(error));
         }
+        self.perform_http_inner(origin, request, bearer)
+    }
+
+    fn perform_http_inner(
+        &mut self,
+        origin: String,
+        request: HttpRequest,
+        bearer: Option<Resource<SecretHandle>>,
+    ) -> wasmtime::Result<Result<HttpResponse, String>> {
         self.require_grant("http.request", &origin)?;
         let parsed = krit_capability::HttpOrigin::parse_exact(&origin).map_err(|error| {
             wasmtime::Error::new(RuntimeError::authorization(format!(
@@ -1254,6 +1667,15 @@ impl HostState {
         if let Some(error) = self.record_fallible_host_call()? {
             return Ok(Err(error));
         }
+        self.perform_ai_inner(adapter_name, input, None)
+    }
+
+    fn perform_ai_inner(
+        &mut self,
+        adapter_name: String,
+        input: String,
+        stable_idempotency_key: Option<&str>,
+    ) -> wasmtime::Result<Result<String, String>> {
         self.require_grant("ai.invoke", &adapter_name)?;
         let next_ai_calls = self
             .ai_calls
@@ -1299,11 +1721,17 @@ impl HostState {
             }
             None => None,
         };
-        let idempotency_key = self
-            .agent_host
-            .next_ai_idempotency_key(&adapter_name)
-            .map_err(wasmtime::Error::new)?;
-        let request = match adapter.build_request(&input, &idempotency_key) {
+        let generated_key;
+        let idempotency_key = if let Some(key) = stable_idempotency_key {
+            key
+        } else {
+            generated_key = self
+                .agent_host
+                .next_ai_idempotency_key(&adapter_name)
+                .map_err(wasmtime::Error::new)?;
+            &generated_key
+        };
+        let request = match adapter.build_request(&input, idempotency_key) {
             Ok(request) => request,
             Err(error) => return Ok(Err(error)),
         };
@@ -1581,6 +2009,69 @@ fn map_wasmtime_error(error: wasmtime::Error) -> RuntimeError {
     } else {
         RuntimeError::guest("K4001", format!("component execution failed: {message}"))
     }
+}
+
+fn replay_safe_http(request: &HttpRequest, max_key_bytes: usize) -> bool {
+    if matches!(request.method.as_str(), "GET" | "HEAD") {
+        return true;
+    }
+    let mut keys = request
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("idempotency-key"));
+    let Some(key) = keys.next() else {
+        return false;
+    };
+    keys.next().is_none() && policy::valid_idempotency_key(&key.value, max_key_bytes)
+}
+
+fn replay_http_digest(origin: &str, request: &HttpRequest) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hash_replay_part(&mut hasher, origin.as_bytes());
+    hasher.update(policy::exact_request_digest(request).as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn replay_ai_digest(adapter: &str, input: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hash_replay_part(&mut hasher, adapter.as_bytes());
+    hash_replay_part(&mut hasher, input.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn stable_replay_idempotency_key(
+    artifact: &[u8; 32],
+    store: &str,
+    operation: &str,
+    input_digest: &[u8; 32],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(artifact);
+    hash_replay_part(&mut hasher, store.as_bytes());
+    hash_replay_part(&mut hasher, operation.as_bytes());
+    hasher.update(input_digest);
+    format!("krit-replay-{}", hasher.finalize().to_hex())
+}
+
+fn hash_replay_part(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn wall_clock_millis() -> wasmtime::Result<i64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| {
+            wasmtime::Error::new(RuntimeError::durable_state(
+                "system clock is before the Unix epoch",
+            ))
+        })?
+        .as_millis();
+    i64::try_from(millis).map_err(|_| {
+        wasmtime::Error::new(RuntimeError::durable_state(
+            "system clock exceeds durable timestamp range",
+        ))
+    })
 }
 
 struct DeadlineWorker {

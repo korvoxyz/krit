@@ -1,6 +1,6 @@
 # WebAssembly sandbox
 
-**Status:** Policy-1 scalar path and Phase 4 policy-2 host implemented
+**Status:** Policy-1 scalar path and Phase 6 policy-2 durable host implemented
 **Artifact metadata schema:** 1
 **Validation policy:** 1
 
@@ -81,7 +81,7 @@ imports. Krit does not grant a general WASI environment; Preview 1 inheritance
 is not a compatibility path.
 
 The same package defines buildable `webhook`, `config`, `secrets`, `http`,
-`http-anonymous`, `ai`, and `logging` interfaces. A finite deterministic
+`http-anonymous`, `ai`, `logging`, and `state` interfaces. A finite deterministic
 webhook world exists for every supported effect combination. HTTP without
 `secret.read` selects the
 anonymous interface, so unauthenticated HTTP does not implicitly import
@@ -127,6 +127,13 @@ accepts `option<borrow<secrets.secret>>`; `http-anonymous` omits the bearer
 parameter. A runtime-only all-host binding world supplies linker definitions,
 but extra definitions are unreachable: validation accepts only the exact
 component imports and corresponding finite compiler world.
+
+The state interface exposes bounded string key/value and checkpoint operations
+plus explicit anonymous HTTP and AI replay operations. State-enabled worlds are
+the finite existing webhook effect combinations plus exactly
+`krit:runtime/state@0.2.0`. Replay external authority remains exact metadata
+requirements; importing state does not import the general HTTP or AI
+interfaces.
 
 ## Build pipeline
 
@@ -180,6 +187,8 @@ Policy 2 adds a deliberately bounded webhook ABI:
 - Result/Option matching and static references to non-capturing helpers
 - a typed webhook export plus exact stdout/config/secrets/HTTP imports
 - neutral AI string results and ordered structured logging fields
+- transactional string state, named checkpoints, anonymous HTTP replay, and AI
+  replay through the state interface
 
 The core uses guest linear-memory offsets, never host pointers. Canonical
 parameters/results, list elements, records, variants, UTF-8, and allocation
@@ -211,6 +220,9 @@ Schema-1 adjacent metadata contains compiler and language versions, edition,
 package name/version, target, WIT world, package-relative entry, exact digest
 and byte size, sorted effects/imports, exact resource requirements, build
 profile, approval-required AI/bearer resources, and validation policy version.
+State-free artifacts remain policy 1. Artifacts importing the state interface
+use policy 2 and must carry exact state and replay external-resource
+requirements.
 Embedded metadata is bounded and
 contains no source text, absolute paths, credentials, or secret values.
 `krit-wasm::validate_artifact`
@@ -239,7 +251,9 @@ Webhook invocation uses the same Engine but a fresh Store, instance, resource
 table, output buffer, structured-log buffer, and host handles. A reusable
 embedding-owned `AgentHost` separately owns bounded rate and idempotency state
 across requests. Idempotency is bounded by both entry count and retained
-response bytes. Config is explicit immutable startup
+response bytes. Phase 6 optionally backs idempotency and guest-visible state
+with host-configured SQLite while every component Store and transaction
+overlay remains fresh. Config is explicit immutable startup
 data, never inherited environment. Secret bytes live behind an opaque
 Wasmtime resource in a host-owned `zeroize` buffer. Persistent buffers are
 zeroed on final drop; TLS/client-library transient copies cannot be guaranteed
@@ -278,11 +292,21 @@ progress callback during active transfers. DNS worker creation is capped.
 Epoch interruption remains responsible for guest execution but is not relied
 upon to interrupt blocking HTTP.
 
-Inbound mutating requests may use one bounded `Idempotency-Key`.
-`AgentHost` stores only completed serialized responses in a process-local
-TTL/LRU cache. Matching requests replay without Store creation; digest
-conflicts return 409. Failed/trapped invocations and in-progress work are not
-cached. This is explicitly not durable or distributed state.
+Inbound mutating requests may use one bounded `Idempotency-Key`. Without a
+schema-3 durable store selection, `AgentHost` preserves the Phase 4
+process-local TTL/LRU cache. With an explicit manifest-granted selection,
+SQLite persists in-progress leases and completed serialized responses across
+`AgentHost` and process restarts. Matching requests replay without Store
+creation; credential-sensitive digest conflicts return 409; live reservations
+reject duplicate work. Failed/trapped/state-conflicted invocations remove
+their owned reservation.
+
+Invocation state writes and checkpoints are staged in host memory and commit
+with one revision-checked SQLite transaction only after successful guest and
+response validation. Replay records are separate immediate durable commits so
+completed external operations survive a later guest trap/cancellation. The
+remaining provider-effect-before-record crash window is explicit and no
+distributed exactly-once behavior is claimed.
 
 The wall deadline uses Wasmtime epoch interruption. Because an engine epoch is
 shared across Stores, each `Runtime` serializes component compilation and
@@ -307,6 +331,9 @@ HTTP/TLS client to `curl` 0.4.50, secret clearing to `zeroize` 1.9.0, and CLI
 serving to `tiny_http` 0.12.0. Unix secret opens use `rustix` 1.1.4 with
 `O_NOFOLLOW`. Default features are disabled except curl's rustls and static-libcurl
 backends. The ignored `trusted_public_https_smoke_test` exercises platform
+Durable state uses locked `rusqlite` 0.40.2 with bundled SQLite through the
+isolated `krit-state` crate. SQLite paths are never guest-visible and no system
+SQLite linkage is used. The ignored `trusted_public_https_smoke_test` exercises platform
 roots when public DNS/network access is available. Every curl/libcurl upgrade requires an audited
 `CURLOPT_RESOLVE`, proxy, redirect, TLS, timeout, and ordered-header review
 plus the complete network test suite. Exact resolved transitive versions
@@ -349,6 +376,17 @@ the bounded policy-2 webhook surface:
 | Overall HTTP timeout | 750 ms | 20 s |
 | Host config bytes | 64 KiB | 1 MiB |
 | Bytes per secret | 64 KiB | 1 MiB |
+| Durable stores | 4 | 16 |
+| State operations per invocation | 128 | 1,024 |
+| State key | 256 bytes | 4 KiB |
+| State/checkpoint value | 64 KiB | 1 MiB |
+| Staged state transaction | 1 MiB | 16 MiB |
+| Durable database | 64 MiB | 1 GiB |
+| SQLite busy timeout | 250 ms | 5 s |
+| Replay entries per store | 1,024 | 65,536 |
+| Replay retained bytes | 16 MiB | 256 MiB |
+| Replay TTL | 7 days | 30 days |
+| Replay/in-progress lease | 30 seconds | 5 minutes |
 
 The embedded authority document is capped at 48 KiB, leaving deterministic
 headroom for package, compiler, digest, import, and entry fields in the
@@ -398,6 +436,13 @@ fields, inline values, environment inheritance, ungranted names, escaping
 paths, symlinks, oversized files, and group/other-readable Unix secret files
 fail closed.
 
+Schema 3 retains all schema-2 fields and adds manifest-narrowed durable stores,
+durability/limit policy, and an optional durable inbound-idempotency store.
+There is no default state path. Relative `.db` paths require existing
+owner-only directories on Unix; database/WAL/SHM files reject symlinks,
+non-files, oversize data, and group/other permissions. Schema 1 and 2 remain
+readable unchanged.
+
 `invoke` response JSON remains exact on stdout. Structured application logs
 are emitted as JSON Lines on stderr only after completion. `serve` never
 places them in an HTTP body. Validated redacted failure logs may publish with
@@ -407,8 +452,9 @@ deployment and approval evaluation `not-evaluated`.
 
 ## Instance lifecycle
 
-The safest baseline creates a fresh logical application state for each
-invocation. Hosts may pool initialized instances only when:
+The safest baseline creates a fresh component instance and invocation
+transaction overlay for each invocation. Explicit durable state lives only in
+the host store. Hosts may pool initialized instances only when:
 
 - linear memory and mutable globals are reset
 - capability handles cannot survive the invocation

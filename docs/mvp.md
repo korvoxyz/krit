@@ -72,7 +72,7 @@ The MVP does not train or host its own model.
 
 - package registry and publishing
 - arbitrary Rust extension authoring
-- databases and durable transactions
+- general databases and distributed transactions
 - queues and schedules
 - many provider connectors
 - autonomous whole-project rewriting
@@ -112,5 +112,6 @@ The stateless runtime portion of this MVP is complete at the Phase 4 gate, and
 Phase 5 guided authoring is complete through the deterministic language server
 and explicit inspect/suggest/review/accept assistance workflow. Assistance
 remains optional and disabled without explicit provider configuration.
-Process-local rate and idempotency policy is intentionally not durable or
-distributed; Phase 6 owns transactional replay and state.
+Phase 6 now provides bounded local transactional state, checkpoints, replay,
+and optional durable inbound idempotency. Rate state remains process-local,
+and no distributed exactly-once claim is made.

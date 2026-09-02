@@ -2080,41 +2080,13 @@ impl<'a> Verifier<'a> {
                     )));
                 };
                 let mut requirements = function.requirements().iter().cloned().collect::<Vec<_>>();
-                if let Some(builtin) = self.builtin_values.get(callee)
-                    && matches!(
-                        builtin,
-                        Builtin::AiInvoke
-                            | Builtin::ConfigString
-                            | Builtin::Secret
-                            | Builtin::HttpRequest
-                    )
-                {
-                    let argument = arguments.first().ok_or_else(|| {
-                        IrError::new(format!(
-                            "{} resource host call has no argument",
-                            operation.result
-                        ))
-                    })?;
-                    let resource = self.string_literals.get(argument).ok_or_else(|| {
-                        IrError::new(format!(
-                            "{} resource host call argument is not a string literal",
-                            operation.result
-                        ))
-                    })?;
-                    let capability = match builtin {
-                        Builtin::AiInvoke => crate::Effect::AiInvoke,
-                        Builtin::ConfigString => crate::Effect::ConfigRead,
-                        Builtin::Secret => crate::Effect::SecretRead,
-                        Builtin::HttpRequest => crate::Effect::HttpRequest,
-                        _ => unreachable!("matched resource host built-ins"),
-                    };
-                    requirements.push(crate::CapabilityRequirement::new(
-                        capability,
-                        resource.clone(),
-                    ));
+                if let Some(builtin) = self.builtin_values.get(callee) {
+                    requirements
+                        .extend(self.builtin_direct_requirements(operation, *builtin, arguments)?);
                 }
                 require_requirements(operation, &RequirementSet::from_requirements(requirements))
             }
+
             OperationKind::If {
                 consequent,
                 alternative,
@@ -2145,6 +2117,72 @@ impl<'a> Verifier<'a> {
             | OperationKind::Discard { .. } => {
                 expect_requirements(operation, &RequirementSet::default())
             }
+        }
+    }
+
+    fn builtin_direct_requirements(
+        &self,
+        operation: &CoreOperation,
+        builtin: Builtin,
+        arguments: &[ValueId],
+    ) -> Result<Vec<crate::CapabilityRequirement>, IrError> {
+        let resource = |index: usize| {
+            let argument = arguments.get(index).ok_or_else(|| {
+                IrError::new(format!(
+                    "{} host call has too few arguments",
+                    operation.result
+                ))
+            })?;
+            self.string_literals.get(argument).cloned().ok_or_else(|| {
+                IrError::new(format!(
+                    "{} host call resource is not a string literal",
+                    operation.result
+                ))
+            })
+        };
+        match builtin {
+            Builtin::AiInvoke => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::AiInvoke,
+                resource(0)?,
+            )]),
+            Builtin::ConfigString => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::ConfigRead,
+                resource(0)?,
+            )]),
+            Builtin::Secret => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::SecretRead,
+                resource(0)?,
+            )]),
+            Builtin::HttpRequest => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::HttpRequest,
+                resource(0)?,
+            )]),
+            Builtin::StateGet
+            | Builtin::StatePut
+            | Builtin::StateDelete
+            | Builtin::CheckpointGet
+            | Builtin::CheckpointPut => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::StateTransaction,
+                resource(0)?,
+            )]),
+            Builtin::ReplayHttp => Ok(vec![
+                crate::CapabilityRequirement::new(crate::Effect::StateTransaction, resource(0)?),
+                crate::CapabilityRequirement::new(crate::Effect::HttpRequest, resource(2)?),
+            ]),
+            Builtin::ReplayAi => Ok(vec![
+                crate::CapabilityRequirement::new(crate::Effect::StateTransaction, resource(0)?),
+                crate::CapabilityRequirement::new(crate::Effect::AiInvoke, resource(2)?),
+            ]),
+            Builtin::Print
+            | Builtin::Println
+            | Builtin::Some
+            | Builtin::None
+            | Builtin::Ok
+            | Builtin::Err
+            | Builtin::JsonEncode
+            | Builtin::JsonDecode
+            | Builtin::LogInfo
+            | Builtin::LogError => Ok(Vec::new()),
         }
     }
 
@@ -2279,6 +2317,118 @@ impl<'a> Verifier<'a> {
                         "{} has invalid signature",
                         builtin.as_str()
                     )))
+                }
+            }
+            Builtin::StateGet | Builtin::CheckpointGet => {
+                let Type::Function(function) = ty else {
+                    return Err(IrError::new(format!(
+                        "{} has non-function type",
+                        builtin.as_str()
+                    )));
+                };
+                let expected = Type::Result(
+                    Arc::new(Type::Option(Arc::new(Type::String))),
+                    Arc::new(Type::String),
+                );
+                if function.parameters() == [Arc::new(Type::String), Arc::new(Type::String)]
+                    && function.return_type() == &expected
+                    && function
+                        .effects()
+                        .contains(&crate::Effect::StateTransaction)
+                {
+                    Ok(())
+                } else {
+                    Err(IrError::new(format!(
+                        "{} has invalid signature",
+                        builtin.as_str()
+                    )))
+                }
+            }
+            Builtin::StatePut | Builtin::CheckpointPut => {
+                let Type::Function(function) = ty else {
+                    return Err(IrError::new(format!(
+                        "{} has non-function type",
+                        builtin.as_str()
+                    )));
+                };
+                let expected = Type::Result(Arc::new(Type::Unit), Arc::new(Type::String));
+                if function.parameters()
+                    == [
+                        Arc::new(Type::String),
+                        Arc::new(Type::String),
+                        Arc::new(Type::String),
+                    ]
+                    && function.return_type() == &expected
+                    && function
+                        .effects()
+                        .contains(&crate::Effect::StateTransaction)
+                {
+                    Ok(())
+                } else {
+                    Err(IrError::new(format!(
+                        "{} has invalid signature",
+                        builtin.as_str()
+                    )))
+                }
+            }
+            Builtin::StateDelete => {
+                let Type::Function(function) = ty else {
+                    return Err(IrError::new("state_delete has non-function type"));
+                };
+                let expected = Type::Result(Arc::new(Type::Unit), Arc::new(Type::String));
+                if function.parameters() == [Arc::new(Type::String), Arc::new(Type::String)]
+                    && function.return_type() == &expected
+                    && function
+                        .effects()
+                        .contains(&crate::Effect::StateTransaction)
+                {
+                    Ok(())
+                } else {
+                    Err(IrError::new("state_delete has invalid signature"))
+                }
+            }
+            Builtin::ReplayHttp => {
+                let Type::Function(function) = ty else {
+                    return Err(IrError::new("replay_http has non-function type"));
+                };
+                let expected = Type::Result(Arc::new(Type::HttpResponse), Arc::new(Type::String));
+                if function.parameters()
+                    == [
+                        Arc::new(Type::String),
+                        Arc::new(Type::String),
+                        Arc::new(Type::String),
+                        Arc::new(Type::HttpRequest),
+                    ]
+                    && function.return_type() == &expected
+                    && function
+                        .effects()
+                        .contains(&crate::Effect::StateTransaction)
+                {
+                    Ok(())
+                } else {
+                    Err(IrError::new("replay_http has invalid signature"))
+                }
+            }
+            Builtin::ReplayAi => {
+                let Type::Function(function) = ty else {
+                    return Err(IrError::new("replay_ai has non-function type"));
+                };
+                let expected = Type::Result(Arc::new(Type::String), Arc::new(Type::String));
+                if function.parameters()
+                    == [
+                        Arc::new(Type::String),
+                        Arc::new(Type::String),
+                        Arc::new(Type::String),
+                        Arc::new(Type::String),
+                    ]
+                    && function.return_type() == &expected
+                    && function
+                        .effects()
+                        .contains(&crate::Effect::StateTransaction)
+                {
+                    Ok(())
+                } else {
+                    Err(IrError::new("replay_ai has invalid signature"))
                 }
             }
         }

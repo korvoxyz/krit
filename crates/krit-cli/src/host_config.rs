@@ -9,8 +9,9 @@ use std::{
 
 use krit_package::Manifest;
 use krit_runtime::{
-    AgentHost, AgentHostPolicy, AiAdapterConfig, ApprovalOperation, ExplicitApprovalPolicy,
-    HostInputs, HttpJsonAdapterConfig, IdempotencyPolicy, RateLimitPolicy, RetryPolicy,
+    AgentHost, AgentHostPolicy, AiAdapterConfig, ApprovalOperation, Durability, DurableState,
+    DurableStoreDefinition, DurableStoreLimits, ExplicitApprovalPolicy, HostInputs,
+    HttpJsonAdapterConfig, IdempotencyPolicy, RateLimitPolicy, RetentionPolicy, RetryPolicy,
     RuntimeLimits, SecretStore,
 };
 use serde::Deserialize;
@@ -24,6 +25,7 @@ pub(crate) enum HostConfigErrorKind {
 #[derive(Debug)]
 pub(crate) struct HostConfigError {
     kind: HostConfigErrorKind,
+    code: &'static str,
     message: String,
 }
 
@@ -61,6 +63,72 @@ struct HostConfigV2 {
     #[serde(default)]
     idempotency: IdempotencyFile,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostConfigV3 {
+    schema: u32,
+    #[serde(default)]
+    config: BTreeMap<String, String>,
+    #[serde(default)]
+    secrets: BTreeMap<String, SecretReference>,
+    #[serde(default)]
+    ai_adapters: BTreeMap<String, AiAdapterFile>,
+    #[serde(default)]
+    approvals: Vec<ApprovalFile>,
+    #[serde(default)]
+    retries: RetriesFile,
+    #[serde(default)]
+    rate_limits: RateLimitsFile,
+    #[serde(default)]
+    idempotency: IdempotencyFile,
+    state: StateFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StateFile {
+    #[serde(default)]
+    stores: BTreeMap<String, StateStoreFile>,
+    #[serde(default)]
+    durable_idempotency_store: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StateStoreFile {
+    path: PathBuf,
+    durability: DurabilityFile,
+    busy_timeout_ms: u64,
+    max_operations: usize,
+    max_key_bytes: usize,
+    max_value_bytes: usize,
+    max_transaction_bytes: usize,
+    max_database_bytes: u64,
+    max_replay_entries: usize,
+    max_replay_bytes: usize,
+    replay_ttl_seconds: u64,
+    lease_seconds: u64,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DurabilityFile {
+    Full,
+    Normal,
+}
+
+const MAX_STATE_STORES: usize = 16;
+const MAX_STATE_OPERATIONS: usize = 1024;
+const MAX_STATE_KEY_BYTES: usize = 4 * 1024;
+const MAX_STATE_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_STATE_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STATE_DATABASE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_STATE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REPLAY_ENTRIES: usize = 65_536;
+const MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
+const MAX_REPLAY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MAX_REPLAY_LEASE: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -202,9 +270,14 @@ impl HostConfigError {
         &self.message
     }
 
+    pub(crate) const fn code(&self) -> &'static str {
+        self.code
+    }
+
     fn input(message: impl Into<String>) -> Self {
         Self {
             kind: HostConfigErrorKind::Input,
+            code: "K7003",
             message: message.into(),
         }
     }
@@ -212,7 +285,16 @@ impl HostConfigError {
     fn authorization(message: impl Into<String>) -> Self {
         Self {
             kind: HostConfigErrorKind::Authorization,
+            code: "K5001",
             message: message.into(),
+        }
+    }
+
+    fn durable(error: krit_runtime::RuntimeError) -> Self {
+        Self {
+            kind: HostConfigErrorKind::Input,
+            code: error.code(),
+            message: error.message().to_owned(),
         }
     }
 }
@@ -261,88 +343,354 @@ pub(crate) fn load(
                 ))
             })?;
             debug_assert_eq!(file.schema, 2);
-            let inputs = load_inputs(path, manifest, limits, file.config, file.secrets)?;
-            let mut policy = AgentHostPolicy::default();
-            for (name, adapter) in file.ai_adapters {
-                require_manifest_ai(manifest, &name)?;
-                let adapter = match adapter {
-                    AiAdapterFile::HttpJson {
-                        origin,
-                        path,
-                        model,
-                        secret,
-                        max_input_bytes,
-                        max_response_bytes,
-                        timeout_ms,
-                    } => {
-                        require_manifest_http(manifest, &origin)?;
-                        if let Some(secret) = &secret {
-                            require_manifest_secret(manifest, secret)?;
-                        }
-                        AiAdapterConfig::HttpJson(HttpJsonAdapterConfig {
-                            origin,
-                            path,
-                            model,
-                            secret,
-                            max_input_bytes,
-                            max_response_bytes,
-                            timeout: milliseconds(timeout_ms, "AI adapter timeout")?,
-                        })
-                    }
-                };
-                policy.ai_adapters.insert(name, adapter);
-            }
-            policy.default_http_retry = retry_policy(file.retries.default_http)?;
-            policy.default_ai_retry = retry_policy(file.retries.default_ai)?;
-            for (origin, retry) in file.retries.http {
-                require_manifest_http(manifest, &origin)?;
-                policy.http_retries.insert(origin, retry_policy(retry)?);
-            }
-            for (adapter, retry) in file.retries.ai {
-                require_manifest_ai(manifest, &adapter)?;
-                policy.ai_retries.insert(adapter, retry_policy(retry)?);
-            }
-            policy.default_http_rate = rate_policy(file.rate_limits.default_http)?;
-            policy.default_ai_rate = rate_policy(file.rate_limits.default_ai)?;
-            for (origin, rate) in file.rate_limits.http {
-                require_manifest_http(manifest, &origin)?;
-                policy.http_rates.insert(origin, rate_policy(rate)?);
-            }
-            for (adapter, rate) in file.rate_limits.ai {
-                require_manifest_ai(manifest, &adapter)?;
-                policy.ai_rates.insert(adapter, rate_policy(rate)?);
-            }
-            policy.max_tracked_resources = file.rate_limits.max_tracked_resources;
-            policy.idempotency = IdempotencyPolicy {
-                max_entries: file.idempotency.max_entries,
-                max_bytes: file.idempotency.max_bytes,
-                ttl: milliseconds(file.idempotency.ttl_ms, "idempotency TTL")?,
-                max_key_bytes: file.idempotency.max_key_bytes,
+            load_configured_host(path, manifest, limits, file, DurableState::default())
+        }
+        3 => {
+            let file: HostConfigV3 = serde_json::from_slice(&bytes).map_err(|error| {
+                HostConfigError::input(format!(
+                    "invalid strict schema-3 host config {}: {error}",
+                    path.display()
+                ))
+            })?;
+            debug_assert_eq!(file.schema, 3);
+            let durable = load_durable_state(path, manifest, file.state)?;
+            let compatible = HostConfigV2 {
+                schema: 2,
+                config: file.config,
+                secrets: file.secrets,
+                ai_adapters: file.ai_adapters,
+                approvals: file.approvals,
+                retries: file.retries,
+                rate_limits: file.rate_limits,
+                idempotency: file.idempotency,
             };
-
-            let mut approvals = Vec::new();
-            for approval in file.approvals {
-                let operation = match approval.operation {
-                    ApprovalOperationFile::AiInvoke => {
-                        require_manifest_ai(manifest, &approval.resource)?;
-                        ApprovalOperation::AiInvoke
-                    }
-                    ApprovalOperationFile::HttpBearer => {
-                        require_manifest_http(manifest, &approval.resource)?;
-                        ApprovalOperation::HttpBearer
-                    }
-                };
-                approvals.push((operation, approval.resource));
-            }
-            let approvals = ExplicitApprovalPolicy::new(approvals)
-                .map_err(|error| HostConfigError::input(error.message().to_owned()))?;
-            AgentHost::new(inputs, policy, Arc::new(approvals))
-                .map_err(|error| HostConfigError::input(error.message().to_owned()))
+            load_configured_host(path, manifest, limits, compatible, durable)
         }
         unsupported => Err(HostConfigError::input(format!(
-            "unsupported host config schema {unsupported}; expected 1 or 2"
+            "unsupported host config schema {unsupported}; expected 1, 2, or 3"
         ))),
     }
+}
+
+fn load_configured_host(
+    path: &Path,
+    manifest: &Manifest,
+    limits: RuntimeLimits,
+    file: HostConfigV2,
+    durable: DurableState,
+) -> Result<AgentHost, HostConfigError> {
+    let inputs = load_inputs(path, manifest, limits, file.config, file.secrets)?;
+    let mut policy = AgentHostPolicy::default();
+    for (name, adapter) in file.ai_adapters {
+        require_manifest_ai(manifest, &name)?;
+        let adapter = match adapter {
+            AiAdapterFile::HttpJson {
+                origin,
+                path,
+                model,
+                secret,
+                max_input_bytes,
+                max_response_bytes,
+                timeout_ms,
+            } => {
+                require_manifest_http(manifest, &origin)?;
+                if let Some(secret) = &secret {
+                    require_manifest_secret(manifest, secret)?;
+                }
+                AiAdapterConfig::HttpJson(HttpJsonAdapterConfig {
+                    origin,
+                    path,
+                    model,
+                    secret,
+                    max_input_bytes,
+                    max_response_bytes,
+                    timeout: milliseconds(timeout_ms, "AI adapter timeout")?,
+                })
+            }
+        };
+        policy.ai_adapters.insert(name, adapter);
+    }
+    policy.default_http_retry = retry_policy(file.retries.default_http)?;
+    policy.default_ai_retry = retry_policy(file.retries.default_ai)?;
+    for (origin, retry) in file.retries.http {
+        require_manifest_http(manifest, &origin)?;
+        policy.http_retries.insert(origin, retry_policy(retry)?);
+    }
+    for (adapter, retry) in file.retries.ai {
+        require_manifest_ai(manifest, &adapter)?;
+        policy.ai_retries.insert(adapter, retry_policy(retry)?);
+    }
+    policy.default_http_rate = rate_policy(file.rate_limits.default_http)?;
+    policy.default_ai_rate = rate_policy(file.rate_limits.default_ai)?;
+    for (origin, rate) in file.rate_limits.http {
+        require_manifest_http(manifest, &origin)?;
+        policy.http_rates.insert(origin, rate_policy(rate)?);
+    }
+    for (adapter, rate) in file.rate_limits.ai {
+        require_manifest_ai(manifest, &adapter)?;
+        policy.ai_rates.insert(adapter, rate_policy(rate)?);
+    }
+    policy.max_tracked_resources = file.rate_limits.max_tracked_resources;
+    policy.idempotency = IdempotencyPolicy {
+        max_entries: file.idempotency.max_entries,
+        max_bytes: file.idempotency.max_bytes,
+        ttl: milliseconds(file.idempotency.ttl_ms, "idempotency TTL")?,
+        max_key_bytes: file.idempotency.max_key_bytes,
+    };
+
+    let mut approvals = Vec::new();
+    for approval in file.approvals {
+        let operation = match approval.operation {
+            ApprovalOperationFile::AiInvoke => {
+                require_manifest_ai(manifest, &approval.resource)?;
+                ApprovalOperation::AiInvoke
+            }
+            ApprovalOperationFile::HttpBearer => {
+                require_manifest_http(manifest, &approval.resource)?;
+                ApprovalOperation::HttpBearer
+            }
+        };
+        approvals.push((operation, approval.resource));
+    }
+    let approvals = ExplicitApprovalPolicy::new(approvals)
+        .map_err(|error| HostConfigError::input(error.message().to_owned()))?;
+    AgentHost::new_with_state(inputs, policy, Arc::new(approvals), durable)
+        .map_err(|error| HostConfigError::input(error.message().to_owned()))
+}
+
+fn load_durable_state(
+    host_config_path: &Path,
+    manifest: &Manifest,
+    state: StateFile,
+) -> Result<DurableState, HostConfigError> {
+    if state.stores.len() > MAX_STATE_STORES {
+        return Err(HostConfigError::input(format!(
+            "too many durable stores; maximum is {MAX_STATE_STORES}"
+        )));
+    }
+    let root = host_config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()
+        .map_err(|_| HostConfigError::input("host config directory is not accessible"))?;
+    let mut definitions = BTreeMap::new();
+    let mut paths = BTreeMap::<PathBuf, String>::new();
+    for (name, file) in state.stores {
+        require_manifest_state(manifest, &name)?;
+        validate_state_store_file(&file)?;
+        validate_relative_state_path(&file.path)?;
+        let database = prepare_state_database_path(&root, &file.path, file.max_database_bytes)?;
+        if let Some(previous) = paths.insert(database.clone(), name.clone()) {
+            return Err(HostConfigError::input(format!(
+                "durable stores `{previous}` and `{name}` use the same database path"
+            )));
+        }
+        let busy_timeout = milliseconds(file.busy_timeout_ms, "state busy timeout")?;
+        let replay_ttl = seconds(file.replay_ttl_seconds, "state replay TTL")?;
+        let lease = seconds(file.lease_seconds, "state replay lease")?;
+        definitions.insert(
+            name,
+            DurableStoreDefinition {
+                path: database,
+                durability: match file.durability {
+                    DurabilityFile::Full => Durability::Full,
+                    DurabilityFile::Normal => Durability::Normal,
+                },
+                limits: DurableStoreLimits {
+                    busy_timeout,
+                    max_operations: file.max_operations,
+                    max_key_bytes: file.max_key_bytes,
+                    max_value_bytes: file.max_value_bytes,
+                    max_transaction_bytes: file.max_transaction_bytes,
+                    max_database_bytes: file.max_database_bytes,
+                    max_replay_entries: file.max_replay_entries,
+                    max_replay_bytes: file.max_replay_bytes,
+                },
+                replay: RetentionPolicy {
+                    max_entries: file.max_replay_entries,
+                    max_bytes: file.max_replay_bytes,
+                    ttl: replay_ttl,
+                    lease,
+                },
+            },
+        );
+    }
+    if let Some(name) = &state.durable_idempotency_store {
+        require_manifest_state(manifest, name)?;
+        if !definitions.contains_key(name) {
+            return Err(HostConfigError::input(
+                "durable idempotency store is not present in `state.stores`",
+            ));
+        }
+    }
+    DurableState::open(definitions, state.durable_idempotency_store)
+        .map_err(HostConfigError::durable)
+}
+
+fn validate_state_store_file(file: &StateStoreFile) -> Result<(), HostConfigError> {
+    let busy = Duration::from_millis(file.busy_timeout_ms);
+    let replay_ttl = Duration::from_secs(file.replay_ttl_seconds);
+    let lease = Duration::from_secs(file.lease_seconds);
+    if busy.is_zero()
+        || busy > MAX_STATE_BUSY_TIMEOUT
+        || file.max_operations == 0
+        || file.max_operations > MAX_STATE_OPERATIONS
+        || file.max_key_bytes == 0
+        || file.max_key_bytes > MAX_STATE_KEY_BYTES
+        || file.max_value_bytes == 0
+        || file.max_value_bytes > MAX_STATE_VALUE_BYTES
+        || file.max_transaction_bytes == 0
+        || file.max_transaction_bytes > MAX_STATE_TRANSACTION_BYTES
+        || file.max_database_bytes < 4096
+        || file.max_database_bytes > MAX_STATE_DATABASE_BYTES
+        || file.max_replay_entries == 0
+        || file.max_replay_entries > MAX_REPLAY_ENTRIES
+        || file.max_replay_bytes == 0
+        || file.max_replay_bytes > MAX_REPLAY_BYTES
+        || replay_ttl.is_zero()
+        || replay_ttl > MAX_REPLAY_TTL
+        || lease.is_zero()
+        || lease > MAX_REPLAY_LEASE
+    {
+        return Err(HostConfigError::input(
+            "durable state store limits exceed the Phase 6 bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relative_state_path(path: &Path) -> Result<(), HostConfigError> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.to_string_lossy().contains('\\')
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || path.extension().and_then(|extension| extension.to_str()) != Some("db")
+    {
+        return Err(HostConfigError::input(
+            "durable state path must be a host-config-relative `.db` path without `.` or `..`",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_state_database_path(
+    root: &Path,
+    relative: &Path,
+    max_bytes: u64,
+) -> Result<PathBuf, HostConfigError> {
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    let mut lexical = root.to_owned();
+    for component in parent_relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(HostConfigError::input(
+                "durable state parent path is invalid",
+            ));
+        };
+        lexical.push(name);
+        let metadata = fs::symlink_metadata(&lexical)
+            .map_err(|_| HostConfigError::input("durable state directory is not accessible"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(HostConfigError::input(
+                "durable state directory components must be real directories",
+            ));
+        }
+    }
+    let parent = root
+        .join(parent_relative)
+        .canonicalize()
+        .map_err(|_| HostConfigError::input("durable state directory is not accessible"))?;
+    if !parent.starts_with(root) {
+        return Err(HostConfigError::input(
+            "durable state directory escapes the host config root",
+        ));
+    }
+    validate_owner_only_directory(&parent)?;
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| HostConfigError::input("durable state path has no file name"))?;
+    let database = parent.join(file_name);
+    if database.exists() {
+        validate_owner_only_state_file(&database, max_bytes)?;
+    } else {
+        create_owner_only_state_file(&database)?;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = database.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        if sidecar.exists() {
+            validate_owner_only_state_file(&sidecar, max_bytes)?;
+        }
+    }
+    Ok(database)
+}
+
+#[cfg(unix)]
+fn validate_owner_only_directory(path: &Path) -> Result<(), HostConfigError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::metadata(path)
+        .map_err(|_| HostConfigError::input("could not inspect durable state directory"))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(HostConfigError::input(
+            "durable state directory must be owner-only on Unix",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_owner_only_directory(_path: &Path) -> Result<(), HostConfigError> {
+    Ok(())
+}
+
+fn validate_owner_only_state_file(path: &Path, max_bytes: u64) -> Result<(), HostConfigError> {
+    let link = fs::symlink_metadata(path)
+        .map_err(|_| HostConfigError::input("could not inspect durable state file"))?;
+    if link.file_type().is_symlink() || !link.is_file() || link.len() > max_bytes {
+        return Err(HostConfigError::input(
+            "durable state file is unsafe or exceeds its configured byte limit",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if link.permissions().mode() & 0o077 != 0 {
+            return Err(HostConfigError::input(
+                "durable state files must be owner-only on Unix",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_owner_only_state_file(path: &Path) -> Result<(), HostConfigError> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::open(
+        path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )
+    .map(|_| ())
+    .map_err(|_| HostConfigError::input("could not create owner-only durable state file"))
+}
+
+#[cfg(not(unix))]
+fn create_owner_only_state_file(path: &Path) -> Result<(), HostConfigError> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(|_| ())
+        .map_err(|_| HostConfigError::input("could not create durable state file"))
 }
 
 fn load_inputs(
@@ -419,6 +767,21 @@ fn require_manifest_ai(manifest: &Manifest, name: &str) -> Result<(), HostConfig
     }
 }
 
+fn require_manifest_state(manifest: &Manifest, name: &str) -> Result<(), HostConfigError> {
+    if manifest
+        .capabilities
+        .state
+        .iter()
+        .any(|entry| entry == name)
+    {
+        Ok(())
+    } else {
+        Err(HostConfigError::authorization(format!(
+            "durable state store `{name}` is not granted by the package manifest"
+        )))
+    }
+}
+
 fn require_manifest_http(manifest: &Manifest, origin: &str) -> Result<(), HostConfigError> {
     if manifest
         .capabilities
@@ -468,7 +831,15 @@ fn milliseconds(value: u64, name: &str) -> Result<Duration, HostConfigError> {
     if value == 0 {
         return Err(HostConfigError::input(format!("{name} must be nonzero")));
     }
+
     Ok(Duration::from_millis(value))
+}
+
+fn seconds(value: u64, name: &str) -> Result<Duration, HostConfigError> {
+    if value == 0 {
+        return Err(HostConfigError::input(format!("{name} must be nonzero")));
+    }
+    Ok(Duration::from_secs(value))
 }
 
 const fn default_retry_attempts() -> u8 {

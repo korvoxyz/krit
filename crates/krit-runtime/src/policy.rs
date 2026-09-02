@@ -11,7 +11,10 @@ use std::{
 use krit_capability::{HttpOrigin, is_valid_resource_name};
 use krit_wasm::ArtifactMetadata;
 
-use crate::{HostInputs, HttpRequest, HttpResponse, RuntimeError, RuntimeLimits};
+use crate::{
+    DurableState, HostInputs, HttpRequest, HttpResponse, RuntimeError, RuntimeLimits,
+    state::StoreBinding,
+};
 
 pub const MAX_POLICY_RESOURCES: usize = 256;
 pub const MAX_RETRY_ATTEMPTS: u8 = 4;
@@ -305,6 +308,7 @@ struct AgentHostInner {
     operation_sequence: AtomicU64,
     rates: Mutex<RateState>,
     idempotency: Mutex<IdempotencyState>,
+    durable_state: DurableState,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -340,9 +344,15 @@ struct IdempotencyState {
     sequence: u64,
 }
 
-pub(crate) struct IdempotencyToken {
-    key: ([u8; 32], String),
-    digest: blake3::Hash,
+pub(crate) enum IdempotencyToken {
+    Memory {
+        key: ([u8; 32], String),
+        digest: blake3::Hash,
+    },
+    Durable {
+        binding: Arc<StoreBinding>,
+        lease: krit_state::IdempotencyLease,
+    },
 }
 
 pub(crate) enum IdempotencyDecision {
@@ -358,6 +368,15 @@ impl AgentHost {
         policy: AgentHostPolicy,
         approvals: Arc<dyn ApprovalPolicy>,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_state(inputs, policy, approvals, DurableState::default())
+    }
+
+    pub fn new_with_state(
+        inputs: HostInputs,
+        policy: AgentHostPolicy,
+        approvals: Arc<dyn ApprovalPolicy>,
+        durable_state: DurableState,
+    ) -> Result<Self, RuntimeError> {
         validate_policy(&policy)?;
         Ok(Self {
             inner: Arc::new(AgentHostInner {
@@ -368,6 +387,7 @@ impl AgentHost {
                 operation_sequence: AtomicU64::new(0),
                 rates: Mutex::new(RateState::default()),
                 idempotency: Mutex::new(IdempotencyState::default()),
+                durable_state,
             }),
         })
     }
@@ -384,6 +404,10 @@ impl AgentHost {
         &self.inner.inputs
     }
 
+    pub(crate) fn durable_state(&self) -> &DurableState {
+        &self.inner.durable_state
+    }
+
     pub(crate) fn next_ai_idempotency_key(&self, adapter: &str) -> Result<String, RuntimeError> {
         let sequence = self
             .inner
@@ -397,6 +421,21 @@ impl AgentHost {
         hasher.update(&sequence.to_le_bytes());
         hash_part(&mut hasher, adapter.as_bytes());
         Ok(format!("krit-ai-{}", hasher.finalize().to_hex()))
+    }
+
+    pub(crate) fn next_lease_owner(&self) -> [u8; 16] {
+        let sequence = self
+            .inner
+            .operation_sequence
+            .fetch_add(1, Ordering::Relaxed);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.inner.instance_nonce);
+        hasher.update(&sequence.to_le_bytes());
+        hasher.update(b"durable-lease");
+        let hash = hasher.finalize();
+        let mut owner = [0; 16];
+        owner.copy_from_slice(&hash.as_bytes()[..16]);
+        owner
     }
 
     pub(crate) fn policy(&self) -> &AgentHostPolicy {
@@ -505,13 +544,61 @@ impl AgentHost {
                 "Idempotency-Key may appear only once".to_owned(),
             ));
         }
-        if !valid_idempotency_key(&header.value, self.inner.policy.idempotency.max_key_bytes) {
+        let durable_binding = self.inner.durable_state.idempotency_binding();
+        let max_key_bytes = durable_binding.as_ref().map_or(
+            self.inner.policy.idempotency.max_key_bytes,
+            |binding| {
+                self.inner
+                    .policy
+                    .idempotency
+                    .max_key_bytes
+                    .min(binding.store().limits().max_key_bytes)
+            },
+        );
+        if !valid_idempotency_key(&header.value, max_key_bytes) {
             return Ok(IdempotencyDecision::Reject(
                 "Idempotency-Key is invalid or exceeds the configured bound".to_owned(),
             ));
         }
         let key = (artifact_identity(metadata), header.value.clone());
         let digest = request_digest(request);
+        if let Some(binding) = durable_binding
+            && self.inner.policy.idempotency.max_entries > 0
+            && self.inner.policy.idempotency.max_bytes > 0
+        {
+            let owner = self.next_lease_owner();
+            let policy = durable_idempotency_policy(
+                self.inner.policy.idempotency,
+                binding.replay_policy().lease,
+                binding.store().limits(),
+            );
+            let decision = binding
+                .store()
+                .idempotency_decision(
+                    &key.0,
+                    &header.value,
+                    digest.as_bytes(),
+                    &owner,
+                    wall_clock_millis()?,
+                    policy,
+                )
+                .map_err(|error| RuntimeError::durable_idempotency(error.message()))?;
+            return Ok(match decision {
+                krit_state::IdempotencyDecision::Execute(lease) => {
+                    IdempotencyDecision::Execute(Some(IdempotencyToken::Durable { binding, lease }))
+                }
+                krit_state::IdempotencyDecision::Replay(bytes) => {
+                    let response = serde_json::from_slice(&bytes).map_err(|_| {
+                        RuntimeError::durable_idempotency("durable idempotency response is invalid")
+                    })?;
+                    IdempotencyDecision::Replay(response)
+                }
+                krit_state::IdempotencyDecision::Conflict => IdempotencyDecision::Conflict,
+                krit_state::IdempotencyDecision::InProgress => IdempotencyDecision::Reject(
+                    "request with Idempotency-Key is already in progress".to_owned(),
+                ),
+            });
+        }
         let mut state = self
             .inner
             .idempotency
@@ -531,10 +618,9 @@ impl AgentHost {
             }
             return Ok(IdempotencyDecision::Conflict);
         }
-        Ok(IdempotencyDecision::Execute(Some(IdempotencyToken {
-            key,
-            digest,
-        })))
+        Ok(IdempotencyDecision::Execute(Some(
+            IdempotencyToken::Memory { key, digest },
+        )))
     }
 
     pub(crate) fn complete_idempotency(
@@ -546,6 +632,52 @@ impl AgentHost {
             return Ok(());
         };
         let policy = self.inner.policy.idempotency;
+        if let IdempotencyToken::Durable { binding, lease } = token {
+            let fail_after_abort =
+                |error: RuntimeError| match binding.store().abort_idempotency(&lease) {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.with_cleanup_failure(
+                        &RuntimeError::durable_idempotency(cleanup.message()),
+                    )),
+                };
+            if policy.max_entries == 0 || policy.max_bytes == 0 {
+                return binding
+                    .store()
+                    .abort_idempotency(&lease)
+                    .map_err(|error| RuntimeError::durable_idempotency(error.message()));
+            }
+            let bytes = match serde_json::to_vec(response) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return fail_after_abort(RuntimeError::durable_idempotency(
+                        "could not encode durable idempotency response",
+                    ));
+                }
+            };
+            let retention = durable_idempotency_policy(
+                policy,
+                binding.replay_policy().lease,
+                binding.store().limits(),
+            );
+            if bytes.len() > retention.max_bytes {
+                return binding
+                    .store()
+                    .abort_idempotency(&lease)
+                    .map_err(|error| RuntimeError::durable_idempotency(error.message()));
+            }
+            let now_millis = match wall_clock_millis() {
+                Ok(now_millis) => now_millis,
+                Err(error) => return fail_after_abort(error),
+            };
+            let completion = binding
+                .store()
+                .complete_idempotency(&lease, &bytes, now_millis, retention)
+                .map_err(|error| RuntimeError::durable_idempotency(error.message()));
+            return match completion {
+                Ok(()) => Ok(()),
+                Err(error) => fail_after_abort(error),
+            };
+        }
         if policy.max_entries == 0 || policy.max_bytes == 0 {
             return Ok(());
         }
@@ -555,12 +687,15 @@ impl AgentHost {
         if response_bytes > policy.max_bytes {
             return Ok(());
         }
+        let IdempotencyToken::Memory { key, digest } = token else {
+            unreachable!("durable token returned above")
+        };
         let mut state = self
             .inner
             .idempotency
             .lock()
             .map_err(|_| RuntimeError::setup("idempotency state is unavailable"))?;
-        if let Some(previous) = state.entries.remove(&token.key) {
+        if let Some(previous) = state.entries.remove(&key) {
             state.bytes = state.bytes.saturating_sub(previous.size_bytes);
         }
         while state.entries.len() >= policy.max_entries
@@ -584,9 +719,9 @@ impl AgentHost {
         state.sequence = state.sequence.saturating_add(1);
         let sequence = state.sequence;
         state.entries.insert(
-            token.key,
+            key,
             IdempotencyEntry {
-                digest: token.digest,
+                digest,
                 response: response.clone(),
                 size_bytes: response_bytes,
                 expires: Instant::now() + policy.ttl,
@@ -600,6 +735,19 @@ impl AgentHost {
         Ok(())
     }
 
+    pub(crate) fn abort_idempotency(
+        &self,
+        token: Option<IdempotencyToken>,
+    ) -> Result<(), RuntimeError> {
+        let Some(IdempotencyToken::Durable { binding, lease }) = token else {
+            return Ok(());
+        };
+        binding
+            .store()
+            .abort_idempotency(&lease)
+            .map_err(|error| RuntimeError::durable_idempotency(error.message()))
+    }
+
     pub fn tracked_rate_resource_count(&self) -> usize {
         self.inner
             .rates
@@ -609,6 +757,13 @@ impl AgentHost {
     }
 
     pub fn idempotency_entry_count(&self) -> usize {
+        if let Some(binding) = self.inner.durable_state.idempotency_binding() {
+            return binding
+                .store()
+                .idempotency_counts()
+                .map(|counts| counts.0)
+                .unwrap_or_default();
+        }
         self.inner
             .idempotency
             .lock()
@@ -617,6 +772,13 @@ impl AgentHost {
     }
 
     pub fn idempotency_cached_bytes(&self) -> usize {
+        if let Some(binding) = self.inner.durable_state.idempotency_binding() {
+            return binding
+                .store()
+                .idempotency_counts()
+                .map(|counts| counts.1)
+                .unwrap_or_default();
+        }
         self.inner
             .idempotency
             .lock()
@@ -761,14 +923,22 @@ pub(crate) fn valid_idempotency_key(value: &str, maximum: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
-fn request_digest(request: &HttpRequest) -> blake3::Hash {
+pub(crate) fn request_digest(request: &HttpRequest) -> blake3::Hash {
+    hash_request(request, true)
+}
+
+pub(crate) fn exact_request_digest(request: &HttpRequest) -> blake3::Hash {
+    hash_request(request, false)
+}
+
+fn hash_request(request: &HttpRequest, omit_idempotency_key: bool) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
     hash_part(&mut hasher, request.method.as_bytes());
     hash_part(&mut hasher, request.path.as_bytes());
     hash_part(&mut hasher, request.query.as_bytes());
     for header in &request.headers {
         let normalized = header.name.to_ascii_lowercase();
-        if normalized == "idempotency-key" {
+        if omit_idempotency_key && normalized == "idempotency-key" {
             continue;
         }
         hash_part(&mut hasher, normalized.as_bytes());
@@ -778,7 +948,29 @@ fn request_digest(request: &HttpRequest) -> blake3::Hash {
     hasher.finalize()
 }
 
-fn artifact_identity(metadata: &ArtifactMetadata) -> [u8; 32] {
+fn durable_idempotency_policy(
+    policy: IdempotencyPolicy,
+    lease: Duration,
+    limits: krit_state::StoreLimits,
+) -> krit_state::RetentionPolicy {
+    krit_state::RetentionPolicy {
+        max_entries: policy.max_entries.min(limits.max_replay_entries),
+        max_bytes: policy.max_bytes.min(limits.max_replay_bytes),
+        ttl: policy.ttl,
+        lease,
+    }
+}
+
+fn wall_clock_millis() -> Result<i64, RuntimeError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| RuntimeError::durable_idempotency("system clock is before Unix epoch"))?
+        .as_millis();
+    i64::try_from(millis)
+        .map_err(|_| RuntimeError::durable_idempotency("system clock exceeds timestamp range"))
+}
+
+pub(crate) fn artifact_identity(metadata: &ArtifactMetadata) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hash_part(&mut hasher, metadata.package.name.as_bytes());
     hash_part(&mut hasher, metadata.package.version.as_bytes());

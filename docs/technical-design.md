@@ -1,6 +1,6 @@
 # Krit Rust technical design
 
-**Status:** Accepted; Phase 4 stateless reference host implemented
+**Status:** Accepted; Phase 6 durable local state implemented
 **Owner:** Akshay Bhardwaj
 
 ## Decision
@@ -60,6 +60,7 @@ crates/
   krit-semantics/    names, types, effects, HIR
   krit-ir/           normalized Core IR
   krit-wasm/         Core IR to WebAssembly component lowering
+  krit-state/        transactional SQLite state, replay, and idempotency records
   krit-runtime/      component runtime, limits, and capability handles
   krit-package/      manifests, lockfiles, resolver, store
   krit-cli/          user command and orchestration
@@ -339,6 +340,50 @@ do not invalidate downstream modules when the public interface is unchanged.
 Build writes use temporary files followed by atomic rename. Locks coordinate
 concurrent builds, and stale locks are recoverable without deleting valid
 artifacts.
+
+## Durable local state and replay
+
+`krit-state` owns bundled SQLite and has no compiler, Wasm, runtime-network, or
+CLI dependency. Each host-configured logical store maps to one owner-only
+database with application ID `KRIT`, `user_version = 1`, WAL journaling,
+foreign keys, trusted-schema disabled, configurable FULL/NORMAL synchronous
+durability, bounded busy timeout, and a page-count database-size ceiling.
+Unknown/newer schemas, foreign application IDs, corruption, non-empty
+unversioned files, and failed integrity checks are never reset automatically.
+
+One fresh `HostState` contains an `InvocationState` overlay. The first
+operation records the durable revision. Reads consult staged changes then
+SQLite. Writes, deletes, and checkpoints remain in memory. A successful valid
+webhook commits the one touched store with `BEGIN IMMEDIATE` and a revision
+compare before response/stdout/success-log publication. Any failure discards
+the overlay. Protocol 1 rejects cross-store transactions instead of pretending
+SQLite files share one atomic commit.
+
+The state WIT interface also owns explicit `replay-http` and `replay-ai`
+operations. Completed replay results commit independently immediately after
+the bounded external call. They are keyed by artifact identity, operation
+kind/name, and exact input digest. Matching results survive process restart;
+conflicts and active leases fail closed. Replay hits recheck current artifact
+requirements, manifest grants, configured adapters, and AI approval.
+
+Anonymous replay HTTP permits GET/HEAD or one valid ordinary
+`Idempotency-Key`. Replay AI derives one stable provider key from artifact,
+store, operation, adapter, and input. A provider may still complete an effect
+before SQLite records it, so recovery is at-least-once with idempotency-key
+protection, not distributed exactly once.
+
+Schema-3 host configuration maps only manifest-granted store names to
+host-owned relative `.db` paths and bounded policies. Unix state directories
+are owner-only; database/WAL/SHM paths reject symlinks and group/other access.
+No default path exists. Schema 1/2 behavior remains unchanged. Schema 3 may
+select one configured store for durable inbound idempotency; otherwise the
+existing process-local cache remains in use.
+
+State commit and durable inbound-response completion are intentionally
+separate transactions in this milestone. A crash between them can cause guest
+re-entry after the reservation lease expires; explicit replay identities
+protect completed external operations, and no cross-transaction exactly-once
+claim is made.
 
 ## CLI
 

@@ -26,6 +26,9 @@ executing source or granting runtime/network authority.
 `krit assist` optionally sends only explicit bounded redacted context and
 range-filtered compiler facts to a configured provider, then treats the
 response as an untrusted review-gated source proposal.
+The current pack also includes named transactional state, workflow
+checkpoints, durable HTTP/AI replay, and schema-3 host configuration. It does
+not claim distributed exactly once or expose database paths/SQL to source.
 
 ## Use
 
@@ -85,6 +88,23 @@ config JSON. Schema 2 host config owns adapter mappings, retries, finite rates,
 process-local idempotency, and explicit noninteractive approvals.
 `krit run` still returns K5003 rather than simulating hosts.
 `krit invoke` and `krit serve` never build or fall back to interpretation.
+
+State-enabled source additionally uses:
+
+```sh
+mkdir -m 700 state
+krit build --manifest examples/stateful-webhook.krit.pkg
+krit invoke \
+  --manifest examples/stateful-webhook.krit.pkg \
+  --host-config examples/stateful-webhook.host.json \
+  --request examples/webhook-agent.request.json
+```
+
+`state_get`/`state_put`/`state_delete` and named checkpoint operations use
+bounded strings. `replay_http` and `replay_ai` record completed results under
+stable operation names. A provider-side effect can still complete before its
+local replay record commits, so generated code must use safe methods or stable
+idempotency keys and must not describe the result as distributed exactly once.
 
 AI output is nondeterministic untrusted raw UTF-8. Generated source must match
 the `Result`, explicitly parse or validate data before structured use, and

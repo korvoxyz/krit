@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::{RuntimeError, RuntimeErrorKind};
 
 pub const HOST_POLICY_VERSION: u32 = 1;
+pub const STATE_HOST_POLICY_VERSION: u32 = 2;
 pub const HOST_STACK_HEADROOM_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -17,7 +17,8 @@ pub use error::{BuildError, BuildErrorKind};
 pub use metadata::{
     ARTIFACT_METADATA_SCHEMA, ARTIFACT_POLICY_VERSION, ApprovalRequirementMetadata,
     ArtifactMetadata, BuildOptions, COMPILER_NAME, LANGUAGE_NAME, LANGUAGE_VERSION,
-    LanguageMetadata, PackageMetadata, ResourceRequirementMetadata, VersionedTool,
+    LanguageMetadata, PackageMetadata, ResourceRequirementMetadata, STATE_ARTIFACT_POLICY_VERSION,
+    VersionedTool,
 };
 pub use support::SUPPORTED_BACKEND_SEMANTICS;
 pub use validation::{
@@ -26,8 +27,9 @@ pub use validation::{
 };
 pub use wit::{
     AI_INTERFACE, CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, LOGGING_INTERFACE,
-    PROGRAM_WORLD, PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STDOUT_INTERFACE,
+    PROGRAM_WORLD, PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STATE_INTERFACE, STDOUT_INTERFACE,
     WEBHOOK_ALL_PROGRAM_WORLD, WEBHOOK_INTERFACE, WEBHOOK_PROGRAM_WORLD,
+    WEBHOOK_STATE_ALL_PROGRAM_WORLD,
 };
 
 use compiler::encode_core;
@@ -94,12 +96,14 @@ pub fn build_component(
         ))
     })?;
 
+    let policy_version = artifact_policy_version(&checked.effects);
     let embedded = EmbeddedMetadata::new(
         &options.edition,
         &contract.world,
         checked.effects.clone(),
         checked.requirements.clone(),
         checked.approvals.clone(),
+        policy_version,
     );
     let embedded = serde_json::to_vec(&embedded).map_err(|error| {
         BuildError::artifact(format!("could not serialize component metadata: {error}"))
@@ -150,8 +154,16 @@ pub fn build_component(
         approvals: inspection.approvals,
         imports: inspection.imports,
         build_profile: options.build_profile.clone(),
-        policy_version: ARTIFACT_POLICY_VERSION,
+        policy_version,
     };
     validate_artifact(&bytes, &metadata)?;
     Ok(BuiltComponent { bytes, metadata })
+}
+
+pub(crate) fn artifact_policy_version(effects: &[String]) -> u32 {
+    if effects.iter().any(|effect| effect == "state.transaction") {
+        STATE_ARTIFACT_POLICY_VERSION
+    } else {
+        ARTIFACT_POLICY_VERSION
+    }
 }

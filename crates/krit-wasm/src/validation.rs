@@ -8,14 +8,14 @@ use wasmparser::{
 use wit_component::DecodedWasm;
 
 use crate::{
-    AI_INTERFACE, ARTIFACT_METADATA_SCHEMA, ARTIFACT_POLICY_VERSION, ApprovalRequirementMetadata,
-    ArtifactMetadata, BuildError, COMPILER_NAME, CONFIG_INTERFACE, EmbeddedMetadata,
-    HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, LANGUAGE_NAME, LANGUAGE_VERSION, LOGGING_INTERFACE,
-    ResourceRequirementMetadata, SECRETS_INTERFACE, STDOUT_INTERFACE, WASM_COMPONENT_TARGET,
-    WEBHOOK_INTERFACE,
+    AI_INTERFACE, ARTIFACT_METADATA_SCHEMA, ApprovalRequirementMetadata, ArtifactMetadata,
+    BuildError, COMPILER_NAME, CONFIG_INTERFACE, EmbeddedMetadata, HTTP_ANONYMOUS_INTERFACE,
+    HTTP_INTERFACE, LANGUAGE_NAME, LANGUAGE_VERSION, LOGGING_INTERFACE,
+    ResourceRequirementMetadata, SECRETS_INTERFACE, STATE_INTERFACE, STDOUT_INTERFACE,
+    WASM_COMPONENT_TARGET, WEBHOOK_INTERFACE, artifact_policy_version,
     wit::{
         AI_EFFECT, CONFIG_EFFECT, HTTP_EFFECT, LOGGING_EFFECT, ProgramKind, SECRETS_EFFECT,
-        STDOUT_EFFECT, WitContract, contract_from_world, load_contract,
+        STATE_EFFECT, STDOUT_EFFECT, WitContract, contract_from_world, load_contract,
     },
 };
 
@@ -415,6 +415,7 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
                 HTTP_INTERFACE => HTTP_EFFECT,
                 HTTP_ANONYMOUS_INTERFACE => HTTP_EFFECT,
                 LOGGING_INTERFACE => LOGGING_EFFECT,
+                STATE_INTERFACE => STATE_EFFECT,
                 _ => {
                     return Err(BuildError::artifact(
                         "component imports do not match WebAssembly policy 1",
@@ -461,7 +462,7 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
         || embedded.effects != effects
         || !valid_requirements(&embedded.requirements, &effects)
         || !valid_approvals(&embedded.approvals, &embedded.requirements, &effects)
-        || embedded.policy_version != ARTIFACT_POLICY_VERSION
+        || embedded.policy_version != artifact_policy_version(&effects)
         || !sorted_unique(&embedded.effects)
     {
         return Err(BuildError::artifact(
@@ -493,7 +494,7 @@ pub fn validate_artifact(
     metadata: &ArtifactMetadata,
 ) -> Result<ComponentInspection, BuildError> {
     if metadata.schema != ARTIFACT_METADATA_SCHEMA
-        || metadata.policy_version != ARTIFACT_POLICY_VERSION
+        || metadata.policy_version != artifact_policy_version(&metadata.effects)
         || metadata.compiler.name != COMPILER_NAME
         || metadata.compiler.version != env!("CARGO_PKG_VERSION")
         || metadata.language.name != LANGUAGE_NAME
@@ -584,9 +585,13 @@ fn valid_requirements(requirements: &[ResourceRequirementMetadata], effects: &[S
                     .any(|requirement| &requirement.capability == effect)
         })
         && requirements.iter().all(|requirement| {
-            effects.binary_search(&requirement.capability).is_ok()
+            (effects.binary_search(&requirement.capability).is_ok()
+                || (effects
+                    .binary_search_by(|effect| effect.as_str().cmp(STATE_EFFECT))
+                    .is_ok()
+                    && matches!(requirement.capability.as_str(), AI_EFFECT | HTTP_EFFECT)))
                 && match requirement.capability.as_str() {
-                    AI_EFFECT | CONFIG_EFFECT | SECRETS_EFFECT => {
+                    AI_EFFECT | CONFIG_EFFECT | SECRETS_EFFECT | STATE_EFFECT => {
                         krit_capability::is_valid_resource_name(&requirement.resource)
                     }
                     HTTP_EFFECT => {

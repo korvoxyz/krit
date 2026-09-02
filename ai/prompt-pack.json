@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "promptVersion": "0.2.11",
+  "promptVersion": "0.2.12",
   "languageVersion": "0.2.0",
   "edition": "2026",
   "status": "implemented",
@@ -9,7 +9,9 @@
   "diagnosticSchema": 1,
   "artifactMetadataSchema": 1,
   "artifactPolicyVersion": 1,
+  "artifactPolicyVersions": [1, 2],
   "runtimeHostPolicyVersion": 1,
+  "runtimeHostPolicyVersions": [1, 2],
   "authoringProtocolVersion": 1,
   "authoringRequestSchema": 1,
   "authoringResponseSchema": 1,
@@ -22,5 +24,7 @@
   "httpRuntimeStatus": "implemented-bounded",
   "aiRuntimeStatus": "implemented-provider-neutral-http-json",
   "observabilityStatus": "implemented-structured-redacted",
-  "reliabilityStatus": "implemented-process-local-bounded"
+  "reliabilityStatus": "implemented-process-local-bounded",
+  "durableStateStatus": "implemented-local-transactional-schema-1",
+  "durableHostConfigSchema": 3
 }

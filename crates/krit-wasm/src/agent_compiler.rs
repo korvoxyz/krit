@@ -808,6 +808,89 @@ fn encode_builtin_call(
             load_value(function, context, operation.result)?;
             call_import(function, context, "invoke")?;
         }
+        Builtin::StateGet | Builtin::CheckpointGet => {
+            let [store, key] = arguments else {
+                return Err(BuildError::invalid_core(format!(
+                    "{} call does not have two arguments",
+                    builtin.as_str()
+                )));
+            };
+            allocate_result(function, context, operation.result, 16, 4)?;
+            load_string_flat(function, context, *store)?;
+            load_string_flat(function, context, *key)?;
+            load_value(function, context, operation.result)?;
+            call_import(
+                function,
+                context,
+                if builtin == Builtin::StateGet {
+                    "get"
+                } else {
+                    "checkpoint-get"
+                },
+            )?;
+        }
+        Builtin::StatePut | Builtin::CheckpointPut => {
+            let [store, key, value] = arguments else {
+                return Err(BuildError::invalid_core(format!(
+                    "{} call does not have three arguments",
+                    builtin.as_str()
+                )));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *store)?;
+            load_string_flat(function, context, *key)?;
+            load_string_flat(function, context, *value)?;
+            load_value(function, context, operation.result)?;
+            call_import(
+                function,
+                context,
+                if builtin == Builtin::StatePut {
+                    "put"
+                } else {
+                    "checkpoint-put"
+                },
+            )?;
+        }
+        Builtin::StateDelete => {
+            let [store, key] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "state_delete call does not have two arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *store)?;
+            load_string_flat(function, context, *key)?;
+            load_value(function, context, operation.result)?;
+            call_import(function, context, "delete")?;
+        }
+        Builtin::ReplayHttp => {
+            let [store, operation_name, origin, request] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "replay_http call does not have four arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 32, 8)?;
+            load_string_flat(function, context, *store)?;
+            load_string_flat(function, context, *operation_name)?;
+            load_string_flat(function, context, *origin)?;
+            load_request_flat(function, context, *request)?;
+            load_value(function, context, operation.result)?;
+            call_import(function, context, "replay-http")?;
+        }
+        Builtin::ReplayAi => {
+            let [store, operation_name, adapter, input] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "replay_ai call does not have four arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *store)?;
+            load_string_flat(function, context, *operation_name)?;
+            load_string_flat(function, context, *adapter)?;
+            load_string_flat(function, context, *input)?;
+            load_value(function, context, operation.result)?;
+            call_import(function, context, "replay-ai")?;
+        }
         Builtin::Print | Builtin::Println => {
             let argument = arguments
                 .first()
@@ -2011,11 +2094,28 @@ fn memory_layout(ty: &Type) -> Result<Layout, BuildError> {
 
 fn variant_layout(ty: &Type) -> Result<Layout, BuildError> {
     match ty {
+        Type::Option(element) if element.as_ref() == &Type::String => Ok(Layout {
+            size: 12,
+            align: 4,
+            payload_offset: 4,
+        }),
         Type::Option(element) if element.as_ref() == &Type::Secret => Ok(Layout {
             size: 8,
             align: 4,
             payload_offset: 4,
         }),
+        Type::Result(value, error)
+            if matches!(
+                value.as_ref(),
+                Type::Option(element) if element.as_ref() == &Type::String
+            ) && error.as_ref() == &Type::String =>
+        {
+            Ok(Layout {
+                size: 16,
+                align: 4,
+                payload_offset: 4,
+            })
+        }
         Type::Result(value, error)
             if error.as_ref() == &Type::String
                 && matches!(value.as_ref(), Type::String | Type::Secret) =>

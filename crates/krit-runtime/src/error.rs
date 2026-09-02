@@ -21,6 +21,10 @@ pub enum RuntimeErrorKind {
     IntegerOverflow,
     GuestTrap,
     RuntimeSetup,
+    DurableState,
+    StateConflict,
+    Replay,
+    DurableIdempotency,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +94,22 @@ impl RuntimeError {
         Self::new("K7003", RuntimeErrorKind::RuntimeSetup, message)
     }
 
+    pub(crate) fn durable_state(message: impl Into<String>) -> Self {
+        Self::new("K5201", RuntimeErrorKind::DurableState, message)
+    }
+
+    pub(crate) fn state_conflict(message: impl Into<String>) -> Self {
+        Self::new("K5202", RuntimeErrorKind::StateConflict, message)
+    }
+
+    pub(crate) fn replay(message: impl Into<String>) -> Self {
+        Self::new("K5203", RuntimeErrorKind::Replay, message)
+    }
+
+    pub(crate) fn durable_idempotency(message: impl Into<String>) -> Self {
+        Self::new("K5204", RuntimeErrorKind::DurableIdempotency, message)
+    }
+
     pub const fn code(&self) -> &'static str {
         self.code
     }
@@ -108,6 +128,13 @@ impl RuntimeError {
 
     pub(crate) fn with_events(mut self, events: Vec<LogEvent>) -> Self {
         self.events = events;
+        self
+    }
+
+    pub(crate) fn with_cleanup_failure(mut self, cleanup: &RuntimeError) -> Self {
+        self.message
+            .push_str("; durable idempotency reservation cleanup also failed: ");
+        self.message.push_str(cleanup.message());
         self
     }
 }

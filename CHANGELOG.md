@@ -202,6 +202,34 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Fake provider, loopback HTTP provider, malicious response/context, prompt
   injection, redaction, stale/atomic failure, permission escalation, semantic
   cleanup, AI-off, and reference webhook guided-edit coverage
+- Normative durable-state/replay specification with explicit local crash,
+  transaction, checkpoint, migration, filesystem, retention, and exactly-once
+  limitations
+- `krit-state`, a bundled-SQLite schema-1 transactional store using WAL,
+  configurable FULL/NORMAL synchronization, application/schema identity,
+  integrity validation, bounded page count, busy timeout, revision conflicts,
+  replay leases/results, and durable idempotency records
+- Edition-2026 `state_get`, `state_put`, `state_delete`, `checkpoint_get`,
+  `checkpoint_put`, `replay_http`, and `replay_ai` built-ins with direct
+  canonical store/checkpoint/operation/resource facts
+- Manifest `state` grants, `state.transaction` analysis/Core/metadata facts,
+  policy-2 state artifact validation, typed `krit:runtime/state@0.2.0` WIT,
+  finite exact state world selection, and bounded Wasm lowering
+- Invocation-local state/checkpoint overlays with revision-checked commit only
+  after successful guest completion and rollback on traps, cancellation,
+  deadlines, invalid responses, conflicts, and host failures
+- Durable completed HTTP/AI replay with exact artifact/operation/input identity,
+  current grant and approval rechecks, stable AI idempotency keys, safe/keyed
+  HTTP enforcement, leases, expiry, LRU, and byte bounds
+- Optional durable inbound `Idempotency-Key` reservations/responses scoped by
+  artifact identity and credential-sensitive request digests, while schema
+  1/2 and unconfigured schema 3 preserve process-local behavior
+- Strict schema-3 host config with manifest-narrowed named stores, no default
+  path, bounded durability/SQLite/replay policy, owner-only directories/files,
+  symlink denial, and corrupt/newer/foreign database rejection
+- Stateful checkpoint example plus compiler, WIT, artifact, runtime,
+  restart, killed-writer recovery, cancellation, replay, idempotency,
+  filesystem, CLI, and legacy factorial-byte regression coverage
 
 ### Changed
 
@@ -249,6 +277,11 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   LLM dependency to source checking, builds, runtime execution, or deployment
 - Updated the provider-neutral generation prompt to version 0.2.11 for strict
   authoring protocol 1, review-gated edits, and permission-delta approval
+- Completed `phase6-state` for durable local single-host coordination while
+  retaining honest provider crash windows and no distributed exactly-once
+  claim
+- Updated the provider-neutral generation prompt to version 0.2.12 for durable
+  state, checkpoints, replay, and schema-3 host configuration
 
 ## [0.2.0] - 2026-09-01
 
