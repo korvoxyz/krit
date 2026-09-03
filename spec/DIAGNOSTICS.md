@@ -106,9 +106,10 @@ Initial required codes:
 | `K5105` | Buffered output-byte limit exceeded |
 | `K5106` | Embedding cancellation requested before guest execution |
 | `K5201` | Durable state database, schema, corruption, migration, or I/O failure |
-| `K5202` | Durable state transaction conflict or configured state limit exceeded |
+| `K5202` | Durable state transaction conflict, configured state/queue/schedule/object limit exceeded, or an unrepresentable delivery instant |
 | `K5203` | Replay operation is unsafe, in progress, expired incorrectly, or conflicts with recorded input |
 | `K5204` | Durable inbound idempotency reservation or completion failed |
+| `K5205` | Durable delivery lease, acknowledgement, or outcome detail is invalid |
 | `K6001` | Invalid package manifest |
 | `K6002` | Lockfile is stale or invalid |
 | `K7001` | Residual or unresolved type requires specialization before layout |

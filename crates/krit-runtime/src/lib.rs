@@ -2,6 +2,7 @@ mod ai;
 mod bindings;
 mod error;
 mod host;
+mod jobs;
 mod limits;
 mod network;
 mod observability;
@@ -35,6 +36,10 @@ use ai::AiAdapter;
 use error::HostLimitError;
 pub use error::{RuntimeError, RuntimeErrorKind};
 pub use host::{HostInputs, MAX_HOST_INPUT_ENTRIES, NetworkPolicy, SecretStore};
+pub use jobs::{
+    DeliveryExecutionResult, DeliveryOutcome, DeliveryRequest, MAX_OUTCOME_DETAIL_BYTES,
+};
+pub use krit_state::{JobDisposition, MINIMUM_DATABASE_BYTES, ScheduleCatchUp};
 pub use limits::{
     DEFAULT_LIMITS, HARD_MAX_LIMITS, HOST_POLICY_VERSION, HOST_STACK_HEADROOM_BYTES, RuntimeLimits,
     STATE_HOST_POLICY_VERSION,
@@ -49,7 +54,8 @@ pub use policy::{
     MAX_RATE_WINDOW, MAX_RETRY_ATTEMPTS, MAX_RETRY_DELAY, RateLimitPolicy, RetryPolicy,
 };
 pub use state::{
-    Durability, DurableState, DurableStoreDefinition, RetentionPolicy,
+    BucketDefinition, BucketPolicy, Durability, DurableState, DurableStoreDefinition,
+    QueueDefinition, QueuePolicy, RetentionPolicy, ScheduleDefinition, SchedulePolicy,
     StoreLimits as DurableStoreLimits,
 };
 pub use webhook::{HttpHeader, HttpRequest, HttpResponse};
@@ -90,6 +96,9 @@ pub struct ExecutionStats {
     pub checkpoint_writes: u64,
     pub replay_hits: u64,
     pub replay_misses: u64,
+    pub object_reads: u64,
+    pub object_writes: u64,
+    pub queue_publishes: u64,
     pub output_bytes: usize,
     pub elapsed_micros: u128,
 }
@@ -455,7 +464,21 @@ impl Runtime {
             )
             .with_events(store.data().events.clone()));
         }
-        if let Err(error) = store.data_mut().state.commit() {
+        let durable = store.data().agent_host.durable_state().clone();
+        let now_millis = match wall_clock_millis() {
+            Ok(now_millis) => now_millis,
+            Err(error) => {
+                return Err(RuntimeError::durable_state(format!(
+                    "host wall clock is unavailable: {error}"
+                ))
+                .with_events(store.data().events.clone()));
+            }
+        };
+        if let Err(error) = store
+            .data_mut()
+            .state
+            .commit_outcome(&durable, None, now_millis)
+        {
             return Err(error.with_events(store.data().events.clone()));
         }
         let remaining = store.get_fuel().map_err(|error| {
@@ -487,6 +510,9 @@ impl Runtime {
                 checkpoint_writes: state.state.checkpoint_writes(),
                 replay_hits: state.state.replay_hits(),
                 replay_misses: state.state.replay_misses(),
+                object_reads: state.state.object_reads(),
+                object_writes: state.state.object_writes(),
+                queue_publishes: state.state.queue_publishes(),
                 output_bytes: state.output.len(),
                 elapsed_micros: started.elapsed().as_micros(),
             },
@@ -564,6 +590,9 @@ impl Runtime {
                 checkpoint_writes: 0,
                 replay_hits: 0,
                 replay_misses: 0,
+                object_reads: 0,
+                object_writes: 0,
+                queue_publishes: 0,
                 output_bytes: state.output.len(),
                 elapsed_micros: started.elapsed().as_micros(),
             },
@@ -608,6 +637,9 @@ impl Runtime {
             checkpoint_writes: 0,
             replay_hits: 0,
             replay_misses: 0,
+            object_reads: 0,
+            object_writes: 0,
+            queue_publishes: 0,
             output_bytes: 0,
             elapsed_micros: 0,
         }
@@ -784,8 +816,9 @@ impl Runtime {
                 )));
             }
         }
+        let job_stores = agent_host.durable_state().job_store_names();
         for name in agent_host.durable_state().store_names() {
-            if !grants.grants("state.transaction", Some(name)) {
+            if !grants.grants("state.transaction", Some(name)) && !job_stores.contains(name) {
                 return Err(RuntimeError::authorization(format!(
                     "durable state store `{name}` is not granted by the manifest"
                 )));
@@ -797,6 +830,46 @@ impl Runtime {
             .filter(|requirement| requirement.capability == "state.transaction")
         {
             agent_host.durable_state().binding(&requirement.resource)?;
+        }
+        let durable = agent_host.durable_state();
+        for name in durable.queue_names() {
+            if !grants.grants("queue.publish", Some(name))
+                && !grants.grants("queue.consume", Some(name))
+            {
+                return Err(RuntimeError::authorization(format!(
+                    "durable queue `{name}` is not granted by the manifest"
+                )));
+            }
+        }
+        for name in durable.schedule_names() {
+            if !grants.grants("schedule.trigger", Some(name)) {
+                return Err(RuntimeError::authorization(format!(
+                    "durable schedule `{name}` is not granted by the manifest"
+                )));
+            }
+        }
+        for name in durable.bucket_names() {
+            if !grants.grants("object.read", Some(name))
+                && !grants.grants("object.write", Some(name))
+            {
+                return Err(RuntimeError::authorization(format!(
+                    "object bucket `{name}` is not granted by the manifest"
+                )));
+            }
+        }
+        for requirement in &metadata.requirements {
+            match requirement.capability.as_str() {
+                "queue.publish" | "queue.consume" => {
+                    durable.queue(&requirement.resource)?;
+                }
+                "schedule.trigger" => {
+                    durable.schedule(&requirement.resource)?;
+                }
+                "object.read" | "object.write" => {
+                    durable.bucket(&requirement.resource)?;
+                }
+                _ => {}
+            }
         }
         let rate_resources = metadata
             .requirements
@@ -1521,6 +1594,79 @@ impl bindings::webhook::krit::runtime::state::Host for HostState {
     }
 }
 
+impl bindings::webhook::krit::runtime::queue::Host for HostState {
+    fn queue_publish(
+        &mut self,
+        queue: String,
+        body: String,
+    ) -> wasmtime::Result<Result<String, String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("queue.publish", &queue)?;
+        let durable = self.agent_host.durable_state().clone();
+        let id = self.agent_host.next_lease_owner();
+        self.state
+            .queue_publish(&durable, &queue, body, id)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(hex_identity(&id)))
+    }
+}
+
+impl bindings::webhook::krit::runtime::objects_read::Host for HostState {
+    fn object_get(
+        &mut self,
+        bucket: String,
+        key: String,
+    ) -> wasmtime::Result<Result<Option<String>, String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("object.read", &bucket)?;
+        let durable = self.agent_host.durable_state().clone();
+        let value = self
+            .state
+            .object_get(&durable, &bucket, &key)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(value))
+    }
+}
+
+impl bindings::webhook::krit::runtime::objects_write::Host for HostState {
+    fn object_put(
+        &mut self,
+        bucket: String,
+        key: String,
+        value: String,
+    ) -> wasmtime::Result<Result<(), String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("object.write", &bucket)?;
+        let durable = self.agent_host.durable_state().clone();
+        self.state
+            .object_put(&durable, &bucket, key, value)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(()))
+    }
+
+    fn object_delete(
+        &mut self,
+        bucket: String,
+        key: String,
+    ) -> wasmtime::Result<Result<(), String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("object.write", &bucket)?;
+        let durable = self.agent_host.durable_state().clone();
+        self.state
+            .object_delete(&durable, &bucket, key)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(()))
+    }
+}
+
 impl HostState {
     fn record_host_call(&mut self) -> wasmtime::Result<()> {
         let next = self
@@ -2056,6 +2202,16 @@ fn stable_replay_idempotency_key(
 fn hash_replay_part(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(&(value.len() as u64).to_le_bytes());
     hasher.update(value);
+}
+
+/// Renders one durable identity as lowercase hexadecimal. Identities are
+/// derived from host state only and never disclose paths or credentials.
+pub(crate) fn hex_identity(bytes: &[u8; 16]) -> String {
+    let mut rendered = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        rendered.push_str(&format!("{byte:02x}"));
+    }
+    rendered
 }
 
 fn wall_clock_millis() -> wasmtime::Result<i64> {

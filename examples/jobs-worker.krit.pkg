@@ -1,0 +1,13 @@
+schema = 1
+
+[package]
+name = "akshay/jobs-worker"
+version = "0.2.0"
+edition = "2026"
+entry = "jobs-worker.krit"
+license = "Apache-2.0"
+
+[capabilities]
+buckets = ["render-output"]
+consumes = ["render-jobs"]
+state = ["agent-work"]

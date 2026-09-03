@@ -504,7 +504,7 @@ fn rejects_limits_corruption_wrong_identity_and_newer_schema() {
     );
 
     let newer = directory.path.join("newer.db");
-    configure_foreign_database(&newer, 0x4b52_4954, 2);
+    configure_foreign_database(&newer, 0x4b52_4954, krit_state::STORE_SCHEMA_VERSION + 1);
     assert_eq!(
         DurableStore::open(&newer, Durability::Full, limits())
             .expect_err("newer schema should fail")
@@ -513,7 +513,7 @@ fn rejects_limits_corruption_wrong_identity_and_newer_schema() {
     );
 
     let foreign = directory.path.join("foreign.db");
-    configure_foreign_database(&foreign, 1234, 1);
+    configure_foreign_database(&foreign, 1234, krit_state::STORE_SCHEMA_VERSION);
     assert_eq!(
         DurableStore::open(&foreign, Durability::Full, limits())
             .expect_err("foreign database should fail")

@@ -403,6 +403,10 @@ impl Document {
             | Builtin::CheckpointPut
             | Builtin::ReplayHttp
             | Builtin::ReplayAi => &package.manifest.capabilities.state,
+            Builtin::QueuePublish => &package.manifest.capabilities.queues,
+            Builtin::ObjectGet | Builtin::ObjectPut | Builtin::ObjectDelete => {
+                &package.manifest.capabilities.buckets
+            }
             _ => return Vec::new(),
         };
         let replacement = self.lines.range(
@@ -1094,6 +1098,9 @@ fn builtin_capability(builtin: Builtin) -> Option<&'static str> {
         | Builtin::CheckpointPut
         | Builtin::ReplayHttp
         | Builtin::ReplayAi => Some("state.transaction"),
+        Builtin::QueuePublish => Some("queue.publish"),
+        Builtin::ObjectGet => Some("object.read"),
+        Builtin::ObjectPut | Builtin::ObjectDelete => Some("object.write"),
         _ => None,
     }
 }
@@ -1192,6 +1199,8 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
             | krit::TypeKind::HttpRequest
             | krit::TypeKind::HttpResponse
             | krit::TypeKind::LogField
+            | krit::TypeKind::QueueJob
+            | krit::TypeKind::ScheduleEvent
             | krit::TypeKind::Secret => {}
         }
     }
@@ -1222,6 +1231,18 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
                 ..
             }
             | StatementKind::Webhook {
+                parameters,
+                return_type,
+                body,
+                ..
+            }
+            | StatementKind::QueueConsumer {
+                parameters,
+                return_type,
+                body,
+                ..
+            }
+            | StatementKind::ScheduleHandler {
                 parameters,
                 return_type,
                 body,
@@ -1409,7 +1430,10 @@ fn symbol_completion_kind(kind: CompilerSymbolKind) -> CompletionItemKind {
         CompilerSymbolKind::Let | CompilerSymbolKind::Parameter | CompilerSymbolKind::Match => {
             CompletionItemKind::VARIABLE
         }
-        CompilerSymbolKind::Function | CompilerSymbolKind::Webhook => CompletionItemKind::FUNCTION,
+        CompilerSymbolKind::Function
+        | CompilerSymbolKind::Webhook
+        | CompilerSymbolKind::QueueConsumer
+        | CompilerSymbolKind::ScheduleHandler => CompletionItemKind::FUNCTION,
     }
 }
 
@@ -1418,7 +1442,10 @@ fn document_symbol_kind(kind: CompilerSymbolKind) -> SymbolKind {
         CompilerSymbolKind::Let | CompilerSymbolKind::Parameter | CompilerSymbolKind::Match => {
             SymbolKind::VARIABLE
         }
-        CompilerSymbolKind::Function | CompilerSymbolKind::Webhook => SymbolKind::FUNCTION,
+        CompilerSymbolKind::Function
+        | CompilerSymbolKind::Webhook
+        | CompilerSymbolKind::QueueConsumer
+        | CompilerSymbolKind::ScheduleHandler => SymbolKind::FUNCTION,
     }
 }
 
@@ -1435,6 +1462,8 @@ fn compiler_symbol_kind(kind: CompilerSymbolKind) -> &'static str {
         CompilerSymbolKind::Let => "let",
         CompilerSymbolKind::Function => "function",
         CompilerSymbolKind::Webhook => "webhook",
+        CompilerSymbolKind::QueueConsumer => "queue consumer",
+        CompilerSymbolKind::ScheduleHandler => "schedule handler",
         CompilerSymbolKind::Parameter => "parameter",
         CompilerSymbolKind::Match => "match binding",
     }
@@ -1697,11 +1726,26 @@ impl<'a> DeclarationCollector<'a> {
                 parameters,
                 return_type,
                 body,
+            }
+            | StatementKind::QueueConsumer {
+                name,
+                parameters,
+                return_type,
+                body,
+                ..
+            }
+            | StatementKind::ScheduleHandler {
+                name,
+                parameters,
+                return_type,
+                body,
+                ..
             } => {
-                let kind = if matches!(statement.kind, StatementKind::Webhook { .. }) {
-                    CompilerSymbolKind::Webhook
-                } else {
-                    CompilerSymbolKind::Function
+                let kind = match statement.kind {
+                    StatementKind::Webhook { .. } => CompilerSymbolKind::Webhook,
+                    StatementKind::QueueConsumer { .. } => CompilerSymbolKind::QueueConsumer,
+                    StatementKind::ScheduleHandler { .. } => CompilerSymbolKind::ScheduleHandler,
+                    _ => CompilerSymbolKind::Function,
                 };
                 self.add(
                     name,

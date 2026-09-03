@@ -31,7 +31,7 @@ An application exports one or more typed entry points:
 HTTP route       request -> response
 Webhook          verified event -> acknowledgement
 Schedule         scheduled event -> unit
-Queue consumer   message -> acknowledgement or retry
+Queue consumer   message -> acknowledgement, retry, or dead letter
 Agent tool       structured input -> structured output
 ```
 

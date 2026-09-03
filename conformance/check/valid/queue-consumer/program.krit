@@ -1,0 +1,6 @@
+queue "render-jobs" fn worker(job: QueueJob) -> Result<String, String> {
+    match object_put("render-output", job.id, job.body) {
+        Ok(stored) => Ok(job.id),
+        Err(error) => Err(error),
+    }
+}

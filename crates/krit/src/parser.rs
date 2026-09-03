@@ -26,22 +26,29 @@ impl Parser {
 
     fn program(mut self) -> Result<Program, Diagnostic> {
         let mut statements = Vec::new();
-        let mut webhook = None;
+        let mut entrypoint = None;
         while !self.check(&TokenKind::Eof) {
             let statement = if self.check(&TokenKind::Webhook) {
                 self.webhook_declaration()?
+            } else if self.entrypoint_keyword().is_some() {
+                self.resource_entrypoint_declaration()?
             } else {
                 self.statement()?
             };
-            if matches!(statement.kind, StatementKind::Webhook { .. }) {
-                if webhook.is_some() {
+            if matches!(
+                statement.kind,
+                StatementKind::Webhook { .. }
+                    | StatementKind::QueueConsumer { .. }
+                    | StatementKind::ScheduleHandler { .. }
+            ) {
+                if entrypoint.is_some() {
                     return Err(Diagnostic::new(
                         "K2002",
-                        "a source module may declare at most one webhook",
+                        "a source module may declare at most one `webhook`, `queue`, or `schedule` entrypoint",
                         statement.span,
                     ));
                 }
-                webhook = Some(statement.span);
+                entrypoint = Some(statement.span);
             }
             statements.push(statement);
         }
@@ -49,10 +56,10 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Result<Statement, Diagnostic> {
-        if self.check(&TokenKind::Webhook) {
+        if let Some(keyword) = self.nested_entrypoint_keyword() {
             Err(Diagnostic::new(
                 "K1004",
-                "`webhook` declarations are only allowed at the top level",
+                format!("`{keyword}` declarations are only allowed at the top level"),
                 self.current().span,
             ))
         } else if self.check(&TokenKind::Let) {
@@ -141,6 +148,86 @@ impl Parser {
         })
     }
 
+    /// Parses `queue "name" fn ...` or `schedule "name" fn ...`.
+    ///
+    /// `queue` and `schedule` are contextual: they introduce an entrypoint only
+    /// when followed by a direct name literal and `fn`, so ordinary bindings and
+    /// record fields keep those spellings.
+    fn resource_entrypoint_declaration(&mut self) -> Result<Statement, Diagnostic> {
+        let keyword = self
+            .entrypoint_keyword()
+            .ok_or_else(|| self.expected("`queue` or `schedule`"))?;
+        let start = self.advance().span;
+        let token = self.advance().clone();
+        let TokenKind::String(resource) = token.kind else {
+            return Err(Diagnostic::new(
+                "K1002",
+                format!(
+                    "`{keyword}` declarations require a direct canonical `{keyword}` name literal"
+                ),
+                token.span,
+            ));
+        };
+        let resource_span = token.span;
+        self.expect(TokenKind::Fn)?;
+        let (name, _) = self.binding_name()?;
+        let parameters = self.parameters()?;
+        let return_type = if self.consume(&TokenKind::ThinArrow) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
+        let body = self.block()?;
+        let span = start.join(body.span);
+        let kind = if keyword == "queue" {
+            StatementKind::QueueConsumer {
+                queue: resource,
+                queue_span: resource_span,
+                name,
+                parameters,
+                return_type,
+                body,
+            }
+        } else {
+            StatementKind::ScheduleHandler {
+                schedule: resource,
+                schedule_span: resource_span,
+                name,
+                parameters,
+                return_type,
+                body,
+            }
+        };
+        Ok(Statement { kind, span })
+    }
+
+    fn entrypoint_keyword(&self) -> Option<&'static str> {
+        let TokenKind::Identifier(name) = &self.current().kind else {
+            return None;
+        };
+        let keyword = match name.as_str() {
+            "queue" => "queue",
+            "schedule" => "schedule",
+            _ => return None,
+        };
+        let follows_literal = matches!(
+            self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+            Some(TokenKind::String(_))
+        );
+        let follows_fn = matches!(
+            self.tokens.get(self.cursor + 2).map(|token| &token.kind),
+            Some(TokenKind::Fn)
+        );
+        (follows_literal && follows_fn).then_some(keyword)
+    }
+
+    fn nested_entrypoint_keyword(&self) -> Option<&'static str> {
+        if self.check(&TokenKind::Webhook) {
+            return Some("webhook");
+        }
+        self.entrypoint_keyword()
+    }
+
     fn parameters(&mut self) -> Result<Vec<Parameter>, Diagnostic> {
         self.expect(TokenKind::LeftParen)?;
         let mut parameters = Vec::new();
@@ -189,10 +276,10 @@ impl Parser {
             if self.check(&TokenKind::Eof) {
                 return Err(self.expected("`}`"));
             }
-            if self.check(&TokenKind::Webhook) {
+            if let Some(keyword) = self.nested_entrypoint_keyword() {
                 return Err(Diagnostic::new(
                     "K1004",
-                    "`webhook` declarations are only allowed at the top level",
+                    format!("`{keyword}` declarations are only allowed at the top level"),
                     self.current().span,
                 ));
             }
@@ -753,6 +840,8 @@ impl Parser {
             "HttpRequest" => TypeKind::HttpRequest,
             "HttpResponse" => TypeKind::HttpResponse,
             "LogField" => TypeKind::LogField,
+            "QueueJob" => TypeKind::QueueJob,
+            "ScheduleEvent" => TypeKind::ScheduleEvent,
             "Secret" => TypeKind::Secret,
             "List" => {
                 self.expect(TokenKind::Less)?;

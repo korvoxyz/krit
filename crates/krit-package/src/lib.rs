@@ -49,6 +49,16 @@ pub struct Capabilities {
     pub logs: bool,
     #[serde(default)]
     pub state: Vec<String>,
+    #[serde(default)]
+    pub queues: Vec<String>,
+    #[serde(default)]
+    pub consumes: Vec<String>,
+    #[serde(default)]
+    pub schedules: Vec<String>,
+    #[serde(default)]
+    pub buckets: Vec<String>,
+    #[serde(default, rename = "readOnlyBuckets")]
+    pub read_only_buckets: Vec<String>,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -168,6 +178,29 @@ impl Manifest {
         for name in &self.capabilities.state {
             validate_resource_name("durable state store", name)?;
         }
+        for (label, names) in [
+            ("durable queue", &self.capabilities.queues),
+            ("durable queue consumer", &self.capabilities.consumes),
+            ("durable schedule", &self.capabilities.schedules),
+            ("object bucket", &self.capabilities.buckets),
+            (
+                "read-only object bucket",
+                &self.capabilities.read_only_buckets,
+            ),
+        ] {
+            validate_sorted_unique_names(label, names)?;
+            validate_capability_count(label, names)?;
+            for name in names {
+                validate_resource_name(label, name)?;
+            }
+        }
+        for name in &self.capabilities.read_only_buckets {
+            if self.capabilities.buckets.contains(name) {
+                return Err(ManifestError::new(format!(
+                    "object bucket `{name}` cannot request both read-only and write authority"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -247,6 +280,28 @@ impl Manifest {
                 resource: Some(resource),
             }
         }));
+        for (capability, names) in [
+            ("queue.publish", &self.capabilities.queues),
+            ("queue.consume", &self.capabilities.consumes),
+            ("schedule.trigger", &self.capabilities.schedules),
+            ("object.write", &self.capabilities.buckets),
+        ] {
+            requested.extend(names.iter().cloned().map(|resource| PermissionRequest {
+                capability,
+                resource: Some(resource),
+            }));
+        }
+        requested.extend(
+            self.capabilities
+                .buckets
+                .iter()
+                .chain(&self.capabilities.read_only_buckets)
+                .cloned()
+                .map(|resource| PermissionRequest {
+                    capability: "object.read",
+                    resource: Some(resource),
+                }),
+        );
         requested.sort();
         PermissionPlan {
             schema: 1,
@@ -288,6 +343,37 @@ impl Manifest {
                 self.capabilities
                     .state
                     .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "queue.publish" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .queues
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "queue.consume" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .consumes
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "schedule.trigger" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .schedules
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "object.write" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .buckets
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "object.read" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .buckets
+                    .iter()
+                    .chain(&self.capabilities.read_only_buckets)
                     .any(|granted| granted == resource)
             }),
             _ => false,

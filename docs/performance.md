@@ -40,6 +40,9 @@ The baseline suite contains:
 - SQLite state read and one-mutation FULL/NORMAL commits
 - checkpoint read/commit and replay hit/miss overhead
 - durable idempotency reservation/completion/replay across process restart
+- queue publish, reservation, acknowledgement, retry, and dead-letter commits
+- schedule materialization, catch-up, and fire acknowledgement
+- object put/get/delete with replacement accounting and bucket byte checks
 
 Inputs and expected checksums are versioned. Benchmarks do not print large
 results during timing.
@@ -129,6 +132,14 @@ read, busy wait, WAL commit/fsync, replay serialization, and component/runtime
 overhead. FULL and NORMAL synchronization are reported separately. Replay-hit
 latency is never compared directly with provider/network latency.
 
+Delivery measurements separate reservation, guest execution, and the outcome
+commit, because only the last one is a durable write. Queue throughput is
+reported per store, never as a distributed broker number, and schedule
+measurements state the configured interval and catch-up bound. Reservation and
+cleanup queries are covered by `queue_jobs_ready`, `queue_dead_cleanup`,
+`schedule_fires_ready`, and the `objects` primary key; a query plan regression
+that turns any of them into a scan is a performance defect, not a tuning knob.
+
 ## Cache measurement
 
 For every cache:
@@ -154,7 +165,8 @@ targets or steady-state runtime throughput. The host file preserves every raw
 sample and states that process startup, validation, JIT compilation,
 instantiation, execution, and cleanup are included.
 
-No Phase 6 latency baseline is published yet. Correctness tests cover bounded
+No Phase 6 latency baseline is published yet, for state or for jobs.
+Correctness tests cover bounded
 local transaction/replay behavior without introducing noisy wall-clock CI
 thresholds; representative 30-sample release measurements remain a dedicated
 benchmark-runner task.

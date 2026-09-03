@@ -56,7 +56,16 @@ impl FromStr for PermissionKey {
             });
         let resource_required = matches!(
             capability,
-            "ai.invoke" | "config.read" | "http.request" | "secret.read"
+            "ai.invoke"
+                | "config.read"
+                | "http.request"
+                | "object.read"
+                | "object.write"
+                | "queue.consume"
+                | "queue.publish"
+                | "schedule.trigger"
+                | "secret.read"
+                | "state.transaction"
         );
         let resource_forbidden = matches!(capability, "io.stdout" | "observe.log");
         if !resource_required && !resource_forbidden {

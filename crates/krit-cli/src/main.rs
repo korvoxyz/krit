@@ -17,8 +17,8 @@ use krit::{
 };
 use krit_package::Manifest;
 use krit_runtime::{
-    GrantSet, HttpHeader, HttpRequest, LogEvent, LogField, LogLevel, Runtime, RuntimeError,
-    RuntimeErrorKind, RuntimeLimits,
+    CancellationHandle, DeliveryOutcome, GrantSet, HttpHeader, HttpRequest, LogEvent, LogField,
+    LogLevel, Runtime, RuntimeError, RuntimeErrorKind, RuntimeLimits,
 };
 use krit_wasm::{ArtifactMetadata, BuildErrorKind, BuildOptions, build_component};
 use serde::Serialize;
@@ -62,6 +62,8 @@ fn run(arguments: Vec<String>) -> u8 {
         "permissions" => permissions_command(&arguments[1..]),
         "sandbox" => sandbox_command(&arguments[1..]),
         "invoke" => invoke_command(&arguments[1..]),
+        "worker" => delivery_command(&arguments[1..], DeliveryKind::Queue),
+        "schedule" => delivery_command(&arguments[1..], DeliveryKind::Schedule),
         "serve" => serve_command(&arguments[1..]),
         "package" => package_command(&arguments[1..]),
         unknown => {
@@ -162,6 +164,23 @@ fn build_command(arguments: &[String]) -> u8 {
     }
     if !manifest.capabilities.state.is_empty() {
         options.grant_effect("state.transaction");
+    }
+    if !manifest.capabilities.queues.is_empty() {
+        options.grant_effect("queue.publish");
+    }
+    if !manifest.capabilities.consumes.is_empty() {
+        options.grant_effect("queue.consume");
+    }
+    if !manifest.capabilities.schedules.is_empty() {
+        options.grant_effect("schedule.trigger");
+    }
+    if !manifest.capabilities.buckets.is_empty() {
+        options.grant_effect("object.write");
+    }
+    if !manifest.capabilities.buckets.is_empty()
+        || !manifest.capabilities.read_only_buckets.is_empty()
+    {
+        options.grant_effect("object.read");
     }
     let artifact = match build_component(&module, &options) {
         Ok(artifact) => artifact,
@@ -783,6 +802,14 @@ fn normalized_entrypoint_signature(
         EntrypointKind::ModuleInit => format!("fn() -> {}", function.signature.result),
         EntrypointKind::Webhook => format!(
             "webhook fn {}(request: HttpRequest) -> HttpResponse",
+            function.debug_name.as_deref().unwrap_or("<anonymous>")
+        ),
+        EntrypointKind::QueueConsumer => format!(
+            "queue fn {}(job: QueueJob) -> Result<String, String>",
+            function.debug_name.as_deref().unwrap_or("<anonymous>")
+        ),
+        EntrypointKind::ScheduleHandler => format!(
+            "schedule fn {}(event: ScheduleEvent) -> Result<String, String>",
             function.debug_name.as_deref().unwrap_or("<anonymous>")
         ),
         _ => format!("fn(...) -> {}", function.signature.result),
@@ -1413,6 +1440,386 @@ fn invoke_command(arguments: &[String]) -> u8 {
         return 1;
     }
     0
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryKind {
+    Queue,
+    Schedule,
+}
+
+impl DeliveryKind {
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Queue => "worker",
+            Self::Schedule => "schedule",
+        }
+    }
+
+    const fn option(self) -> &'static str {
+        match self {
+            Self::Queue => "--queue",
+            Self::Schedule => "--schedule",
+        }
+    }
+}
+
+struct DeliveryOptions {
+    manifest: PathBuf,
+    artifact: Option<PathBuf>,
+    host_config: Option<PathBuf>,
+    resource: String,
+    max_deliveries: u32,
+    now_millis: Option<i64>,
+    json: bool,
+}
+
+/// Hard bound on deliveries one bounded dispatch invocation may process.
+const MAX_DELIVERIES_PER_RUN: u32 = 1024;
+
+/// Schema-1 delivery report.
+///
+/// `outcomes` and `outputs` are parallel arrays in dispatch order: `outputs[i]`
+/// is the bounded standard output the guest produced for `outcomes[i]`. In JSON
+/// mode standard output carries this document and nothing else, so a worker or
+/// scheduler artifact that also holds `io.stdout` cannot corrupt the stream.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryReport {
+    schema: u32,
+    resource: String,
+    now_millis: i64,
+    dispatched: u32,
+    completed: u32,
+    retried: u32,
+    dead_lettered: u32,
+    idle: bool,
+    /// Set when dispatch stopped early because the collected guest output
+    /// reached the runtime output budget.
+    stopped_for_output_budget: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    materialized: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped: Option<u64>,
+    outcomes: Vec<DeliveryOutcome>,
+    outputs: Vec<String>,
+}
+
+fn delivery_command(arguments: &[String], kind: DeliveryKind) -> u8 {
+    let options = match parse_delivery_options(arguments, kind) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("krit: {message}");
+            return 2;
+        }
+    };
+    let manifest = match Manifest::load(&options.manifest) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!(
+                "{}:1:1: error[K6001]: {error}",
+                options.manifest.to_string_lossy()
+            );
+            return 3;
+        }
+    };
+    let limits = RuntimeLimits::default();
+    let artifact_path = options
+        .artifact
+        .clone()
+        .unwrap_or_else(|| default_build_output(&options.manifest, &manifest));
+    let artifact = match load_artifact(&artifact_path, limits) {
+        Ok(artifact) => artifact,
+        Err(message) => return report_artifact_error(&artifact_path, &message),
+    };
+    let agent_host = match host_config::load(options.host_config.as_deref(), &manifest, limits) {
+        Ok(host) => host,
+        Err(error) => {
+            let authorization = error.kind() == host_config::HostConfigErrorKind::Authorization;
+            eprintln!(
+                "{}:1:1: error[{}]: {}",
+                options
+                    .host_config
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("<host-config>"))
+                    .to_string_lossy(),
+                error.code(),
+                error.message()
+            );
+            return if authorization { 4 } else { 1 };
+        }
+    };
+    let now_millis = match options.now_millis {
+        Some(now) => now,
+        None => match host_wall_clock_millis() {
+            Ok(now) => now,
+            Err(message) => {
+                eprintln!("krit: error[K7003]: {message}");
+                return 1;
+            }
+        },
+    };
+    let runtime = match Runtime::new(limits) {
+        Ok(runtime) => runtime,
+        Err(error) => return report_runtime_error(&artifact_path, &error),
+    };
+    let grants = GrantSet::from_manifest(&manifest);
+    let cancellation = CancellationHandle::new();
+    let dispatch = krit_runtime::DeliveryRequest {
+        bytes: &artifact.bytes,
+        metadata: &artifact.metadata,
+        grants: &grants,
+        agent_host: &agent_host,
+        resource: &options.resource,
+        now_millis,
+        cancellation: &cancellation,
+    };
+    let mut report = DeliveryReport {
+        schema: 1,
+        resource: options.resource.clone(),
+        now_millis,
+        dispatched: 0,
+        completed: 0,
+        retried: 0,
+        dead_lettered: 0,
+        idle: true,
+        stopped_for_output_budget: false,
+        materialized: None,
+        skipped: None,
+        outcomes: Vec::new(),
+        outputs: Vec::new(),
+    };
+    let output_budget = limits.output_bytes();
+    let mut collected_output_bytes = 0usize;
+    for _ in 0..options.max_deliveries {
+        let (catch_up, result) = match kind {
+            DeliveryKind::Queue => (None, runtime.dispatch_job(dispatch)),
+            DeliveryKind::Schedule => match runtime.dispatch_schedule(dispatch) {
+                Ok((catch_up, result)) => (Some(catch_up), Ok(result)),
+                Err(error) => (None, Err(error)),
+            },
+        };
+        if let Some(catch_up) = catch_up {
+            report.materialized = Some(report.materialized.unwrap_or(0) + catch_up.materialized);
+            report.skipped = Some(report.skipped.unwrap_or(0) + catch_up.skipped);
+        }
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = publish_logs(error.events(), "failure");
+                return report_runtime_error(&artifact_path, &error);
+            }
+        };
+        if let Err(error) = publish_logs(&result.events, "success") {
+            eprintln!("krit: error[K4007]: could not publish structured logs: {error}");
+            return 1;
+        }
+        if result.outcome.is_idle() {
+            break;
+        }
+        report.idle = false;
+        report.dispatched += 1;
+        match &result.outcome {
+            DeliveryOutcome::Completed { .. } => report.completed += 1,
+            DeliveryOutcome::Retried { .. } => report.retried += 1,
+            DeliveryOutcome::DeadLettered { .. } => report.dead_lettered += 1,
+            DeliveryOutcome::Idle => {}
+        }
+        report.outcomes.push(result.outcome);
+        if options.json {
+            let output = match String::from_utf8(result.output) {
+                Ok(output) => output,
+                Err(_) => {
+                    eprintln!(
+                        "krit: error[K4007]: guest output is not UTF-8 and cannot be reported as JSON"
+                    );
+                    return 1;
+                }
+            };
+            collected_output_bytes = collected_output_bytes.saturating_add(output.len());
+            report.outputs.push(output);
+            if collected_output_bytes >= output_budget {
+                report.stopped_for_output_budget = true;
+                break;
+            }
+        } else if !result.output.is_empty()
+            && let Err(error) = write_buffered_output(&mut io::stdout().lock(), &result.output)
+        {
+            eprintln!("krit: error[K4007]: could not publish guest output: {error}");
+            return 1;
+        }
+    }
+    if options.json {
+        let mut rendered = match serde_json::to_vec(&report) {
+            Ok(rendered) => rendered,
+            Err(error) => return internal_error("KICE0003", "serializing delivery report", &error),
+        };
+        rendered.push(b'\n');
+        if let Err(error) = write_buffered_output(&mut io::stdout().lock(), &rendered) {
+            eprintln!("krit: error[K4007]: could not publish delivery report: {error}");
+            return 1;
+        }
+    } else {
+        println!(
+            "{} {}: dispatched {} completed {} retried {} dead-lettered {}",
+            kind.command(),
+            report.resource,
+            report.dispatched,
+            report.completed,
+            report.retried,
+            report.dead_lettered
+        );
+    }
+    0
+}
+
+fn host_wall_clock_millis() -> Result<i64, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "host wall clock is before the UNIX epoch".to_owned())?;
+    i64::try_from(now.as_millis()).map_err(|_| "host wall clock exceeds i64".to_owned())
+}
+
+fn parse_delivery_options(
+    arguments: &[String],
+    kind: DeliveryKind,
+) -> Result<DeliveryOptions, String> {
+    let mut manifest = PathBuf::from("krit.pkg");
+    let mut artifact = None;
+    let mut host_config = None;
+    let mut resource = None;
+    let mut max_deliveries = None;
+    let mut now_millis = None;
+    let mut json = false;
+    let resource_option = kind.option();
+    let resource_assignment = format!("{resource_option}=");
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments[index].as_str();
+        match argument {
+            "--manifest" => {
+                manifest = option_path(arguments, index, "--manifest")?;
+                index += 2;
+            }
+            argument if argument.starts_with("--manifest=") => {
+                manifest = assigned_path(argument, "--manifest")?;
+                index += 1;
+            }
+            "--artifact" => {
+                artifact = Some(option_path(arguments, index, "--artifact")?);
+                index += 2;
+            }
+            argument if argument.starts_with("--artifact=") => {
+                artifact = Some(assigned_path(argument, "--artifact")?);
+                index += 1;
+            }
+            "--host-config" => {
+                host_config = Some(option_path(arguments, index, "--host-config")?);
+                index += 2;
+            }
+            argument if argument.starts_with("--host-config=") => {
+                host_config = Some(assigned_path(argument, "--host-config")?);
+                index += 1;
+            }
+            argument if argument == resource_option => {
+                resource = Some(option_text(arguments, index, resource_option)?);
+                index += 2;
+            }
+            argument if argument.starts_with(&resource_assignment) => {
+                resource = Some(assigned_text(argument, resource_option)?);
+                index += 1;
+            }
+            "--once" => {
+                max_deliveries = Some(1);
+                index += 1;
+            }
+            "--max-deliveries" => {
+                max_deliveries = Some(parse_count(&option_text(
+                    arguments,
+                    index,
+                    "--max-deliveries",
+                )?)?);
+                index += 2;
+            }
+            argument if argument.starts_with("--max-deliveries=") => {
+                max_deliveries = Some(parse_count(&assigned_text(argument, "--max-deliveries")?)?);
+                index += 1;
+            }
+            "--now" => {
+                now_millis = Some(parse_instant(&option_text(arguments, index, "--now")?)?);
+                index += 2;
+            }
+            argument if argument.starts_with("--now=") => {
+                now_millis = Some(parse_instant(&assigned_text(argument, "--now")?)?);
+                index += 1;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            argument if argument.starts_with('-') => {
+                return Err(format!("unknown option `{argument}`"));
+            }
+            argument => {
+                return Err(format!(
+                    "unexpected {} argument `{argument}`",
+                    kind.command()
+                ));
+            }
+        }
+    }
+    Ok(DeliveryOptions {
+        manifest,
+        artifact,
+        host_config,
+        resource: resource
+            .ok_or_else(|| format!("`{}` requires `{resource_option} NAME`", kind.command()))?,
+        max_deliveries: max_deliveries.unwrap_or(1),
+        now_millis,
+        json,
+    })
+}
+
+fn parse_count(value: &str) -> Result<u32, String> {
+    let count: u32 = value
+        .parse()
+        .map_err(|_| "`--max-deliveries` requires a non-negative integer".to_owned())?;
+    if count == 0 || count > MAX_DELIVERIES_PER_RUN {
+        return Err(format!(
+            "`--max-deliveries` must be between 1 and {MAX_DELIVERIES_PER_RUN}"
+        ));
+    }
+    Ok(count)
+}
+
+fn parse_instant(value: &str) -> Result<i64, String> {
+    let millis: i64 = value
+        .parse()
+        .map_err(|_| "`--now` requires UTC epoch milliseconds".to_owned())?;
+    if millis < 0 {
+        return Err("`--now` must not precede the UNIX epoch".to_owned());
+    }
+    Ok(millis)
+}
+
+fn option_text(arguments: &[String], index: usize, option: &str) -> Result<String, String> {
+    arguments
+        .get(index + 1)
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+        .cloned()
+        .ok_or_else(|| format!("`{option}` requires a value"))
+}
+
+fn assigned_text(argument: &str, option: &str) -> Result<String, String> {
+    let value = argument
+        .split_once('=')
+        .map(|(_, value)| value)
+        .unwrap_or_default();
+    if value.is_empty() {
+        Err(format!("`{option}` requires a value"))
+    } else {
+        Ok(value.to_owned())
+    }
 }
 
 fn serve_command(arguments: &[String]) -> u8 {
@@ -2103,6 +2510,8 @@ USAGE:
     krit permissions [--artifact PATH] [--json] [MANIFEST]
     krit sandbox [--manifest PATH] [--artifact PATH]
     krit invoke [--manifest PATH] [--artifact PATH] [--host-config PATH] --request FILE
+    krit worker --queue NAME [--manifest PATH] [--artifact PATH] [--host-config PATH] [--once] [--max-deliveries N] [--now EPOCH_MILLIS] [--json]
+    krit schedule --schedule NAME [--manifest PATH] [--artifact PATH] [--host-config PATH] [--once] [--max-deliveries N] [--now EPOCH_MILLIS] [--json]
     krit serve [--manifest PATH] [--artifact PATH] [--host-config PATH] [--bind IP:PORT] [--once]
     krit package check [MANIFEST]
     krit --version
@@ -2197,6 +2606,6 @@ mod tests {
             count += 1;
             remaining = &code[end + "\n```".len()..];
         }
-        assert_eq!(count, 8, "prompt should contain eight canonical examples");
+        assert_eq!(count, 10, "prompt should contain ten canonical examples");
     }
 }

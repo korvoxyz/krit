@@ -129,11 +129,62 @@ but extra definitions are unreachable: validation accepts only the exact
 component imports and corresponding finite compiler world.
 
 The state interface exposes bounded string key/value and checkpoint operations
-plus explicit anonymous HTTP and AI replay operations. State-enabled worlds are
-the finite existing webhook effect combinations plus exactly
-`krit:runtime/state@0.2.0`. Replay external authority remains exact metadata
-requirements; importing state does not import the general HTTP or AI
-interfaces.
+plus explicit anonymous HTTP and AI replay operations. Replay external authority
+remains exact metadata requirements; importing state does not import the general
+HTTP or AI interfaces.
+
+Phase 6 jobs add three narrow import interfaces and two export interfaces:
+
+```wit
+interface queue {
+    queue-publish: func(queue: string, body: string) -> result<string, string>;
+}
+
+interface objects-read {
+    object-get: func(bucket: string, key: string) -> result<option<string>, string>;
+}
+
+interface objects-write {
+    object-put: func(bucket: string, key: string, value: string) -> result<_, string>;
+    object-delete: func(bucket: string, key: string) -> result<_, string>;
+}
+
+interface job {
+    record delivery {
+        queue: string,
+        id: string,
+        body: string,
+        attempt: s64,
+        max-attempts: s64,
+    }
+    handle: func(delivery: delivery) -> result<string, string>;
+}
+
+interface schedule {
+    record trigger {
+        schedule: string,
+        id: string,
+        scheduled-at-millis: s64,
+        fired-at-millis: s64,
+        attempt: s64,
+        max-attempts: s64,
+    }
+    handle: func(trigger: trigger) -> result<string, string>;
+}
+```
+
+Object read and write are separate interfaces so that read-only authority never
+implies write authority. Worlds are named
+`{webhook|job|schedule}-<sorted import tokens>-program@0.2.0` over the fixed
+import order `stdout, config, secrets, http, ai, logs, state, queue, objread,
+objwrite`, with bearer `http` selected only alongside `secrets`. The finite
+world set is deterministic: the checked-in package carries every world that
+existed before Phase 6, and any other least-authority world is generated
+byte-identically from its mask at build and validation time. Validation
+re-derives every effect from the actual component imports and export, so
+`queue.consume` and `schedule.trigger` cannot be forged in metadata and no world
+may import a surface the guest never uses. WASI, clocks, randomness, files,
+sockets, and databases are never imported.
 
 ## Build pipeline
 
@@ -331,9 +382,10 @@ HTTP/TLS client to `curl` 0.4.50, secret clearing to `zeroize` 1.9.0, and CLI
 serving to `tiny_http` 0.12.0. Unix secret opens use `rustix` 1.1.4 with
 `O_NOFOLLOW`. Default features are disabled except curl's rustls and static-libcurl
 backends. The ignored `trusted_public_https_smoke_test` exercises platform
-Durable state uses locked `rusqlite` 0.40.2 with bundled SQLite through the
-isolated `krit-state` crate. SQLite paths are never guest-visible and no system
-SQLite linkage is used. The ignored `trusted_public_https_smoke_test` exercises platform
+Durable state, queues, schedules, and object buckets use locked `rusqlite`
+0.40.2 with bundled SQLite through the isolated `krit-state` crate. SQLite paths
+are never guest-visible and no system SQLite linkage is used. Phase 6 jobs and
+object storage add no new dependency. The ignored `trusted_public_https_smoke_test` exercises platform
 roots when public DNS/network access is available. Every curl/libcurl upgrade requires an audited
 `CURLOPT_RESOLVE`, proxy, redirect, TLS, timeout, and ordered-header review
 plus the complete network test suite. Exact resolved transitive versions
@@ -381,12 +433,32 @@ the bounded policy-2 webhook surface:
 | State key | 256 bytes | 4 KiB |
 | State/checkpoint value | 64 KiB | 1 MiB |
 | Staged state transaction | 1 MiB | 16 MiB |
-| Durable database | 64 MiB | 1 GiB |
+| Durable database | 64 MiB | 1 MiB minimum, 1 GiB maximum |
 | SQLite busy timeout | 250 ms | 5 s |
 | Replay entries per store | 1,024 | 65,536 |
 | Replay retained bytes | 16 MiB | 256 MiB |
 | Replay TTL | 7 days | 30 days |
 | Replay/in-progress lease | 30 seconds | 5 minutes |
+| Configured queues, schedules, buckets | none | 16 each |
+| Queue depth | none | 65,536 |
+| Job body | none | 1 MiB |
+| Retained queue bytes | none | 256 MiB |
+| Delivery attempts | none | 16 |
+| Delivery lease | none | 5 minutes |
+| Retry backoff | none | 1 hour |
+| Dead-letter entries | none | 4,096 |
+| Dead-letter retention | none | 30 days |
+| Schedule interval | none | 1 second .. 365 days |
+| Schedule catch-up per tick | none | 64 |
+| Retained schedule fires | none | 4,096 |
+| Objects per bucket | none | 65,536 |
+| Object key | none | 1 KiB |
+| Object value | none | 4 MiB |
+| Bucket bytes | none | 1 GiB |
+| Delivery outcome detail | 4 KiB | 4 KiB |
+| Deliveries per CLI dispatch | 1 | 1,024 |
+| Delivery lease minimum | — | deadline + store busy timeout |
+| Collected `--json` guest output | — | twice the output limit |
 
 The embedded authority document is capped at 48 KiB, leaving deterministic
 headroom for package, compiler, digest, import, and entry fields in the

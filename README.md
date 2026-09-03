@@ -73,6 +73,15 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
   loopback `serve --once`
 - deterministic fixture-driven `krit invoke --request FILE` with all outbound
   access still constrained by exact host policy
+- typed `queue "name" fn` and `schedule "name" fn` entrypoints with fixed
+  `QueueJob`/`ScheduleEvent` contracts and `Result<String, String>` outcomes
+- durable queues with owner leases, bounded attempts, capped backoff, and
+  terminal dead letters, plus host-owned UTC scheduled triggers with bounded
+  catch-up and duplicate-proof fire identities
+- capability-scoped bounded object buckets that commit with the delivery
+  acknowledgement in one transaction
+- bounded `krit worker --once` and `krit schedule --once` dispatch with
+  host-supplied wall time
 - recursive function declarations
 - exhaustive empty/cons list matching
 - deterministic comment-preserving canonical source formatting
@@ -85,11 +94,13 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - implementation-neutral conformance cases
 - strict package manifest validation
 
-Phase 6 state is complete for bounded local single-host coordination. The checked
-reference flow calls a GitHub-like origin, one neutral AI adapter, and one
-messaging-like origin with exact permissions and approval requirements; state
-and replay can now resume interrupted work without repeating recorded external
-operations.
+Phase 6 is complete for bounded local single-host coordination: transactional
+state, checkpoints, replay, durable idempotency, typed durable queues with
+leases, retries, and dead letters, host-owned scheduled triggers, and
+capability-scoped bounded object storage. The checked reference flow calls a
+GitHub-like origin, one neutral AI adapter, and one messaging-like origin with
+exact permissions and approval requirements; interrupted worker deliveries
+resume without repeating recorded external operations.
 General composite Wasm layouts beyond the documented webhook subset, modules,
 dependency resolution, build caching, broader autonomous editing, and
 production multi-tenant OS isolation are also future work. Krit is not
@@ -368,6 +379,84 @@ The checked-in
 transactional state and a named checkpoint. Create an owner-only
 `examples/state` directory before using its schema-3 host config.
 
+### Durable queues, scheduled triggers, and object storage
+
+Publish, consume, trigger, and bucket authority are separate manifest grants:
+
+```toml
+[capabilities]
+queues = ["render-jobs"]        # queue.publish
+consumes = ["render-jobs"]      # queue.consume
+schedules = ["hourly-sweep"]    # schedule.trigger
+buckets = ["render-output"]     # object.read and object.write
+```
+
+An ingress webhook enqueues without any consume or state authority:
+
+```krit
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match queue_publish("render-jobs", request.body) {
+        Ok(id) => record { status: 202, headers: [], body: id },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}
+```
+
+A worker declares the queue it consumes and returns a typed outcome:
+
+```krit
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    match object_put("render-output", job.id, job.body) {
+        Ok(stored) => Ok(job.id),
+        Err(error) => Err(error),
+    }
+}
+```
+
+`Ok(detail)` acknowledges the delivery and commits staged state, checkpoints,
+object writes, and queue publishes in the same transaction. `Err(detail)`
+commits nothing and lets the host retry with capped backoff until the attempt
+budget is exhausted, after which the job moves to a bounded dead-letter table.
+
+Scheduled triggers are host-owned. Occurrences are `start + k * interval` UTC
+epoch instants, a fire identity is `(schedule, dueAtMillis)`, and the guest only
+receives typed facts:
+
+```krit
+schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
+    Ok(event.id)
+}
+```
+
+Dispatch is explicit and bounded — there is no daemon and no polling loop:
+
+```sh
+krit worker --queue render-jobs --manifest examples/jobs-worker.krit.pkg   --host-config examples/jobs-worker.host.json --once --json
+krit schedule --schedule hourly-sweep --manifest examples/jobs-schedule.krit.pkg   --host-config examples/jobs-schedule.host.json --once --now 7200000 --json
+```
+
+With `--json` both commands emit exactly one schema-1 report on standard output
+— never mixed with guest bytes — carrying parallel `outcomes` and `outputs`
+arrays plus dispatch counts.
+
+Host config schema 4 binds manifest-granted queues, schedules, and buckets to
+already-configured owner-only stores and can only narrow them. Every job
+definition, grant, limit, and store reference is validated before any database
+is created, opened, or migrated, and a delivery lease must cover one complete
+guest execution. The complete
+contract, state machine, limits, and crash model are normative in
+[the jobs and storage specification](spec/JOBS-AND-STORAGE.md). The checked-in
+[`examples/jobs-webhook.krit`](examples/jobs-webhook.krit),
+[`examples/jobs-worker.krit`](examples/jobs-worker.krit), and
+[`examples/jobs-schedule.krit`](examples/jobs-schedule.krit) form the reference
+enqueue -> worker -> object flow; create an owner-only `examples/state`
+directory before running them.
+
+Krit does not lose or silently duplicate committed queue, schedule, or object
+state on one host. It does not provide distributed queues, brokers, consumer
+groups, cron expressions, guest-visible listing, or provider-side exactly
+once.
+
 Request JSON Lines diagnostics for tools and AI agents:
 
 ```sh
@@ -625,6 +714,8 @@ The specification is the semantic authority:
   LSP and review-gated provider-neutral assistance baseline
 - [Durable state and replay](spec/DURABLE-STATE.md) — transactional local
   stores, checkpoints, replay, and durable idempotency
+- [Jobs and object storage](spec/JOBS-AND-STORAGE.md) — durable queues,
+  host-owned scheduled triggers, and bounded object buckets
 - [Narrow product MVP](docs/mvp.md)
 - [Agent platform roadmap](docs/agent-roadmap.md)
 - [Rust technical design](docs/technical-design.md)
@@ -669,7 +760,9 @@ The accepted implementation path is:
    and separately approved semantic cleanup (complete)
 9. durable transactional state, checkpoints, replay, and idempotency
    (complete for local single-host coordination)
-10. typed queues, schedules, and bounded object storage (Phase 6; next)
+10. typed durable queues, host-owned scheduled triggers, and bounded object
+    storage (complete for local single-host coordination)
+11. capability-scoped database and cache services (Phase 7; next)
 
 Performance claims follow [docs/performance.md](docs/performance.md), not
 implementation-language assumptions.

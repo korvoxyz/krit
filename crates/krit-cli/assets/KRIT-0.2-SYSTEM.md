@@ -16,17 +16,22 @@ checked integer operators, comparisons, and scalar `print`/`println`. The
 bounded webhook path additionally supports strings, fixed HTTP records,
 header lists, Result/Option matching, static non-capturing helpers,
 `config_string`, `secret`, `http_request`, `ai_invoke`, `log_info`, and
-`log_error`, bounded string state/checkpoint operations, and durable
-`replay_http`/`replay_ai`. It also supports unescaped JSON-string decoding when
+`log_error`, bounded string state/checkpoint operations, durable
+`replay_http`/`replay_ai`, `queue_publish`, and bounded
+`object_get`/`object_put`/`object_delete`. The same bounded path backs the
+`queue "name" fn` and `schedule "name" fn` entrypoints. It also supports
+unescaped JSON-string decoding when
 the inferred result is `String`. General composites, general JSON shapes,
 escaped JSON strings, data captures, and dynamic string operators still fail
 closed.
 
 For a requested buildable-and-runnable package, require this deterministic
 workflow: `krit check`, `krit build`, `krit permissions --artifact PATH`, then
-`krit sandbox` for module-init programs or `krit invoke --request FILE` /
-`krit serve` for webhooks. Never claim that an execution command builds
-source, falls back to interpretation, or adds undeclared authority.
+`krit sandbox` for module-init programs, `krit invoke --request FILE` /
+`krit serve` for webhooks, `krit worker --queue NAME --once` for queue
+consumers, or `krit schedule --schedule NAME --once` for scheduled handlers.
+Never claim that an execution command builds source, falls back to
+interpretation, or adds undeclared authority.
 
 ## Output contract
 
@@ -192,6 +197,30 @@ process restart, but current grants and AI approval are rechecked. Krit does
 not claim distributed exactly once: a provider can complete an effect before
 the local replay record commits, so stable provider idempotency remains
 necessary.
+
+Schema-1 manifests may also request `queues`, `consumes`, `schedules`,
+`buckets`, and `readOnlyBuckets`. Publish and consume are separate grants.
+`queue_publish(queue, body)` returns `Result<String, String>` with the durable
+job identity. `object_get(bucket, key)` returns
+`Result<Option<String>, String>`; `object_put(bucket, key, value)` and
+`object_delete(bucket, key)` return `Result<Unit, String>`. Queue, schedule,
+and bucket names are direct canonical literals; keys and bodies are bounded
+ordinary strings. Guest-visible object listing does not exist.
+
+A module declares at most one `webhook`, `queue`, or `schedule` entrypoint.
+`queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String>` and
+`schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String,
+String>` are the only delivery signatures. `QueueJob` has `queue`, `id`,
+`body`, `attempt`, and `maxAttempts`; `ScheduleEvent` has `schedule`, `id`,
+`scheduledAtMillis`, `firedAtMillis`, `attempt`, and `maxAttempts`. All
+instants are host-supplied UTC epoch milliseconds; there is no guest clock,
+timer, sleep, or cron expression.
+
+`Ok(detail)` acknowledges a delivery and commits staged state, checkpoints,
+object writes, and queue publishes in one transaction. `Err(detail)` commits
+nothing and lets the host retry with capped backoff until the configured
+attempt budget dead-letters the delivery. Never emulate retries, backoff,
+timers, or dead-letter queues inside source.
 
 ## Expressions
 
@@ -395,6 +424,25 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
         },
         Err(error) => record { status: 500, headers: [], body: error },
     }
+}
+```
+
+Durable queue worker:
+
+```krit
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    match object_put("render-output", job.id, job.body) {
+        Ok(stored) => Ok(job.id),
+        Err(error) => Err(error),
+    }
+}
+```
+
+Scheduled trigger:
+
+```krit
+schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
+    Ok(event.id)
 }
 ```
 

@@ -25,6 +25,7 @@ pub enum RuntimeErrorKind {
     StateConflict,
     Replay,
     DurableIdempotency,
+    Delivery,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +109,10 @@ impl RuntimeError {
 
     pub(crate) fn durable_idempotency(message: impl Into<String>) -> Self {
         Self::new("K5204", RuntimeErrorKind::DurableIdempotency, message)
+    }
+
+    pub(crate) fn delivery(message: impl Into<String>) -> Self {
+        Self::new("K5205", RuntimeErrorKind::Delivery, message)
     }
 
     pub const fn code(&self) -> &'static str {

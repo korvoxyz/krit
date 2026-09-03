@@ -73,7 +73,8 @@ The MVP does not train or host its own model.
 - package registry and publishing
 - arbitrary Rust extension authoring
 - general databases and distributed transactions
-- queues and schedules
+- distributed queues, brokers, and consumer groups
+- cron expressions and calendar schedules
 - many provider connectors
 - autonomous whole-project rewriting
 - custom bytecode VM
@@ -85,8 +86,9 @@ The MVP does not train or host its own model.
 These features require evidence from the reference agent rather than being
 prerequisites for it.
 
-The post-MVP service order is transactional state, queues and schedules,
-object storage, database access, then cache and search. See
+The post-MVP service order is transactional state, queues and schedules, and
+object storage (all implemented for bounded local single-host coordination),
+then database access, cache, and search. See
 [agent-roadmap.md](agent-roadmap.md).
 
 ## Acceptance criteria

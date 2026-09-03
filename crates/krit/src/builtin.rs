@@ -23,10 +23,14 @@ pub enum Builtin {
     CheckpointPut,
     ReplayHttp,
     ReplayAi,
+    QueuePublish,
+    ObjectGet,
+    ObjectPut,
+    ObjectDelete,
 }
 
 impl Builtin {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 25] = [
         Self::AiInvoke,
         Self::ConfigString,
         Self::Err,
@@ -48,6 +52,10 @@ impl Builtin {
         Self::CheckpointPut,
         Self::ReplayAi,
         Self::ReplayHttp,
+        Self::QueuePublish,
+        Self::ObjectDelete,
+        Self::ObjectGet,
+        Self::ObjectPut,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -73,6 +81,10 @@ impl Builtin {
             "checkpoint_put" => Some(Self::CheckpointPut),
             "replay_http" => Some(Self::ReplayHttp),
             "replay_ai" => Some(Self::ReplayAi),
+            "queue_publish" => Some(Self::QueuePublish),
+            "object_get" => Some(Self::ObjectGet),
+            "object_put" => Some(Self::ObjectPut),
+            "object_delete" => Some(Self::ObjectDelete),
             _ => None,
         }
     }
@@ -100,6 +112,10 @@ impl Builtin {
             Self::CheckpointPut => "checkpoint_put",
             Self::ReplayHttp => "replay_http",
             Self::ReplayAi => "replay_ai",
+            Self::QueuePublish => "queue_publish",
+            Self::ObjectGet => "object_get",
+            Self::ObjectPut => "object_put",
+            Self::ObjectDelete => "object_delete",
         }
     }
 
@@ -119,7 +135,11 @@ impl Builtin {
             | Self::CheckpointGet
             | Self::CheckpointPut
             | Self::ReplayHttp
-            | Self::ReplayAi => BuiltinCategory::HostEffect,
+            | Self::ReplayAi
+            | Self::QueuePublish
+            | Self::ObjectGet
+            | Self::ObjectPut
+            | Self::ObjectDelete => BuiltinCategory::HostEffect,
         }
     }
 
@@ -155,6 +175,18 @@ impl Builtin {
             }
             Self::ReplayAi => {
                 "fn(String, String, String, String) -> Result<String, String> effects {state.transaction}"
+            }
+            Self::QueuePublish => {
+                "fn(String, String) -> Result<String, String> effects {queue.publish}"
+            }
+            Self::ObjectGet => {
+                "fn(String, String) -> Result<Option<String>, String> effects {object.read}"
+            }
+            Self::ObjectPut => {
+                "fn(String, String, String) -> Result<Unit, String> effects {object.write}"
+            }
+            Self::ObjectDelete => {
+                "fn(String, String) -> Result<Unit, String> effects {object.write}"
             }
         }
     }
@@ -201,6 +233,16 @@ impl Builtin {
             }
             Self::ReplayAi => {
                 "Performs or reuses one completed AI operation under a stable durable identity."
+            }
+            Self::QueuePublish => {
+                "Stages one bounded job for a manifest-granted durable queue and returns its durable identity."
+            }
+            Self::ObjectGet => {
+                "Reads one bounded object from a manifest-granted capability-scoped bucket."
+            }
+            Self::ObjectPut => "Stages one bounded object write for the successful outcome commit.",
+            Self::ObjectDelete => {
+                "Stages one bounded object deletion for the successful outcome commit."
             }
         }
     }

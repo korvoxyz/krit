@@ -1,0 +1,46 @@
+{
+  "schema": 4,
+  "state": {
+    "stores": {
+      "agent-work": {
+        "path": "state/jobs-agent-work.db",
+        "durability": "full",
+        "busyTimeoutMs": 250,
+        "maxOperations": 128,
+        "maxKeyBytes": 256,
+        "maxValueBytes": 65536,
+        "maxTransactionBytes": 1048576,
+        "maxDatabaseBytes": 67108864,
+        "maxReplayEntries": 1024,
+        "maxReplayBytes": 16777216,
+        "replayTtlSeconds": 604800,
+        "leaseSeconds": 30
+      }
+    }
+  },
+  "jobs": {
+    "buckets": {
+      "render-output": {
+        "store": "agent-work",
+        "maxObjects": 1024,
+        "maxKeyBytes": 256,
+        "maxObjectBytes": 65536,
+        "maxBucketBytes": 8388608
+      }
+    },
+    "schedules": {
+      "hourly-sweep": {
+        "store": "agent-work",
+        "intervalSeconds": 3600,
+        "startEpochMillis": 0,
+        "maxCatchUp": 4,
+        "maxAttempts": 3,
+        "leaseSeconds": 30,
+        "backoffSeconds": 1,
+        "maxBackoffSeconds": 60,
+        "retentionSeconds": 604800,
+        "maxRetainedFires": 256
+      }
+    }
+  }
+}

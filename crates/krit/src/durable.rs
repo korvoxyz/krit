@@ -12,6 +12,10 @@ pub enum DurableOperationKind {
     CheckpointPut,
     ReplayHttp,
     ReplayAi,
+    QueuePublish,
+    ObjectGet,
+    ObjectPut,
+    ObjectDelete,
 }
 
 impl DurableOperationKind {
@@ -24,6 +28,10 @@ impl DurableOperationKind {
             Self::CheckpointPut => "checkpoint-put",
             Self::ReplayHttp => "replay-http",
             Self::ReplayAi => "replay-ai",
+            Self::QueuePublish => "queue-publish",
+            Self::ObjectGet => "object-get",
+            Self::ObjectPut => "object-put",
+            Self::ObjectDelete => "object-delete",
         }
     }
 }
@@ -31,6 +39,7 @@ impl DurableOperationKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableOperationFact {
     kind: DurableOperationKind,
+    /// Durable store, queue, or bucket named by the first literal argument.
     store: String,
     identity: Option<String>,
     external_capability: Option<&'static str>,
@@ -76,7 +85,10 @@ pub fn durable_operations(program: &Program) -> Vec<DurableOperationFact> {
 fn collect_statement(statement: &Statement, facts: &mut Vec<DurableOperationFact>) {
     match &statement.kind {
         StatementKind::Let { value, .. } => collect_expression(value, facts),
-        StatementKind::Function { body, .. } | StatementKind::Webhook { body, .. } => {
+        StatementKind::Function { body, .. }
+        | StatementKind::Webhook { body, .. }
+        | StatementKind::QueueConsumer { body, .. }
+        | StatementKind::ScheduleHandler { body, .. } => {
             collect_block(body, facts);
         }
         StatementKind::Expression(expression) => collect_expression(expression, facts),
@@ -202,6 +214,25 @@ fn operation_fact(
             string_argument(arguments, 1).map(str::to_owned),
             Some("ai.invoke"),
             string_argument(arguments, 2).map(str::to_owned),
+        ),
+        "queue_publish" => (DurableOperationKind::QueuePublish, None, None, None),
+        "object_get" => (
+            DurableOperationKind::ObjectGet,
+            string_argument(arguments, 1).map(str::to_owned),
+            None,
+            None,
+        ),
+        "object_put" => (
+            DurableOperationKind::ObjectPut,
+            string_argument(arguments, 1).map(str::to_owned),
+            None,
+            None,
+        ),
+        "object_delete" => (
+            DurableOperationKind::ObjectDelete,
+            string_argument(arguments, 1).map(str::to_owned),
+            None,
+            None,
         ),
         _ => return None,
     };

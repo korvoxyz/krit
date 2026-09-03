@@ -17,6 +17,11 @@ pub(crate) const HTTP_EFFECT: &str = "http.request";
 pub(crate) const LOGGING_EFFECT: &str = "observe.log";
 pub(crate) const SECRETS_EFFECT: &str = "secret.read";
 pub(crate) const STATE_EFFECT: &str = "state.transaction";
+pub(crate) const QUEUE_PUBLISH_EFFECT: &str = "queue.publish";
+pub(crate) const QUEUE_CONSUME_EFFECT: &str = "queue.consume";
+pub(crate) const SCHEDULE_TRIGGER_EFFECT: &str = "schedule.trigger";
+pub(crate) const OBJECT_READ_EFFECT: &str = "object.read";
+pub(crate) const OBJECT_WRITE_EFFECT: &str = "object.write";
 pub const AI_INTERFACE: &str = "krit:runtime/ai@0.2.0";
 pub const STDOUT_INTERFACE: &str = "krit:runtime/stdout@0.2.0";
 pub const CONFIG_INTERFACE: &str = "krit:runtime/config@0.2.0";
@@ -25,7 +30,12 @@ pub const HTTP_ANONYMOUS_INTERFACE: &str = "krit:runtime/http-anonymous@0.2.0";
 pub const SECRETS_INTERFACE: &str = "krit:runtime/secrets@0.2.0";
 pub const LOGGING_INTERFACE: &str = "krit:runtime/logging@0.2.0";
 pub const STATE_INTERFACE: &str = "krit:runtime/state@0.2.0";
+pub const QUEUE_INTERFACE: &str = "krit:runtime/queue@0.2.0";
+pub const OBJECTS_READ_INTERFACE: &str = "krit:runtime/objects-read@0.2.0";
+pub const OBJECTS_WRITE_INTERFACE: &str = "krit:runtime/objects-write@0.2.0";
 pub const WEBHOOK_INTERFACE: &str = "krit:runtime/webhook@0.2.0";
+pub const JOB_INTERFACE: &str = "krit:runtime/job@0.2.0";
+pub const SCHEDULE_INTERFACE: &str = "krit:runtime/schedule@0.2.0";
 pub const PROGRAM_WORLD: &str = "krit:runtime/program@0.2.0";
 pub const PURE_PROGRAM_WORLD: &str = "krit:runtime/pure-program@0.2.0";
 pub const WEBHOOK_PROGRAM_WORLD: &str = "krit:runtime/webhook-program@0.2.0";
@@ -33,12 +43,55 @@ pub const WEBHOOK_ALL_PROGRAM_WORLD: &str =
     "krit:runtime/webhook-stdout-config-secrets-http-ai-logs-program@0.2.0";
 pub const WEBHOOK_STATE_ALL_PROGRAM_WORLD: &str =
     "krit:runtime/webhook-stdout-config-secrets-http-ai-logs-state-program@0.2.0";
+pub const JOB_PROGRAM_WORLD: &str = "krit:runtime/job-program@0.2.0";
+pub const SCHEDULE_PROGRAM_WORLD: &str = "krit:runtime/schedule-program@0.2.0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProgramKind {
     Module,
     Webhook,
+    Job,
+    Schedule,
 }
+
+impl ProgramKind {
+    /// Effect implied by exporting this entrypoint contract.
+    pub(crate) const fn export_effect(self) -> Option<&'static str> {
+        match self {
+            Self::Module | Self::Webhook => None,
+            Self::Job => Some(QUEUE_CONSUME_EFFECT),
+            Self::Schedule => Some(SCHEDULE_TRIGGER_EFFECT),
+        }
+    }
+
+    const fn world_prefix(self) -> &'static str {
+        match self {
+            Self::Module => "program",
+            Self::Webhook => "webhook",
+            Self::Job => "job",
+            Self::Schedule => "schedule",
+        }
+    }
+}
+
+/// Ordered import surfaces. The bit order fixes every generated world name.
+const IMPORT_SURFACES: [(u16, &str, &str, &str); 10] = [
+    (1 << 0, "stdout", "stdout", STDOUT_INTERFACE),
+    (1 << 1, "config", "config", CONFIG_INTERFACE),
+    (1 << 2, "secrets", "secrets", SECRETS_INTERFACE),
+    (1 << 3, "http", "http-anonymous", HTTP_ANONYMOUS_INTERFACE),
+    (1 << 4, "ai", "ai", AI_INTERFACE),
+    (1 << 5, "logs", "logging", LOGGING_INTERFACE),
+    (1 << 6, "state", "state", STATE_INTERFACE),
+    (1 << 7, "queue", "queue", QUEUE_INTERFACE),
+    (1 << 8, "objread", "objects-read", OBJECTS_READ_INTERFACE),
+    (1 << 9, "objwrite", "objects-write", OBJECTS_WRITE_INTERFACE),
+];
+
+const SECRETS_BIT: u16 = 1 << 2;
+const HTTP_BIT: u16 = 1 << 3;
+/// Import surfaces whose webhook worlds are checked in to `wit/runtime.wit`.
+const CHECKED_IN_MASK: u16 = 0b11_1111;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct WitFunction {
@@ -90,6 +143,8 @@ struct WorldSelection {
     name: String,
     id: String,
     component_imports: Vec<String>,
+    generated: bool,
+    export: &'static str,
 }
 
 pub(crate) fn load_contract(
@@ -98,7 +153,7 @@ pub(crate) fn load_contract(
 ) -> Result<(Resolve, WorldId, WitContract), BuildError> {
     let selection = select_world(kind, effects)?;
     let mut resolve = Resolve::default();
-    let source = complete_wit_source();
+    let source = complete_wit_source(&selection);
     let package = resolve
         .push_str("krit-runtime.wit", &source)
         .map_err(|error| BuildError::artifact(format!("invalid built-in WIT package: {error}")))?;
@@ -115,7 +170,7 @@ pub(crate) fn load_contract(
     }
 
     let contract = contract_from_world(&resolve, world)?;
-    let mut expected_component_imports = selection.component_imports;
+    let mut expected_component_imports = selection.component_imports.clone();
     expected_component_imports.sort();
     if contract.world != selection.id || contract.component_imports != expected_component_imports {
         return Err(BuildError::artifact(
@@ -238,7 +293,7 @@ pub(crate) fn contract_from_world(
         entry_signature,
         post_entry_signature,
         kind,
-        requires_memory: kind == ProgramKind::Webhook,
+        requires_memory: kind != ProgramKind::Module,
         memory_export: resolve.wasm_export_name(ManglingAndAbi::Standard32, WasmExport::Memory),
         realloc_export: resolve.wasm_export_name(ManglingAndAbi::Standard32, WasmExport::Realloc),
     })
@@ -270,28 +325,26 @@ fn export_function(
             let identity = resolve
                 .id_of(*id)
                 .ok_or_else(|| BuildError::artifact("WIT export interface has no identity"))?;
-            if identity != WEBHOOK_INTERFACE {
-                return Err(BuildError::artifact(
-                    "built-in WIT exports an unknown interface",
-                ));
-            }
+            let kind = match identity.as_str() {
+                WEBHOOK_INTERFACE => ProgramKind::Webhook,
+                JOB_INTERFACE => ProgramKind::Job,
+                SCHEDULE_INTERFACE => ProgramKind::Schedule,
+                _ => {
+                    return Err(BuildError::artifact(
+                        "built-in WIT exports an unknown interface",
+                    ));
+                }
+            };
             let interface = &resolve.interfaces[*id];
             if interface.functions.len() != 1 {
                 return Err(BuildError::artifact(
-                    "webhook WIT interface must export exactly one function",
+                    "entrypoint WIT interface must export exactly one function",
                 ));
             }
-            let function = interface
-                .functions
-                .get("handle")
-                .ok_or_else(|| BuildError::artifact("webhook WIT interface is missing `handle`"))?;
-            Ok((
-                key,
-                Some(key),
-                function,
-                WEBHOOK_INTERFACE.to_owned(),
-                ProgramKind::Webhook,
-            ))
+            let function = interface.functions.get("handle").ok_or_else(|| {
+                BuildError::artifact("entrypoint WIT interface is missing `handle`")
+            })?;
+            Ok((key, Some(key), function, identity, kind))
         }
         _ => Err(BuildError::artifact(
             "built-in WIT export is not an approved function or interface",
@@ -311,11 +364,15 @@ fn select_world(kind: ProgramKind, effects: &[String]) -> Result<WorldSelection,
                 name: "pure-program".to_owned(),
                 id: PURE_PROGRAM_WORLD.to_owned(),
                 component_imports: Vec::new(),
+                generated: false,
+                export: "run",
             }),
             [effect] if effect == STDOUT_EFFECT => Ok(WorldSelection {
                 name: "program".to_owned(),
                 id: PROGRAM_WORLD.to_owned(),
                 component_imports: vec![STDOUT_INTERFACE.to_owned()],
+                generated: false,
+                export: "run",
             }),
             _ => Err(BuildError::artifact(
                 "checked module effects do not map to a WebAssembly policy 1 WIT world",
@@ -323,101 +380,108 @@ fn select_world(kind: ProgramKind, effects: &[String]) -> Result<WorldSelection,
         };
     }
 
+    let export_effect = kind.export_effect();
+    let mut saw_export_effect = false;
     let mut mask = 0u16;
     for effect in effects {
+        if Some(effect.as_str()) == export_effect {
+            saw_export_effect = true;
+            continue;
+        }
         mask |= match effect.as_str() {
             STDOUT_EFFECT => 1 << 0,
             CONFIG_EFFECT => 1 << 1,
-            SECRETS_EFFECT => 1 << 2,
-            HTTP_EFFECT => 1 << 3,
+            SECRETS_EFFECT => SECRETS_BIT,
+            HTTP_EFFECT => HTTP_BIT,
             AI_EFFECT => 1 << 4,
             LOGGING_EFFECT => 1 << 5,
             STATE_EFFECT => 1 << 6,
+            QUEUE_PUBLISH_EFFECT => 1 << 7,
+            OBJECT_READ_EFFECT => 1 << 8,
+            OBJECT_WRITE_EFFECT => 1 << 9,
             _ => {
                 return Err(BuildError::artifact(
-                    "checked webhook effects contain an unknown host surface",
+                    "checked entrypoint effects contain an unknown host surface",
                 ));
             }
         };
     }
-    if mask == 0 {
-        return Ok(WorldSelection {
-            name: "webhook-program".to_owned(),
-            id: WEBHOOK_PROGRAM_WORLD.to_owned(),
-            component_imports: Vec::new(),
-        });
+    if export_effect.is_some() != saw_export_effect {
+        return Err(BuildError::artifact(
+            "checked entrypoint effects do not match the exported host contract",
+        ));
     }
-    let mut tokens = Vec::new();
-    let mut component_imports = Vec::new();
-    for (bit, token, interface) in [
-        (1 << 0, "stdout", STDOUT_INTERFACE),
-        (1 << 1, "config", CONFIG_INTERFACE),
-        (1 << 2, "secrets", SECRETS_INTERFACE),
-        (
-            1 << 3,
-            "http",
-            if mask & (1 << 2) == 0 {
-                HTTP_ANONYMOUS_INTERFACE
-            } else {
-                HTTP_INTERFACE
-            },
-        ),
-        (1 << 4, "ai", AI_INTERFACE),
-        (1 << 5, "logs", LOGGING_INTERFACE),
-        (1 << 6, "state", STATE_INTERFACE),
-    ] {
-        if mask & bit != 0 {
-            tokens.push(token);
-            component_imports.push(interface.to_owned());
-        }
-    }
-    let name = format!("webhook-{}-program", tokens.join("-"));
+    let (tokens, component_imports) = surfaces(mask);
+    let name = if tokens.is_empty() {
+        format!("{}-program", kind.world_prefix())
+    } else {
+        format!("{}-{}-program", kind.world_prefix(), tokens.join("-"))
+    };
+    let generated = kind != ProgramKind::Webhook || mask & !CHECKED_IN_MASK != 0;
     Ok(WorldSelection {
         id: format!("krit:runtime/{name}@0.2.0"),
         name,
         component_imports,
+        generated,
+        export: kind.world_prefix(),
     })
 }
 
-fn complete_wit_source() -> String {
-    let mut source = WIT_SOURCE.to_owned();
-    for mask in 0u16..(1 << 6) {
-        let mut tokens = Vec::new();
-        let mut imports = Vec::new();
-        for (bit, token, interface) in [
-            (1 << 0, "stdout", "stdout"),
-            (1 << 1, "config", "config"),
-            (1 << 2, "secrets", "secrets"),
-            (
-                1 << 3,
-                "http",
-                if mask & (1 << 2) == 0 {
-                    "http-anonymous"
-                } else {
-                    "http"
-                },
-            ),
-            (1 << 4, "ai", "ai"),
-            (1 << 5, "logs", "logging"),
-        ] {
-            if mask & bit != 0 {
-                tokens.push(token);
-                imports.push(interface);
-            }
+/// Returns the ordered world-name tokens and component import identities for
+/// one import mask. Bearer HTTP is selected only alongside secret authority.
+fn surfaces(mask: u16) -> (Vec<&'static str>, Vec<String>) {
+    let mut tokens = Vec::new();
+    let mut imports = Vec::new();
+    for (bit, token, _, interface) in IMPORT_SURFACES {
+        if mask & bit == 0 {
+            continue;
         }
-        tokens.push("state");
-        imports.push("state");
-        let name = format!("webhook-{}-program", tokens.join("-"));
-        source.push_str("\nworld ");
-        source.push_str(&name);
-        source.push_str(" {\n");
-        for import in imports {
-            source.push_str("    import ");
-            source.push_str(import);
-            source.push_str(";\n");
+        tokens.push(token);
+        if bit == HTTP_BIT && mask & SECRETS_BIT != 0 {
+            imports.push(HTTP_INTERFACE.to_owned());
+        } else {
+            imports.push(interface.to_owned());
         }
-        source.push_str("    export webhook;\n}\n");
     }
+    imports.sort();
+    (tokens, imports)
+}
+
+/// Returns the checked-in package plus, when required, the one deterministic
+/// least-authority world selected for this build.
+fn complete_wit_source(selection: &WorldSelection) -> String {
+    let mut source = WIT_SOURCE.to_owned();
+    if !selection.generated {
+        return source;
+    }
+    let mut mask = 0u16;
+    for (bit, _, _, interface) in IMPORT_SURFACES {
+        let selected = selection
+            .component_imports
+            .iter()
+            .any(|import| import == interface || (bit == HTTP_BIT && import == HTTP_INTERFACE));
+        if selected {
+            mask |= bit;
+        }
+    }
+    source.push_str("\nworld ");
+    source.push_str(&selection.name);
+    source.push_str(" {\n");
+    for (bit, _, wit_name, _) in IMPORT_SURFACES {
+        if mask & bit == 0 {
+            continue;
+        }
+        source.push_str("    import ");
+        if bit == HTTP_BIT && mask & SECRETS_BIT != 0 {
+            source.push_str("http");
+        } else {
+            source.push_str(wit_name);
+        }
+        source.push_str(";\n");
+    }
+    source.push_str("    export ");
+    source.push_str(selection.export);
+    source.push_str(";\n}\n");
     source
 }
 

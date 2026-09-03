@@ -200,7 +200,7 @@ availability.
 
 ## Phase 6: durable execution
 
-**Status:** In progress
+**Status:** Complete
 
 ### `phase6-state`
 
@@ -218,14 +218,34 @@ exactly-once behavior remain explicitly unclaimed.
 
 ### `phase6-jobs-storage`
 
-**Status:** Not started
+**Status:** Complete
 
-- typed queues with retry and dead-letter outcomes
-- scheduled triggers
-- bounded object storage
+- typed durable queues with owner leases, bounded attempts, capped backoff, and
+  terminal dead-letter outcomes
+- host-owned scheduled triggers with durable UTC fire identities, bounded
+  catch-up, and explicit misfire skipping
+- capability-scoped bounded object storage backed by the same transactional
+  store
+- separate `queue.publish`, `queue.consume`, `schedule.trigger`, `object.read`,
+  and `object.write` authority through parser, analyzer, Core, WIT, manifest,
+  permissions, explain, LSP, and assist redaction
+- deterministic store schema-2 migration that preserves schema-1 data and
+  strictly rejects foreign, newer, or malformed schemas
+- `krit worker --once` and `krit schedule --once [--now]` bounded dispatch paths
+  with host-supplied wall time and no unbounded loops
+- strict host config schema 4 that can only narrow manifest-requested queues,
+  schedules, and buckets onto owner-only stores
 
-Gate: interrupted agent work resumes safely without repeating completed
-external side effects.
+Gate met: `crates/krit-runtime/tests/jobs.rs` interrupts a delivery after one
+completed HTTP effect, rolls its checkpoint back, redelivers under a new
+`Runtime` and `AgentHost`, reuses the durable replay result without a second
+mock call, and commits the acknowledgement atomically with the checkpoint.
+Lease recovery, retry-then-success, dead-letter exhaustion, schedule fire
+recovery, and bounded object persistence are covered by the same suite, and
+`crates/krit-cli/tests/cli.rs` proves the same behavior across real processes.
+
+Single-host durability only. Cross-host coordination and provider-side
+exactly once remain explicitly unclaimed.
 
 ## Phase 7: data services
 

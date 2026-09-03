@@ -142,9 +142,17 @@ emission. `config.read("agent.model")` requires an exact `config` entry and
 resources are `K5001`. `http.request("https://api.example.com")` likewise
 requires one exact normalized `http` entry, and `ai.invoke("reviewer")`
 requires one exact sorted `ai` entry. `observe.log` requires `logs = true`.
-`state.transaction("agent-work")` requires one exact `state` entry. Replay
-operations separately retain their exact HTTP/AI requirement. Manifest state
-names are logical authority only; database paths and durability settings are
+`state.transaction("agent-work")` requires one exact `state` entry.
+`queue.publish("render-jobs")` requires one exact `queues` entry and
+`queue.consume("render-jobs")` requires one exact `consumes` entry, so publish
+and consume authority are separately reviewable.
+`schedule.trigger("hourly-sweep")` requires one exact `schedules` entry.
+`object.write("render-output")` requires one exact `buckets` entry, and
+`object.read("render-output")` is satisfied by `buckets` or the disjoint
+read-only `readOnlyBuckets` list. Replay
+operations separately retain their exact HTTP/AI requirement. Manifest state,
+queue, schedule, and bucket names are logical authority only; database paths,
+durability settings, lease durations, attempt budgets, and byte bounds are
 strict host configuration and never package data.
 Matching resources permit the bounded webhook backend only; unsupported
 general composite layouts still fail closed. Host-config adapter origins,

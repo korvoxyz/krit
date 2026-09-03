@@ -104,10 +104,17 @@ clock.read
 random.read
 secret.read
 ai.invoke
+queue.publish
+queue.consume
+schedule.trigger
+object.read
+object.write
 ```
 
 Implemented analysis recognizes `io.stdout`, `config.read`, `secret.read`,
-`http.request`, `ai.invoke`, `observe.log`, and `state.transaction`. Pure functions have an empty
+`http.request`, `ai.invoke`, `observe.log`, `state.transaction`,
+`queue.publish`, `queue.consume`, `schedule.trigger`, `object.read`, and
+`object.write`. Pure functions have an empty
 effect set. Calling a function adds its effects to the caller,
 including recursive and higher-order propagation. Branch and match effects
 are conservative unions. JSON conversion is pure.
@@ -117,10 +124,15 @@ The Rust API returns effects in sorted deterministic order through
 `Analysis` separately exposes sorted, deduplicated literal-resource
 requirements through `Analysis::requirements`; function, expression, and
 block facts expose the same transitive requirement summaries. A requirement
-is the ordered pair `(capability, resource)`, currently `config.read`/configuration-key, `secret.read`/secret-name,
-`http.request`/exact-origin, `ai.invoke`/adapter-name, or
-`state.transaction`/store-name. Replay operations carry the state effect and
-both the store and exact external HTTP/AI requirements. Coarse effects
+is the ordered pair `(capability, resource)`, currently
+`config.read`/configuration-key, `secret.read`/secret-name,
+`http.request`/exact-origin, `ai.invoke`/adapter-name,
+`state.transaction`/store-name, `queue.publish`/queue-name,
+`queue.consume`/queue-name, `schedule.trigger`/schedule-name, or
+`object.read`/`object.write`/bucket-name. Replay operations carry the state
+effect and both the store and exact external HTTP/AI requirements.
+`queue.consume` and `schedule.trigger` come from the entrypoint declaration
+rather than a call. Coarse effects
 never erase or replace these resource identities. `Analysis` also exposes
 normalized symbol facts and resolved symbol or built-in identities. Core
 lowering consumes those facts and does not run an independent inference

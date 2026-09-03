@@ -26,6 +26,7 @@ infer semantics from historical interpreter behavior.
 | [WASM-SANDBOX.md](WASM-SANDBOX.md) | Implemented Phase 4 | Policy-1 scalar and bounded stateless webhook components |
 | [GUIDED-AUTHORING.md](GUIDED-AUTHORING.md) | Implemented Phase 5 baseline | Offline LSP facts and review-gated provider-neutral suggestions |
 | [DURABLE-STATE.md](DURABLE-STATE.md) | Normative bounded Phase 6 | Transactional local state, checkpoints, replay, and durable idempotency |
+| [JOBS-AND-STORAGE.md](JOBS-AND-STORAGE.md) | Normative bounded Phase 6 | Durable queues, host-owned scheduled triggers, and bounded object storage |
 
 `LANGUAGE.md` deliberately defines a new readable syntax for the Rust
 implementation. The S-expression syntax in the archived Racket prototype is

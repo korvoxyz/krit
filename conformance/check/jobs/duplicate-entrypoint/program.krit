@@ -1,0 +1,7 @@
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.path }
+}
+
+queue "render-jobs" fn worker(job: QueueJob) -> Result<String, String> {
+    Ok(job.id)
+}

@@ -10,12 +10,15 @@ use wit_component::DecodedWasm;
 use crate::{
     AI_INTERFACE, ARTIFACT_METADATA_SCHEMA, ApprovalRequirementMetadata, ArtifactMetadata,
     BuildError, COMPILER_NAME, CONFIG_INTERFACE, EmbeddedMetadata, HTTP_ANONYMOUS_INTERFACE,
-    HTTP_INTERFACE, LANGUAGE_NAME, LANGUAGE_VERSION, LOGGING_INTERFACE,
-    ResourceRequirementMetadata, SECRETS_INTERFACE, STATE_INTERFACE, STDOUT_INTERFACE,
+    HTTP_INTERFACE, JOB_INTERFACE, LANGUAGE_NAME, LANGUAGE_VERSION, LOGGING_INTERFACE,
+    OBJECTS_READ_INTERFACE, OBJECTS_WRITE_INTERFACE, QUEUE_INTERFACE, ResourceRequirementMetadata,
+    SCHEDULE_INTERFACE, SECRETS_INTERFACE, STATE_INTERFACE, STDOUT_INTERFACE,
     WASM_COMPONENT_TARGET, WEBHOOK_INTERFACE, artifact_policy_version,
     wit::{
-        AI_EFFECT, CONFIG_EFFECT, HTTP_EFFECT, LOGGING_EFFECT, ProgramKind, SECRETS_EFFECT,
-        STATE_EFFECT, STDOUT_EFFECT, WitContract, contract_from_world, load_contract,
+        AI_EFFECT, CONFIG_EFFECT, HTTP_EFFECT, LOGGING_EFFECT, OBJECT_READ_EFFECT,
+        OBJECT_WRITE_EFFECT, ProgramKind, QUEUE_CONSUME_EFFECT, QUEUE_PUBLISH_EFFECT,
+        SCHEDULE_TRIGGER_EFFECT, SECRETS_EFFECT, STATE_EFFECT, STDOUT_EFFECT, WitContract,
+        contract_from_world, load_contract,
     },
 };
 
@@ -393,6 +396,8 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
     let kind = match exports.as_slice() {
         [export] if export == "run" => ProgramKind::Module,
         [export] if export == WEBHOOK_INTERFACE => ProgramKind::Webhook,
+        [export] if export == JOB_INTERFACE => ProgramKind::Job,
+        [export] if export == SCHEDULE_INTERFACE => ProgramKind::Schedule,
         _ => {
             return Err(BuildError::artifact(
                 "component exports do not match a policy 1 WIT world",
@@ -416,6 +421,9 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
                 HTTP_ANONYMOUS_INTERFACE => HTTP_EFFECT,
                 LOGGING_INTERFACE => LOGGING_EFFECT,
                 STATE_INTERFACE => STATE_EFFECT,
+                QUEUE_INTERFACE => QUEUE_PUBLISH_EFFECT,
+                OBJECTS_READ_INTERFACE => OBJECT_READ_EFFECT,
+                OBJECTS_WRITE_INTERFACE => OBJECT_WRITE_EFFECT,
                 _ => {
                     return Err(BuildError::artifact(
                         "component imports do not match WebAssembly policy 1",
@@ -424,6 +432,9 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
             }
             .to_owned(),
         );
+    }
+    if let Some(effect) = kind.export_effect() {
+        effects.push(effect.to_owned());
     }
     effects.sort();
     let (_, _, contract) = load_contract(kind, &effects)?;
@@ -591,7 +602,15 @@ fn valid_requirements(requirements: &[ResourceRequirementMetadata], effects: &[S
                     .is_ok()
                     && matches!(requirement.capability.as_str(), AI_EFFECT | HTTP_EFFECT)))
                 && match requirement.capability.as_str() {
-                    AI_EFFECT | CONFIG_EFFECT | SECRETS_EFFECT | STATE_EFFECT => {
+                    AI_EFFECT
+                    | CONFIG_EFFECT
+                    | SECRETS_EFFECT
+                    | STATE_EFFECT
+                    | QUEUE_PUBLISH_EFFECT
+                    | QUEUE_CONSUME_EFFECT
+                    | SCHEDULE_TRIGGER_EFFECT
+                    | OBJECT_READ_EFFECT
+                    | OBJECT_WRITE_EFFECT => {
                         krit_capability::is_valid_resource_name(&requirement.resource)
                     }
                     HTTP_EFFECT => {

@@ -1,0 +1,3 @@
+queue "render-jobs" fn worker(job: QueueJob) -> String {
+    job.id
+}

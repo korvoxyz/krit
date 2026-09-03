@@ -3260,3 +3260,918 @@ stdout = {stdout}
 "#
     )
 }
+
+fn owner_only_directory(name: &str) -> TestDirectory {
+    let directory = TestDirectory::new(name);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+            .expect("test root should be owner-only");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(directory.path.join("state"))
+            .expect("state directory should be owner-only");
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(directory.path.join("state")).expect("state directory should exist");
+    directory
+}
+
+const JOBS_STORE: &str = r#"
+  "state": {
+    "stores": {
+      "agent-work": {
+        "path": "state/jobs.db",
+        "durability": "full",
+        "busyTimeoutMs": 250,
+        "maxOperations": 128,
+        "maxKeyBytes": 256,
+        "maxValueBytes": 65536,
+        "maxTransactionBytes": 1048576,
+        "maxDatabaseBytes": 67108864,
+        "maxReplayEntries": 1024,
+        "maxReplayBytes": 16777216,
+        "replayTtlSeconds": 604800,
+        "leaseSeconds": 30
+      }
+    }
+  }
+"#;
+
+const JOBS_QUEUE: &str = r#"
+      "render-jobs": {
+        "store": "agent-work",
+        "maxDepth": 1024,
+        "maxJobBytes": 65536,
+        "maxQueueBytes": 8388608,
+        "maxAttempts": 2,
+        "leaseSeconds": 30,
+        "backoffSeconds": 1,
+        "maxBackoffSeconds": 60,
+        "deadLetterMaxEntries": 16,
+        "deadLetterRetentionSeconds": 3600
+      }
+"#;
+
+const JOBS_BUCKET: &str = r#"
+      "render-output": {
+        "store": "agent-work",
+        "maxObjects": 64,
+        "maxKeyBytes": 128,
+        "maxObjectBytes": 4096,
+        "maxBucketBytes": 65536
+      }
+"#;
+
+#[test]
+fn worker_once_dispatches_one_durable_delivery_across_processes() {
+    let directory = owner_only_directory("worker-once");
+    directory.file(
+        "publish.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match queue_publish("render-jobs", request.body) {
+        Ok(id) => record { status: 202, headers: [], body: id },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}
+"#,
+    );
+    directory.file(
+        "publish.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/jobs-publish"
+version = "0.2.0"
+edition = "2026"
+entry = "publish.krit"
+license = "Apache-2.0"
+
+[capabilities]
+queues = ["render-jobs"]
+"#,
+    );
+    directory.file(
+        "worker.krit",
+        r#"
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    match object_put("render-output", job.id, job.body) {
+        Ok(stored) => match checkpoint_put("agent-work", "last-render", job.id) {
+            Ok(marked) => Ok(job.body),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+"#,
+    );
+    directory.file(
+        "worker.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/jobs-worker"
+version = "0.2.0"
+edition = "2026"
+entry = "worker.krit"
+license = "Apache-2.0"
+
+[capabilities]
+buckets = ["render-output"]
+consumes = ["render-jobs"]
+state = ["agent-work"]
+"#,
+    );
+    directory.file(
+        "publish.host.json",
+        &format!("{{\n  \"schema\": 4,{JOBS_STORE},\n  \"jobs\": {{\n    \"queues\": {{{JOBS_QUEUE}}}\n  }}\n}}"),
+    );
+    directory.file(
+        "worker.host.json",
+        &format!(
+            "{{\n  \"schema\": 4,{JOBS_STORE},\n  \"jobs\": {{\n    \"queues\": {{{JOBS_QUEUE}}},\n    \"buckets\": {{{JOBS_BUCKET}}}\n  }}\n}}"
+        ),
+    );
+    directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/render","query":"","headers":[],"body":"payload"}"#,
+    );
+
+    for manifest in ["publish.pkg", "worker.pkg"] {
+        let build = krit_in(&directory)
+            .args(["build", "--manifest", manifest])
+            .output()
+            .expect("job package should build");
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+
+    let permissions = krit_in(&directory)
+        .args([
+            "permissions",
+            "--json",
+            "--artifact",
+            "target/krit/jobs-worker.wasm",
+            "worker.pkg",
+        ])
+        .output()
+        .expect("worker permissions should run");
+    assert!(permissions.status.success());
+    let permissions: serde_json::Value =
+        serde_json::from_slice(&permissions.stdout).expect("permissions should be JSON");
+    assert_eq!(
+        permissions["required"],
+        serde_json::json!([
+            {"capability": "object.write", "resource": "render-output"},
+            {"capability": "queue.consume", "resource": "render-jobs"},
+            {"capability": "state.transaction", "resource": "agent-work"},
+        ])
+    );
+    assert_eq!(permissions["localGrantStatus"], "allowed");
+    let rendered = serde_json::to_string(&permissions).expect("permissions should render");
+    assert!(!rendered.contains("state/jobs.db"));
+
+    let publish = krit_in(&directory)
+        .args([
+            "invoke",
+            "--manifest",
+            "publish.pkg",
+            "--host-config",
+            "publish.host.json",
+            "--request",
+            "request.json",
+        ])
+        .output()
+        .expect("publish should run");
+    assert!(
+        publish.status.success(),
+        "{}",
+        String::from_utf8_lossy(&publish.stderr)
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&publish.stdout).expect("response should be JSON");
+    assert_eq!(response["status"], 202);
+    let identity = response["body"].as_str().expect("identity should be text");
+
+    let worker = krit_in(&directory)
+        .args([
+            "worker",
+            "--queue",
+            "render-jobs",
+            "--manifest",
+            "worker.pkg",
+            "--host-config",
+            "worker.host.json",
+            "--once",
+            "--json",
+        ])
+        .output()
+        .expect("worker should run");
+    assert!(
+        worker.status.success(),
+        "{}",
+        String::from_utf8_lossy(&worker.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&worker.stdout).expect("report should be JSON");
+    assert_eq!(report["dispatched"], 1);
+    assert_eq!(report["completed"], 1);
+    assert_eq!(report["outcomes"][0]["outcome"], "completed");
+    assert_eq!(report["outcomes"][0]["id"], identity);
+
+    let idle = krit_in(&directory)
+        .args([
+            "worker",
+            "--queue",
+            "render-jobs",
+            "--manifest",
+            "worker.pkg",
+            "--host-config",
+            "worker.host.json",
+            "--once",
+            "--json",
+        ])
+        .output()
+        .expect("idle worker should run");
+    assert!(idle.status.success());
+    let idle: serde_json::Value =
+        serde_json::from_slice(&idle.stdout).expect("report should be JSON");
+    assert_eq!(idle["dispatched"], 0);
+    assert_eq!(idle["idle"], true);
+    assert!(directory.path.join("state/jobs.db").is_file());
+}
+
+#[test]
+fn schedule_once_fires_exactly_once_per_host_supplied_instant() {
+    let directory = owner_only_directory("schedule-once");
+    directory.file(
+        "sweep.krit",
+        r#"
+schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
+    match object_put("render-output", event.id, event.schedule) {
+        Ok(stored) => Ok(event.id),
+        Err(error) => Err(error),
+    }
+}
+"#,
+    );
+    directory.file(
+        "sweep.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/jobs-sweep"
+version = "0.2.0"
+edition = "2026"
+entry = "sweep.krit"
+license = "Apache-2.0"
+
+[capabilities]
+buckets = ["render-output"]
+schedules = ["hourly-sweep"]
+"#,
+    );
+    directory.file(
+        "sweep.host.json",
+        &format!(
+            r#"{{
+  "schema": 4,{JOBS_STORE},
+  "jobs": {{
+    "schedules": {{
+      "hourly-sweep": {{
+        "store": "agent-work",
+        "intervalSeconds": 3600,
+        "startEpochMillis": 0,
+        "maxCatchUp": 2,
+        "maxAttempts": 2,
+        "leaseSeconds": 30,
+        "backoffSeconds": 1,
+        "maxBackoffSeconds": 60,
+        "retentionSeconds": 3600,
+        "maxRetainedFires": 16
+      }}
+    }},
+    "buckets": {{{JOBS_BUCKET}}}
+  }}
+}}"#
+        ),
+    );
+
+    let build = krit_in(&directory)
+        .args(["build", "--manifest", "sweep.pkg"])
+        .output()
+        .expect("schedule package should build");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let arguments = [
+        "schedule",
+        "--schedule",
+        "hourly-sweep",
+        "--manifest",
+        "sweep.pkg",
+        "--host-config",
+        "sweep.host.json",
+        "--once",
+        "--now",
+        "7200000",
+        "--json",
+    ];
+    let first = krit_in(&directory)
+        .args(arguments)
+        .output()
+        .expect("first tick should run");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value =
+        serde_json::from_slice(&first.stdout).expect("report should be JSON");
+    assert_eq!(first["materialized"], 1);
+    assert_eq!(first["completed"], 1);
+    assert_eq!(first["outcomes"][0]["id"], "hourly-sweep@7200000");
+
+    let repeated = krit_in(&directory)
+        .args(arguments)
+        .output()
+        .expect("repeated tick should run");
+    assert!(repeated.status.success());
+    let repeated: serde_json::Value =
+        serde_json::from_slice(&repeated.stdout).expect("report should be JSON");
+    assert_eq!(repeated["materialized"], 0);
+    assert_eq!(repeated["dispatched"], 0);
+    assert_eq!(repeated["idle"], true);
+}
+
+#[test]
+fn delivery_commands_reject_unbounded_and_ungranted_requests() {
+    let directory = owner_only_directory("delivery-guards");
+    directory.file(
+        "worker.krit",
+        r#"
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    Ok(job.body)
+}
+"#,
+    );
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/jobs-guard"
+version = "0.2.0"
+edition = "2026"
+entry = "worker.krit"
+license = "Apache-2.0"
+
+[capabilities]
+consumes = ["render-jobs"]
+"#,
+    );
+    directory.file(
+        "host.json",
+        &format!("{{\n  \"schema\": 4,{JOBS_STORE},\n  \"jobs\": {{\n    \"queues\": {{{JOBS_QUEUE}}}\n  }}\n}}"),
+    );
+    directory.file(
+        "ungranted.host.json",
+        &format!(
+            "{{\n  \"schema\": 4,{JOBS_STORE},\n  \"jobs\": {{\n    \"queues\": {{{JOBS_QUEUE}}},\n    \"buckets\": {{{JOBS_BUCKET}}}\n  }}\n}}"
+        ),
+    );
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("guard package should build");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let missing = krit_in(&directory)
+        .args(["worker", "--host-config", "host.json", "--once"])
+        .output()
+        .expect("worker should run");
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--queue"));
+
+    let unbounded = krit_in(&directory)
+        .args([
+            "worker",
+            "--queue",
+            "render-jobs",
+            "--host-config",
+            "host.json",
+            "--max-deliveries",
+            "0",
+        ])
+        .output()
+        .expect("worker should run");
+    assert_eq!(unbounded.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&unbounded.stderr).contains("--max-deliveries"));
+
+    let ungranted = krit_in(&directory)
+        .args([
+            "worker",
+            "--queue",
+            "render-jobs",
+            "--host-config",
+            "ungranted.host.json",
+            "--once",
+        ])
+        .output()
+        .expect("worker should run");
+    assert_eq!(ungranted.status.code(), Some(4));
+    assert!(
+        String::from_utf8_lossy(&ungranted.stderr).contains("render-output"),
+        "{}",
+        String::from_utf8_lossy(&ungranted.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regressions for the phase6-jobs-storage review findings.
+// ---------------------------------------------------------------------------
+
+/// Finding 10: a worker artifact that also holds `io.stdout` must not corrupt
+/// the `--json` report stream.
+#[test]
+fn json_delivery_reports_stay_parseable_when_the_guest_writes_stdout() {
+    let directory = owner_only_directory("json-stdout-worker");
+    directory.file(
+        "publish.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match queue_publish("render-jobs", request.body) {
+        Ok(id) => record { status: 202, headers: [], body: id },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}
+"#,
+    );
+    directory.file(
+        "publish.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/stdout-publish"
+version = "0.2.0"
+edition = "2026"
+entry = "publish.krit"
+license = "Apache-2.0"
+
+[capabilities]
+queues = ["render-jobs"]
+"#,
+    );
+    directory.file(
+        "worker.krit",
+        r#"
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    let noise = println(job.attempt);
+    Ok(job.id)
+}
+"#,
+    );
+    directory.file(
+        "worker.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/stdout-worker"
+version = "0.2.0"
+edition = "2026"
+entry = "worker.krit"
+license = "Apache-2.0"
+
+[capabilities]
+consumes = ["render-jobs"]
+stdout = true
+"#,
+    );
+    directory.file(
+        "host.json",
+        &format!("{{\n  \"schema\": 4,{JOBS_STORE},\n  \"jobs\": {{\n    \"queues\": {{{JOBS_QUEUE}}}\n  }}\n}}"),
+    );
+    directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/render","query":"","headers":[],"body":"payload"}"#,
+    );
+    for manifest in ["publish.pkg", "worker.pkg"] {
+        let build = krit_in(&directory)
+            .args(["build", "--manifest", manifest])
+            .output()
+            .expect("package should build");
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+    let publish = krit_in(&directory)
+        .args([
+            "invoke",
+            "--manifest",
+            "publish.pkg",
+            "--host-config",
+            "host.json",
+            "--request",
+            "request.json",
+        ])
+        .output()
+        .expect("publish should run");
+    assert!(
+        publish.status.success(),
+        "{}",
+        String::from_utf8_lossy(&publish.stderr)
+    );
+
+    let worker = krit_in(&directory)
+        .args([
+            "worker",
+            "--queue",
+            "render-jobs",
+            "--manifest",
+            "worker.pkg",
+            "--host-config",
+            "host.json",
+            "--once",
+            "--json",
+        ])
+        .output()
+        .expect("worker should run");
+    assert!(
+        worker.status.success(),
+        "{}",
+        String::from_utf8_lossy(&worker.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&worker.stdout)
+        .expect("JSON mode standard output must parse as one report");
+    assert_eq!(report["dispatched"], 1);
+    assert_eq!(report["completed"], 1);
+    assert_eq!(report["outputs"], serde_json::json!(["1\n"]));
+    assert_eq!(report["stoppedForOutputBudget"], false);
+    assert_eq!(
+        report["outcomes"].as_array().map(Vec::len),
+        report["outputs"].as_array().map(Vec::len),
+        "outcomes and outputs must be parallel arrays"
+    );
+
+    // Human mode still streams the guest bytes on standard output.
+    let publish = krit_in(&directory)
+        .args([
+            "invoke",
+            "--manifest",
+            "publish.pkg",
+            "--host-config",
+            "host.json",
+            "--request",
+            "request.json",
+        ])
+        .output()
+        .expect("second publish should run");
+    assert!(publish.status.success());
+    let human = krit_in(&directory)
+        .args([
+            "worker",
+            "--queue",
+            "render-jobs",
+            "--manifest",
+            "worker.pkg",
+            "--host-config",
+            "host.json",
+            "--once",
+        ])
+        .output()
+        .expect("human worker should run");
+    assert!(human.status.success());
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(human.contains("1\n"), "{human}");
+    assert!(
+        human.contains("worker render-jobs: dispatched 1"),
+        "{human}"
+    );
+}
+
+/// Finding 10: the same guarantee for scheduled triggers.
+#[test]
+fn json_schedule_reports_stay_parseable_when_the_guest_writes_stdout() {
+    let directory = owner_only_directory("json-stdout-schedule");
+    directory.file(
+        "sweep.krit",
+        r#"
+schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
+    let noise = println(event.attempt);
+    Ok(event.id)
+}
+"#,
+    );
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/stdout-sweep"
+version = "0.2.0"
+edition = "2026"
+entry = "sweep.krit"
+license = "Apache-2.0"
+
+[capabilities]
+schedules = ["hourly-sweep"]
+stdout = true
+"#,
+    );
+    directory.file(
+        "host.json",
+        &format!(
+            r#"{{
+  "schema": 4,{JOBS_STORE},
+  "jobs": {{
+    "schedules": {{
+      "hourly-sweep": {{
+        "store": "agent-work",
+        "intervalSeconds": 3600,
+        "startEpochMillis": 0,
+        "maxCatchUp": 2,
+        "maxAttempts": 2,
+        "leaseSeconds": 30,
+        "backoffSeconds": 1,
+        "maxBackoffSeconds": 60,
+        "retentionSeconds": 3600,
+        "maxRetainedFires": 16
+      }}
+    }}
+  }}
+}}"#
+        ),
+    );
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("schedule package should build");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let tick = krit_in(&directory)
+        .args([
+            "schedule",
+            "--schedule",
+            "hourly-sweep",
+            "--host-config",
+            "host.json",
+            "--once",
+            "--now",
+            "7200000",
+            "--json",
+        ])
+        .output()
+        .expect("tick should run");
+    assert!(
+        tick.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tick.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&tick.stdout)
+        .expect("JSON mode standard output must parse as one report");
+    assert_eq!(report["completed"], 1);
+    assert_eq!(report["outputs"], serde_json::json!(["1\n"]));
+    assert_eq!(report["outcomes"][0]["id"], "hourly-sweep@7200000");
+}
+
+/// Finding 8: an unrepresentable `--now` fails without moving the cursor, and a
+/// later ordinary tick still fires.
+#[test]
+fn extreme_schedule_instants_fail_without_disturbing_later_ticks() {
+    let directory = owner_only_directory("extreme-now");
+    directory.file(
+        "sweep.krit",
+        r#"
+schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
+    Ok(event.id)
+}
+"#,
+    );
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/extreme-sweep"
+version = "0.2.0"
+edition = "2026"
+entry = "sweep.krit"
+license = "Apache-2.0"
+
+[capabilities]
+schedules = ["hourly-sweep"]
+"#,
+    );
+    directory.file(
+        "host.json",
+        &format!(
+            r#"{{
+  "schema": 4,{JOBS_STORE},
+  "jobs": {{
+    "schedules": {{
+      "hourly-sweep": {{
+        "store": "agent-work",
+        "intervalSeconds": 3600,
+        "startEpochMillis": 0,
+        "maxCatchUp": 2,
+        "maxAttempts": 2,
+        "leaseSeconds": 30,
+        "backoffSeconds": 1,
+        "maxBackoffSeconds": 60,
+        "retentionSeconds": 3600,
+        "maxRetainedFires": 16
+      }}
+    }}
+  }}
+}}"#
+        ),
+    );
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("schedule package should build");
+    assert!(build.status.success());
+
+    let extreme = krit_in(&directory)
+        .args([
+            "schedule",
+            "--schedule",
+            "hourly-sweep",
+            "--host-config",
+            "host.json",
+            "--once",
+            "--now",
+            &i64::MAX.to_string(),
+            "--json",
+        ])
+        .output()
+        .expect("extreme tick should run");
+    assert!(!extreme.status.success());
+    assert!(
+        String::from_utf8_lossy(&extreme.stderr).contains("K5202"),
+        "{}",
+        String::from_utf8_lossy(&extreme.stderr)
+    );
+    assert!(
+        extreme.stdout.is_empty(),
+        "a refused tick must not emit a report"
+    );
+
+    let normal = krit_in(&directory)
+        .args([
+            "schedule",
+            "--schedule",
+            "hourly-sweep",
+            "--host-config",
+            "host.json",
+            "--once",
+            "--now",
+            "7200000",
+            "--json",
+        ])
+        .output()
+        .expect("later tick should run");
+    assert!(
+        normal.status.success(),
+        "{}",
+        String::from_utf8_lossy(&normal.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&normal.stdout).expect("report should be JSON");
+    assert_eq!(report["materialized"], 1);
+    assert_eq!(report["completed"], 1);
+    assert_eq!(report["outcomes"][0]["id"], "hourly-sweep@7200000");
+}
+
+/// Finding 5: an invalid or ungranted `jobs` section is rejected before any
+/// database is created, opened, or migrated.
+#[test]
+fn invalid_job_configuration_never_touches_a_store() {
+    let directory = owner_only_directory("jobs-no-side-effects");
+    directory.file(
+        "worker.krit",
+        r#"
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    Ok(job.id)
+}
+"#,
+    );
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/jobs-side-effects"
+version = "0.2.0"
+edition = "2026"
+entry = "worker.krit"
+license = "Apache-2.0"
+
+[capabilities]
+consumes = ["render-jobs"]
+"#,
+    );
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("package should build");
+    assert!(build.status.success());
+
+    let bad_depth = format!(
+        "{{\n  \"schema\": 4,{JOBS_STORE},\n  \"jobs\": {{\n    \"queues\": {{\n      \"render-jobs\": {{\n        \"store\": \"agent-work\",\n        \"maxDepth\": 0,\n        \"maxJobBytes\": 65536,\n        \"maxQueueBytes\": 8388608,\n        \"maxAttempts\": 2,\n        \"leaseSeconds\": 30,\n        \"backoffSeconds\": 1,\n        \"maxBackoffSeconds\": 60,\n        \"deadLetterMaxEntries\": 16,\n        \"deadLetterRetentionSeconds\": 3600\n      }}\n    }}\n  }}\n}}"
+    );
+    directory.file("bad-depth.host.json", &bad_depth);
+    directory.file(
+        "ungranted-bucket.host.json",
+        &format!(
+            "{{\n  \"schema\": 4,{JOBS_STORE},\n  \"jobs\": {{\n    \"queues\": {{{JOBS_QUEUE}}},\n    \"buckets\": {{{JOBS_BUCKET}}}\n  }}\n}}"
+        ),
+    );
+    directory.file(
+        "missing-store.host.json",
+        &format!(
+            "{{\n  \"schema\": 4,{JOBS_STORE},\n  \"jobs\": {{\n    \"queues\": {{\n      \"render-jobs\": {{\n        \"store\": \"absent\",\n        \"maxDepth\": 8,\n        \"maxJobBytes\": 65536,\n        \"maxQueueBytes\": 8388608,\n        \"maxAttempts\": 2,\n        \"leaseSeconds\": 30,\n        \"backoffSeconds\": 1,\n        \"maxBackoffSeconds\": 60,\n        \"deadLetterMaxEntries\": 16,\n        \"deadLetterRetentionSeconds\": 3600\n      }}\n    }}\n  }}\n}}"
+        ),
+    );
+
+    let database = directory.path.join("state/jobs.db");
+    for (config, expected) in [
+        ("bad-depth.host.json", 1),
+        ("ungranted-bucket.host.json", 4),
+        ("missing-store.host.json", 1),
+    ] {
+        assert!(
+            !database.exists(),
+            "no store may exist before `{config}` is evaluated"
+        );
+        let output = krit_in(&directory)
+            .args([
+                "worker",
+                "--queue",
+                "render-jobs",
+                "--host-config",
+                config,
+                "--once",
+            ])
+            .output()
+            .expect("worker should run");
+        assert_eq!(output.status.code(), Some(expected), "config: {config}");
+        assert!(
+            !database.exists(),
+            "`{config}` must not create the store: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // A valid configuration still creates and uses the store.
+    directory.file(
+        "valid.host.json",
+        &format!("{{\n  \"schema\": 4,{JOBS_STORE},\n  \"jobs\": {{\n    \"queues\": {{{JOBS_QUEUE}}}\n  }}\n}}"),
+    );
+    let output = krit_in(&directory)
+        .args([
+            "worker",
+            "--queue",
+            "render-jobs",
+            "--host-config",
+            "valid.host.json",
+            "--once",
+            "--json",
+        ])
+        .output()
+        .expect("worker should run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(database.is_file());
+}

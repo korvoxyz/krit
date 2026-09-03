@@ -668,7 +668,10 @@ fn ast_sensitive_literal_spans(
     ) {
         match &statement.kind {
             StatementKind::Let { value, .. } => expression_spans(source, value, spans),
-            StatementKind::Function { body, .. } | StatementKind::Webhook { body, .. } => {
+            StatementKind::Function { body, .. }
+            | StatementKind::Webhook { body, .. }
+            | StatementKind::QueueConsumer { body, .. }
+            | StatementKind::ScheduleHandler { body, .. } => {
                 block_spans(source, body, spans);
             }
             StatementKind::Expression(expression) => expression_spans(source, expression, spans),
@@ -742,6 +745,10 @@ fn ast_sensitive_literal_spans(
                             (1, "replay-operation"),
                             (2, "capability-resource"),
                         ],
+                        "queue_publish" => &[(0, "capability-resource")],
+                        "object_delete" | "object_get" | "object_put" => {
+                            &[(0, "capability-resource"), (1, "object-key")]
+                        }
                         _ => &[],
                     };
                     for (index, category) in sensitive {
@@ -867,9 +874,8 @@ fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static
         let content = &source[content_start..content_end];
         let category = preceding_token_call(&tokens)
             .and_then(|name| match name {
-                "ai_invoke" | "config_string" | "http_request" | "secret" => {
-                    Some("capability-resource")
-                }
+                "ai_invoke" | "config_string" | "http_request" | "object_delete" | "object_get"
+                | "object_put" | "queue_publish" | "secret" => Some("capability-resource"),
                 "log_error" | "log_info" => Some("event-name"),
                 _ => None,
             })

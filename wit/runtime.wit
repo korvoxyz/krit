@@ -601,6 +601,44 @@ world webhook-stdout-config-secrets-http-ai-logs-program {
     export webhook;
 }
 
+interface queue {
+    queue-publish: func(queue: string, body: string) -> result<string, string>;
+}
+
+interface objects-read {
+    object-get: func(bucket: string, key: string) -> result<option<string>, string>;
+}
+
+interface objects-write {
+    object-put: func(bucket: string, key: string, value: string) -> result<_, string>;
+    object-delete: func(bucket: string, key: string) -> result<_, string>;
+}
+
+interface job {
+    record delivery {
+        queue: string,
+        id: string,
+        body: string,
+        attempt: s64,
+        max-attempts: s64,
+    }
+
+    handle: func(delivery: delivery) -> result<string, string>;
+}
+
+interface schedule {
+    record trigger {
+        schedule: string,
+        id: string,
+        scheduled-at-millis: s64,
+        fired-at-millis: s64,
+        attempt: s64,
+        max-attempts: s64,
+    }
+
+    handle: func(trigger: trigger) -> result<string, string>;
+}
+
 world webhook-host-program {
     import stdout;
     import config;
@@ -610,5 +648,38 @@ world webhook-host-program {
     import ai;
     import logging;
     import state;
+    import queue;
+    import objects-read;
+    import objects-write;
     export webhook;
+}
+
+world job-host-program {
+    import stdout;
+    import config;
+    import secrets;
+    import http;
+    import http-anonymous;
+    import ai;
+    import logging;
+    import state;
+    import queue;
+    import objects-read;
+    import objects-write;
+    export job;
+}
+
+world schedule-host-program {
+    import stdout;
+    import config;
+    import secrets;
+    import http;
+    import http-anonymous;
+    import ai;
+    import logging;
+    import state;
+    import queue;
+    import objects-read;
+    import objects-write;
+    export schedule;
 }

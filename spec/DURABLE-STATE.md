@@ -1,8 +1,8 @@
 # Durable state, checkpoints, replay, and idempotency
 
 **Status:** Normative bounded Phase 6 local host
-**Store schema:** 1
-**Host config schema:** 3
+**Store schema:** 2 (schema 1 migrates forward in place)
+**Host config schema:** 4 (schemas 1-3 remain readable)
 **Artifact validation policy:** 2 for state-enabled artifacts
 
 ## Scope
@@ -199,25 +199,33 @@ never receives SQL, paths, connections, transactions, row IDs, or handles.
 Each store is one database file with:
 
 - SQLite `application_id` identifying Krit durable state
-- `user_version = 1`
+- `user_version = 2`
 - WAL journaling
 - foreign keys and defensive/trusted-schema restrictions
 - configurable `FULL` (default) or `NORMAL` synchronous durability
 - bounded busy timeout
-- bounded page count derived from the database-byte limit
+- a page ceiling derived from the database-byte limit, installed before any
+  schema work and re-verified against the materialized `page_count` afterwards
 - indexed key/checkpoint/replay/idempotency tables
 - one monotonically increasing store revision and LRU sequence
 
-Schema 0 initializes in one exclusive transaction. Schema 1 opens only when
-the strict table definitions, ordered columns, primary keys, constraints, and
-cleanup indexes match exactly; extra tables, indexes, views, or triggers are
-rejected. A newer schema, wrong application ID, malformed schema, corruption,
-failed integrity check, or failed migration is `K5201`; Krit never resets or
-replaces an unknown database automatically.
+Schema 0 initializes in one exclusive transaction. Schema 1 migrates forward to
+schema 2 in one exclusive transaction that validates the complete existing
+schema-1 object set — exact table and index name lists, declared definitions,
+ordered columns and constraints, and the absence of views and triggers — before
+adding the queue, schedule, and object tables, and revalidates the finished
+schema before committing; existing rows, revisions, and sequences are preserved
+and a rejected migration leaves the database byte-for-byte unchanged. Schema 2 opens only when the strict
+table definitions, ordered columns, primary keys, constraints, and cleanup
+indexes match exactly; extra tables, indexes, views, or triggers are rejected. A
+newer schema, wrong application ID, malformed schema, corruption, failed
+integrity check, or failed migration is `K5201`; Krit never resets or replaces
+an unknown database automatically.
 
 ## Host configuration
 
-Schema 1 and 2 remain readable. Schema 3 extends schema 2:
+Schemas 1 and 2 remain readable. Schema 3 extends schema 2 with `state`, and
+schema 4 adds the `jobs` section defined in `JOBS-AND-STORAGE.md`:
 
 ```json
 {
@@ -266,7 +274,7 @@ Protocol-1 hard maxima:
 | Key bytes | 256 | 4 KiB |
 | Value/checkpoint bytes | 64 KiB | 1 MiB |
 | Staged transaction bytes | 1 MiB | 16 MiB |
-| Database bytes | 64 MiB | 1 GiB |
+| Database bytes | 64 MiB | 1 MiB minimum, 1 GiB maximum |
 | SQLite busy timeout | 250 ms | 5 s |
 | Replay entries per store | 1,024 | 65,536 |
 | Replay retained bytes | 16 MiB | 256 MiB |
@@ -303,6 +311,9 @@ external request/response bodies, or digests.
 - distributed locks, consensus, or multi-host exactly once
 - arbitrary guest database queries
 - cross-store atomic transactions
-- durable queues, schedules, or object storage (the next Phase 6 milestone)
 - authenticated replay HTTP in protocol 1
 - storing opaque secrets or host capability handles
+
+Durable queues, scheduled triggers, and object storage are normative in
+[JOBS-AND-STORAGE.md](JOBS-AND-STORAGE.md); they reuse this store, its
+transaction boundary, and its crash model.

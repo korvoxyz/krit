@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
@@ -9,10 +9,11 @@ use std::{
 
 use krit_package::Manifest;
 use krit_runtime::{
-    AgentHost, AgentHostPolicy, AiAdapterConfig, ApprovalOperation, Durability, DurableState,
-    DurableStoreDefinition, DurableStoreLimits, ExplicitApprovalPolicy, HostInputs,
-    HttpJsonAdapterConfig, IdempotencyPolicy, RateLimitPolicy, RetentionPolicy, RetryPolicy,
-    RuntimeLimits, SecretStore,
+    AgentHost, AgentHostPolicy, AiAdapterConfig, ApprovalOperation, BucketDefinition, BucketPolicy,
+    Durability, DurableState, DurableStoreDefinition, DurableStoreLimits, ExplicitApprovalPolicy,
+    HostInputs, HttpJsonAdapterConfig, IdempotencyPolicy, QueueDefinition, QueuePolicy,
+    RateLimitPolicy, RetentionPolicy, RetryPolicy, RuntimeLimits, ScheduleDefinition,
+    SchedulePolicy, SecretStore,
 };
 use serde::Deserialize;
 
@@ -85,6 +86,80 @@ struct HostConfigV3 {
     state: StateFile,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostConfigV4 {
+    schema: u32,
+    #[serde(default)]
+    config: BTreeMap<String, String>,
+    #[serde(default)]
+    secrets: BTreeMap<String, SecretReference>,
+    #[serde(default)]
+    ai_adapters: BTreeMap<String, AiAdapterFile>,
+    #[serde(default)]
+    approvals: Vec<ApprovalFile>,
+    #[serde(default)]
+    retries: RetriesFile,
+    #[serde(default)]
+    rate_limits: RateLimitsFile,
+    #[serde(default)]
+    idempotency: IdempotencyFile,
+    state: StateFile,
+    #[serde(default)]
+    jobs: JobsFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JobsFile {
+    #[serde(default)]
+    queues: BTreeMap<String, QueueFile>,
+    #[serde(default)]
+    schedules: BTreeMap<String, ScheduleFile>,
+    #[serde(default)]
+    buckets: BTreeMap<String, BucketFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QueueFile {
+    store: String,
+    max_depth: usize,
+    max_job_bytes: usize,
+    max_queue_bytes: usize,
+    max_attempts: u32,
+    lease_seconds: u64,
+    backoff_seconds: u64,
+    max_backoff_seconds: u64,
+    dead_letter_max_entries: usize,
+    dead_letter_retention_seconds: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScheduleFile {
+    store: String,
+    interval_seconds: u64,
+    start_epoch_millis: i64,
+    max_catch_up: u32,
+    max_attempts: u32,
+    lease_seconds: u64,
+    backoff_seconds: u64,
+    max_backoff_seconds: u64,
+    retention_seconds: u64,
+    max_retained_fires: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BucketFile {
+    store: String,
+    max_objects: usize,
+    max_key_bytes: usize,
+    max_object_bytes: usize,
+    max_bucket_bytes: usize,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StateFile {
@@ -124,11 +199,33 @@ const MAX_STATE_KEY_BYTES: usize = 4 * 1024;
 const MAX_STATE_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_STATE_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STATE_DATABASE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Smallest budget that can hold the strict schema-2 store.
+const MIN_STATE_DATABASE_BYTES: u64 = krit_runtime::MINIMUM_DATABASE_BYTES;
 const MAX_STATE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REPLAY_ENTRIES: usize = 65_536;
 const MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_REPLAY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const MAX_REPLAY_LEASE: Duration = Duration::from_secs(5 * 60);
+const MAX_QUEUES: usize = 16;
+const MAX_SCHEDULES: usize = 16;
+const MAX_BUCKETS: usize = 16;
+const MAX_QUEUE_DEPTH: usize = 65_536;
+const MAX_QUEUE_JOB_BYTES: usize = 1024 * 1024;
+const MAX_QUEUE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_DELIVERY_ATTEMPTS: u32 = 16;
+const MAX_DELIVERY_LEASE: Duration = Duration::from_secs(5 * 60);
+const MAX_DELIVERY_BACKOFF: Duration = Duration::from_secs(60 * 60);
+const MAX_DEAD_LETTER_ENTRIES: usize = 4096;
+const MAX_DEAD_LETTER_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MIN_SCHEDULE_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_SCHEDULE_INTERVAL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+const MAX_SCHEDULE_CATCH_UP: u32 = 64;
+const MAX_SCHEDULE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MAX_RETAINED_FIRES: usize = 4096;
+const MAX_BUCKET_OBJECTS: usize = 65_536;
+const MAX_OBJECT_KEY_BYTES: usize = 1024;
+const MAX_OBJECT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BUCKET_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -353,7 +450,34 @@ pub(crate) fn load(
                 ))
             })?;
             debug_assert_eq!(file.schema, 3);
-            let durable = load_durable_state(path, manifest, file.state)?;
+            let durable = load_durable_state(path, manifest, file.state, &BTreeSet::new())?;
+            let compatible = HostConfigV2 {
+                schema: 2,
+                config: file.config,
+                secrets: file.secrets,
+                ai_adapters: file.ai_adapters,
+                approvals: file.approvals,
+                retries: file.retries,
+                rate_limits: file.rate_limits,
+                idempotency: file.idempotency,
+            };
+            load_configured_host(path, manifest, limits, compatible, durable)
+        }
+        4 => {
+            let file: HostConfigV4 = serde_json::from_slice(&bytes).map_err(|error| {
+                HostConfigError::input(format!(
+                    "invalid strict schema-4 host config {}: {error}",
+                    path.display()
+                ))
+            })?;
+            debug_assert_eq!(file.schema, 4);
+            let configured_stores = file.state.stores.keys().cloned().collect();
+            let jobs = validate_jobs(manifest, file.jobs, &configured_stores)?;
+            let host_owned = jobs.store_names();
+            let durable = load_durable_state(path, manifest, file.state, &host_owned)?;
+            let durable = durable
+                .with_jobs(jobs.queues, jobs.schedules, jobs.buckets)
+                .map_err(HostConfigError::durable)?;
             let compatible = HostConfigV2 {
                 schema: 2,
                 config: file.config,
@@ -367,7 +491,7 @@ pub(crate) fn load(
             load_configured_host(path, manifest, limits, compatible, durable)
         }
         unsupported => Err(HostConfigError::input(format!(
-            "unsupported host config schema {unsupported}; expected 1, 2, or 3"
+            "unsupported host config schema {unsupported}; expected 1, 2, 3, or 4"
         ))),
     }
 }
@@ -458,10 +582,214 @@ fn load_configured_host(
         .map_err(|error| HostConfigError::input(error.message().to_owned()))
 }
 
+/// Fully validated job bindings.
+///
+/// Building this value performs no I/O, so an invalid `jobs` section is
+/// rejected before any database is created, opened, or migrated.
+struct PreparedJobs {
+    queues: BTreeMap<String, QueueDefinition>,
+    schedules: BTreeMap<String, ScheduleDefinition>,
+    buckets: BTreeMap<String, BucketDefinition>,
+}
+
+impl PreparedJobs {
+    /// Stores that back at least one job resource and are therefore host-owned.
+    fn store_names(&self) -> BTreeSet<String> {
+        self.queues
+            .values()
+            .map(|definition| definition.store.clone())
+            .chain(
+                self.schedules
+                    .values()
+                    .map(|definition| definition.store.clone()),
+            )
+            .chain(
+                self.buckets
+                    .values()
+                    .map(|definition| definition.store.clone()),
+            )
+            .collect()
+    }
+}
+
+/// Validates every queue, schedule, and bucket definition, grant, limit, and
+/// store reference. Purely a parsing and checking step.
+fn validate_jobs(
+    manifest: &Manifest,
+    jobs: JobsFile,
+    configured_stores: &BTreeSet<String>,
+) -> Result<PreparedJobs, HostConfigError> {
+    if jobs.queues.len() > MAX_QUEUES
+        || jobs.schedules.len() > MAX_SCHEDULES
+        || jobs.buckets.len() > MAX_BUCKETS
+    {
+        return Err(HostConfigError::input(
+            "configured queues, schedules, or buckets exceed the Phase 6 bounds",
+        ));
+    }
+    let require_store = |store: &str| -> Result<(), HostConfigError> {
+        if configured_stores.contains(store) {
+            Ok(())
+        } else {
+            Err(HostConfigError::input(
+                "durable job resource names a store that `state.stores` does not configure",
+            ))
+        }
+    };
+    let mut queues = BTreeMap::new();
+    for (name, file) in jobs.queues {
+        if !manifest.grants_permission("queue.publish", Some(&name))
+            && !manifest.grants_permission("queue.consume", Some(&name))
+        {
+            return Err(HostConfigError::authorization(format!(
+                "durable queue `{name}` is not granted by the package manifest"
+            )));
+        }
+        require_store(&file.store)?;
+        let lease = seconds(file.lease_seconds, "queue lease")?;
+        let backoff = seconds(file.backoff_seconds, "queue backoff")?;
+        let max_backoff = seconds(file.max_backoff_seconds, "queue maximum backoff")?;
+        let dead_letter_ttl = seconds(file.dead_letter_retention_seconds, "dead-letter retention")?;
+        if file.max_depth == 0
+            || file.max_depth > MAX_QUEUE_DEPTH
+            || file.max_job_bytes == 0
+            || file.max_job_bytes > MAX_QUEUE_JOB_BYTES
+            || file.max_queue_bytes < file.max_job_bytes
+            || file.max_queue_bytes > MAX_QUEUE_BYTES
+            || file.max_attempts == 0
+            || file.max_attempts > MAX_DELIVERY_ATTEMPTS
+            || lease.is_zero()
+            || lease > MAX_DELIVERY_LEASE
+            || backoff.is_zero()
+            || backoff > max_backoff
+            || max_backoff > MAX_DELIVERY_BACKOFF
+            || file.dead_letter_max_entries == 0
+            || file.dead_letter_max_entries > MAX_DEAD_LETTER_ENTRIES
+            || dead_letter_ttl.is_zero()
+            || dead_letter_ttl > MAX_DEAD_LETTER_RETENTION
+        {
+            return Err(HostConfigError::input(
+                "durable queue limits exceed the Phase 6 bounds",
+            ));
+        }
+        queues.insert(
+            name,
+            QueueDefinition {
+                store: file.store,
+                policy: QueuePolicy {
+                    max_depth: file.max_depth,
+                    max_job_bytes: file.max_job_bytes,
+                    max_queue_bytes: file.max_queue_bytes,
+                    max_attempts: file.max_attempts,
+                    lease,
+                    backoff,
+                    max_backoff,
+                    dead_letter_max_entries: file.dead_letter_max_entries,
+                    dead_letter_ttl,
+                },
+            },
+        );
+    }
+    let mut schedules = BTreeMap::new();
+    for (name, file) in jobs.schedules {
+        if !manifest.grants_permission("schedule.trigger", Some(&name)) {
+            return Err(HostConfigError::authorization(format!(
+                "durable schedule `{name}` is not granted by the package manifest"
+            )));
+        }
+        require_store(&file.store)?;
+        let interval = seconds(file.interval_seconds, "schedule interval")?;
+        let lease = seconds(file.lease_seconds, "schedule lease")?;
+        let backoff = seconds(file.backoff_seconds, "schedule backoff")?;
+        let max_backoff = seconds(file.max_backoff_seconds, "schedule maximum backoff")?;
+        let retention = seconds(file.retention_seconds, "schedule retention")?;
+        if interval < MIN_SCHEDULE_INTERVAL
+            || interval > MAX_SCHEDULE_INTERVAL
+            || file.start_epoch_millis < 0
+            || file.max_catch_up == 0
+            || file.max_catch_up > MAX_SCHEDULE_CATCH_UP
+            || file.max_attempts == 0
+            || file.max_attempts > MAX_DELIVERY_ATTEMPTS
+            || lease.is_zero()
+            || lease > MAX_DELIVERY_LEASE
+            || backoff.is_zero()
+            || backoff > max_backoff
+            || max_backoff > MAX_DELIVERY_BACKOFF
+            || retention.is_zero()
+            || retention > MAX_SCHEDULE_RETENTION
+            || file.max_retained_fires == 0
+            || file.max_retained_fires > MAX_RETAINED_FIRES
+        {
+            return Err(HostConfigError::input(
+                "durable schedule limits exceed the Phase 6 bounds",
+            ));
+        }
+        schedules.insert(
+            name,
+            ScheduleDefinition {
+                store: file.store,
+                policy: SchedulePolicy {
+                    interval,
+                    start_millis: file.start_epoch_millis,
+                    max_catch_up: file.max_catch_up,
+                    max_attempts: file.max_attempts,
+                    lease,
+                    backoff,
+                    max_backoff,
+                    retention,
+                    max_retained_fires: file.max_retained_fires,
+                },
+            },
+        );
+    }
+    let mut buckets = BTreeMap::new();
+    for (name, file) in jobs.buckets {
+        if !manifest.grants_permission("object.read", Some(&name))
+            && !manifest.grants_permission("object.write", Some(&name))
+        {
+            return Err(HostConfigError::authorization(format!(
+                "object bucket `{name}` is not granted by the package manifest"
+            )));
+        }
+        require_store(&file.store)?;
+        if file.max_objects == 0
+            || file.max_objects > MAX_BUCKET_OBJECTS
+            || file.max_key_bytes == 0
+            || file.max_key_bytes > MAX_OBJECT_KEY_BYTES
+            || file.max_object_bytes == 0
+            || file.max_object_bytes > MAX_OBJECT_BYTES
+            || file.max_bucket_bytes < file.max_object_bytes
+            || u64::try_from(file.max_bucket_bytes).unwrap_or(u64::MAX) > MAX_BUCKET_BYTES
+        {
+            return Err(HostConfigError::input(
+                "object bucket limits exceed the Phase 6 bounds",
+            ));
+        }
+        buckets.insert(
+            name,
+            BucketDefinition {
+                store: file.store,
+                policy: BucketPolicy {
+                    max_objects: file.max_objects,
+                    max_key_bytes: file.max_key_bytes,
+                    max_object_bytes: file.max_object_bytes,
+                    max_bucket_bytes: file.max_bucket_bytes,
+                },
+            },
+        );
+    }
+    Ok(PreparedJobs {
+        queues,
+        schedules,
+        buckets,
+    })
+}
+
 fn load_durable_state(
     host_config_path: &Path,
     manifest: &Manifest,
     state: StateFile,
+    host_owned: &BTreeSet<String>,
 ) -> Result<DurableState, HostConfigError> {
     if state.stores.len() > MAX_STATE_STORES {
         return Err(HostConfigError::input(format!(
@@ -476,11 +804,14 @@ fn load_durable_state(
         .map_err(|_| HostConfigError::input("host config directory is not accessible"))?;
     let mut definitions = BTreeMap::new();
     let mut paths = BTreeMap::<PathBuf, String>::new();
+    // Pass one validates and resolves every store without creating a file.
     for (name, file) in state.stores {
-        require_manifest_state(manifest, &name)?;
+        if !host_owned.contains(&name) {
+            require_manifest_state(manifest, &name)?;
+        }
         validate_state_store_file(&file)?;
         validate_relative_state_path(&file.path)?;
-        let database = prepare_state_database_path(&root, &file.path, file.max_database_bytes)?;
+        let database = resolve_state_database_path(&root, &file.path, file.max_database_bytes)?;
         if let Some(previous) = paths.insert(database.clone(), name.clone()) {
             return Err(HostConfigError::input(format!(
                 "durable stores `{previous}` and `{name}` use the same database path"
@@ -524,6 +855,11 @@ fn load_durable_state(
             ));
         }
     }
+    // Pass two performs the side effects: create missing files, then open,
+    // validate, and migrate each database.
+    for definition in definitions.values() {
+        create_state_database_file(&definition.path)?;
+    }
     DurableState::open(definitions, state.durable_idempotency_store)
         .map_err(HostConfigError::durable)
 }
@@ -542,7 +878,7 @@ fn validate_state_store_file(file: &StateStoreFile) -> Result<(), HostConfigErro
         || file.max_value_bytes > MAX_STATE_VALUE_BYTES
         || file.max_transaction_bytes == 0
         || file.max_transaction_bytes > MAX_STATE_TRANSACTION_BYTES
-        || file.max_database_bytes < 4096
+        || file.max_database_bytes < MIN_STATE_DATABASE_BYTES
         || file.max_database_bytes > MAX_STATE_DATABASE_BYTES
         || file.max_replay_entries == 0
         || file.max_replay_entries > MAX_REPLAY_ENTRIES
@@ -576,7 +912,11 @@ fn validate_relative_state_path(path: &Path) -> Result<(), HostConfigError> {
     Ok(())
 }
 
-fn prepare_state_database_path(
+/// Resolves a store path without creating anything.
+///
+/// Every directory, symlink, ownership, and sidecar check runs here so that a
+/// later configuration error cannot leave a half-created store behind.
+fn resolve_state_database_path(
     root: &Path,
     relative: &Path,
     max_bytes: u64,
@@ -614,8 +954,6 @@ fn prepare_state_database_path(
     let database = parent.join(file_name);
     if database.exists() {
         validate_owner_only_state_file(&database, max_bytes)?;
-    } else {
-        create_owner_only_state_file(&database)?;
     }
     for suffix in ["-wal", "-shm"] {
         let mut sidecar = database.as_os_str().to_os_string();
@@ -626,6 +964,15 @@ fn prepare_state_database_path(
         }
     }
     Ok(database)
+}
+
+/// Creates a missing owner-only database file. Called only after every
+/// configuration value has already been validated.
+fn create_state_database_file(database: &Path) -> Result<(), HostConfigError> {
+    if database.exists() {
+        return Ok(());
+    }
+    create_owner_only_state_file(database)
 }
 
 #[cfg(unix)]

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "promptVersion": "0.2.12",
+  "promptVersion": "0.2.13",
   "languageVersion": "0.2.0",
   "edition": "2026",
   "status": "implemented",
@@ -25,6 +25,9 @@
   "aiRuntimeStatus": "implemented-provider-neutral-http-json",
   "observabilityStatus": "implemented-structured-redacted",
   "reliabilityStatus": "implemented-process-local-bounded",
-  "durableStateStatus": "implemented-local-transactional-schema-1",
-  "durableHostConfigSchema": 3
+  "durableStateStatus": "implemented-local-transactional-schema-2",
+  "durableHostConfigSchema": 4,
+  "durableStoreSchema": 2,
+  "jobsStatus": "implemented-local-queues-schedules-objects",
+  "deliveryProtocolVersion": 1
 }

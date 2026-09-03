@@ -27,8 +27,11 @@ executing source or granting runtime/network authority.
 range-filtered compiler facts to a configured provider, then treats the
 response as an untrusted review-gated source proposal.
 The current pack also includes named transactional state, workflow
-checkpoints, durable HTTP/AI replay, and schema-3 host configuration. It does
-not claim distributed exactly once or expose database paths/SQL to source.
+checkpoints, durable HTTP/AI replay, typed durable queues with host-owned
+leases and dead letters, host-owned UTC scheduled triggers, capability-scoped
+bounded object buckets, and schema-4 host configuration. It does not claim
+distributed exactly once, expose database paths or SQL to source, provide a
+guest clock or cron expression, or expose guest-visible object listing.
 
 ## Use
 

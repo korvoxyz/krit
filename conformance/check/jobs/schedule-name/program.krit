@@ -1,0 +1,3 @@
+schedule "Hourly Sweep" fn tick(event: ScheduleEvent) -> Result<String, String> {
+    Ok(event.id)
+}

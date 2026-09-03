@@ -46,20 +46,32 @@ pub(crate) fn check_module(module: &CoreModule) -> Result<CheckedModule, BuildEr
         .verify()
         .map_err(|error| BuildError::invalid_core(format!("Core verification failed: {error}")))?;
 
-    let webhook = module
+    let exported = module
         .entrypoints()
         .iter()
-        .find(|entrypoint| entrypoint.kind == krit::EntrypointKind::Webhook);
-    if webhook.is_some() && !module.entrypoint_function().signature.effects.is_empty() {
+        .find(|entrypoint| entrypoint.kind.is_exported());
+    if exported.is_some() && !module.entrypoint_function().signature.effects.is_empty() {
         return Err(BuildError::unsupported(
-            "webhook components cannot contain effectful module-initialization statements",
+            "entrypoint components cannot contain effectful module-initialization statements",
             module.entrypoint_function().source,
         ));
     }
-    let (kind, entrypoint) = webhook
-        .map_or((ProgramKind::Module, module.entrypoint()), |entrypoint| {
-            (ProgramKind::Webhook, entrypoint.function)
-        });
+    let (kind, entrypoint) = match exported {
+        Some(entrypoint) => (
+            match entrypoint.kind {
+                krit::EntrypointKind::Webhook => ProgramKind::Webhook,
+                krit::EntrypointKind::QueueConsumer => ProgramKind::Job,
+                krit::EntrypointKind::ScheduleHandler => ProgramKind::Schedule,
+                _ => {
+                    return Err(BuildError::invalid_core(
+                        "module initialization is not an exported entrypoint",
+                    ));
+                }
+            },
+            entrypoint.function,
+        ),
+        None => (ProgramKind::Module, module.entrypoint()),
+    };
 
     if module.has_residual_types() {
         return Err(BuildError::residual(
@@ -74,11 +86,11 @@ pub(crate) fn check_module(module: &CoreModule) -> Result<CheckedModule, BuildEr
         check_function(
             function,
             &minimum_literal_operands,
-            kind == ProgramKind::Webhook,
+            kind != ProgramKind::Module,
             &static_functions,
         )?;
     }
-    if kind == ProgramKind::Webhook {
+    if kind != ProgramKind::Module {
         check_restricted_uses(module)?;
     }
 
@@ -659,6 +671,66 @@ fn check_builtin(
         {
             Ok(())
         }
+        Builtin::QueuePublish
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::String && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::ObjectGet
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if matches!(
+                            value.as_ref(),
+                            Type::Option(element) if element.as_ref() == &Type::String
+                        ) && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::ObjectPut
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::Unit && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::ObjectDelete
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::Unit && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
         Builtin::JsonDecode
             if function.parameters() == [std::sync::Arc::new(Type::String)]
                 && function.return_type() == &Type::String =>
@@ -707,6 +779,8 @@ fn check_type_inner(
         | Type::HttpRequest
         | Type::HttpResponse
         | Type::LogField
+        | Type::QueueJob
+        | Type::ScheduleEvent
         | Type::Secret
             if webhook =>
         {
@@ -722,6 +796,8 @@ fn check_type_inner(
         Type::HttpRequest => Err(unsupported_layout("HttpRequest", span)),
         Type::HttpResponse => Err(unsupported_layout("HttpResponse", span)),
         Type::LogField => Err(unsupported_layout("LogField", span)),
+        Type::QueueJob => Err(unsupported_layout("QueueJob", span)),
+        Type::ScheduleEvent => Err(unsupported_layout("ScheduleEvent", span)),
         Type::Secret => Err(unsupported_layout("Secret", span)),
         Type::List(_) => Err(unsupported_layout("List", span)),
         Type::Record(_) => Err(unsupported_layout("Record", span)),
@@ -961,6 +1037,8 @@ fn is_supported_webhook_type(ty: &Type) -> bool {
         | Type::HttpRequest
         | Type::HttpResponse
         | Type::LogField
+        | Type::QueueJob
+        | Type::ScheduleEvent
         | Type::Secret => true,
         Type::List(_) => is_header_list(ty) || is_log_field_list(ty),
         Type::Record(_) => is_http_contract_type(ty) || is_log_field(ty),
@@ -1177,6 +1255,8 @@ fn contains_residual(ty: &Type) -> bool {
         | Type::HttpRequest
         | Type::HttpResponse
         | Type::LogField
+        | Type::QueueJob
+        | Type::ScheduleEvent
         | Type::Secret => false,
     }
 }

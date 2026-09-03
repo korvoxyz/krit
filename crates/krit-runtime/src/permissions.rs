@@ -3,8 +3,9 @@ use std::collections::BTreeSet;
 use krit_package::Manifest;
 use krit_wasm::{
     AI_INTERFACE, ArtifactMetadata, CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE,
-    LOGGING_INTERFACE, PROGRAM_WORLD, PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STATE_INTERFACE,
-    STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD,
+    LOGGING_INTERFACE, OBJECTS_READ_INTERFACE, OBJECTS_WRITE_INTERFACE, PROGRAM_WORLD,
+    PURE_PROGRAM_WORLD, QUEUE_INTERFACE, SECRETS_INTERFACE, STATE_INTERFACE, STDOUT_INTERFACE,
+    WEBHOOK_PROGRAM_WORLD,
 };
 use serde::Serialize;
 
@@ -95,6 +96,49 @@ impl GrantSet {
             effects.insert("state.transaction".to_owned());
             imports.insert(STATE_INTERFACE.to_owned());
         }
+        if !manifest.capabilities.queues.is_empty() {
+            effects.insert("queue.publish".to_owned());
+            imports.insert(QUEUE_INTERFACE.to_owned());
+        }
+        if !manifest.capabilities.consumes.is_empty() {
+            effects.insert("queue.consume".to_owned());
+        }
+        if !manifest.capabilities.schedules.is_empty() {
+            effects.insert("schedule.trigger".to_owned());
+        }
+        if !manifest.capabilities.buckets.is_empty() {
+            effects.insert("object.write".to_owned());
+            imports.insert(OBJECTS_WRITE_INTERFACE.to_owned());
+        }
+        if !manifest.capabilities.buckets.is_empty()
+            || !manifest.capabilities.read_only_buckets.is_empty()
+        {
+            effects.insert("object.read".to_owned());
+            imports.insert(OBJECTS_READ_INTERFACE.to_owned());
+        }
+        for (capability, names) in [
+            ("queue.publish", &manifest.capabilities.queues),
+            ("queue.consume", &manifest.capabilities.consumes),
+            ("schedule.trigger", &manifest.capabilities.schedules),
+            ("object.write", &manifest.capabilities.buckets),
+        ] {
+            requested.extend(names.iter().cloned().map(|resource| PermissionFact {
+                capability: capability.to_owned(),
+                resource: Some(resource),
+            }));
+        }
+        requested.extend(
+            manifest
+                .capabilities
+                .buckets
+                .iter()
+                .chain(&manifest.capabilities.read_only_buckets)
+                .cloned()
+                .map(|resource| PermissionFact {
+                    capability: "object.read".to_owned(),
+                    resource: Some(resource),
+                }),
+        );
         requested.extend(
             manifest
                 .capabilities
@@ -397,6 +441,9 @@ fn valid_policy_world(metadata: &ArtifactMetadata) -> bool {
             "ai.invoke" => Some(AI_INTERFACE.to_owned()),
             "observe.log" => Some(LOGGING_INTERFACE.to_owned()),
             "state.transaction" => Some(STATE_INTERFACE.to_owned()),
+            "queue.publish" => Some(QUEUE_INTERFACE.to_owned()),
+            "object.read" => Some(OBJECTS_READ_INTERFACE.to_owned()),
+            "object.write" => Some(OBJECTS_WRITE_INTERFACE.to_owned()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -409,7 +456,13 @@ fn valid_policy_world(metadata: &ArtifactMetadata) -> bool {
         PROGRAM_WORLD => metadata.effects == ["io.stdout"],
         WEBHOOK_PROGRAM_WORLD => metadata.effects.is_empty(),
         world => {
-            world.starts_with("krit:runtime/webhook-")
+            [
+                "krit:runtime/webhook-",
+                "krit:runtime/job",
+                "krit:runtime/schedule",
+            ]
+            .iter()
+            .any(|prefix| world.starts_with(prefix))
                 && world.ends_with("-program@0.2.0")
                 && !metadata.effects.is_empty()
         }

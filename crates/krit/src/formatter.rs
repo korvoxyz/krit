@@ -446,13 +446,8 @@ impl SyntaxMap {
         }
 
         fn top_level_break(current: &Statement, next: &Statement) -> usize {
-            let has_function_declaration = matches!(
-                current.kind,
-                StatementKind::Function { .. } | StatementKind::Webhook { .. }
-            ) || matches!(
-                next.kind,
-                StatementKind::Function { .. } | StatementKind::Webhook { .. }
-            );
+            let has_function_declaration =
+                is_declaration(&current.kind) || is_declaration(&next.kind);
             let changes_between_declaration_and_expression = !matches!(
                 (&current.kind, &next.kind),
                 (StatementKind::Let { .. }, StatementKind::Let { .. })
@@ -463,6 +458,16 @@ impl SyntaxMap {
             } else {
                 1
             }
+        }
+
+        const fn is_declaration(kind: &StatementKind) -> bool {
+            matches!(
+                kind,
+                StatementKind::Function { .. }
+                    | StatementKind::Webhook { .. }
+                    | StatementKind::QueueConsumer { .. }
+                    | StatementKind::ScheduleHandler { .. }
+            )
         }
 
         Self {
@@ -508,6 +513,18 @@ impl SyntaxCollector {
                 ..
             }
             | StatementKind::Webhook {
+                parameters,
+                return_type,
+                body,
+                ..
+            }
+            | StatementKind::QueueConsumer {
+                parameters,
+                return_type,
+                body,
+                ..
+            }
+            | StatementKind::ScheduleHandler {
                 parameters,
                 return_type,
                 body,
@@ -634,6 +651,8 @@ impl SyntaxCollector {
             | TypeKind::HttpRequest
             | TypeKind::HttpResponse
             | TypeKind::LogField
+            | TypeKind::QueueJob
+            | TypeKind::ScheduleEvent
             | TypeKind::Secret => {}
         }
     }

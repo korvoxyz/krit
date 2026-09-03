@@ -19,7 +19,7 @@ use wasm_encoder::{
 use crate::{
     BuildError,
     compiler::EncodedCore,
-    wit::{Scalar, Signature, WitContract},
+    wit::{ProgramKind, Scalar, Signature, WitContract},
 };
 
 const STATIC_MEMORY_BASE: u32 = 1024;
@@ -260,7 +260,8 @@ pub(crate) fn encode_webhook_core(
     for flavor in &stdout_flavors {
         code.function(&encode_stdout_wrapper(*flavor, contract)?);
     }
-    code.function(&encode_webhook_adapter(
+    code.function(&encode_entry_adapter(
+        contract.kind,
         import_count + entrypoint.as_u32(),
         realloc_index,
     )?);
@@ -891,6 +892,55 @@ fn encode_builtin_call(
             load_value(function, context, operation.result)?;
             call_import(function, context, "replay-ai")?;
         }
+        Builtin::QueuePublish => {
+            let [queue, body] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "queue_publish call does not have two arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *queue)?;
+            load_string_flat(function, context, *body)?;
+            load_value(function, context, operation.result)?;
+            call_import(function, context, "queue-publish")?;
+        }
+        Builtin::ObjectGet => {
+            let [bucket, key] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "object_get call does not have two arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 16, 4)?;
+            load_string_flat(function, context, *bucket)?;
+            load_string_flat(function, context, *key)?;
+            load_value(function, context, operation.result)?;
+            call_import(function, context, "object-get")?;
+        }
+        Builtin::ObjectPut => {
+            let [bucket, key, value] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "object_put call does not have three arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *bucket)?;
+            load_string_flat(function, context, *key)?;
+            load_string_flat(function, context, *value)?;
+            load_value(function, context, operation.result)?;
+            call_import(function, context, "object-put")?;
+        }
+        Builtin::ObjectDelete => {
+            let [bucket, key] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "object_delete call does not have two arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *bucket)?;
+            load_string_flat(function, context, *key)?;
+            load_value(function, context, operation.result)?;
+            call_import(function, context, "object-delete")?;
+        }
         Builtin::Print | Builtin::Println => {
             let argument = arguments
                 .first()
@@ -1486,17 +1536,76 @@ fn call_import(
     Ok(())
 }
 
-fn encode_webhook_adapter(webhook_index: u32, realloc_index: u32) -> Result<Function, BuildError> {
+/// Canonical ABI lift for one typed exported entrypoint record.
+///
+/// Each entry lists the flattened parameter index, its byte offset in the
+/// bounded record, and whether the field is a 64-bit scalar.
+const WEBHOOK_ENTRY_FIELDS: &[(u32, u32, bool)] = &[
+    (0, 0, false),
+    (1, 4, false),
+    (2, 8, false),
+    (3, 12, false),
+    (4, 16, false),
+    (5, 20, false),
+    (6, 24, false),
+    (7, 28, false),
+    (8, 32, false),
+    (9, 36, false),
+];
+
+const JOB_ENTRY_FIELDS: &[(u32, u32, bool)] = &[
+    (0, 0, false),
+    (1, 4, false),
+    (2, 8, false),
+    (3, 12, false),
+    (4, 16, false),
+    (5, 20, false),
+    (6, 24, true),
+    (7, 32, true),
+];
+
+const SCHEDULE_ENTRY_FIELDS: &[(u32, u32, bool)] = &[
+    (0, 0, false),
+    (1, 4, false),
+    (2, 8, false),
+    (3, 12, false),
+    (4, 16, true),
+    (5, 24, true),
+    (6, 32, true),
+    (7, 40, true),
+];
+
+fn encode_entry_adapter(
+    kind: ProgramKind,
+    entry_index: u32,
+    realloc_index: u32,
+) -> Result<Function, BuildError> {
+    let (fields, size, align) = match kind {
+        ProgramKind::Webhook => (WEBHOOK_ENTRY_FIELDS, 40, 4),
+        ProgramKind::Job => (JOB_ENTRY_FIELDS, 40, 8),
+        ProgramKind::Schedule => (SCHEDULE_ENTRY_FIELDS, 48, 8),
+        ProgramKind::Module => {
+            return Err(BuildError::artifact(
+                "module worlds have no entrypoint record adapter",
+            ));
+        }
+    };
+    let scratch = u32::try_from(fields.len())
+        .map_err(|_| BuildError::artifact("entrypoint adapter has too many parameters"))?;
     let mut function = Function::new([(1, wasm_encoder::ValType::I32)]);
-    emit_allocate(&mut function, realloc_index, 40, 4);
-    function.instruction(&Instruction::LocalSet(10));
-    for (parameter, offset) in (0u32..10).zip([0u32, 4, 8, 12, 16, 20, 24, 28, 32, 36]) {
-        function.instruction(&Instruction::LocalGet(10));
+    emit_allocate(&mut function, realloc_index, size, align);
+    function.instruction(&Instruction::LocalSet(scratch));
+    for (parameter, offset, wide) in fields.iter().copied() {
+        function.instruction(&Instruction::LocalGet(scratch));
         function.instruction(&Instruction::LocalGet(parameter));
-        function.instruction(&Instruction::I32Store(memarg(offset, 2)));
+        if wide {
+            function.instruction(&Instruction::I64Store(memarg(offset, 3)));
+        } else {
+            function.instruction(&Instruction::I32Store(memarg(offset, 2)));
+        }
     }
-    function.instruction(&Instruction::LocalGet(10));
-    function.instruction(&Instruction::Call(webhook_index));
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::Call(entry_index));
     function.instruction(&Instruction::End);
     Ok(function)
 }
@@ -2040,6 +2149,8 @@ fn value_layout(ty: &Type) -> Result<Option<Scalar>, BuildError> {
         | Type::HttpRequest
         | Type::HttpResponse
         | Type::LogField
+        | Type::QueueJob
+        | Type::ScheduleEvent
         | Type::Secret
         | Type::List(_)
         | Type::Record(_)
@@ -2085,6 +2196,20 @@ fn memory_layout(ty: &Type) -> Result<Layout, BuildError> {
     if is_response(ty) {
         return Ok(Layout {
             size: 24,
+            align: 8,
+            payload_offset: 0,
+        });
+    }
+    if is_queue_job(ty) {
+        return Ok(Layout {
+            size: 40,
+            align: 8,
+            payload_offset: 0,
+        });
+    }
+    if is_schedule_event(ty) {
+        return Ok(Layout {
+            size: 48,
             align: 8,
             payload_offset: 0,
         });
@@ -2152,7 +2277,13 @@ fn variant_layout(ty: &Type) -> Result<Layout, BuildError> {
 }
 
 fn record_layout(ty: &Type) -> Result<Layout, BuildError> {
-    if is_header(ty) || is_request(ty) || is_response(ty) || is_log_field(ty) {
+    if is_header(ty)
+        || is_request(ty)
+        || is_response(ty)
+        || is_log_field(ty)
+        || is_queue_job(ty)
+        || is_schedule_event(ty)
+    {
         memory_layout(ty)
     } else {
         Err(BuildError::unsupported(
@@ -2195,6 +2326,27 @@ fn record_field(ty: &Type, field: &str) -> Result<(u32, Type), BuildError> {
             _ => Err(BuildError::invalid_core("unknown HttpResponse field")),
         };
     }
+    if is_queue_job(ty) {
+        return match field {
+            "queue" => Ok((0, Type::String)),
+            "id" => Ok((8, Type::String)),
+            "body" => Ok((16, Type::String)),
+            "attempt" => Ok((24, Type::Int)),
+            "maxAttempts" => Ok((32, Type::Int)),
+            _ => Err(BuildError::invalid_core("unknown QueueJob field")),
+        };
+    }
+    if is_schedule_event(ty) {
+        return match field {
+            "schedule" => Ok((0, Type::String)),
+            "id" => Ok((8, Type::String)),
+            "scheduledAtMillis" => Ok((16, Type::Int)),
+            "firedAtMillis" => Ok((24, Type::Int)),
+            "attempt" => Ok((32, Type::Int)),
+            "maxAttempts" => Ok((40, Type::Int)),
+            _ => Err(BuildError::invalid_core("unknown ScheduleEvent field")),
+        };
+    }
     Err(BuildError::unsupported(
         format!("record field `{field}` is outside the bounded webhook ABI"),
         None,
@@ -2209,6 +2361,8 @@ fn is_pointer_value(ty: &Type) -> bool {
             | Type::HttpRequest
             | Type::HttpResponse
             | Type::LogField
+            | Type::QueueJob
+            | Type::ScheduleEvent
             | Type::List(_)
             | Type::Record(_)
             | Type::Option(_)
@@ -2280,6 +2434,41 @@ fn is_response(ty: &Type) -> bool {
     }
 }
 
+fn is_queue_job(ty: &Type) -> bool {
+    match ty {
+        Type::QueueJob => true,
+        Type::Record(fields) => record_matches(
+            fields,
+            &[
+                ("queue", Type::String),
+                ("id", Type::String),
+                ("body", Type::String),
+                ("attempt", Type::Int),
+                ("maxAttempts", Type::Int),
+            ],
+        ),
+        _ => false,
+    }
+}
+
+fn is_schedule_event(ty: &Type) -> bool {
+    match ty {
+        Type::ScheduleEvent => true,
+        Type::Record(fields) => record_matches(
+            fields,
+            &[
+                ("schedule", Type::String),
+                ("id", Type::String),
+                ("scheduledAtMillis", Type::Int),
+                ("firedAtMillis", Type::Int),
+                ("attempt", Type::Int),
+                ("maxAttempts", Type::Int),
+            ],
+        ),
+        _ => false,
+    }
+}
+
 fn record_matches(fields: &[krit::RecordType], expected: &[(&str, Type)]) -> bool {
     fields.len() == expected.len()
         && expected.iter().all(|(name, ty)| {
@@ -2296,6 +2485,8 @@ fn equivalent(left: &Type, right: &Type) -> bool {
         || (is_request(left) && is_request(right))
         || (is_response(left) && is_response(right))
         || (is_log_field(left) && is_log_field(right))
+        || (is_queue_job(left) && is_queue_job(right))
+        || (is_schedule_event(left) && is_schedule_event(right))
         || matches!(
             (left, right),
             (Type::List(left), Type::List(right)) if equivalent(left, right)

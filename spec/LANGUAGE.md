@@ -39,7 +39,7 @@ else false fn if let match record true webhook
 Reserved built-in names:
 
 ```text
-Err None Ok Some ai_invoke checkpoint_get checkpoint_put config_string http_request json_decode json_encode log_error log_info print println replay_ai replay_http secret state_delete state_get state_put
+Err None Ok Some ai_invoke checkpoint_get checkpoint_put config_string http_request json_decode json_encode log_error log_info object_delete object_get object_put print println queue_publish replay_ai replay_http secret state_delete state_get state_put
 ```
 
 A binding cannot use a keyword or reserved built-in name.
@@ -438,7 +438,8 @@ Output rendering is deterministic:
 Output is the only host effect executable by the direct evaluator. It is
 modeled as `io.stdout`. The component runtime additionally provides bounded
 `config.read`, `secret.read`, `http.request`, `ai.invoke`, and `observe.log`
-interfaces plus `state.transaction` to typed webhook artifacts.
+interfaces plus `state.transaction`, `queue.publish`, `object.read`, and
+`object.write` to typed webhook, queue, and schedule artifacts.
 
 ## 13. JSON conversion
 
@@ -472,7 +473,7 @@ is validated and decoded without importing a host interface. Escapes and all
 other component JSON shapes remain `K7002` or a bounded guest validation trap;
 there is no evaluator fallback.
 
-## 13.1 Configuration, secret, HTTP, AI, logging, and durable-state host contracts
+## 13.1 Configuration, secret, HTTP, AI, logging, durable-state, queue, and object host contracts
 
 ```krit
 config_string("agent.model") // Result<String, String>
@@ -494,6 +495,10 @@ replay_http("agent-work", "fetch", "https://api.example.com", request)
 // Result<HttpResponse, String>
 replay_ai("agent-work", "summarize", "reviewer", input)
 // Result<String, String>
+queue_publish("render-jobs", body) // Result<String, String>
+object_get("render-output", key) // Result<Option<String>, String>
+object_put("render-output", key, value) // Result<Unit, String>
+object_delete("render-output", key) // Result<Unit, String>
 ```
 
 Config and secret operations require exactly one direct string-literal
@@ -525,6 +530,45 @@ the recorded call. `replay_http` is anonymous and accepts only safe methods or
 one valid ordinary `Idempotency-Key`; authenticated replay HTTP is unavailable.
 `Secret` cannot enter any state, checkpoint, or replay value. The complete
 crash and durability semantics are normative in `DURABLE-STATE.md`.
+
+Queue names and object bucket names are also direct canonical literals; job
+bodies and object keys are bounded ordinary strings. `queue_publish` adds
+`queue.publish("queue")` and returns the durable job identity. `object_get`
+adds `object.read("bucket")`; `object_put` and `object_delete` add
+`object.write("bucket")`. Object and queue mutations stage in the invocation
+transaction and commit only at the successful outcome boundary. `Secret` cannot
+enter a job body, an object key, or an object value. Guest-visible object
+listing is not part of protocol 1. The complete queue, schedule, and object
+semantics are normative in `JOBS-AND-STORAGE.md`.
+
+## 13.2 Typed delivery entrypoints
+
+A module declares at most one `webhook`, `queue`, or `schedule` entrypoint:
+
+```krit
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> { Ok(job.id) }
+
+schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
+    Ok(event.id)
+}
+```
+
+`queue` and `schedule` are contextual keywords: they introduce an entrypoint
+only when directly followed by a canonical name literal and `fn`, so ordinary
+bindings, parameters, and record fields may still be spelled `queue` or
+`schedule`. The declared name is the exact resource of the
+`queue.consume("queue")` or `schedule.trigger("schedule")` requirement.
+
+`QueueJob` is the closed contract
+`Record { queue: String, id: String, body: String, attempt: Int, maxAttempts: Int }`.
+`ScheduleEvent` is the closed contract `Record { schedule: String, id: String,
+scheduledAtMillis: Int, firedAtMillis: Int, attempt: Int, maxAttempts: Int }`.
+Both instants are host-supplied UTC epoch milliseconds; guests have no clock.
+
+`Ok(detail)` acknowledges the delivery and commits every staged mutation with
+the acknowledgement in one transaction. `Err(detail)` commits nothing and lets
+the host retry or dead-letter under its configured policy. `detail` is bounded
+and is never interpreted as control flow.
 
 The source checker does not require a manifest. Package build orchestration
 checks requirements against the schema-1 manifest. The direct evaluator emits

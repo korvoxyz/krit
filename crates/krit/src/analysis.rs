@@ -130,6 +130,8 @@ pub enum SymbolKind {
     Let,
     Function,
     Webhook,
+    QueueConsumer,
+    ScheduleHandler,
     Parameter,
     Match,
 }
@@ -255,6 +257,8 @@ pub enum Type {
     HttpRequest,
     HttpResponse,
     LogField,
+    QueueJob,
+    ScheduleEvent,
     Secret,
     List(Arc<Self>),
     Record(Vec<RecordType>),
@@ -272,6 +276,8 @@ impl Type {
             Self::HttpRequest => Some(public_contract_fields(&InferType::HttpRequest)),
             Self::HttpResponse => Some(public_contract_fields(&InferType::HttpResponse)),
             Self::LogField => Some(public_contract_fields(&InferType::LogField)),
+            Self::QueueJob => Some(public_contract_fields(&InferType::QueueJob)),
+            Self::ScheduleEvent => Some(public_contract_fields(&InferType::ScheduleEvent)),
             Self::Int
             | Self::Bool
             | Self::String
@@ -335,6 +341,8 @@ fn render_type_bounded(ty: &Type, writer: &mut BoundedTypeWriter, depth: usize) 
         Type::HttpRequest => writer.write_str("HttpRequest"),
         Type::HttpResponse => writer.write_str("HttpResponse"),
         Type::LogField => writer.write_str("LogField"),
+        Type::QueueJob => writer.write_str("QueueJob"),
+        Type::ScheduleEvent => writer.write_str("ScheduleEvent"),
         Type::Secret => writer.write_str("Secret"),
         Type::List(element) => {
             writer.write_str("List<")?;
@@ -413,6 +421,8 @@ impl fmt::Display for Type {
             Self::HttpRequest => formatter.write_str("HttpRequest"),
             Self::HttpResponse => formatter.write_str("HttpResponse"),
             Self::LogField => formatter.write_str("LogField"),
+            Self::QueueJob => formatter.write_str("QueueJob"),
+            Self::ScheduleEvent => formatter.write_str("ScheduleEvent"),
             Self::Secret => formatter.write_str("Secret"),
             Self::List(element) => write!(formatter, "List<{element}>"),
             Self::Record(fields) => {
@@ -528,7 +538,12 @@ pub enum Effect {
     ConfigRead,
     HttpRequest,
     IoStdout,
+    ObjectRead,
+    ObjectWrite,
     ObserveLog,
+    QueueConsume,
+    QueuePublish,
+    ScheduleTrigger,
     SecretRead,
     StateTransaction,
 }
@@ -540,7 +555,12 @@ impl Effect {
             Self::ConfigRead => "config.read",
             Self::HttpRequest => "http.request",
             Self::IoStdout => "io.stdout",
+            Self::ObjectRead => "object.read",
+            Self::ObjectWrite => "object.write",
             Self::ObserveLog => "observe.log",
+            Self::QueueConsume => "queue.consume",
+            Self::QueuePublish => "queue.publish",
+            Self::ScheduleTrigger => "schedule.trigger",
             Self::SecretRead => "secret.read",
             Self::StateTransaction => "state.transaction",
         }
@@ -693,6 +713,8 @@ enum InferType {
     HttpRequest,
     HttpResponse,
     LogField,
+    QueueJob,
+    ScheduleEvent,
     Secret,
     List(Box<Self>),
     Record {
@@ -923,6 +945,83 @@ impl Analyzer {
         })
     }
 
+    /// Validates one top-level entrypoint declaration and returns its symbol
+    /// kind plus the exact capability requirement the host must grant.
+    fn entrypoint_declaration(
+        &self,
+        statement: &Statement,
+        parameters: &[Parameter],
+        return_type: Option<&TypeAnnotation>,
+    ) -> Result<Option<(SymbolKind, Option<CapabilityRequirement>)>, Diagnostic> {
+        let (keyword, symbol_kind, parameter_kind, resource) = match &statement.kind {
+            StatementKind::Webhook { .. } => (
+                "webhook",
+                SymbolKind::Webhook,
+                EntrypointParameter::Request,
+                None,
+            ),
+            StatementKind::QueueConsumer {
+                queue, queue_span, ..
+            } => (
+                "queue",
+                SymbolKind::QueueConsumer,
+                EntrypointParameter::QueueJob,
+                Some((Effect::QueueConsume, queue.as_str(), *queue_span)),
+            ),
+            StatementKind::ScheduleHandler {
+                schedule,
+                schedule_span,
+                ..
+            } => (
+                "schedule",
+                SymbolKind::ScheduleHandler,
+                EntrypointParameter::ScheduleEvent,
+                Some((Effect::ScheduleTrigger, schedule.as_str(), *schedule_span)),
+            ),
+            _ => return Ok(None),
+        };
+        if self.scopes.len() != 1 {
+            return Err(Diagnostic::new(
+                "K1004",
+                format!("`{keyword}` declarations are only allowed at the top level"),
+                statement.span,
+            ));
+        }
+        let valid_parameter = parameters.len() == 1
+            && parameters[0]
+                .annotation
+                .as_ref()
+                .is_some_and(|annotation| parameter_kind.matches(&annotation.kind));
+        let valid_return =
+            return_type.is_some_and(|annotation| parameter_kind.matches_return(annotation));
+        if !valid_parameter || !valid_return {
+            return Err(Diagnostic::new(
+                "K3007",
+                format!(
+                    "{keyword} signature must be exactly `{}`",
+                    parameter_kind.signature()
+                ),
+                statement.span,
+            ));
+        }
+        let requirement = match resource {
+            Some((effect, name, span)) => {
+                if !is_valid_resource_name(name) {
+                    return Err(Diagnostic::new(
+                        "K3008",
+                        format!(
+                            "{keyword} name must use 1-64 lowercase letters, digits, `.` or `-`, without leading/trailing punctuation or `..`/`--`"
+                        ),
+                        span,
+                    ));
+                }
+                Some(CapabilityRequirement::new(effect, name))
+            }
+            None => None,
+        };
+        Ok(Some((symbol_kind, requirement)))
+    }
+
     fn statement(&mut self, statement: &Statement) -> Result<InferEffects, Diagnostic> {
         match &statement.kind {
             StatementKind::Let {
@@ -974,33 +1073,26 @@ impl Analyzer {
                 parameters,
                 return_type,
                 body,
+            }
+            | StatementKind::QueueConsumer {
+                name,
+                parameters,
+                return_type,
+                body,
+                ..
+            }
+            | StatementKind::ScheduleHandler {
+                name,
+                parameters,
+                return_type,
+                body,
+                ..
             } => {
-                let symbol_kind = if matches!(statement.kind, StatementKind::Webhook { .. }) {
-                    if self.scopes.len() != 1 {
-                        return Err(Diagnostic::new(
-                            "K1004",
-                            "`webhook` declarations are only allowed at the top level",
-                            statement.span,
-                        ));
-                    }
-                    let valid_parameter = parameters.len() == 1
-                        && parameters[0].annotation.as_ref().is_some_and(|annotation| {
-                            matches!(annotation.kind, TypeKind::HttpRequest)
-                        });
-                    let valid_return = return_type.as_ref().is_some_and(|annotation| {
-                        matches!(annotation.kind, TypeKind::HttpResponse)
-                    });
-                    if !valid_parameter || !valid_return {
-                        return Err(Diagnostic::new(
-                            "K3007",
-                            "webhook signature must be exactly `(request: HttpRequest) -> HttpResponse`",
-                            statement.span,
-                        ));
-                    }
-                    SymbolKind::Webhook
-                } else {
-                    SymbolKind::Function
-                };
+                let entrypoint =
+                    self.entrypoint_declaration(statement, parameters, return_type.as_ref())?;
+                let symbol_kind = entrypoint
+                    .as_ref()
+                    .map_or(SymbolKind::Function, |(kind, _)| *kind);
                 self.ensure_name_available(name, statement.span)?;
                 let parameter_types = parameters
                     .iter()
@@ -1039,6 +1131,11 @@ impl Analyzer {
                     "function return type",
                 )?;
                 self.effect_definitions[effect as usize].union(body_info.effects);
+                if let Some(requirement) = entrypoint.and_then(|(_, requirement)| requirement) {
+                    let definition = &mut self.effect_definitions[effect as usize];
+                    definition.direct.insert(requirement.capability().clone());
+                    definition.direct_requirements.insert(requirement);
+                }
                 self.bindings.push(PendingBinding {
                     id,
                     name: name.clone(),
@@ -1104,6 +1201,10 @@ impl Analyzer {
                             | Builtin::CheckpointPut
                             | Builtin::ReplayHttp
                             | Builtin::ReplayAi
+                            | Builtin::QueuePublish
+                            | Builtin::ObjectGet
+                            | Builtin::ObjectPut
+                            | Builtin::ObjectDelete
                     )
                 ) {
                     let ResolvedName::Builtin(builtin) = resolution else {
@@ -1434,6 +1535,20 @@ impl Analyzer {
                         CapabilityRequirement::new(Effect::HttpRequest, normalized.as_str()),
                     ]
                 }
+                (Builtin::QueuePublish, [queue, _]) => {
+                    let queue = require_canonical_literal(queue, builtin, "durable queue")?;
+                    vec![CapabilityRequirement::new(Effect::QueuePublish, queue)]
+                }
+                (Builtin::ObjectGet | Builtin::ObjectDelete, [bucket, _])
+                | (Builtin::ObjectPut, [bucket, _, _]) => {
+                    let effect = if builtin == Builtin::ObjectGet {
+                        Effect::ObjectRead
+                    } else {
+                        Effect::ObjectWrite
+                    };
+                    let bucket = require_canonical_literal(bucket, builtin, "object bucket")?;
+                    vec![CapabilityRequirement::new(effect, bucket)]
+                }
                 (Builtin::ReplayAi, [store, operation, adapter, _]) => {
                     let store = require_canonical_literal(store, builtin, "durable state store")?;
                     require_canonical_literal(operation, builtin, "replay operation")?;
@@ -1722,6 +1837,8 @@ impl Analyzer {
             TypeKind::HttpRequest => InferType::HttpRequest,
             TypeKind::HttpResponse => InferType::HttpResponse,
             TypeKind::LogField => InferType::LogField,
+            TypeKind::QueueJob => InferType::QueueJob,
+            TypeKind::ScheduleEvent => InferType::ScheduleEvent,
             TypeKind::Secret => InferType::Secret,
             TypeKind::List(element) => InferType::List(Box::new(self.annotation(element))),
             TypeKind::Option(element) => InferType::Option(Box::new(self.annotation(element))),
@@ -1874,7 +1991,9 @@ impl Analyzer {
             nominal @ (InferType::HttpHeader
             | InferType::HttpRequest
             | InferType::HttpResponse
-            | InferType::LogField) => {
+            | InferType::LogField
+            | InferType::QueueJob
+            | InferType::ScheduleEvent) => {
                 let (field_type, _) =
                     self.require_field_and_widen(contract_record(&nominal), field, span)?;
                 Ok((field_type, nominal))
@@ -2222,6 +2341,8 @@ impl Analyzer {
             | InferType::HttpRequest
             | InferType::HttpResponse
             | InferType::LogField
+            | InferType::QueueJob
+            | InferType::ScheduleEvent
             | InferType::Secret => false,
         }
     }
@@ -2376,7 +2497,9 @@ impl Analyzer {
             | InferType::HttpHeader
             | InferType::HttpRequest
             | InferType::HttpResponse
-            | InferType::LogField => true,
+            | InferType::LogField
+            | InferType::QueueJob
+            | InferType::ScheduleEvent => true,
             InferType::Secret => false,
         }
     }
@@ -2419,7 +2542,9 @@ impl Analyzer {
             | InferType::HttpHeader
             | InferType::HttpRequest
             | InferType::HttpResponse
-            | InferType::LogField => false,
+            | InferType::LogField
+            | InferType::QueueJob
+            | InferType::ScheduleEvent => false,
         }
     }
 
@@ -2682,6 +2807,62 @@ impl Analyzer {
                     effect,
                 }
             }
+            Builtin::QueuePublish => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::QueuePublish);
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::String),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::ObjectGet => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::ObjectRead);
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Option(Box::new(InferType::String))),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::ObjectPut => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::ObjectWrite);
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Unit),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::ObjectDelete => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::ObjectWrite);
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Unit),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
         };
         Some((ty, ResolvedName::Builtin(builtin)))
     }
@@ -2863,6 +3044,8 @@ impl<'a> TypeNormalizer<'a> {
             InferType::HttpRequest => Arc::new(Type::HttpRequest),
             InferType::HttpResponse => Arc::new(Type::HttpResponse),
             InferType::LogField => Arc::new(Type::LogField),
+            InferType::QueueJob => Arc::new(Type::QueueJob),
+            InferType::ScheduleEvent => Arc::new(Type::ScheduleEvent),
             InferType::Secret => Arc::new(Type::Secret),
             InferType::List(element) => Arc::new(Type::List(self.normalize(element))),
             InferType::Record { fields, .. } => Arc::new(Type::Record(
@@ -2938,6 +3121,21 @@ fn contract_record(nominal: &InferType) -> InferType {
             ),
             ("status".to_owned(), InferType::Int),
         ]),
+        InferType::QueueJob => BTreeMap::from([
+            ("attempt".to_owned(), InferType::Int),
+            ("body".to_owned(), InferType::String),
+            ("id".to_owned(), InferType::String),
+            ("maxAttempts".to_owned(), InferType::Int),
+            ("queue".to_owned(), InferType::String),
+        ]),
+        InferType::ScheduleEvent => BTreeMap::from([
+            ("attempt".to_owned(), InferType::Int),
+            ("firedAtMillis".to_owned(), InferType::Int),
+            ("id".to_owned(), InferType::String),
+            ("maxAttempts".to_owned(), InferType::Int),
+            ("schedule".to_owned(), InferType::String),
+            ("scheduledAtMillis".to_owned(), InferType::Int),
+        ]),
         _ => unreachable!("only built-in record contract types have structural aliases"),
     };
     InferType::Record {
@@ -2984,9 +3182,50 @@ fn direct_host_builtin(callee: &Expression) -> Option<Builtin> {
             | Builtin::CheckpointGet
             | Builtin::CheckpointPut
             | Builtin::ReplayHttp
-            | Builtin::ReplayAi),
+            | Builtin::ReplayAi
+            | Builtin::QueuePublish
+            | Builtin::ObjectGet
+            | Builtin::ObjectPut
+            | Builtin::ObjectDelete),
         ) => Some(builtin),
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EntrypointParameter {
+    Request,
+    QueueJob,
+    ScheduleEvent,
+}
+
+impl EntrypointParameter {
+    const fn matches(self, kind: &TypeKind) -> bool {
+        match self {
+            Self::Request => matches!(kind, TypeKind::HttpRequest),
+            Self::QueueJob => matches!(kind, TypeKind::QueueJob),
+            Self::ScheduleEvent => matches!(kind, TypeKind::ScheduleEvent),
+        }
+    }
+
+    fn matches_return(self, annotation: &TypeAnnotation) -> bool {
+        match self {
+            Self::Request => matches!(annotation.kind, TypeKind::HttpResponse),
+            Self::QueueJob | Self::ScheduleEvent => matches!(
+                &annotation.kind,
+                TypeKind::Result(value, error)
+                    if matches!(value.kind, TypeKind::String)
+                        && matches!(error.kind, TypeKind::String)
+            ),
+        }
+    }
+
+    const fn signature(self) -> &'static str {
+        match self {
+            Self::Request => "(request: HttpRequest) -> HttpResponse",
+            Self::QueueJob => "(job: QueueJob) -> Result<String, String>",
+            Self::ScheduleEvent => "(event: ScheduleEvent) -> Result<String, String>",
+        }
     }
 }
 

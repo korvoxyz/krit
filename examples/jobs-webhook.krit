@@ -1,0 +1,6 @@
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match queue_publish("render-jobs", request.body) {
+        Ok(id) => record { status: 202, headers: [], body: id },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}

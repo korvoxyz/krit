@@ -1,0 +1,15 @@
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    match object_get("render-output", job.id) {
+        Ok(existing) => match existing {
+            Some(previous) => Ok(previous),
+            None => match object_put("render-output", job.id, job.body) {
+                Ok(stored) => match checkpoint_put("agent-work", "last-render", job.id) {
+                    Ok(marked) => Ok(job.id),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            },
+        },
+        Err(error) => Err(error),
+    }
+}

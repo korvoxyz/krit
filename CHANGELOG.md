@@ -230,6 +230,45 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Stateful checkpoint example plus compiler, WIT, artifact, runtime,
   restart, killed-writer recovery, cancellation, replay, idempotency,
   filesystem, CLI, and legacy factorial-byte regression coverage
+- Normative durable queue, scheduled-trigger, and object-storage specification
+  with lifecycle state machines, ordering, lease, retry, dead-letter, catch-up,
+  atomicity, crash-window, filesystem, limit, and non-goal contracts
+- Store schema 2 with strict `queue_jobs`, `queue_dead`, `schedule_fires`,
+  `schedule_cursors`, and `objects` tables, indexed reservation and cleanup
+  queries, and a deterministic in-place schema-1 migration that preserves data
+  and still rejects foreign, newer, extra, or malformed schemas
+- Contextual `queue "name" fn` and `schedule "name" fn` entrypoints with the
+  fixed `QueueJob` and `ScheduleEvent` contracts and `Result<String, String>`
+  outcomes, plus `queue_publish`, `object_get`, `object_put`, and
+  `object_delete` built-ins with direct canonical resource facts
+- Separate `queue.publish`, `queue.consume`, `schedule.trigger`, `object.read`,
+  and `object.write` effects across parser, analyzer, Core, manifest
+  (`queues`, `consumes`, `schedules`, `buckets`, `readOnlyBuckets`),
+  permissions, explain, LSP completion, and assist redaction
+- Typed `krit:runtime/queue`, `objects-read`, `objects-write`, `job`, and
+  `schedule` WIT interfaces, deterministic least-authority world generation for
+  every import mask, and validation that re-derives every effect from the real
+  component imports and export
+- Durable queue publish, reservation, acknowledgement, retry with capped
+  backoff, attempt caps, dead letters, and owner leases whose expiry recovers
+  interrupted work without holding a database lock across guest execution
+- Host-owned scheduled triggers with UTC epoch occurrences, durable
+  `(schedule, due)` fire identities, bounded catch-up with explicit misfire
+  skipping, and shared retry/dead-letter handling
+- Capability-scoped object buckets with bounded object count, key, value, and
+  total bytes, replacement accounting, and deterministic host-side listing
+- One-transaction outcome commits that bind staged state, checkpoints, object
+  writes, queue publishes, and the delivery acknowledgement together
+- `krit worker --queue NAME` and `krit schedule --schedule NAME` with `--once`,
+  bounded `--max-deliveries`, explicit `--now` wall time, and schema-1 JSON
+  delivery reports
+- Strict host config schema 4 that binds manifest-granted queues, schedules,
+  and buckets to already-configured owner-only stores and can only narrow them
+- Enqueue, worker, and scheduled-trigger examples plus store, compiler,
+  artifact, runtime, and real-process CLI coverage for FIFO delivery,
+  concurrent reservation, lease recovery, retry-then-success, dead-letter
+  exhaustion, schedule fire recovery, object bounds, schema migration, and
+  non-repeated completed external effects
 
 ### Changed
 
@@ -282,6 +321,39 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   claim
 - Updated the provider-neutral generation prompt to version 0.2.12 for durable
   state, checkpoints, replay, and schema-3 host configuration
+- Completed `phase6-jobs-storage` and the Phase 6 durable-execution gate:
+  interrupted worker deliveries resume safely without losing committed state or
+  repeating completed external side effects, while distributed queues, brokers,
+  cron expressions, and provider-side exactly once remain unclaimed
+- Added `K5205` for invalid durable delivery leases, acknowledgements, and
+  outcome details
+- Updated the provider-neutral generation prompt to version 0.2.13 for durable
+  queues, scheduled triggers, bounded object storage, and schema-4 host
+  configuration
+- Committed terminal queue and schedule transitions when a reservation reaches
+  its scan bound, so a depth-one or single-attempt resource dead-letters and
+  stays usable instead of wedging
+- Required every configured queue and schedule lease to cover the runtime
+  execution deadline plus the backing store's busy timeout
+- Validated the complete schema-1 object set inside the exclusive migration
+  transaction before any DDL and revalidated the finished schema before commit,
+  so a rejected migration leaves the database byte-for-byte unchanged
+- Installed the database page ceiling before initialization or migration,
+  re-verified the materialized page count against the byte budget, and raised
+  the minimum configurable database budget to a truthful 1 MiB
+- Validated every schema-4 job definition, grant, limit, and store reference
+  before any database is created, opened, or migrated
+- Decoupled queue publication from the state revision so independent publishers
+  never conflict, while combined state outcomes still advance it exactly once
+- Charged staged queue depth per queue so an atomic fan-out to several queues
+  commits
+- Rejected unrepresentable schedule and queue instants before any cursor, fire,
+  or job row moves
+- Replaced case-insensitive `LIKE` object-prefix matching with exact
+  case-sensitive binary matching in which `%` and `_` are ordinary characters
+- Kept `krit worker --json` and `krit schedule --json` standard output a single
+  machine-readable report by moving bounded guest output into an explicit
+  `outputs` array
 
 ## [0.2.0] - 2026-09-01
 

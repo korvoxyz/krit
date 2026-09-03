@@ -44,6 +44,8 @@ id_type!(MatchBindingId, "m");
 pub enum EntrypointKind {
     ModuleInit,
     Webhook,
+    QueueConsumer,
+    ScheduleHandler,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +59,14 @@ impl EntrypointKind {
         match self {
             Self::ModuleInit => "module-init",
             Self::Webhook => "webhook",
+            Self::QueueConsumer => "queue",
+            Self::ScheduleHandler => "schedule",
         }
+    }
+
+    /// Returns whether this entrypoint is a typed exported host contract.
+    pub const fn is_exported(self) -> bool {
+        !matches!(self, Self::ModuleInit)
     }
 }
 
@@ -66,6 +75,8 @@ pub enum BindingKind {
     Let,
     Function,
     Webhook,
+    QueueConsumer,
+    ScheduleHandler,
     Parameter,
     Match,
 }
@@ -76,6 +87,8 @@ impl BindingKind {
             Self::Let => "let",
             Self::Function => "function",
             Self::Webhook => "webhook",
+            Self::QueueConsumer => "queue",
+            Self::ScheduleHandler => "schedule",
             Self::Parameter => "parameter",
             Self::Match => "match",
         }
@@ -88,6 +101,8 @@ impl From<SymbolKind> for BindingKind {
             SymbolKind::Let => Self::Let,
             SymbolKind::Function => Self::Function,
             SymbolKind::Webhook => Self::Webhook,
+            SymbolKind::QueueConsumer => Self::QueueConsumer,
+            SymbolKind::ScheduleHandler => Self::ScheduleHandler,
             SymbolKind::Parameter => Self::Parameter,
             SymbolKind::Match => Self::Match,
         }
@@ -334,7 +349,7 @@ impl CoreModule {
                 function.id,
                 entrypoint.kind.as_str()
             ));
-            if entrypoint.kind == EntrypointKind::Webhook {
+            if entrypoint.kind.is_exported() {
                 output.push_str(&format!(
                     " {}",
                     function.debug_name.as_deref().unwrap_or("<anonymous>")
@@ -687,9 +702,27 @@ impl<'a> Lowerer<'a> {
                 parameters,
                 body,
                 ..
+            }
+            | StatementKind::QueueConsumer {
+                name,
+                parameters,
+                body,
+                ..
+            }
+            | StatementKind::ScheduleHandler {
+                name,
+                parameters,
+                body,
+                ..
             } => {
-                let binding =
-                    self.declaration_binding(statement.span, name, SymbolKind::Webhook)?;
+                let (symbol_kind, entrypoint_kind) = match &statement.kind {
+                    StatementKind::Webhook { .. } => (SymbolKind::Webhook, EntrypointKind::Webhook),
+                    StatementKind::QueueConsumer { .. } => {
+                        (SymbolKind::QueueConsumer, EntrypointKind::QueueConsumer)
+                    }
+                    _ => (SymbolKind::ScheduleHandler, EntrypointKind::ScheduleHandler),
+                };
+                let binding = self.declaration_binding(statement.span, name, symbol_kind)?;
                 let ty = self.binding_type(binding)?;
                 let (value, function) = self.lower_function(
                     Some((binding, name.as_str())),
@@ -710,13 +743,13 @@ impl<'a> Lowerer<'a> {
                 if self
                     .webhook_entrypoint
                     .replace(CoreEntrypoint {
-                        kind: EntrypointKind::Webhook,
+                        kind: entrypoint_kind,
                         function,
                     })
                     .is_some()
                 {
                     return Err(IrError::new(
-                        "multiple webhook entrypoints reached Core lowering",
+                        "multiple exported entrypoints reached Core lowering",
                     ));
                 }
             }
@@ -1419,16 +1452,16 @@ impl<'a> Verifier<'a> {
         {
             return Err(IrError::new("invalid module-init entrypoint identity"));
         }
-        if let Some(webhook) = self.module.entrypoints.get(1)
-            && (webhook.kind != EntrypointKind::Webhook
-                || webhook.function == FunctionId(0)
-                || webhook.function.0 as usize >= self.module.functions.len()
-                || self.module.functions[webhook.function.0 as usize]
+        if let Some(exported) = self.module.entrypoints.get(1)
+            && (!exported.kind.is_exported()
+                || exported.function == FunctionId(0)
+                || exported.function.0 as usize >= self.module.functions.len()
+                || self.module.functions[exported.function.0 as usize]
                     .debug_name
                     .as_deref()
                     .is_none_or(str::is_empty))
         {
-            return Err(IrError::new("invalid webhook entrypoint identity"));
+            return Err(IrError::new("invalid exported entrypoint identity"));
         }
         for (index, function) in self.module.functions.iter().enumerate() {
             if function.id.0 as usize != index {
@@ -1451,13 +1484,25 @@ impl<'a> Verifier<'a> {
         {
             return Err(IrError::new("invalid module-init entrypoint boundary"));
         }
-        if let Some(webhook) = self.module.entrypoints.get(1) {
-            let function = self.function(webhook.function)?;
+        if let Some(exported) = self.module.entrypoints.get(1) {
+            let function = self.function(exported.function)?;
+            let (parameter, result) = match exported.kind {
+                EntrypointKind::Webhook => (Type::HttpRequest, Type::HttpResponse),
+                EntrypointKind::QueueConsumer => (
+                    Type::QueueJob,
+                    Type::Result(Arc::new(Type::String), Arc::new(Type::String)),
+                ),
+                EntrypointKind::ScheduleHandler => (
+                    Type::ScheduleEvent,
+                    Type::Result(Arc::new(Type::String), Arc::new(Type::String)),
+                ),
+                _ => return Err(IrError::new("invalid exported entrypoint kind")),
+            };
             if function.signature.parameters.len() != 1
-                || function.signature.parameters[0].as_ref() != &Type::HttpRequest
-                || function.signature.result.as_ref() != &Type::HttpResponse
+                || function.signature.parameters[0].as_ref() != &parameter
+                || function.signature.result.as_ref() != &result
             {
-                return Err(IrError::new("invalid webhook entrypoint boundary"));
+                return Err(IrError::new("invalid exported entrypoint boundary"));
             }
         }
         for function in &self.module.functions {
@@ -1507,7 +1552,13 @@ impl<'a> Verifier<'a> {
             self.insert_value(recursive.value, Arc::clone(&recursive.ty))?;
             self.binding_type_matches(recursive.binding, &recursive.ty)?;
             let binding = self.binding(recursive.binding)?;
-            if !matches!(binding.kind, BindingKind::Function | BindingKind::Webhook) {
+            if !matches!(
+                binding.kind,
+                BindingKind::Function
+                    | BindingKind::Webhook
+                    | BindingKind::QueueConsumer
+                    | BindingKind::ScheduleHandler
+            ) {
                 return Err(IrError::new(format!(
                     "{} recursive binding has invalid kind {}",
                     function.id,
@@ -2049,7 +2100,11 @@ impl<'a> Verifier<'a> {
                 self.binding_type_matches(*binding, self.value_type(*value)?)?;
                 if !matches!(
                     self.binding(*binding)?.kind,
-                    BindingKind::Let | BindingKind::Function | BindingKind::Webhook
+                    BindingKind::Let
+                        | BindingKind::Function
+                        | BindingKind::Webhook
+                        | BindingKind::QueueConsumer
+                        | BindingKind::ScheduleHandler
                 ) {
                     return Err(IrError::new(format!(
                         "{} binds non-declaration {}",
@@ -2173,6 +2228,20 @@ impl<'a> Verifier<'a> {
                 crate::CapabilityRequirement::new(crate::Effect::StateTransaction, resource(0)?),
                 crate::CapabilityRequirement::new(crate::Effect::AiInvoke, resource(2)?),
             ]),
+            Builtin::QueuePublish => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::QueuePublish,
+                resource(0)?,
+            )]),
+            Builtin::ObjectGet => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::ObjectRead,
+                resource(0)?,
+            )]),
+            Builtin::ObjectPut | Builtin::ObjectDelete => {
+                Ok(vec![crate::CapabilityRequirement::new(
+                    crate::Effect::ObjectWrite,
+                    resource(0)?,
+                )])
+            }
             Builtin::Print
             | Builtin::Println
             | Builtin::Some
@@ -2205,6 +2274,37 @@ impl<'a> Verifier<'a> {
                     Err(IrError::new("ai_invoke has invalid signature"))
                 }
             }
+            Builtin::QueuePublish => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::String, Type::String],
+                &Type::Result(Arc::new(Type::String), Arc::new(Type::String)),
+                crate::Effect::QueuePublish,
+            ),
+            Builtin::ObjectGet => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::String, Type::String],
+                &Type::Result(
+                    Arc::new(Type::Option(Arc::new(Type::String))),
+                    Arc::new(Type::String),
+                ),
+                crate::Effect::ObjectRead,
+            ),
+            Builtin::ObjectPut => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::String, Type::String, Type::String],
+                &Type::Result(Arc::new(Type::Unit), Arc::new(Type::String)),
+                crate::Effect::ObjectWrite,
+            ),
+            Builtin::ObjectDelete => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::String, Type::String],
+                &Type::Result(Arc::new(Type::Unit), Arc::new(Type::String)),
+                crate::Effect::ObjectWrite,
+            ),
             Builtin::Print | Builtin::Println => {
                 let Type::Function(function) = ty else {
                     return Err(IrError::new(format!("{builtin} has non-function type")));
@@ -2700,6 +2800,18 @@ fn record_field_type(ty: &Type, name: &str) -> Option<Arc<Type>> {
             "name" | "value" => Some(Arc::new(Type::String)),
             _ => None,
         },
+        Type::QueueJob => match name {
+            "queue" | "id" | "body" => Some(Arc::new(Type::String)),
+            "attempt" | "maxAttempts" => Some(Arc::new(Type::Int)),
+            _ => None,
+        },
+        Type::ScheduleEvent => match name {
+            "schedule" | "id" => Some(Arc::new(Type::String)),
+            "scheduledAtMillis" | "firedAtMillis" | "attempt" | "maxAttempts" => {
+                Some(Arc::new(Type::Int))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -2722,6 +2834,8 @@ fn type_contains_no_function(ty: &Type) -> bool {
         | Type::HttpRequest
         | Type::HttpResponse
         | Type::LogField
+        | Type::QueueJob
+        | Type::ScheduleEvent
         | Type::Variable(_) => true,
         Type::Secret => false,
     }
@@ -2748,6 +2862,8 @@ fn type_contains_secret(ty: &Type) -> bool {
         | Type::HttpRequest
         | Type::HttpResponse
         | Type::LogField
+        | Type::QueueJob
+        | Type::ScheduleEvent
         | Type::Variable(_) => false,
     }
 }
@@ -2843,7 +2959,30 @@ fn type_has_residual(ty: &Type, visited: &mut HashSet<*const Type>) -> bool {
         | Type::HttpRequest
         | Type::HttpResponse
         | Type::LogField
+        | Type::QueueJob
+        | Type::ScheduleEvent
         | Type::Secret => false,
+    }
+}
+
+fn verify_host_builtin(
+    builtin: Builtin,
+    ty: &Type,
+    parameters: &[Type],
+    result: &Type,
+    effect: crate::Effect,
+) -> Result<(), IrError> {
+    let Type::Function(function) = ty else {
+        return Err(IrError::new(format!("{builtin} has non-function type")));
+    };
+    let expected = parameters.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+    if function.parameters() == expected.as_slice()
+        && function.return_type() == result
+        && function.effects().contains(&effect)
+    {
+        Ok(())
+    } else {
+        Err(IrError::new(format!("{builtin} has invalid signature")))
     }
 }
 

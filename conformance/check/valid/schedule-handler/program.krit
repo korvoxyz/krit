@@ -1,0 +1,7 @@
+schedule "hourly-sweep" fn tick(event: ScheduleEvent) -> Result<String, String> {
+    if event.attempt < event.maxAttempts {
+        Ok(event.id)
+    } else {
+        Err(event.schedule)
+    }
+}

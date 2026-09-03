@@ -282,7 +282,7 @@ fn every_valid_repository_program_lowers_and_verifies() {
         count += 1;
         remaining = &code[end + "\n```".len()..];
     }
-    assert_eq!(count, 8);
+    assert_eq!(count, 10);
 }
 
 #[test]
@@ -362,7 +362,10 @@ fn assert_statement_names_resolved(statement: &krit::Statement, analysis: &Analy
         StatementKind::Let { value, .. } | StatementKind::Expression(value) => {
             assert_expression_names_resolved(value, analysis);
         }
-        StatementKind::Function { body, .. } | StatementKind::Webhook { body, .. } => {
+        StatementKind::Function { body, .. }
+        | StatementKind::Webhook { body, .. }
+        | StatementKind::QueueConsumer { body, .. }
+        | StatementKind::ScheduleHandler { body, .. } => {
             assert_block_names_resolved(body, analysis)
         }
     }

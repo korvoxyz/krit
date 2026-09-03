@@ -1,0 +1,6 @@
+schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
+    match object_put("render-output", event.id, event.schedule) {
+        Ok(stored) => Ok(event.id),
+        Err(error) => Err(error),
+    }
+}

@@ -30,6 +30,11 @@ random.read
 secret.read
 ai.invoke
 state.transaction
+queue.publish
+queue.consume
+schedule.trigger
+object.read
+object.write
 ```
 
 Unknown capability identifiers are errors. Names are versioned through the
@@ -48,14 +53,26 @@ secrets = ["github-token", "slack-token"]
 ai = ["reviewer"]
 logs = true
 state = ["agent-work"]
+queues = ["render-jobs"]
+consumes = ["render-jobs"]
+schedules = ["hourly-sweep"]
+buckets = ["render-output"]
+readOnlyBuckets = ["reference"]
 ```
 
 The schema-1 manifest implements requests for `stdout`, `config`, `http`,
-`secrets`, `ai`, structured `logs`, and durable `state`. The language emits literal-resource
-facts for `config.read`, `secret.read`, `http.request`, and `ai.invoke`;
-`observe.log` is resource-free. Files, generic sockets, processes,
-environment variables, clocks, randomness, queues, and object storage remain
-unavailable. Durable state is available only through exact named stores below.
+`secrets`, `ai`, structured `logs`, durable `state`, durable queue publish
+(`queues`) and consume (`consumes`), scheduled triggers (`schedules`), and
+object buckets (`buckets` for read and write, `readOnlyBuckets` for read only;
+the two lists are disjoint). The language emits literal-resource facts for
+`config.read`, `secret.read`, `http.request`, `ai.invoke`, `state.transaction`,
+`queue.publish`, `object.read`, and `object.write`; `queue.consume` and
+`schedule.trigger` come from the `queue` and `schedule` entrypoint
+declarations, and `observe.log` is resource-free. Files, generic sockets,
+processes, environment variables, clocks, and randomness remain unavailable.
+Durable state, queues, schedules, and buckets are available only through exact
+named resources that a host configuration binds to owner-only stores; see
+[JOBS-AND-STORAGE.md](JOBS-AND-STORAGE.md).
 
 Paths are package-root-relative and resolved before execution. A lexical path
 that escapes the granted root is rejected. Symlink and platform-specific path

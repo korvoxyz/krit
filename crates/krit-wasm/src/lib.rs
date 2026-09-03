@@ -26,10 +26,11 @@ pub use validation::{
     validate_artifact, validate_component,
 };
 pub use wit::{
-    AI_INTERFACE, CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, LOGGING_INTERFACE,
-    PROGRAM_WORLD, PURE_PROGRAM_WORLD, SECRETS_INTERFACE, STATE_INTERFACE, STDOUT_INTERFACE,
-    WEBHOOK_ALL_PROGRAM_WORLD, WEBHOOK_INTERFACE, WEBHOOK_PROGRAM_WORLD,
-    WEBHOOK_STATE_ALL_PROGRAM_WORLD,
+    AI_INTERFACE, CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, JOB_INTERFACE,
+    JOB_PROGRAM_WORLD, LOGGING_INTERFACE, OBJECTS_READ_INTERFACE, OBJECTS_WRITE_INTERFACE,
+    PROGRAM_WORLD, PURE_PROGRAM_WORLD, QUEUE_INTERFACE, SCHEDULE_INTERFACE, SCHEDULE_PROGRAM_WORLD,
+    SECRETS_INTERFACE, STATE_INTERFACE, STDOUT_INTERFACE, WEBHOOK_ALL_PROGRAM_WORLD,
+    WEBHOOK_INTERFACE, WEBHOOK_PROGRAM_WORLD, WEBHOOK_STATE_ALL_PROGRAM_WORLD,
 };
 
 use compiler::encode_core;
@@ -160,8 +161,21 @@ pub fn build_component(
     Ok(BuiltComponent { bytes, metadata })
 }
 
+/// Durable Phase 6 surfaces raise artifact validation to policy 2.
+pub(crate) const DURABLE_EFFECTS: [&str; 6] = [
+    "object.read",
+    "object.write",
+    "queue.consume",
+    "queue.publish",
+    "schedule.trigger",
+    "state.transaction",
+];
+
 pub(crate) fn artifact_policy_version(effects: &[String]) -> u32 {
-    if effects.iter().any(|effect| effect == "state.transaction") {
+    if effects
+        .iter()
+        .any(|effect| DURABLE_EFFECTS.contains(&effect.as_str()))
+    {
         STATE_ARTIFACT_POLICY_VERSION
     } else {
         ARTIFACT_POLICY_VERSION

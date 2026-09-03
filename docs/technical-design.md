@@ -1,6 +1,6 @@
 # Krit Rust technical design
 
-**Status:** Accepted; Phase 6 durable local state implemented
+**Status:** Accepted; Phase 6 durable local state, jobs, and object storage implemented
 **Owner:** Akshay Bhardwaj
 
 ## Decision
@@ -60,7 +60,8 @@ crates/
   krit-semantics/    names, types, effects, HIR
   krit-ir/           normalized Core IR
   krit-wasm/         Core IR to WebAssembly component lowering
-  krit-state/        transactional SQLite state, replay, and idempotency records
+  krit-state/        transactional SQLite state, replay, idempotency, queue,
+                     schedule, and object records
   krit-runtime/      component runtime, limits, and capability handles
   krit-package/      manifests, lockfiles, resolver, store
   krit-cli/          user command and orchestration
@@ -345,7 +346,7 @@ artifacts.
 
 `krit-state` owns bundled SQLite and has no compiler, Wasm, runtime-network, or
 CLI dependency. Each host-configured logical store maps to one owner-only
-database with application ID `KRIT`, `user_version = 1`, WAL journaling,
+database with application ID `KRIT`, `user_version = 2`, WAL journaling,
 foreign keys, trusted-schema disabled, configurable FULL/NORMAL synchronous
 durability, bounded busy timeout, and a page-count database-size ceiling.
 Unknown/newer schemas, foreign application IDs, corruption, non-empty
@@ -384,6 +385,49 @@ separate transactions in this milestone. A crash between them can cause guest
 re-entry after the reservation lease expires; explicit replay identities
 protect completed external operations, and no cross-transaction exactly-once
 claim is made.
+
+## Durable queues, schedules, and object storage
+
+The same store carries schema-2 queue, schedule, and object tables. Schema 1
+migrates forward in one exclusive transaction that first validates the existing
+schema-1 definitions, so a partially written or foreign database is rejected
+instead of repaired.
+
+Queue reservation, failure, and dead-lettering are three short
+`BEGIN IMMEDIATE` transactions; no database lock is held across guest execution
+or network access. A reservation stamps a 16-byte owner and a lease expiry and
+increments the attempt counter, so a killed worker consumes exactly one bounded
+attempt when its lease expires. Retry visibility uses exponential backoff capped
+by configuration, and attempt exhaustion moves the job into a bounded
+dead-letter table with a 256-byte reason.
+
+Scheduled occurrences are `start + k * interval` UTC epoch instants owned by the
+host. A tick materializes every occurrence in `(cursor, now]` up to a catch-up
+bound, reports the skipped count instead of silently dropping work, and stores
+`(schedule, due_at)` as a durable primary key so a restart or duplicate tick
+cannot create a second committed fire.
+
+Objects are SQLite blobs in capability-scoped buckets. Reads consult staged
+writes then the invocation's base revision; writes stage in memory with per
+bucket count, key, object, and total-byte accounting that includes replacement.
+
+`InvocationState` binds the queue's or schedule's store before instantiation, so
+the delivery acknowledgement, staged key/value state, checkpoints, object
+writes, and queue publishes commit in exactly one transaction, or none of them
+do. Queue and schedule bookkeeping uses `meta.sequence` rather than
+`meta.revision`, so concurrent workers do not create spurious revision
+conflicts.
+
+`krit worker --queue NAME --once` and `krit schedule --schedule NAME --once
+[--now EPOCH_MILLIS]` are bounded dispatch commands: at most `--max-deliveries`
+(1..=1024) deliveries, no sleeping, no polling daemon, and an explicit
+host-supplied instant for deterministic tests.
+
+Schema-4 host configuration binds manifest-granted queue, schedule, and bucket
+names onto already-configured stores. It can only narrow the manifest. A store
+that backs job resources alone is host-owned and requires no
+`state.transaction` grant, which keeps an ingress publisher free of state
+authority.
 
 ## CLI
 
