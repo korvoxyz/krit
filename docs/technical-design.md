@@ -62,6 +62,7 @@ crates/
   krit-wasm/         Core IR to WebAssembly component lowering
   krit-state/        transactional SQLite state, replay, idempotency, queue,
                      schedule, and object records
+  krit-cache/        bounded namespaced TTL cache backend
   krit-database/     capability-scoped parameterized application database access
   krit-runtime/      component runtime, limits, and capability handles
   krit-package/      manifests, lockfiles, resolver, store
@@ -429,6 +430,28 @@ names onto already-configured stores. It can only narrow the manifest. A store
 that backs job resources alone is host-owned and requires no
 `state.transaction` grant, which keeps an ingress publisher free of state
 authority.
+
+## Cache and search
+
+`krit-cache` is a dependency-free bounded LRU and TTL store. A namespace keeps
+three coordinated structures - an entry map, an access-ordered index, and an
+expiry-ordered index - so eviction and expiry are both logarithmic rather than a
+scan, and byte accounting is exact rather than estimated. The host supplies
+every instant, so expiry is deterministic and testable.
+
+The cache is process local and shared through `AgentHost`, so a fresh Wasm
+`Store` per invocation still observes it. It is explicitly outside the
+invocation outcome: a trap or a failed delivery does not undo a write. That
+weaker guarantee is safe precisely because `cache_get` returns
+`Result<Option<String>, String>`, forcing source to handle a miss and an outage,
+so no program can become correct only when the cache is warm.
+
+Search connectors live in `krit-runtime::search`. They reuse the existing
+network stack unchanged and add no new transport. A provider response is parsed
+against a strict schema and then **re-encoded** by the host, so the structure
+guest code parses is fixed by Krit rather than by the provider. A search call is
+refused while a database transaction is open, since holding a database lock
+across a network round trip would make the lock window unbounded.
 
 ## Application database access
 

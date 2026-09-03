@@ -37,6 +37,10 @@ object.read
 object.write
 database.read
 database.write
+cache.read
+cache.write
+search.query
+search.vector
 ```
 
 Unknown capability identifiers are errors. Names are versioned through the
@@ -82,6 +86,14 @@ named resources that a host configuration binds to owner-only stores; see
 [JOBS-AND-STORAGE.md](JOBS-AND-STORAGE.md). Application databases are
 operator-owned files with a host-owned statement catalog; see
 [DATABASE.md](DATABASE.md).
+The optional cache adds `cacheNamespaces` (read and write) and
+`readOnlyCacheNamespaces` (read only), which are disjoint and yield
+`cache.read` and `cache.write` requirements per named namespace. Search adds
+`searchIndexes` and `vectorIndexes`, yielding `search.query` and
+`search.vector`. Cache and search are optional: an artifact that declares them
+still runs when the host configures neither, and the operation returns an
+explicit error the source handles. See
+[CACHE-AND-SEARCH.md](CACHE-AND-SEARCH.md).
 
 Paths are package-root-relative and resolved before execution. A lexical path
 that escapes the granted root is rejected. Symlink and platform-specific path

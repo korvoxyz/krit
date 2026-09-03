@@ -2254,6 +2254,24 @@ impl<'a> Verifier<'a> {
             | Builtin::DatabaseExecute
             | Builtin::DatabaseCommit
             | Builtin::DatabaseRollback => Ok(Vec::new()),
+            Builtin::CacheGet => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::CacheRead,
+                resource(0)?,
+            )]),
+            Builtin::CachePut | Builtin::CacheDelete => {
+                Ok(vec![crate::CapabilityRequirement::new(
+                    crate::Effect::CacheWrite,
+                    resource(0)?,
+                )])
+            }
+            Builtin::SearchQuery => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::SearchQuery,
+                resource(0)?,
+            )]),
+            Builtin::VectorSearch => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::SearchVector,
+                resource(0)?,
+            )]),
             Builtin::Print
             | Builtin::Println
             | Builtin::Some
@@ -2292,6 +2310,44 @@ impl<'a> Verifier<'a> {
                 &[Type::String, Type::String],
                 &Type::Result(Arc::new(Type::String), Arc::new(Type::String)),
                 Some(crate::Effect::QueuePublish),
+            ),
+            Builtin::CacheGet => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::String, Type::String],
+                &Type::Result(
+                    Arc::new(Type::Option(Arc::new(Type::String))),
+                    Arc::new(Type::String),
+                ),
+                Some(crate::Effect::CacheRead),
+            ),
+            Builtin::CachePut => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::String, Type::String, Type::String, Type::Int],
+                &Type::Result(Arc::new(Type::Unit), Arc::new(Type::String)),
+                Some(crate::Effect::CacheWrite),
+            ),
+            Builtin::CacheDelete => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::String, Type::String],
+                &Type::Result(Arc::new(Type::Unit), Arc::new(Type::String)),
+                Some(crate::Effect::CacheWrite),
+            ),
+            Builtin::SearchQuery => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::String, Type::String, Type::Int],
+                &Type::Result(Arc::new(Type::String), Arc::new(Type::String)),
+                Some(crate::Effect::SearchQuery),
+            ),
+            Builtin::VectorSearch => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::String, Type::String, Type::Int],
+                &Type::Result(Arc::new(Type::String), Arc::new(Type::String)),
+                Some(crate::Effect::SearchVector),
             ),
             Builtin::ObjectGet => verify_host_builtin(
                 builtin,

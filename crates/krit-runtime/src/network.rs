@@ -63,6 +63,64 @@ impl From<String> for NetworkFailure {
     }
 }
 
+/// Classifies one transfer failure into a fixed, endpoint-neutral message.
+///
+/// `curl::Error`'s `Display` includes curl's error buffer, which routinely
+/// carries the host, the port, the resolved address, a proxy, a URL, or TLS
+/// certificate detail. That text reaches guest code through the search and AI
+/// results, and guest code is never told which endpoint a connector or adapter
+/// uses, so the driver's text is discarded entirely and replaced by a fixed
+/// category. Retry classification is preserved.
+fn sanitize_transfer_error(error: &curl::Error) -> NetworkFailure {
+    let retryable = error.is_couldnt_resolve_host()
+        || error.is_couldnt_resolve_proxy()
+        || error.is_couldnt_connect()
+        || error.is_operation_timedout()
+        || error.is_got_nothing()
+        || error.is_send_error()
+        || error.is_recv_error()
+        || error.is_again()
+        || error.is_partial_file();
+    let message = if error.is_operation_timedout() {
+        "outbound HTTP request timed out"
+    } else if error.is_couldnt_resolve_host() || error.is_couldnt_resolve_proxy() {
+        "outbound HTTP host resolution failed"
+    } else if error.is_ssl_connect_error()
+        || error.is_peer_failed_verification()
+        || error.is_ssl_certproblem()
+        || error.is_ssl_cipher()
+        || error.is_ssl_cacert()
+        || error.is_ssl_cacert_badfile()
+        || error.is_ssl_crl_badfile()
+        || error.is_ssl_issuer_error()
+        || error.is_ssl_engine_notfound()
+        || error.is_ssl_engine_setfailed()
+        || error.is_ssl_engine_initfailed()
+        || error.is_ssl_shutdown_failed()
+        || error.is_use_ssl_failed()
+    {
+        "outbound HTTP TLS verification failed"
+    } else if error.is_too_many_redirects() {
+        "outbound HTTP redirects are denied"
+    } else if error.is_url_malformed() || error.is_unsupported_protocol() {
+        "outbound HTTP request target is not supported"
+    } else if error.is_aborted_by_callback() {
+        "outbound HTTP operation was cancelled"
+    } else if retryable {
+        "outbound HTTP connection failed"
+    } else {
+        "outbound HTTP request failed"
+    };
+    NetworkFailure::new(
+        if retryable {
+            NetworkFailureKind::Retryable
+        } else {
+            NetworkFailureKind::Fatal
+        },
+        message,
+    )
+}
+
 pub(crate) fn send(
     origin: &HttpOrigin,
     request: &HttpRequest,
@@ -129,33 +187,33 @@ pub(crate) fn send(
 
     let mut easy = Easy::new();
     easy.url(&target)
-        .map_err(|error| format!("invalid outbound HTTP URL: {error}"))?;
+        .map_err(|_| "invalid outbound HTTP URL".to_owned())?;
     easy.proxy("")
-        .map_err(|error| format!("could not disable outbound proxy inheritance: {error}"))?;
+        .map_err(|_| "could not disable outbound proxy inheritance".to_owned())?;
     easy.follow_location(false)
-        .map_err(|error| format!("could not disable outbound redirects: {error}"))?;
+        .map_err(|_| "could not disable outbound redirects".to_owned())?;
     easy.max_redirections(0)
-        .map_err(|error| format!("could not bound outbound redirects: {error}"))?;
+        .map_err(|_| "could not bound outbound redirects".to_owned())?;
     easy.fail_on_error(false)
-        .map_err(|error| format!("could not configure HTTP status handling: {error}"))?;
+        .map_err(|_| "could not configure HTTP status handling".to_owned())?;
     easy.http_version(HttpVersion::V11)
-        .map_err(|error| format!("could not select bounded HTTP version: {error}"))?;
+        .map_err(|_| "could not select bounded HTTP version".to_owned())?;
     easy.fresh_connect(true)
         .and_then(|()| easy.forbid_reuse(true))
-        .map_err(|error| format!("could not isolate outbound HTTP connection: {error}"))?;
+        .map_err(|_| "could not isolate outbound HTTP connection".to_owned())?;
     easy.connect_timeout(limits.connect_timeout().min(overall_timeout))
-        .map_err(|error| format!("could not configure connect timeout: {error}"))?;
+        .map_err(|_| "could not configure connect timeout".to_owned())?;
     easy.timeout(overall_timeout)
-        .map_err(|error| format!("could not configure overall HTTP timeout: {error}"))?;
+        .map_err(|_| "could not configure overall HTTP timeout".to_owned())?;
     easy.progress(true)
-        .map_err(|error| format!("could not enable HTTP cancellation checks: {error}"))?;
+        .map_err(|_| "could not enable HTTP cancellation checks".to_owned())?;
     easy.ssl_verify_peer(true)
         .and_then(|()| easy.ssl_verify_host(true))
-        .map_err(|error| format!("could not enforce TLS verification: {error}"))?;
+        .map_err(|_| "could not enforce TLS verification".to_owned())?;
     let mut ssl_options = SslOpt::new();
     ssl_options.native_ca(true);
     easy.ssl_options(&ssl_options)
-        .map_err(|error| format!("could not select native TLS trust roots: {error}"))?;
+        .map_err(|_| "could not select native TLS trust roots".to_owned())?;
 
     if origin.ip_address().is_none() {
         let mut resolve = List::new();
@@ -173,9 +231,9 @@ pub(crate) fn send(
                 origin.host().trim_matches(['[', ']']),
                 origin.port()
             ))
-            .map_err(|error| format!("could not construct pinned DNS result: {error}"))?;
+            .map_err(|_| "could not construct pinned DNS result".to_owned())?;
         easy.resolve(resolve)
-            .map_err(|error| format!("could not pin outbound DNS result: {error}"))?;
+            .map_err(|_| "could not pin outbound DNS result".to_owned())?;
     }
 
     let mut headers = List::new();
@@ -186,7 +244,7 @@ pub(crate) fn send(
         has_expect |= header.name.eq_ignore_ascii_case("expect");
         headers
             .append(&format!("{}: {}", header.name, header.value))
-            .map_err(|error| format!("could not encode outbound HTTP header: {error}"))?;
+            .map_err(|_| "could not encode outbound HTTP header".to_owned())?;
     }
     if let Some(secret) = bearer {
         let bytes = secret.expose_for_bearer();
@@ -202,32 +260,32 @@ pub(crate) fn send(
             .map_err(|_| "secret is not a valid bearer credential".to_owned())?;
         headers
             .append(value_string)
-            .map_err(|error| format!("could not encode bearer header: {error}"))?;
+            .map_err(|_| "could not encode bearer header".to_owned())?;
         value.zeroize();
     }
     if !has_expect {
         headers
             .append("Expect:")
-            .map_err(|error| format!("could not disable automatic Expect header: {error}"))?;
+            .map_err(|_| "could not disable automatic Expect header".to_owned())?;
     }
     if !has_content_type {
         headers
             .append("Content-Type:")
-            .map_err(|error| format!("could not disable automatic Content-Type: {error}"))?;
+            .map_err(|_| "could not disable automatic Content-Type".to_owned())?;
     }
     easy.http_headers(headers)
-        .map_err(|error| format!("could not configure outbound HTTP headers: {error}"))?;
+        .map_err(|_| "could not configure outbound HTTP headers".to_owned())?;
     if request.method.eq_ignore_ascii_case("HEAD") {
         easy.nobody(true)
-            .map_err(|error| format!("could not configure bodyless HEAD response: {error}"))?;
+            .map_err(|_| "could not configure bodyless HEAD response".to_owned())?;
     } else if !request.body.is_empty()
         || !matches!(request.method.as_str(), "GET" | "OPTIONS" | "TRACE")
     {
         easy.post_fields_copy(request.body.as_bytes())
-            .map_err(|error| format!("could not configure outbound HTTP body: {error}"))?;
+            .map_err(|_| "could not configure outbound HTTP body".to_owned())?;
     }
     easy.custom_request(&request.method)
-        .map_err(|error| format!("could not configure outbound HTTP method: {error}"))?;
+        .map_err(|_| "could not configure outbound HTTP method".to_owned())?;
 
     let mut response_body = Vec::new();
     let mut response_headers = Vec::new();
@@ -251,7 +309,7 @@ pub(crate) fn send(
                 }
                 true
             })
-            .map_err(|error| format!("could not install HTTP progress callback: {error}"))?;
+            .map_err(|_| "could not install HTTP progress callback".to_owned())?;
         transfer
             .header_function(|line| {
                 raw_header_bytes = match raw_header_bytes.checked_add(line.len()) {
@@ -318,7 +376,7 @@ pub(crate) fn send(
                 }
                 true
             })
-            .map_err(|error| format!("could not install HTTP header callback: {error}"))?;
+            .map_err(|_| "could not install HTTP header callback".to_owned())?;
         transfer
             .write_function(|data| {
                 let Some(next) = response_body.len().checked_add(data.len()) else {
@@ -332,7 +390,7 @@ pub(crate) fn send(
                 response_body.extend_from_slice(data);
                 Ok(data.len())
             })
-            .map_err(|error| format!("could not install HTTP body callback: {error}"))?;
+            .map_err(|_| "could not install HTTP body callback".to_owned())?;
         transfer.perform()
     };
     if let Some(error) = header_failure {
@@ -358,30 +416,11 @@ pub(crate) fn send(
         ));
     }
     if let Err(error) = perform {
-        let retryable = error.is_couldnt_resolve_host()
-            || error.is_couldnt_connect()
-            || error.is_operation_timedout()
-            || error.is_got_nothing()
-            || error.is_send_error()
-            || error.is_recv_error();
-        return Err(NetworkFailure::new(
-            if retryable {
-                NetworkFailureKind::Retryable
-            } else {
-                NetworkFailureKind::Fatal
-            },
-            if error.is_operation_timedout() {
-                "outbound HTTP request timed out".to_owned()
-            } else if retryable {
-                "outbound HTTP connection failed".to_owned()
-            } else {
-                format!("outbound HTTP request failed: {error}")
-            },
-        ));
+        return Err(sanitize_transfer_error(&error));
     }
     let status = i64::from(
         easy.response_code()
-            .map_err(|error| format!("could not read outbound HTTP status: {error}"))?,
+            .map_err(|_| "could not read outbound HTTP status".to_owned())?,
     );
     if (300..=399).contains(&status) {
         return Err("outbound HTTP redirects are denied".to_owned().into());
@@ -578,6 +617,138 @@ mod tests {
         .expect_err("sub-millisecond budget must not become an unlimited curl timeout");
 
         assert!(error.message.contains("deadline expired"));
+    }
+
+    /// Every message a transfer failure may present to guest code.
+    const ENDPOINT_NEUTRAL_MESSAGES: [&str; 8] = [
+        "outbound HTTP request timed out",
+        "outbound HTTP host resolution failed",
+        "outbound HTTP TLS verification failed",
+        "outbound HTTP redirects are denied",
+        "outbound HTTP request target is not supported",
+        "outbound HTTP operation was cancelled",
+        "outbound HTTP connection failed",
+        "outbound HTTP request failed",
+    ];
+
+    /// Builds a real `curl::Error` for one libcurl code.
+    fn curl_error(code: u32) -> curl::Error {
+        curl::Error::new(code)
+    }
+
+    #[test]
+    fn every_transfer_failure_message_is_endpoint_neutral() {
+        // Codes spanning DNS, connect, TLS, certificate, proxy, redirect,
+        // timeout, and generic failures. None may produce interpolated text.
+        for code in [
+            1, 5, 6, 7, 8, 18, 22, 23, 26, 27, 28, 35, 47, 51, 52, 55, 56, 58, 59, 60, 64, 66, 67,
+            77, 80, 83, 90, 91, 95, 99,
+        ] {
+            let failure = sanitize_transfer_error(&curl_error(code));
+            assert!(
+                failure.message.starts_with("outbound HTTP"),
+                "code {code} produced `{}`",
+                failure.message
+            );
+            // A fixed category, never the driver's own text.
+            assert!(
+                ENDPOINT_NEUTRAL_MESSAGES.contains(&failure.message.as_str()),
+                "code {code} produced an unexpected message `{}`",
+                failure.message
+            );
+            let raw = curl_error(code).to_string();
+            assert!(
+                failure.message != raw,
+                "code {code} leaked the driver message"
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_failures_keep_their_retry_classification() {
+        for (code, expected) in [
+            (6, NetworkFailureKind::Retryable),  // couldn't resolve host
+            (7, NetworkFailureKind::Retryable),  // couldn't connect
+            (28, NetworkFailureKind::Retryable), // timed out
+            (52, NetworkFailureKind::Retryable), // got nothing
+            (55, NetworkFailureKind::Retryable), // send error
+            (56, NetworkFailureKind::Retryable), // recv error
+            (35, NetworkFailureKind::Fatal),     // TLS connect error
+            (60, NetworkFailureKind::Fatal),     // peer verification failed
+            (47, NetworkFailureKind::Fatal),     // too many redirects
+            (3, NetworkFailureKind::Fatal),      // malformed URL
+        ] {
+            assert_eq!(
+                sanitize_transfer_error(&curl_error(code)).kind,
+                expected,
+                "code {code} was classified incorrectly"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tls_failure_against_a_loopback_listener_discloses_no_endpoint() {
+        // A plain TCP listener speaking no TLS: an HTTPS request to it fails
+        // during the handshake, which is exactly the path whose driver text
+        // carries host, port, and certificate detail.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener.local_addr().expect("address").port();
+        let server = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 64];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(b"not tls\r\n");
+            }
+        });
+
+        let origin = HttpOrigin::parse_exact(&format!("https://127.0.0.1:{port}"))
+            .expect("origin should parse");
+        let request = HttpRequest {
+            method: "POST".to_owned(),
+            path: "/private/query".to_owned(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: "{\"query\":\"private question\"}".to_owned(),
+        };
+        let cancellation = CancellationHandle::new();
+        let workers = Arc::new(AtomicUsize::new(0));
+
+        let failure = send(
+            &origin,
+            &request,
+            None,
+            SendContext {
+                policy: NetworkPolicy::loopback_for_tests(),
+                limits: RuntimeLimits::default(),
+                remaining: Duration::from_secs(5),
+                cancellation: &cancellation,
+                active_dns_workers: &workers,
+            },
+        )
+        .expect_err("a non-TLS listener must fail an HTTPS handshake");
+        let _ = server.join();
+
+        for secret in [
+            "127.0.0.1",
+            &port.to_string(),
+            "/private/query",
+            "private question",
+            "://",
+            "localhost",
+        ] {
+            assert!(
+                !failure.message.contains(secret),
+                "`{secret}` leaked into `{}`",
+                failure.message
+            );
+        }
+        // Exactly one of the fixed categories, so a leak in any branch fails
+        // here and not only in the branches the unit test enumerates.
+        assert!(
+            ENDPOINT_NEUTRAL_MESSAGES.contains(&failure.message.as_str()),
+            "unexpected message `{}`",
+            failure.message
+        );
     }
 
     #[test]

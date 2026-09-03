@@ -282,13 +282,29 @@ two-resource window is documented rather than hidden.
 
 ### `phase7-cache-search`
 
-**Status:** Not started
+**Status:** Complete
 
-- cache with namespace, TTL, size, and miss behavior
-- search/vector connectors as libraries
+- bounded namespaced TTL cache with explicit miss, expiry, eviction, and outage
+  behaviour, per-namespace and global entry and byte budgets, LRU eviction, and
+  exact replacement accounting
+- provider-neutral `search.query` and `search.vector` connectors with a strict
+  generic `http-json` transport and a deterministic local transport
+- `cache.read`, `cache.write`, `search.query`, and `search.vector` effects with
+  four least-authority WIT interfaces and host config schema 6
 
 Database and cache access are not prerequisites for the reference agent.
-Correctness cannot depend on cache availability.
+Correctness cannot depend on cache availability: `cache_get` returns
+`Result<Option<String>, String>`, so a hit, a miss, and an outage are three
+distinct values source must handle, and the same artifact runs unchanged with
+the cache configured or absent.
+[`examples/cached-search.krit`](../examples/cached-search.krit) demonstrates the
+whole path: read, fall back on a miss or an outage, store with an explicit time
+to live, and answer identically either way.
+
+The cache is process local, non-durable, and non-transactional. It is shared
+across fresh Wasm stores on one host, lost on restart, and a trap or failed
+delivery does not undo an earlier write. That is stated plainly because it is
+exactly why a cached value may never be load bearing.
 
 ## Deferred platform work
 

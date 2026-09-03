@@ -29,6 +29,10 @@ pub enum RuntimeErrorKind {
     Database,
     DatabaseTransaction,
     DatabaseLimit,
+    Cache,
+    CacheLimit,
+    CacheUnavailable,
+    Search,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,6 +132,24 @@ impl RuntimeError {
 
     pub(crate) fn database_limit(message: impl Into<String>) -> Self {
         Self::new("K5303", RuntimeErrorKind::DatabaseLimit, message)
+    }
+
+    pub(crate) fn cache(message: impl Into<String>) -> Self {
+        Self::new("K5401", RuntimeErrorKind::Cache, message)
+    }
+
+    pub(crate) fn cache_limit(message: impl Into<String>) -> Self {
+        Self::new("K5402", RuntimeErrorKind::CacheLimit, message)
+    }
+
+    /// The cache backend is unusable. Reported so source code can fall back
+    /// explicitly rather than mistaking an outage for a miss.
+    pub(crate) fn cache_unavailable(message: impl Into<String>) -> Self {
+        Self::new("K5403", RuntimeErrorKind::CacheUnavailable, message)
+    }
+
+    pub(crate) fn search(message: impl Into<String>) -> Self {
+        Self::new("K5404", RuntimeErrorKind::Search, message)
     }
 
     pub const fn code(&self) -> &'static str {

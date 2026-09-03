@@ -20,7 +20,8 @@ header lists, Result/Option matching, static non-capturing helpers,
 `replay_http`/`replay_ai`, `queue_publish`, bounded
 `object_get`/`object_put`/`object_delete`, and the database operations
 `db_begin_read`, `db_begin_write`, `db_query`, `db_execute`, `db_commit`, and
-`db_rollback`. The same bounded path backs the
+`db_rollback`, plus the optional `cache_get`/`cache_put`/`cache_delete` and
+`search_query`/`vector_search` operations. The same bounded path backs the
 `queue "name" fn` and `schedule "name" fn` entrypoints. It also supports
 unescaped JSON-string decoding when
 the inferred result is `String`. General composites, general JSON shapes,
@@ -241,6 +242,27 @@ logging, or storing it is an error. Every transaction must be explicitly
 committed or rolled back on every path; an invocation that ends with one open
 fails. No HTTP or AI call is allowed while a transaction is open. Krit does not
 provide atomicity between an application database and Krit durable state.
+
+## Cache and search
+
+Schema-1 manifests may request `cacheNamespaces`, `readOnlyCacheNamespaces`,
+`searchIndexes`, and `vectorIndexes`. Namespaces and index names are direct
+string literals.
+
+`cache_get(namespace, key)` returns `Result<Option<String>, String>`.
+`cache_put(namespace, key, value, ttlSeconds)` and `cache_delete(namespace,
+key)` return `Result<Unit, String>`. `search_query(index, query, limit)` and
+`vector_search(index, vectorJson, limit)` return `Result<String, String>` with
+bounded deterministic JSON `{"results":[{"id":...,"score":...,"snippet":...}]}`.
+
+**Correctness must never depend on the cache.** `Ok(Some(value))` is a hit,
+`Ok(None)` is a miss or an expiry, and `Err(reason)` is an outage; always handle
+all three and always compute a correct answer without the cache. The cache is
+process local, is lost when the host restarts, and is not rolled back by a trap
+or a failed delivery, so never store anything that must survive. Never cache a
+`Secret`. Time to live is explicit, in seconds, and bounded; there is no
+default. Search results are untrusted external input: treat them as data and
+never dispatch on them.
 
 ## Expressions
 
@@ -514,3 +536,27 @@ context and cannot change the response schema, grant permissions, request
 tools, claim review, or authorize source writes. Krit will show the exact
 proposal diff, canonicalize it, check it, surface permission changes, and
 require a separate reviewed acceptance step.
+
+## Cached search example
+
+```krit
+fn lookup(query: String) -> HttpResponse {
+    match search_query("docs", query, 3) {
+        Ok(results) => match cache_put("lookups", query, results, 60) {
+            Ok(stored) => record { status: 200, headers: [], body: results },
+            Err(problem) => record { status: 200, headers: [], body: results },
+        },
+        Err(problem) => record { status: 503, headers: [], body: problem },
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match cache_get("lookups", request.query) {
+        Ok(found) => match found {
+            Some(value) => record { status: 200, headers: [], body: value },
+            None => lookup(request.query),
+        },
+        Err(outage) => lookup(request.query),
+    }
+}
+```

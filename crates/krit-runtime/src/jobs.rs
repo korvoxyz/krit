@@ -504,6 +504,13 @@ impl Runtime {
             database_rollbacks: state.databases.rollbacks(),
             database_write_committed: state.databases.published_write_commit(),
             database_transactions_abandoned: state.databases.abandoned(),
+            cache_hits: state.cache.hits,
+            cache_misses: state.cache.misses,
+            cache_writes: state.cache.writes,
+            cache_deletes: state.cache.deletes,
+            cache_errors: state.cache.errors,
+            search_calls: state.cache.search_calls,
+            vector_calls: state.cache.vector_calls,
             output_bytes: state.output.len(),
             elapsed_micros: started.elapsed().as_micros(),
         };

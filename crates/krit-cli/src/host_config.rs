@@ -9,13 +9,16 @@ use std::{
 
 use krit_package::Manifest;
 use krit_runtime::{
-    AgentHost, AgentHostPolicy, AiAdapterConfig, ApprovalOperation, BucketDefinition, BucketPolicy,
-    DatabaseCatalog, DatabaseDefinition, DatabaseLimits, DatabaseMode, Durability, DurableState,
-    DurableStoreDefinition, DurableStoreLimits, ExplicitApprovalPolicy, HostInputs,
-    HttpJsonAdapterConfig, IdempotencyPolicy, MAX_CATALOG_STATEMENTS, MAX_DATABASES,
-    MAX_PARAMETERS, MAX_RESULT_COLUMNS, ParameterType, QueueDefinition, QueuePolicy,
-    RateLimitPolicy, RetentionPolicy, RetryPolicy, RuntimeLimits, ScheduleDefinition,
-    SchedulePolicy, SecretStore, StatementKind, StatementRequest,
+    AgentHost, AgentHostPolicy, AgentHostServices, AiAdapterConfig, ApprovalOperation,
+    BucketDefinition, BucketPolicy, CacheConfig, CacheHandle, DatabaseCatalog, DatabaseDefinition,
+    DatabaseLimits, DatabaseMode, Durability, DurableState, DurableStoreDefinition,
+    DurableStoreLimits, ExplicitApprovalPolicy, HostInputs, HttpJsonAdapterConfig,
+    HttpJsonConnectorConfig, IdempotencyPolicy, LocalConnectorConfig, LocalDocument,
+    MAX_CACHE_NAMESPACES, MAX_CATALOG_STATEMENTS, MAX_DATABASES, MAX_PARAMETERS,
+    MAX_RESULT_COLUMNS, MAX_SEARCH_CONNECTORS, NamespaceMode, NamespacePolicy, ParameterType,
+    QueueDefinition, QueuePolicy, RateLimitPolicy, RetentionPolicy, RetryPolicy, RuntimeLimits,
+    ScheduleDefinition, SchedulePolicy, SearchCatalog, SearchConnectorConfig, SearchKind,
+    SearchTransport, SecretStore, StatementKind, StatementRequest,
 };
 use serde::Deserialize;
 
@@ -136,6 +139,149 @@ struct HostConfigV5 {
     databases: BTreeMap<String, DatabaseFile>,
     #[serde(default = "default_max_transactions")]
     max_transactions_per_invocation: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostConfigV6 {
+    schema: u32,
+    #[serde(default)]
+    config: BTreeMap<String, String>,
+    #[serde(default)]
+    secrets: BTreeMap<String, SecretReference>,
+    #[serde(default)]
+    ai_adapters: BTreeMap<String, AiAdapterFile>,
+    #[serde(default)]
+    approvals: Vec<ApprovalFile>,
+    #[serde(default)]
+    retries: RetriesFile,
+    #[serde(default)]
+    rate_limits: RateLimitsFile,
+    #[serde(default)]
+    idempotency: IdempotencyFile,
+    state: StateFile,
+    #[serde(default)]
+    jobs: JobsFile,
+    #[serde(default)]
+    databases: BTreeMap<String, DatabaseFile>,
+    #[serde(default = "default_max_transactions")]
+    max_transactions_per_invocation: usize,
+    #[serde(default)]
+    cache: CacheFile,
+    #[serde(default)]
+    #[serde(deserialize_with = "unique_keys")]
+    search: BTreeMap<String, SearchConnectorFile>,
+}
+
+/// Whole-cache configuration. An absent section means no cache at all.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CacheFile {
+    #[serde(default)]
+    #[serde(deserialize_with = "unique_keys")]
+    namespaces: BTreeMap<String, CacheNamespaceFile>,
+    #[serde(default)]
+    max_total_entries: usize,
+    #[serde(default)]
+    max_total_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CacheNamespaceFile {
+    mode: CacheModeFile,
+    max_entries: usize,
+    max_bytes: usize,
+    max_key_bytes: usize,
+    max_value_bytes: usize,
+    max_ttl_seconds: i64,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum CacheModeFile {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SearchConnectorFile {
+    kind: SearchKindFile,
+    #[serde(default)]
+    dimensions: Option<usize>,
+    max_results: usize,
+    transport: SearchTransportFile,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum SearchKindFile {
+    Query,
+    Vector,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+enum SearchTransportFile {
+    /// Strict generic JSON over an exact HTTPS origin. No branded protocol.
+    #[serde(rename_all = "camelCase")]
+    HttpJson {
+        origin: String,
+        path: String,
+        #[serde(default)]
+        secret: Option<String>,
+        max_response_bytes: usize,
+        timeout_ms: u64,
+    },
+    /// Deterministic in-process documents, for examples and tests.
+    #[serde(rename_all = "camelCase")]
+    Local { documents: Vec<LocalDocumentFile> },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalDocumentFile {
+    id: String,
+    text: String,
+}
+
+/// Deserializes a JSON object into a map, rejecting any duplicate key.
+///
+/// `serde_json` keeps the last value for a repeated key, so a configuration
+/// could otherwise declare one namespace or connector twice with conflicting
+/// bounds, endpoints, or credentials and have the earlier definition silently
+/// discarded. This refuses the document instead, during pure phase-one
+/// validation and before any store, database, or cache is touched.
+fn unique_keys<'de, D, V>(deserializer: D) -> Result<BTreeMap<String, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    use serde::de::{Error, MapAccess, Visitor};
+
+    struct UniqueKeys<V>(std::marker::PhantomData<V>);
+
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueKeys<V> {
+        type Value = BTreeMap<String, V>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an object with unique keys")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut entries = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry::<String, V>()? {
+                if entries.contains_key(&key) {
+                    return Err(A::Error::custom(format!("duplicate key `{key}`")));
+                }
+                entries.insert(key, value);
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueKeys(std::marker::PhantomData))
 }
 
 const fn default_max_transactions() -> usize {
@@ -616,8 +762,55 @@ pub(crate) fn load(
                 Ok((durable, databases))
             })
         }
+        6 => {
+            let file: HostConfigV6 = serde_json::from_slice(&bytes).map_err(|error| {
+                HostConfigError::input(format!(
+                    "invalid strict schema-6 host config {}: {error}",
+                    path.display()
+                ))
+            })?;
+            debug_assert_eq!(file.schema, 6);
+            // Phase one: everything below is pure validation and resolution.
+            let cache = validate_cache(manifest, &file.cache)?;
+            let connectors = validate_search(manifest, &file.search)?;
+            let prepared = validate_databases(manifest, &file.databases)?;
+            let configured_stores = file.state.stores.keys().cloned().collect();
+            let jobs = validate_jobs(manifest, file.jobs, &configured_stores)?;
+            let host_owned = jobs.store_names();
+            let resolved = resolve_durable_state(path, manifest, file.state, &host_owned)?;
+            let root = config_root(path)?;
+            reject_aliased_paths(&resolved.definitions, &prepared, &root)?;
+            let max_transactions = file.max_transactions_per_invocation;
+            let compatible = HostConfigV2 {
+                schema: 2,
+                config: file.config,
+                secrets: file.secrets,
+                ai_adapters: file.ai_adapters,
+                approvals: file.approvals,
+                retries: file.retries,
+                rate_limits: file.rate_limits,
+                idempotency: file.idempotency,
+            };
+            load_configured_services(path, manifest, limits, compatible, move || {
+                // Phase two: the first side effects happen only here.
+                let databases = open_databases(path, prepared, max_transactions)?;
+                let durable = open_durable_state(resolved)?
+                    .with_jobs(jobs.queues, jobs.schedules, jobs.buckets)
+                    .map_err(HostConfigError::durable)?;
+                let cache = CacheHandle::open(cache)
+                    .map_err(|error| HostConfigError::input(error.message()))?;
+                let search_catalog = SearchCatalog::open(connectors)
+                    .map_err(|error| HostConfigError::input(error.message().to_owned()))?;
+                Ok(AgentHostServices {
+                    durable_state: durable,
+                    database_catalog: databases,
+                    cache,
+                    search_catalog,
+                })
+            })
+        }
         unsupported => Err(HostConfigError::input(format!(
-            "unsupported host config schema {unsupported}; expected 1, 2, 3, 4, or 5"
+            "unsupported host config schema {unsupported}; expected 1, 2, 3, 4, 5, or 6"
         ))),
     }
 }
@@ -634,6 +827,23 @@ fn load_configured_host(
     limits: RuntimeLimits,
     file: HostConfigV2,
     open_durable: impl FnOnce() -> Result<(DurableState, DatabaseCatalog), HostConfigError>,
+) -> Result<AgentHost, HostConfigError> {
+    load_configured_services(path, manifest, limits, file, || {
+        let (durable_state, database_catalog) = open_durable()?;
+        Ok(AgentHostServices {
+            durable_state,
+            database_catalog,
+            ..AgentHostServices::default()
+        })
+    })
+}
+
+fn load_configured_services(
+    path: &Path,
+    manifest: &Manifest,
+    limits: RuntimeLimits,
+    file: HostConfigV2,
+    open_services: impl FnOnce() -> Result<AgentHostServices, HostConfigError>,
 ) -> Result<AgentHost, HostConfigError> {
     let inputs = load_inputs(path, manifest, limits, file.config, file.secrets)?;
     let mut policy = AgentHostPolicy::default();
@@ -717,8 +927,8 @@ fn load_configured_host(
         .map_err(|error| HostConfigError::input(error.message().to_owned()))?;
     // Everything above this line is pure validation; the durable side effects
     // happen only once the whole configuration is known to be valid.
-    let (durable, databases) = open_durable()?;
-    AgentHost::new_with_resources(inputs, policy, Arc::new(approvals), durable, databases)
+    let services = open_services()?;
+    AgentHost::new_with_services(inputs, policy, Arc::new(approvals), services)
         .map_err(|error| HostConfigError::input(error.message().to_owned()))
 }
 
@@ -923,6 +1133,148 @@ fn validate_jobs(
         schedules,
         buckets,
     })
+}
+
+/// Validates every cache namespace, grant, and limit with no side effects.
+///
+/// The cache is never created here: the returned configuration is applied only
+/// after the whole host configuration is known to be valid.
+fn validate_cache(manifest: &Manifest, cache: &CacheFile) -> Result<CacheConfig, HostConfigError> {
+    if cache.namespaces.is_empty() {
+        if cache.max_total_entries != 0 || cache.max_total_bytes != 0 {
+            return Err(HostConfigError::input(
+                "cache totals are configured without any namespace",
+            ));
+        }
+        return Ok(CacheConfig::default());
+    }
+    if cache.namespaces.len() > MAX_CACHE_NAMESPACES {
+        return Err(HostConfigError::input(
+            "configured cache namespaces exceed the Phase 7 bound",
+        ));
+    }
+    let mut namespaces = BTreeMap::new();
+    for (name, file) in &cache.namespaces {
+        if !krit_capability::is_valid_resource_name(name) {
+            return Err(HostConfigError::input(
+                "cache namespace must use the canonical resource grammar",
+            ));
+        }
+        let mode = match file.mode {
+            CacheModeFile::ReadOnly => NamespaceMode::ReadOnly,
+            CacheModeFile::ReadWrite => NamespaceMode::ReadWrite,
+        };
+        // Host configuration can only narrow the manifest, never widen it.
+        let granted = match mode {
+            NamespaceMode::ReadOnly => manifest.grants_permission("cache.read", Some(name)),
+            NamespaceMode::ReadWrite => manifest.grants_permission("cache.write", Some(name)),
+        };
+        if !granted {
+            return Err(HostConfigError::authorization(format!(
+                "cache namespace `{name}` is not granted by the package manifest"
+            )));
+        }
+        namespaces.insert(
+            name.clone(),
+            NamespacePolicy {
+                mode,
+                max_entries: file.max_entries,
+                max_bytes: file.max_bytes,
+                max_key_bytes: file.max_key_bytes,
+                max_value_bytes: file.max_value_bytes,
+                max_ttl_seconds: file.max_ttl_seconds,
+            },
+        );
+    }
+    let config = CacheConfig {
+        namespaces,
+        max_total_entries: cache.max_total_entries,
+        max_total_bytes: cache.max_total_bytes,
+    };
+    // Bounds are checked here rather than at construction so an invalid limit
+    // never reaches a side-effectful step.
+    CacheHandle::open(config.clone()).map_err(|error| HostConfigError::input(error.message()))?;
+    Ok(config)
+}
+
+/// Validates every search connector, grant, endpoint, and bound with no I/O.
+fn validate_search(
+    manifest: &Manifest,
+    search: &BTreeMap<String, SearchConnectorFile>,
+) -> Result<BTreeMap<String, SearchConnectorConfig>, HostConfigError> {
+    if search.len() > MAX_SEARCH_CONNECTORS {
+        return Err(HostConfigError::input(
+            "configured search connectors exceed the Phase 7 bound",
+        ));
+    }
+    let mut connectors = BTreeMap::new();
+    for (name, file) in search {
+        if !krit_capability::is_valid_resource_name(name) {
+            return Err(HostConfigError::input(
+                "search connector must use the canonical resource grammar",
+            ));
+        }
+        let kind = match file.kind {
+            SearchKindFile::Query => SearchKind::Query,
+            SearchKindFile::Vector => SearchKind::Vector,
+        };
+        if !manifest.grants_permission(kind.capability(), Some(name)) {
+            return Err(HostConfigError::authorization(format!(
+                "search connector `{name}` is not granted by the package manifest"
+            )));
+        }
+        let transport = match &file.transport {
+            SearchTransportFile::HttpJson {
+                origin,
+                path,
+                secret,
+                max_response_bytes,
+                timeout_ms,
+            } => {
+                // A connector may only reach an origin the manifest grants, so
+                // configuration cannot invent network authority.
+                require_manifest_http(manifest, origin)?;
+                if !origin.starts_with("https://") {
+                    return Err(HostConfigError::input(
+                        "search connector origin must use HTTPS",
+                    ));
+                }
+                if let Some(secret) = secret {
+                    require_manifest_secret(manifest, secret)?;
+                }
+                SearchTransport::HttpJson(HttpJsonConnectorConfig {
+                    origin: origin.clone(),
+                    path: path.clone(),
+                    secret: secret.clone(),
+                    max_response_bytes: *max_response_bytes,
+                    timeout: milliseconds(*timeout_ms, "search connector timeout")?,
+                })
+            }
+            SearchTransportFile::Local { documents } => {
+                SearchTransport::Local(LocalConnectorConfig {
+                    documents: documents
+                        .iter()
+                        .map(|document| LocalDocument {
+                            id: document.id.clone(),
+                            text: document.text.clone(),
+                        })
+                        .collect(),
+                })
+            }
+        };
+        let connector = SearchConnectorConfig {
+            kind,
+            index: name.clone(),
+            transport,
+            max_results: file.max_results,
+            dimensions: file.dimensions,
+        };
+        connector
+            .validate()
+            .map_err(|error| HostConfigError::input(error.message().to_owned()))?;
+        connectors.insert(name.clone(), connector);
+    }
+    Ok(connectors)
 }
 
 /// Canonical directory that every configured relative path resolves against.

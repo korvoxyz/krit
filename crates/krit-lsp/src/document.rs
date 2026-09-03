@@ -404,13 +404,57 @@ impl Document {
             | Builtin::ReplayHttp
             | Builtin::ReplayAi => &package.manifest.capabilities.state,
             Builtin::QueuePublish => &package.manifest.capabilities.queues,
-            Builtin::ObjectGet | Builtin::ObjectPut | Builtin::ObjectDelete => {
-                &package.manifest.capabilities.buckets
+            Builtin::ObjectPut | Builtin::ObjectDelete => &package.manifest.capabilities.buckets,
+            // A read grant is satisfied by the writable list *or* the read-only
+            // list, so completion offers the union rather than half of it.
+            Builtin::ObjectGet => {
+                return self.build_resource_completions(
+                    &context,
+                    package,
+                    &union_resources(
+                        &package.manifest.capabilities.buckets,
+                        &package.manifest.capabilities.read_only_buckets,
+                    ),
+                );
             }
             Builtin::DatabaseBeginWrite => &package.manifest.capabilities.databases,
-            Builtin::DatabaseBeginRead => &package.manifest.capabilities.read_only_databases,
+            Builtin::DatabaseBeginRead => {
+                return self.build_resource_completions(
+                    &context,
+                    package,
+                    &union_resources(
+                        &package.manifest.capabilities.databases,
+                        &package.manifest.capabilities.read_only_databases,
+                    ),
+                );
+            }
+            Builtin::CachePut | Builtin::CacheDelete => {
+                &package.manifest.capabilities.cache_namespaces
+            }
+            Builtin::CacheGet => {
+                return self.build_resource_completions(
+                    &context,
+                    package,
+                    &union_resources(
+                        &package.manifest.capabilities.cache_namespaces,
+                        &package.manifest.capabilities.read_only_cache_namespaces,
+                    ),
+                );
+            }
+            Builtin::SearchQuery => &package.manifest.capabilities.search_indexes,
+            Builtin::VectorSearch => &package.manifest.capabilities.vector_indexes,
             _ => return Vec::new(),
         };
+        self.build_resource_completions(&context, package, resources)
+    }
+
+    /// Builds completion items for one already-selected resource list.
+    fn build_resource_completions(
+        &self,
+        context: &ResourceCompletionContext,
+        package: &PackageContext,
+        resources: &[String],
+    ) -> Vec<CompletionItem> {
         let replacement = self.lines.range(
             self.source.text(),
             Span::new(context.content_start, context.cursor),
@@ -1105,6 +1149,10 @@ fn builtin_capability(builtin: Builtin) -> Option<&'static str> {
         Builtin::ObjectPut | Builtin::ObjectDelete => Some("object.write"),
         Builtin::DatabaseBeginRead => Some("database.read"),
         Builtin::DatabaseBeginWrite => Some("database.write"),
+        Builtin::CacheGet => Some("cache.read"),
+        Builtin::CachePut | Builtin::CacheDelete => Some("cache.write"),
+        Builtin::SearchQuery => Some("search.query"),
+        Builtin::VectorSearch => Some("search.vector"),
         _ => None,
     }
 }
@@ -1421,6 +1469,18 @@ fn keyword_completions() -> Vec<CompletionItem> {
         ..CompletionItem::default()
     })
     .collect()
+}
+
+/// Sorted, deduplicated union of a writable and a read-only grant list.
+fn union_resources(writable: &[String], read_only: &[String]) -> Vec<String> {
+    let mut resources = writable
+        .iter()
+        .chain(read_only)
+        .cloned()
+        .collect::<Vec<_>>();
+    resources.sort();
+    resources.dedup();
+    resources
 }
 
 fn sort_completions(items: &mut [CompletionItem]) {
@@ -2904,5 +2964,31 @@ license = "Apache-2.0"
         assert_eq!(field_repair_attempts(800_000), 1);
         assert_eq!(field_repair_attempts(264_496), 3);
         assert_eq!(field_repair_attempts(1024), MAX_FIELD_REPAIR_ATTEMPTS);
+    }
+
+    #[test]
+    fn read_grants_complete_the_union_of_both_lists() {
+        let writable = vec!["beta".to_owned(), "alpha".to_owned()];
+        let read_only = vec!["gamma".to_owned()];
+
+        // Writable only.
+        assert_eq!(
+            union_resources(&writable, &[]),
+            ["alpha".to_owned(), "beta".to_owned()]
+        );
+        // Read-only only.
+        assert_eq!(union_resources(&[], &read_only), ["gamma".to_owned()]);
+        // Both, sorted.
+        assert_eq!(
+            union_resources(&writable, &read_only),
+            ["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()]
+        );
+        // A name appearing in both lists is offered once. Manifest validation
+        // rejects that overlap, so this only guards the completion path.
+        assert_eq!(
+            union_resources(&["alpha".to_owned()], &["alpha".to_owned()]),
+            ["alpha".to_owned()]
+        );
+        assert!(union_resources(&[], &[]).is_empty());
     }
 }

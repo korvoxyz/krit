@@ -2,10 +2,11 @@ use std::collections::BTreeSet;
 
 use krit_package::Manifest;
 use krit_wasm::{
-    AI_INTERFACE, ArtifactMetadata, CONFIG_INTERFACE, DATABASE_INTERFACE, HTTP_ANONYMOUS_INTERFACE,
-    HTTP_INTERFACE, LOGGING_INTERFACE, OBJECTS_READ_INTERFACE, OBJECTS_WRITE_INTERFACE,
-    PROGRAM_WORLD, PURE_PROGRAM_WORLD, QUEUE_INTERFACE, SECRETS_INTERFACE, STATE_INTERFACE,
-    STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD,
+    AI_INTERFACE, ArtifactMetadata, CACHE_READ_INTERFACE, CACHE_WRITE_INTERFACE, CONFIG_INTERFACE,
+    DATABASE_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, LOGGING_INTERFACE,
+    OBJECTS_READ_INTERFACE, OBJECTS_WRITE_INTERFACE, PROGRAM_WORLD, PURE_PROGRAM_WORLD,
+    QUEUE_INTERFACE, SEARCH_QUERY_INTERFACE, SEARCH_VECTOR_INTERFACE, SECRETS_INTERFACE,
+    STATE_INTERFACE, STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD,
 };
 use serde::Serialize;
 
@@ -126,6 +127,47 @@ impl GrantSet {
             effects.insert("database.read".to_owned());
             imports.insert(DATABASE_INTERFACE.to_owned());
         }
+        if !manifest.capabilities.cache_namespaces.is_empty() {
+            effects.insert("cache.write".to_owned());
+            imports.insert(CACHE_WRITE_INTERFACE.to_owned());
+        }
+        if !manifest.capabilities.cache_namespaces.is_empty()
+            || !manifest.capabilities.read_only_cache_namespaces.is_empty()
+        {
+            effects.insert("cache.read".to_owned());
+            imports.insert(CACHE_READ_INTERFACE.to_owned());
+        }
+        if !manifest.capabilities.search_indexes.is_empty() {
+            effects.insert("search.query".to_owned());
+            imports.insert(SEARCH_QUERY_INTERFACE.to_owned());
+        }
+        if !manifest.capabilities.vector_indexes.is_empty() {
+            effects.insert("search.vector".to_owned());
+            imports.insert(SEARCH_VECTOR_INTERFACE.to_owned());
+        }
+        requested.extend(
+            manifest
+                .capabilities
+                .cache_namespaces
+                .iter()
+                .cloned()
+                .map(|resource| PermissionFact {
+                    capability: "cache.write".to_owned(),
+                    resource: Some(resource),
+                }),
+        );
+        requested.extend(
+            manifest
+                .capabilities
+                .cache_namespaces
+                .iter()
+                .chain(&manifest.capabilities.read_only_cache_namespaces)
+                .cloned()
+                .map(|resource| PermissionFact {
+                    capability: "cache.read".to_owned(),
+                    resource: Some(resource),
+                }),
+        );
         requested.extend(
             manifest
                 .capabilities
@@ -154,6 +196,8 @@ impl GrantSet {
             ("queue.consume", &manifest.capabilities.consumes),
             ("schedule.trigger", &manifest.capabilities.schedules),
             ("object.write", &manifest.capabilities.buckets),
+            ("search.query", &manifest.capabilities.search_indexes),
+            ("search.vector", &manifest.capabilities.vector_indexes),
         ] {
             requested.extend(names.iter().cloned().map(|resource| PermissionFact {
                 capability: capability.to_owned(),
@@ -476,6 +520,10 @@ fn valid_policy_world(metadata: &ArtifactMetadata) -> bool {
             "state.transaction" => Some(STATE_INTERFACE.to_owned()),
             "queue.publish" => Some(QUEUE_INTERFACE.to_owned()),
             "object.read" => Some(OBJECTS_READ_INTERFACE.to_owned()),
+            "cache.read" => Some(CACHE_READ_INTERFACE.to_owned()),
+            "cache.write" => Some(CACHE_WRITE_INTERFACE.to_owned()),
+            "search.query" => Some(SEARCH_QUERY_INTERFACE.to_owned()),
+            "search.vector" => Some(SEARCH_VECTOR_INTERFACE.to_owned()),
             "object.write" => Some(OBJECTS_WRITE_INTERFACE.to_owned()),
             "database.read" | "database.write" => Some(DATABASE_INTERFACE.to_owned()),
             _ => None,

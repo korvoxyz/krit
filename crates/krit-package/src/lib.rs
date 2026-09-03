@@ -63,6 +63,14 @@ pub struct Capabilities {
     pub databases: Vec<String>,
     #[serde(default, rename = "readOnlyDatabases")]
     pub read_only_databases: Vec<String>,
+    #[serde(default, rename = "cacheNamespaces")]
+    pub cache_namespaces: Vec<String>,
+    #[serde(default, rename = "readOnlyCacheNamespaces")]
+    pub read_only_cache_namespaces: Vec<String>,
+    #[serde(default, rename = "searchIndexes")]
+    pub search_indexes: Vec<String>,
+    #[serde(default, rename = "vectorIndexes")]
+    pub vector_indexes: Vec<String>,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -191,6 +199,18 @@ impl Manifest {
                 "read-only object bucket",
                 &self.capabilities.read_only_buckets,
             ),
+            ("application database", &self.capabilities.databases),
+            (
+                "read-only application database",
+                &self.capabilities.read_only_databases,
+            ),
+            ("cache namespace", &self.capabilities.cache_namespaces),
+            (
+                "read-only cache namespace",
+                &self.capabilities.read_only_cache_namespaces,
+            ),
+            ("search index", &self.capabilities.search_indexes),
+            ("vector index", &self.capabilities.vector_indexes),
         ] {
             validate_sorted_unique_names(label, names)?;
             validate_capability_count(label, names)?;
@@ -209,6 +229,13 @@ impl Manifest {
             if self.capabilities.databases.contains(name) {
                 return Err(ManifestError::new(format!(
                     "application database `{name}` cannot request both read-only and write authority"
+                )));
+            }
+        }
+        for name in &self.capabilities.read_only_cache_namespaces {
+            if self.capabilities.cache_namespaces.contains(name) {
+                return Err(ManifestError::new(format!(
+                    "cache namespace `{name}` cannot request both read-only and write authority"
                 )));
             }
         }
@@ -297,6 +324,9 @@ impl Manifest {
             ("schedule.trigger", &self.capabilities.schedules),
             ("object.write", &self.capabilities.buckets),
             ("database.write", &self.capabilities.databases),
+            ("cache.write", &self.capabilities.cache_namespaces),
+            ("search.query", &self.capabilities.search_indexes),
+            ("search.vector", &self.capabilities.vector_indexes),
         ] {
             requested.extend(names.iter().cloned().map(|resource| PermissionRequest {
                 capability,
@@ -322,6 +352,17 @@ impl Manifest {
                 .cloned()
                 .map(|resource| PermissionRequest {
                     capability: "database.read",
+                    resource: Some(resource),
+                }),
+        );
+        requested.extend(
+            self.capabilities
+                .cache_namespaces
+                .iter()
+                .chain(&self.capabilities.read_only_cache_namespaces)
+                .cloned()
+                .map(|resource| PermissionRequest {
+                    capability: "cache.read",
                     resource: Some(resource),
                 }),
         );
@@ -410,6 +451,31 @@ impl Manifest {
                     .databases
                     .iter()
                     .chain(&self.capabilities.read_only_databases)
+                    .any(|granted| granted == resource)
+            }),
+            "cache.write" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .cache_namespaces
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "cache.read" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .cache_namespaces
+                    .iter()
+                    .chain(&self.capabilities.read_only_cache_namespaces)
+                    .any(|granted| granted == resource)
+            }),
+            "search.query" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .search_indexes
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "search.vector" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .vector_indexes
+                    .iter()
                     .any(|granted| granted == resource)
             }),
             _ => false,

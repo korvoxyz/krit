@@ -1,5 +1,6 @@
 mod ai;
 mod bindings;
+mod cache;
 mod database;
 mod error;
 mod host;
@@ -9,6 +10,7 @@ mod network;
 mod observability;
 mod permissions;
 mod policy;
+mod search;
 mod state;
 mod webhook;
 
@@ -34,6 +36,15 @@ use wasmtime::{
 };
 
 use ai::AiAdapter;
+pub use cache::{
+    CacheConfig, CacheHandle, CacheInstant, CacheStats,
+    MAX_ENTRIES_PER_NAMESPACE as MAX_CACHE_ENTRIES_PER_NAMESPACE,
+    MAX_KEY_BYTES as MAX_CACHE_KEY_BYTES, MAX_NAMESPACE_BYTES as MAX_CACHE_NAMESPACE_BYTES,
+    MAX_NAMESPACES as MAX_CACHE_NAMESPACES, MAX_TOTAL_BYTES as MAX_CACHE_TOTAL_BYTES,
+    MAX_TOTAL_ENTRIES as MAX_CACHE_TOTAL_ENTRIES, MAX_TTL_SECONDS as MAX_CACHE_TTL_SECONDS,
+    MAX_VALUE_BYTES as MAX_CACHE_VALUE_BYTES, MIN_TTL_SECONDS as MIN_CACHE_TTL_SECONDS,
+    NamespaceMode, NamespacePolicy, SearchCatalog,
+};
 pub use database::{
     DatabaseCatalog, DatabaseDefinition, MAX_APPLICATION_DATABASE_BYTES, MAX_CATALOG_STATEMENTS,
     MAX_DATABASE_BUSY_TIMEOUT, MAX_DATABASES, MAX_OPERATIONS_PER_TRANSACTION, MAX_PARAMETER_BYTES,
@@ -56,12 +67,17 @@ pub use limits::{
 pub use observability::{LogEvent, LogField, LogLevel, MAX_LOG_NAME_BYTES, REDACTED_VALUE};
 pub use permissions::{ApprovalFact, EffectivePermissions, GrantSet, PermissionFact};
 pub use policy::{
-    AgentHost, AgentHostPolicy, AiAdapterConfig, ApprovalOperation, ApprovalPolicy,
-    ApprovalRequest, CancellationHandle, DenyAllApprovalPolicy, ExplicitApprovalPolicy,
-    HttpJsonAdapterConfig, IdempotencyPolicy, MAX_IDEMPOTENCY_BYTES, MAX_IDEMPOTENCY_ENTRIES,
-    MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDEMPOTENCY_TTL, MAX_POLICY_RESOURCES, MAX_RATE_CAPACITY,
-    MAX_RATE_WINDOW, MAX_RETRY_ATTEMPTS, MAX_RETRY_DELAY, RateLimitPolicy, RetryPolicy,
-    validate_policy,
+    AgentHost, AgentHostPolicy, AgentHostServices, AiAdapterConfig, ApprovalOperation,
+    ApprovalPolicy, ApprovalRequest, CancellationHandle, DenyAllApprovalPolicy,
+    ExplicitApprovalPolicy, HttpJsonAdapterConfig, IdempotencyPolicy, MAX_IDEMPOTENCY_BYTES,
+    MAX_IDEMPOTENCY_ENTRIES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDEMPOTENCY_TTL, MAX_POLICY_RESOURCES,
+    MAX_RATE_CAPACITY, MAX_RATE_WINDOW, MAX_RETRY_ATTEMPTS, MAX_RETRY_DELAY, RateLimitPolicy,
+    RetryPolicy, validate_policy,
+};
+pub use search::{
+    HttpJsonConnectorConfig, LocalConnectorConfig, LocalDocument, MAX_QUERY_BYTES,
+    MAX_SEARCH_CONNECTORS, MAX_SEARCH_RESPONSE_BYTES, MAX_SEARCH_RESULTS, MAX_VECTOR_BYTES,
+    MAX_VECTOR_DIMENSIONS, SearchConnectorConfig, SearchKind, SearchTransport,
 };
 pub use state::{
     BucketDefinition, BucketPolicy, Durability, DurableState, DurableStoreDefinition,
@@ -116,6 +132,14 @@ pub struct ExecutionStats {
     pub database_write_committed: bool,
     /// Transactions the host rolled back because the guest left them open.
     pub database_transactions_abandoned: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_writes: u64,
+    pub cache_deletes: u64,
+    /// Cache operations that failed. A failure is never counted as a miss.
+    pub cache_errors: u64,
+    pub search_calls: u64,
+    pub vector_calls: u64,
     pub output_bytes: usize,
     pub elapsed_micros: u128,
 }
@@ -152,6 +176,7 @@ struct HostState {
     active_dns_workers: Arc<AtomicUsize>,
     artifact_identity: [u8; 32],
     state: state::InvocationState,
+    cache: cache::InvocationCache,
     databases: database::InvocationDatabases,
     transaction_slots: usize,
 }
@@ -175,11 +200,34 @@ struct RetryRequest<'a> {
     request: &'a HttpRequest,
     bearer: Option<&'a host::SecretBytes>,
     rate_resource: policy::RateResource,
+    /// Guest-visible name for a rate denial. It is not the bucket identity: a
+    /// connector shares its origin's bucket but must never disclose that
+    /// origin to guest code.
+    rate_label: String,
     rate_policy: RateLimitPolicy,
     retry_policy: RetryPolicy,
+    /// Approval identity, which is the exact policy resource. It is not the
+    /// guest-visible name: a connector's origin must never reach guest code.
     approval: Option<(ApprovalOperation, String)>,
+    /// Guest-visible name used when an approval is denied.
+    approval_label: String,
     approval_prechecked: bool,
     deadline: Instant,
+    safety: RetrySafety,
+}
+
+/// How the host knows a request may be re-sent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetrySafety {
+    /// Derive eligibility from the request itself: a safe method, or a single
+    /// valid `Idempotency-Key`. Used for guest-authored HTTP and for AI.
+    FromRequest,
+    /// The host built this request and knows the operation is read-only, so a
+    /// retry cannot duplicate an effect. No key is generated and none is sent.
+    ///
+    /// Only host-constructed read-only operations may use this; a guest can
+    /// never select it.
+    HostReadOnly,
 }
 
 impl Runtime {
@@ -543,6 +591,13 @@ impl Runtime {
                 database_rollbacks: state.databases.rollbacks(),
                 database_write_committed: state.databases.published_write_commit(),
                 database_transactions_abandoned: state.databases.abandoned(),
+                cache_hits: state.cache.hits,
+                cache_misses: state.cache.misses,
+                cache_writes: state.cache.writes,
+                cache_deletes: state.cache.deletes,
+                cache_errors: state.cache.errors,
+                search_calls: state.cache.search_calls,
+                vector_calls: state.cache.vector_calls,
                 output_bytes: state.output.len(),
                 elapsed_micros: started.elapsed().as_micros(),
             },
@@ -634,6 +689,13 @@ impl Runtime {
                 database_rollbacks: 0,
                 database_write_committed: false,
                 database_transactions_abandoned: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                cache_writes: 0,
+                cache_deletes: 0,
+                cache_errors: 0,
+                search_calls: 0,
+                vector_calls: 0,
                 output_bytes: state.output.len(),
                 elapsed_micros: started.elapsed().as_micros(),
             },
@@ -687,6 +749,13 @@ impl Runtime {
             database_rollbacks: 0,
             database_write_committed: false,
             database_transactions_abandoned: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            cache_writes: 0,
+            cache_deletes: 0,
+            cache_errors: 0,
+            search_calls: 0,
+            vector_calls: 0,
             output_bytes: 0,
             elapsed_micros: 0,
         }
@@ -902,6 +971,96 @@ impl Runtime {
                 _ => {}
             }
         }
+        // A configured cache namespace must be granted, and a writable
+        // namespace needs an explicit write grant.
+        for name in agent_host.cache().namespace_names() {
+            let writable = agent_host.cache().mode(&name) == Some(cache::NamespaceMode::ReadWrite);
+            let granted = grants.grants("cache.read", Some(&name))
+                || (writable && grants.grants("cache.write", Some(&name)));
+            if !granted {
+                return Err(RuntimeError::authorization(format!(
+                    "cache namespace `{name}` is not granted by the manifest"
+                )));
+            }
+            if writable && !grants.grants("cache.write", Some(&name)) {
+                return Err(RuntimeError::authorization(format!(
+                    "cache namespace `{name}` is configured writable without a write grant"
+                )));
+            }
+        }
+        // A search connector is validated exactly like an AI adapter: the
+        // connector name, its exact origin, and its credential must all be
+        // granted, and its transport must be re-validated against this host's
+        // network policy. This runs for every host, including one an embedding
+        // built directly through `AgentHostServices`, so nothing depends on the
+        // CLI having checked first.
+        let plaintext_permitted = agent_host
+            .inputs()
+            .network_policy()
+            .permits_plaintext_origin();
+        for (name, connector) in agent_host.search_catalog().connectors() {
+            if !grants.grants(connector.kind.capability(), Some(name)) {
+                return Err(RuntimeError::authorization(format!(
+                    "search connector `{name}` is not granted by the manifest"
+                )));
+            }
+            connector.validate_with_plaintext_allowance(plaintext_permitted)?;
+            if let search::SearchTransport::HttpJson(config) = &connector.transport {
+                if !grants.grants("http.request", Some(&config.origin)) {
+                    return Err(RuntimeError::authorization(format!(
+                        "search connector `{name}` origin `{}` is not granted by the manifest",
+                        config.origin
+                    )));
+                }
+                if let Some(secret) = &config.secret
+                    && !grants.grants("secret.read", Some(secret))
+                {
+                    return Err(RuntimeError::authorization(format!(
+                        "search connector `{name}` secret `{secret}` is not granted by the manifest"
+                    )));
+                }
+            }
+        }
+        // A cache namespace or search connector that is simply *absent* is not
+        // a setup failure. The cache is optional infrastructure, so the same
+        // artifact must run with it configured or disabled; the operation then
+        // returns an explicit error the guest handles. Only a genuine
+        // misconfiguration - a configured resource whose authority or kind
+        // contradicts the artifact - fails closed here.
+        for requirement in &metadata.requirements {
+            match requirement.capability.as_str() {
+                "cache.write" => {
+                    if agent_host
+                        .cache()
+                        .mode(&requirement.resource)
+                        .is_some_and(|mode| mode != cache::NamespaceMode::ReadWrite)
+                    {
+                        return Err(RuntimeError::authorization(
+                            "artifact requires write authority on a read-only cache namespace",
+                        ));
+                    }
+                }
+                "search.query" | "search.vector" => {
+                    let expected = if requirement.capability == "search.query" {
+                        search::SearchKind::Query
+                    } else {
+                        search::SearchKind::Vector
+                    };
+                    if agent_host
+                        .search_catalog()
+                        .kind(&requirement.resource)
+                        .is_some_and(|kind| kind != expected)
+                    {
+                        return Err(RuntimeError::search(format!(
+                            "search connector `{}` is not configured for {} operations",
+                            requirement.resource,
+                            expected.as_str()
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
         let job_stores = agent_host.durable_state().job_store_names();
         for name in agent_host.durable_state().store_names() {
             if !grants.grants("state.transaction", Some(name)) && !job_stores.contains(name) {
@@ -957,22 +1116,35 @@ impl Runtime {
                 _ => {}
             }
         }
-        let rate_resources = metadata
-            .requirements
-            .iter()
-            .filter(|requirement| {
-                matches!(
-                    requirement.capability.as_str(),
-                    "ai.invoke" | "http.request"
-                )
-            })
-            .map(|requirement| {
-                (
-                    requirement.capability.as_str(),
-                    requirement.resource.as_str(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
+        // The exact set of rate buckets this invocation can touch. A search
+        // connector's bucket is its *origin*, which lives in host-owned
+        // configuration rather than in the artifact, so counting requirements
+        // alone would undercount and let LRU replacement silently reset a rate
+        // counter mid-invocation.
+        let mut rate_resources = BTreeSet::new();
+        for requirement in &metadata.requirements {
+            match requirement.capability.as_str() {
+                "ai.invoke" => {
+                    rate_resources.insert(("ai.invoke", requirement.resource.clone()));
+                }
+                "http.request" => {
+                    rate_resources.insert(("http.request", requirement.resource.clone()));
+                }
+                "search.query" | "search.vector" => {
+                    // Only a connector the artifact can actually call counts,
+                    // and only an HTTP one: a local connector never rate
+                    // limits. An origin shared with a direct request or with
+                    // another connector collapses into one bucket.
+                    if let Some(connector) =
+                        agent_host.search_catalog().connector(&requirement.resource)
+                        && let search::SearchTransport::HttpJson(config) = &connector.transport
+                    {
+                        rate_resources.insert(("http.request", config.origin.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
         if rate_resources.len() > agent_host.policy().max_tracked_resources {
             return Err(RuntimeError::resource(format!(
                 "artifact requires {} rate-limited resources but AgentHost tracks at most {}",
@@ -1025,6 +1197,7 @@ impl Runtime {
             active_dns_workers: Arc::clone(&self.active_dns_workers),
             artifact_identity,
             state: state::InvocationState::default(),
+            cache: cache::InvocationCache::default(),
             databases: database::InvocationDatabases::default(),
             transaction_slots: 0,
         }
@@ -1701,6 +1874,114 @@ impl bindings::webhook::krit::runtime::queue::Host for HostState {
     }
 }
 
+impl bindings::webhook::krit::runtime::cache_read::Host for HostState {
+    /// Reads one cache entry.
+    ///
+    /// A miss returns `Ok(None)` and an outage returns `Err`, so guest code can
+    /// tell them apart and must decide its own fallback. The host never
+    /// substitutes a value, and never treats a failure as a miss.
+    fn cache_get(
+        &mut self,
+        namespace: String,
+        key: String,
+    ) -> wasmtime::Result<Result<Option<String>, String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("cache.read", &namespace)?;
+        // A monotonic reading, never a wall clock: a host clock fault can never
+        // become a guest trap, and a backwards jump can never extend a TTL.
+        let now = self.agent_host.cache().now();
+        match self.agent_host.cache().get(&namespace, &key, now) {
+            Ok(Some(value)) => {
+                self.cache.hits = self.cache.hits.saturating_add(1);
+                Ok(Ok(Some(value)))
+            }
+            Ok(None) => {
+                self.cache.misses = self.cache.misses.saturating_add(1);
+                Ok(Ok(None))
+            }
+            Err(error) => {
+                self.cache.errors = self.cache.errors.saturating_add(1);
+                Ok(Err(error.message().to_owned()))
+            }
+        }
+    }
+}
+
+impl bindings::webhook::krit::runtime::cache_write::Host for HostState {
+    fn cache_put(
+        &mut self,
+        namespace: String,
+        key: String,
+        value: String,
+        ttl_seconds: i64,
+    ) -> wasmtime::Result<Result<(), String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("cache.write", &namespace)?;
+        let now = self.agent_host.cache().now();
+        match self
+            .agent_host
+            .cache()
+            .put(&namespace, &key, &value, ttl_seconds, now)
+        {
+            Ok(()) => {
+                self.cache.writes = self.cache.writes.saturating_add(1);
+                Ok(Ok(()))
+            }
+            Err(error) => {
+                self.cache.errors = self.cache.errors.saturating_add(1);
+                Ok(Err(error.message().to_owned()))
+            }
+        }
+    }
+
+    fn cache_delete(
+        &mut self,
+        namespace: String,
+        key: String,
+    ) -> wasmtime::Result<Result<(), String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant("cache.write", &namespace)?;
+        match self.agent_host.cache().delete(&namespace, &key) {
+            Ok(()) => {
+                self.cache.deletes = self.cache.deletes.saturating_add(1);
+                Ok(Ok(()))
+            }
+            Err(error) => {
+                self.cache.errors = self.cache.errors.saturating_add(1);
+                Ok(Err(error.message().to_owned()))
+            }
+        }
+    }
+}
+
+impl bindings::webhook::krit::runtime::search_query::Host for HostState {
+    fn search_query(
+        &mut self,
+        index: String,
+        query: String,
+        limit: i64,
+    ) -> wasmtime::Result<Result<String, String>> {
+        self.perform_search(index, query, limit, search::SearchKind::Query)
+    }
+}
+
+impl bindings::webhook::krit::runtime::search_vector::Host for HostState {
+    fn vector_search(
+        &mut self,
+        index: String,
+        vector: String,
+        limit: i64,
+    ) -> wasmtime::Result<Result<String, String>> {
+        self.perform_search(index, vector, limit, search::SearchKind::Vector)
+    }
+}
+
 impl bindings::webhook::krit::runtime::objects_read::Host for HostState {
     fn object_get(
         &mut self,
@@ -1956,6 +2237,27 @@ impl HostState {
             .then(|| "operation cancelled by embedding host".to_owned()))
     }
 
+    /// Requires one manifest grant for a *host-constructed* operation.
+    ///
+    /// Unlike [`Self::require_grant`] this does not consult the artifact's
+    /// requirement set, because the guest never declares a connector's origin
+    /// or credential: the host owns them. The manifest grant is still
+    /// mandatory, so a connector can never reach authority the package did not
+    /// ask for.
+    fn require_effect_resource(&self, capability: &str, resource: &str) -> wasmtime::Result<()> {
+        if self
+            .grants
+            .as_ref()
+            .is_some_and(|grants| grants.grants(capability, Some(resource)))
+        {
+            Ok(())
+        } else {
+            Err(wasmtime::Error::new(RuntimeError::authorization(format!(
+                "host connector requires ungranted capability `{capability}`"
+            ))))
+        }
+    }
+
     fn require_grant(&self, capability: &str, resource: &str) -> wasmtime::Result<()> {
         if self
             .grants
@@ -2078,11 +2380,14 @@ impl HostState {
             origin: &parsed,
             request: &request,
             bearer: bearer.as_deref(),
-            rate_resource: policy::RateResource::Http(origin),
+            rate_resource: policy::RateResource::Http(origin.clone()),
+            rate_label: origin.clone(),
+            approval_label: origin,
             rate_policy: rate,
             retry_policy: retry,
             approval,
             approval_prechecked: bearer.is_some(),
+            safety: RetrySafety::FromRequest,
             deadline: self.invocation_deadline,
         }))
     }
@@ -2195,16 +2500,202 @@ impl HostState {
             request: &request,
             bearer: bearer.as_deref(),
             rate_resource: policy::RateResource::Ai(adapter_name.clone()),
+            rate_label: adapter_name.clone(),
+            approval_label: adapter_name.clone(),
             rate_policy: rate,
             retry_policy: retry,
             approval: Some((ApprovalOperation::AiInvoke, adapter_name)),
             approval_prechecked: true,
             deadline: adapter_deadline,
+            safety: RetrySafety::FromRequest,
         }) {
             Ok(response) => response,
             Err(error) => return Ok(Err(error)),
         };
         Ok(adapter.parse_response(response))
+    }
+
+    /// Runs one bounded search or vector call against a named connector.
+    ///
+    /// The connector's endpoint, path, credential, and provider identity stay
+    /// on the host. The guest supplies only an index name, bounded input, and a
+    /// bounded result count, and receives deterministic re-encoded JSON that it
+    /// must inspect itself. Nothing in the result is executed.
+    fn perform_search(
+        &mut self,
+        index: String,
+        input: String,
+        limit: i64,
+        kind: search::SearchKind,
+    ) -> wasmtime::Result<Result<String, String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_grant(kind.capability(), &index)?;
+        // A search call can take a network round trip, so it may never run
+        // while a database transaction holds a lock.
+        self.require_no_open_transaction("search")?;
+        let Some(connector) = self.agent_host.search_catalog().connector(&index).cloned() else {
+            return Ok(Err(format!("search connector `{index}` is not configured")));
+        };
+        if connector.kind != kind {
+            return Ok(Err(format!(
+                "search connector `{index}` does not support {} operations",
+                kind.as_str()
+            )));
+        }
+        let limit = match usize::try_from(limit) {
+            Ok(limit) if limit >= 1 && limit <= connector.max_results => limit,
+            _ => {
+                return Ok(Err(
+                    "search result count is outside its configured bounds".to_owned()
+                ));
+            }
+        };
+        match kind {
+            search::SearchKind::Query => {
+                if input.is_empty() || input.len() > search::MAX_QUERY_BYTES {
+                    return Ok(Err(
+                        "search query is empty or exceeds its byte bound".to_owned()
+                    ));
+                }
+                self.cache.search_calls = self.cache.search_calls.saturating_add(1);
+            }
+            search::SearchKind::Vector => {
+                self.cache.vector_calls = self.cache.vector_calls.saturating_add(1);
+            }
+        }
+        // A vector is parsed and dimension-checked on the host before any
+        // request is built, so a malformed vector never reaches a provider.
+        let vector = match kind {
+            search::SearchKind::Query => Vec::new(),
+            search::SearchKind::Vector => {
+                let dimensions = connector.dimensions.unwrap_or(0);
+                match search::parse_vector(&input, dimensions) {
+                    Ok(vector) => vector,
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+        };
+        match &connector.transport {
+            search::SearchTransport::Local(local) => Ok(match kind {
+                search::SearchKind::Query => search::local_query(local, &input, limit),
+                search::SearchKind::Vector => search::local_vector(local, &vector, limit),
+            }),
+            search::SearchTransport::HttpJson(http) => {
+                self.perform_http_search(&index, http, kind, &input, &vector, limit)
+            }
+        }
+    }
+
+    fn perform_http_search(
+        &mut self,
+        index: &str,
+        config: &search::HttpJsonConnectorConfig,
+        kind: search::SearchKind,
+        query: &str,
+        vector: &[f64],
+        limit: usize,
+    ) -> wasmtime::Result<Result<String, String>> {
+        let next_calls = self
+            .http_calls
+            .checked_add(1)
+            .ok_or_else(|| wasmtime::Error::new(HostLimitError::Calls))?;
+        if next_calls > self.limits.http_calls() {
+            return Err(wasmtime::Error::new(RuntimeError::host_calls(
+                "outbound HTTP call limit exceeded",
+            )));
+        }
+        self.http_calls = next_calls;
+        // The origin and the connector's secret are rechecked against the
+        // current grant set at dispatch, not only at setup, so a public
+        // embedding that builds a catalog directly cannot reach an origin or a
+        // credential the manifest never granted.
+        self.require_effect_resource("http.request", &config.origin)?;
+        let bearer = match config.secret.as_deref() {
+            Some(name) => {
+                self.require_effect_resource("secret.read", name)?;
+                let Some(secret) = self.agent_host.inputs().secrets().get(name) else {
+                    return Ok(Err(format!(
+                        "search connector `{index}` secret is not configured"
+                    )));
+                };
+                Some(secret)
+            }
+            None => None,
+        };
+        let request = match kind {
+            search::SearchKind::Query => search::build_query_request(config, query, limit),
+            search::SearchKind::Vector => search::build_vector_request(config, vector, limit),
+        };
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => return Ok(Err(error)),
+        };
+        if let Err(error) = request.validate(self.limits) {
+            return Ok(Err(error.message().to_owned()));
+        }
+        let origin = krit_capability::HttpOrigin::parse_exact(&config.origin).map_err(|_| {
+            wasmtime::Error::new(RuntimeError::setup(
+                "validated search connector origin became invalid",
+            ))
+        })?;
+        // Retry and rate selection match guest HTTP exactly: an exact-origin
+        // override wins, otherwise the default applies. A connector is ordinary
+        // HTTP traffic and must not get its own weaker or stronger policy.
+        let retry = self
+            .agent_host
+            .policy()
+            .http_retries
+            .get(&config.origin)
+            .copied()
+            .unwrap_or(self.agent_host.policy().default_http_retry);
+        let rate = self
+            .agent_host
+            .policy()
+            .http_rates
+            .get(&config.origin)
+            .copied()
+            .unwrap_or(self.agent_host.policy().default_http_rate);
+        let deadline = Instant::now()
+            .checked_add(config.timeout)
+            .unwrap_or(self.invocation_deadline)
+            .min(self.invocation_deadline);
+        // A connector that presents a credential needs explicit default-deny
+        // approval, and `send_with_retry` re-approves before every attempt
+        // because `approval_prechecked` is false.
+        let approval = bearer
+            .is_some()
+            .then(|| (ApprovalOperation::HttpBearer, config.origin.clone()));
+        let response = match self.send_with_retry(RetryRequest {
+            origin: &origin,
+            request: &request,
+            bearer: bearer.as_deref(),
+            // Charged against the origin, not the connector name, so every
+            // connector and every direct request to one origin share a single
+            // bucket. Charging per connector would multiply the configured cap
+            // by the number of names pointed at that origin.
+            rate_resource: policy::RateResource::Http(config.origin.clone()),
+            // The guest knows the index, never the endpoint behind it.
+            rate_label: index.to_owned(),
+            approval_label: index.to_owned(),
+            rate_policy: rate,
+            retry_policy: retry,
+            approval,
+            approval_prechecked: false,
+            deadline,
+            // A search is read-only by construction, so re-sending it cannot
+            // duplicate an effect. No idempotency key is generated or sent.
+            safety: RetrySafety::HostReadOnly,
+        }) {
+            Ok(response) => response,
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(search::parse_response(
+            response,
+            config.max_response_bytes,
+            limit,
+        ))
     }
 
     fn record_log(
@@ -2248,13 +2739,19 @@ impl HostState {
             request,
             bearer,
             rate_resource,
+            rate_label,
             rate_policy,
             retry_policy,
             approval,
+            approval_label,
             approval_prechecked,
             deadline,
+            safety,
         } = retry;
-        let retry_eligible = retry_eligible(request);
+        let retry_eligible = match safety {
+            RetrySafety::FromRequest => retry_eligible(request),
+            RetrySafety::HostReadOnly => true,
+        };
         let mut attempt = 0u8;
         loop {
             attempt = attempt.saturating_add(1);
@@ -2269,13 +2766,13 @@ impl HostState {
                 && !self.agent_host.approve(*operation, resource)
             {
                 return Err(format!(
-                    "approval denied for `{}` resource `{resource}`",
+                    "approval denied for `{}` resource `{approval_label}`",
                     operation.as_str()
                 ));
             }
-            if let Err(error) = self
-                .agent_host
-                .check_rate(rate_resource.clone(), rate_policy)
+            if let Err(error) =
+                self.agent_host
+                    .check_rate(rate_resource.clone(), rate_policy, &rate_label)
             {
                 self.rate_limit_denials = self.rate_limit_denials.saturating_add(1);
                 return Err(error);

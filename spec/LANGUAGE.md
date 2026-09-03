@@ -439,7 +439,8 @@ Output is the only host effect executable by the direct evaluator. It is
 modeled as `io.stdout`. The component runtime additionally provides bounded
 `config.read`, `secret.read`, `http.request`, `ai.invoke`, and `observe.log`
 interfaces plus `state.transaction`, `queue.publish`, `object.read`,
-`object.write`, `database.read`, and `database.write` to typed webhook, queue,
+`object.write`, `database.read`, `database.write`, `cache.read`, `cache.write`,
+`search.query`, and `search.vector` to typed webhook, queue,
 and schedule artifacts.
 
 ## 13. JSON conversion

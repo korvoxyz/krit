@@ -194,6 +194,24 @@ interface database {
     db-commit: func(transaction: borrow<transaction>) -> result<_, string>;
     db-rollback: func(transaction: borrow<transaction>) -> result<_, string>;
 }
+
+interface cache-read {
+    cache-get: func(namespace: string, key: string) -> result<option<string>, string>;
+}
+
+interface cache-write {
+    cache-put: func(namespace: string, key: string, value: string, ttl-seconds: s64)
+        -> result<_, string>;
+    cache-delete: func(namespace: string, key: string) -> result<_, string>;
+}
+
+interface search-query {
+    search-query: func(index: string, query: string, limit: s64) -> result<string, string>;
+}
+
+interface search-vector {
+    vector-search: func(index: string, vector: string, limit: s64) -> result<string, string>;
+}
 ```
 
 Object read and write are separate interfaces so that read-only authority never
@@ -205,7 +223,10 @@ still checks every call against both the manifest grant and the artifact's own
 requirement set. Worlds are named
 `{webhook|job|schedule}-<sorted import tokens>-program@0.2.0` over the fixed
 import order `stdout, config, secrets, http, ai, logs, state, queue, objread,
-objwrite, db`, with bearer `http` selected only alongside `secrets`. The finite
+objwrite, db, cacheread, cachewrite, searchquery, searchvector`, with bearer
+`http` selected only alongside `secrets`. Cache read and write, and search query
+and vector, are separate interfaces like the object surfaces, so effects are
+re-derived directly from imports with no shared-interface compromise. The finite
 world set is deterministic: the checked-in package carries every world that
 existed before Phase 6, and any other least-authority world is generated
 byte-identically from its mask at build and validation time. Validation
@@ -498,6 +519,20 @@ the bounded policy-2 webhook surface:
 | Database parameter bytes | none | 64 KiB |
 | Database result rows | none | 4,096 |
 | Encoded database result | none | 256 KiB |
+| Cache namespaces | none | 16 |
+| Cache entries per namespace | none | 4,096 |
+| Cache entries in total | none | 16,384 |
+| Cache key bytes | none | 512 |
+| Cache value bytes | none | 64 KiB |
+| Cache bytes per namespace | none | 8 MiB |
+| Cache bytes in total | none | 64 MiB |
+| Cache time to live | none | 1 s to 7 days |
+| Search connectors | none | 8 |
+| Search query bytes | none | 4 KiB |
+| Encoded vector bytes | none | 64 KiB |
+| Vector dimensions | none | 4,096 |
+| Search results per call | none | 100 |
+| Encoded search result | none | 256 KiB |
 | Operations per transaction | none | 256 |
 | Transactions per invocation | 1 | 8 |
 | Open transactions at once | — | 1 |

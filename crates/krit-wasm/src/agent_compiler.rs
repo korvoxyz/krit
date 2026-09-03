@@ -904,6 +904,66 @@ fn encode_builtin_call(
             load_value(function, context, operation.result)?;
             call_import(function, context, "queue-publish")?;
         }
+        Builtin::CacheGet => {
+            let [namespace, key] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "cache_get call does not have two arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 16, 4)?;
+            load_string_flat(function, context, *namespace)?;
+            load_string_flat(function, context, *key)?;
+            load_value(function, context, operation.result)?;
+            call_import(function, context, "cache-get")?;
+        }
+        Builtin::CachePut => {
+            let [namespace, key, value, ttl] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "cache_put call does not have four arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *namespace)?;
+            load_string_flat(function, context, *key)?;
+            load_string_flat(function, context, *value)?;
+            load_value(function, context, *ttl)?;
+            load_value(function, context, operation.result)?;
+            call_import(function, context, "cache-put")?;
+        }
+        Builtin::CacheDelete => {
+            let [namespace, key] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "cache_delete call does not have two arguments",
+                ));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *namespace)?;
+            load_string_flat(function, context, *key)?;
+            load_value(function, context, operation.result)?;
+            call_import(function, context, "cache-delete")?;
+        }
+        Builtin::SearchQuery | Builtin::VectorSearch => {
+            let [index, input, limit] = arguments else {
+                return Err(BuildError::invalid_core(format!(
+                    "{} call does not have three arguments",
+                    builtin.as_str()
+                )));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *index)?;
+            load_string_flat(function, context, *input)?;
+            load_value(function, context, *limit)?;
+            load_value(function, context, operation.result)?;
+            call_import(
+                function,
+                context,
+                if builtin == Builtin::SearchQuery {
+                    "search-query"
+                } else {
+                    "vector-search"
+                },
+            )?;
+        }
         Builtin::ObjectGet => {
             let [bucket, key] = arguments else {
                 return Err(BuildError::invalid_core(

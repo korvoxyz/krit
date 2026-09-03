@@ -26,10 +26,11 @@ pub use validation::{
     validate_artifact, validate_component,
 };
 pub use wit::{
-    AI_INTERFACE, CONFIG_INTERFACE, DATABASE_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE,
-    JOB_INTERFACE, JOB_PROGRAM_WORLD, LOGGING_INTERFACE, OBJECTS_READ_INTERFACE,
-    OBJECTS_WRITE_INTERFACE, PROGRAM_WORLD, PURE_PROGRAM_WORLD, QUEUE_INTERFACE,
-    SCHEDULE_INTERFACE, SCHEDULE_PROGRAM_WORLD, SECRETS_INTERFACE, STATE_INTERFACE,
+    AI_INTERFACE, CACHE_READ_INTERFACE, CACHE_WRITE_INTERFACE, CONFIG_INTERFACE,
+    DATABASE_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, JOB_INTERFACE, JOB_PROGRAM_WORLD,
+    LOGGING_INTERFACE, OBJECTS_READ_INTERFACE, OBJECTS_WRITE_INTERFACE, PROGRAM_WORLD,
+    PURE_PROGRAM_WORLD, QUEUE_INTERFACE, SCHEDULE_INTERFACE, SCHEDULE_PROGRAM_WORLD,
+    SEARCH_QUERY_INTERFACE, SEARCH_VECTOR_INTERFACE, SECRETS_INTERFACE, STATE_INTERFACE,
     STDOUT_INTERFACE, WEBHOOK_ALL_PROGRAM_WORLD, WEBHOOK_INTERFACE, WEBHOOK_PROGRAM_WORLD,
     WEBHOOK_STATE_ALL_PROGRAM_WORLD,
 };
@@ -163,7 +164,14 @@ pub fn build_component(
 }
 
 /// Durable Phase 6 surfaces raise artifact validation to policy 2.
-pub(crate) const DURABLE_EFFECTS: [&str; 8] = [
+/// Host surfaces introduced after artifact policy 1.
+///
+/// An artifact that uses any of them selects policy 2. The list is *not* a
+/// durability claim: `cache.read` and `cache.write` are explicitly
+/// non-durable, and are here only because they postdate policy 1.
+pub(crate) const POLICY_TWO_EFFECTS: [&str; 12] = [
+    "cache.read",
+    "cache.write",
     "database.read",
     "database.write",
     "object.read",
@@ -171,13 +179,15 @@ pub(crate) const DURABLE_EFFECTS: [&str; 8] = [
     "queue.consume",
     "queue.publish",
     "schedule.trigger",
+    "search.query",
+    "search.vector",
     "state.transaction",
 ];
 
 pub(crate) fn artifact_policy_version(effects: &[String]) -> u32 {
     if effects
         .iter()
-        .any(|effect| DURABLE_EFFECTS.contains(&effect.as_str()))
+        .any(|effect| POLICY_TWO_EFFECTS.contains(&effect.as_str()))
     {
         STATE_ARTIFACT_POLICY_VERSION
     } else {

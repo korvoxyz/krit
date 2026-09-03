@@ -33,10 +33,15 @@ pub enum Builtin {
     DatabaseExecute,
     DatabaseCommit,
     DatabaseRollback,
+    CacheGet,
+    CachePut,
+    CacheDelete,
+    SearchQuery,
+    VectorSearch,
 }
 
 impl Builtin {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 36] = [
         Self::AiInvoke,
         Self::ConfigString,
         Self::Err,
@@ -68,6 +73,11 @@ impl Builtin {
         Self::DatabaseExecute,
         Self::DatabaseQuery,
         Self::DatabaseRollback,
+        Self::CacheDelete,
+        Self::CacheGet,
+        Self::CachePut,
+        Self::SearchQuery,
+        Self::VectorSearch,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -103,6 +113,11 @@ impl Builtin {
             "db_execute" => Some(Self::DatabaseExecute),
             "db_commit" => Some(Self::DatabaseCommit),
             "db_rollback" => Some(Self::DatabaseRollback),
+            "cache_get" => Some(Self::CacheGet),
+            "cache_put" => Some(Self::CachePut),
+            "cache_delete" => Some(Self::CacheDelete),
+            "search_query" => Some(Self::SearchQuery),
+            "vector_search" => Some(Self::VectorSearch),
             _ => None,
         }
     }
@@ -140,6 +155,11 @@ impl Builtin {
             Self::DatabaseExecute => "db_execute",
             Self::DatabaseCommit => "db_commit",
             Self::DatabaseRollback => "db_rollback",
+            Self::CacheGet => "cache_get",
+            Self::CachePut => "cache_put",
+            Self::CacheDelete => "cache_delete",
+            Self::SearchQuery => "search_query",
+            Self::VectorSearch => "vector_search",
         }
     }
 
@@ -169,7 +189,12 @@ impl Builtin {
             | Self::DatabaseQuery
             | Self::DatabaseExecute
             | Self::DatabaseCommit
-            | Self::DatabaseRollback => BuiltinCategory::HostEffect,
+            | Self::DatabaseRollback
+            | Self::CacheGet
+            | Self::CachePut
+            | Self::CacheDelete
+            | Self::SearchQuery
+            | Self::VectorSearch => BuiltinCategory::HostEffect,
         }
     }
 
@@ -232,6 +257,19 @@ impl Builtin {
             }
             Self::DatabaseCommit | Self::DatabaseRollback => {
                 "fn(DatabaseTransaction) -> Result<Unit, String> effects {}"
+            }
+            Self::CacheGet => {
+                "fn(String, String) -> Result<Option<String>, String> effects {cache.read}"
+            }
+            Self::CachePut => {
+                "fn(String, String, String, Int) -> Result<Unit, String> effects {cache.write}"
+            }
+            Self::CacheDelete => "fn(String, String) -> Result<Unit, String> effects {cache.write}",
+            Self::SearchQuery => {
+                "fn(String, String, Int) -> Result<String, String> effects {search.query}"
+            }
+            Self::VectorSearch => {
+                "fn(String, String, Int) -> Result<String, String> effects {search.vector}"
             }
         }
     }
@@ -303,6 +341,19 @@ impl Builtin {
             }
             Self::DatabaseCommit => "Commits and closes one open database transaction.",
             Self::DatabaseRollback => "Rolls back and closes one open database transaction.",
+            Self::CacheGet => {
+                "Reads one bounded namespaced cache entry. A miss, an expiry, and an outage are all explicit values the caller must handle; correctness may never depend on a hit."
+            }
+            Self::CachePut => {
+                "Writes one bounded cache entry under an explicit time to live in seconds. The write is process local and never durable."
+            }
+            Self::CacheDelete => "Removes one bounded cache entry if it is present.",
+            Self::SearchQuery => {
+                "Runs one bounded text query against a manifest-granted named search connector and returns untrusted deterministic JSON results."
+            }
+            Self::VectorSearch => {
+                "Runs one bounded similarity search against a manifest-granted named vector connector using a JSON-encoded vector."
+            }
         }
     }
 }

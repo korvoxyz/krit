@@ -28,6 +28,7 @@ infer semantics from historical interpreter behavior.
 | [DURABLE-STATE.md](DURABLE-STATE.md) | Normative bounded Phase 6 | Transactional local state, checkpoints, replay, and durable idempotency |
 | [JOBS-AND-STORAGE.md](JOBS-AND-STORAGE.md) | Normative bounded Phase 6 | Durable queues, host-owned scheduled triggers, and bounded object storage |
 | [DATABASE.md](DATABASE.md) | Normative bounded Phase 7 | Capability-scoped catalogued parameterized database transactions |
+| [CACHE-AND-SEARCH.md](CACHE-AND-SEARCH.md) | Normative bounded Phase 7 | Bounded namespaced TTL cache and provider-neutral search and vector connectors |
 
 `LANGUAGE.md` deliberately defines a new readable syntax for the Rust
 implementation. The S-expression syntax in the archived Racket prototype is

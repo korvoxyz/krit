@@ -47,6 +47,10 @@ pub(crate) mod job {
             "krit:runtime/objects-read": crate::bindings::webhook::krit::runtime::objects_read,
             "krit:runtime/objects-write": crate::bindings::webhook::krit::runtime::objects_write,
             "krit:runtime/database": crate::bindings::webhook::krit::runtime::database,
+            "krit:runtime/cache-read": crate::bindings::webhook::krit::runtime::cache_read,
+            "krit:runtime/cache-write": crate::bindings::webhook::krit::runtime::cache_write,
+            "krit:runtime/search-query": crate::bindings::webhook::krit::runtime::search_query,
+            "krit:runtime/search-vector": crate::bindings::webhook::krit::runtime::search_vector,
         },
         imports: { default: trappable },
     });
@@ -70,6 +74,10 @@ pub(crate) mod schedule {
             "krit:runtime/objects-read": crate::bindings::webhook::krit::runtime::objects_read,
             "krit:runtime/objects-write": crate::bindings::webhook::krit::runtime::objects_write,
             "krit:runtime/database": crate::bindings::webhook::krit::runtime::database,
+            "krit:runtime/cache-read": crate::bindings::webhook::krit::runtime::cache_read,
+            "krit:runtime/cache-write": crate::bindings::webhook::krit::runtime::cache_write,
+            "krit:runtime/search-query": crate::bindings::webhook::krit::runtime::search_query,
+            "krit:runtime/search-vector": crate::bindings::webhook::krit::runtime::search_vector,
         },
         imports: { default: trappable },
     });

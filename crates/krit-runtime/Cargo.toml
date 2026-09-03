@@ -13,6 +13,7 @@ blake3.workspace = true
 curl.workspace = true
 http.workspace = true
 krit-capability.workspace = true
+krit-cache.workspace = true
 krit-database.workspace = true
 krit-package.workspace = true
 krit-state.workspace = true

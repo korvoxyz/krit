@@ -1,0 +1,32 @@
+{
+  "schema": 6,
+  "state": { "stores": {} },
+  "cache": {
+    "namespaces": {
+      "lookups": {
+        "mode": "read-write",
+        "maxEntries": 256,
+        "maxBytes": 1048576,
+        "maxKeyBytes": 256,
+        "maxValueBytes": 16384,
+        "maxTtlSeconds": 300
+      }
+    },
+    "maxTotalEntries": 512,
+    "maxTotalBytes": 2097152
+  },
+  "search": {
+    "docs": {
+      "kind": "query",
+      "maxResults": 10,
+      "transport": {
+        "type": "local",
+        "documents": [
+          { "id": "capabilities", "text": "Krit grants capabilities explicitly in the package manifest." },
+          { "id": "cache", "text": "The Krit cache is bounded, namespaced, and never load bearing." },
+          { "id": "search", "text": "Search connectors are provider neutral and host owned." }
+        ]
+      }
+    }
+  }
+}

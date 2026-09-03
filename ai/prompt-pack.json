@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "promptVersion": "0.2.14",
+  "promptVersion": "0.2.15",
   "languageVersion": "0.2.0",
   "edition": "2026",
   "status": "implemented",
@@ -9,9 +9,15 @@
   "diagnosticSchema": 1,
   "artifactMetadataSchema": 1,
   "artifactPolicyVersion": 1,
-  "artifactPolicyVersions": [1, 2],
+  "artifactPolicyVersions": [
+    1,
+    2
+  ],
   "runtimeHostPolicyVersion": 1,
-  "runtimeHostPolicyVersions": [1, 2],
+  "runtimeHostPolicyVersions": [
+    1,
+    2
+  ],
   "authoringProtocolVersion": 1,
   "authoringRequestSchema": 1,
   "authoringResponseSchema": 1,
@@ -32,5 +38,10 @@
   "deliveryProtocolVersion": 1,
   "databaseStatus": "implemented-local-sqlite-catalogued",
   "databaseProtocolVersion": 1,
-  "databaseHostConfigSchema": 5
+  "databaseHostConfigSchema": 5,
+  "cacheStatus": "implemented-process-local-bounded-ttl",
+  "cacheProtocolVersion": 1,
+  "searchStatus": "implemented-provider-neutral-connectors",
+  "searchProtocolVersion": 1,
+  "cacheHostConfigSchema": 6
 }

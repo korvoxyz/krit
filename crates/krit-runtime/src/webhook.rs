@@ -106,14 +106,23 @@ pub(crate) fn validate_headers(
     Ok(())
 }
 
-fn validate_path_query(path: &str, query: &str) -> Result<(), RuntimeError> {
-    if !path.starts_with('/')
-        || path.starts_with("//")
-        || path.contains("://")
-        || path
+/// Whether a string is a safe origin-form absolute path.
+///
+/// Shared so every host-owned path - a webhook request path and a search
+/// connector path alike - is held to exactly the same rule: absolute, no
+/// authority form, no scheme, no backslash, no query or fragment delimiter, and
+/// no control byte.
+pub(crate) fn is_origin_form_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains("://")
+        && !path
             .bytes()
             .any(|byte| byte.is_ascii_control() || matches!(byte, b'\\' | b'?' | b'#'))
-    {
+}
+
+fn validate_path_query(path: &str, query: &str) -> Result<(), RuntimeError> {
+    if !is_origin_form_path(path) {
         return Err(RuntimeError::guest(
             "K4001",
             "HTTP request path must be a safe origin-form absolute path",

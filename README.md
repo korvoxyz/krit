@@ -523,10 +523,44 @@ invocation exit rolls back any transaction the guest left open, SQLite work is
 interrupted at a bounded deadline, and write-ahead logging is refused because
 its on-disk size cannot be bounded.
 
+### Cache and search
+
+Krit adds a bounded namespaced TTL cache and provider-neutral search and vector
+connectors as **optional** capabilities. The rule is absolute: correctness never
+depends on cache availability. `cache_get` returns
+`Result<Option<String>, String>`, so a hit, a miss, and an outage are three
+distinct values source must handle; the host never substitutes a value and never
+turns an outage into a miss.
+
+```sh
+krit build --manifest examples/cached-search.krit.pkg
+krit serve \
+  --manifest examples/cached-search.krit.pkg \
+  --host-config examples/cached-search.host.json \
+  --bind 127.0.0.1:3000
+```
+
+[`examples/cached-search.krit`](examples/cached-search.krit) reads the cache,
+falls back to a named connector on a miss *or an outage*, stores the result with
+an explicit time to live, and answers identically either way. The same artifact
+runs unchanged with the cache configured or absent.
+
+The cache is process local and explicitly non-transactional: it is shared across
+fresh Wasm stores on one host, lost on restart, and a trap or failed delivery
+does not undo an earlier write. That is stated plainly because it is exactly why
+a cached value may never be load bearing.
+
+Connectors are host-owned named bindings. Guest code never sees an endpoint,
+credential, provider identity, or raw handle, and results are re-encoded by the
+host into a fixed bounded shape, so a provider cannot control the structure the
+guest parses. Results are data and are never executed. The complete contract is
+normative in [the cache and search specification](spec/CACHE-AND-SEARCH.md).
+
 Krit does not lose or silently duplicate committed queue, schedule, or object
 state on one host. It does not provide distributed queues, brokers, consumer
 groups, cron expressions, guest-visible listing, or provider-side exactly
-once.
+once. It does not provide a distributed cache, cache invalidation protocols,
+branded provider SDKs, embedding generation, or index management.
 
 Request JSON Lines diagnostics for tools and AI agents:
 
@@ -788,6 +822,8 @@ The specification is the semantic authority:
 - [Jobs and object storage](spec/JOBS-AND-STORAGE.md) — durable queues,
   host-owned scheduled triggers, and bounded object buckets
 - [Database access](spec/DATABASE.md) — catalogued parameterized transactions
+- [Cache and search](spec/CACHE-AND-SEARCH.md) — bounded optional cache and
+  provider-neutral connectors
   against an operator-owned database
 - [Narrow product MVP](docs/mvp.md)
 - [Agent platform roadmap](docs/agent-roadmap.md)

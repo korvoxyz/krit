@@ -4946,3 +4946,768 @@ state = ["agent-work"]
         );
     }
 }
+
+const CACHE_SEARCH_SOURCE: &str = r#"
+fn lookup(query: String, reason: String) -> HttpResponse {
+    match search_query("docs", query, 3) {
+        Ok(results) => match cache_put("lookups", query, results, 60) {
+            Ok(stored) => record {
+                status: 200,
+                headers: [record { name: "x-cache", value: reason }],
+                body: results,
+            },
+            Err(problem) => record {
+                status: 200,
+                headers: [record { name: "x-cache", value: "uncached" }],
+                body: results,
+            },
+        },
+        Err(problem) => record {
+            status: 503,
+            headers: [record { name: "x-cache", value: reason }],
+            body: problem,
+        },
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match cache_get("lookups", request.query) {
+        Ok(found) => match found {
+            Some(value) => record {
+                status: 200,
+                headers: [record { name: "x-cache", value: "hit" }],
+                body: value,
+            },
+            None => lookup(request.query, "miss"),
+        },
+        Err(outage) => lookup(request.query, "unavailable"),
+    }
+}
+"#;
+
+const CACHE_SEARCH_MANIFEST: &str = r#"
+schema = 1
+
+[package]
+name = "example/cached-search"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+cacheNamespaces = ["lookups"]
+searchIndexes = ["docs"]
+"#;
+
+/// A schema-6 configuration with a bounded cache and a deterministic connector.
+fn cache_search_config(cache: &str, search: &str) -> String {
+    format!(
+        r#"{{
+  "schema": 6,
+  "state": {{ "stores": {{}} }},
+  "cache": {cache},
+  "search": {search}
+}}"#
+    )
+}
+
+const VALID_CACHE: &str = r#"{
+    "namespaces": {
+      "lookups": {
+        "mode": "read-write",
+        "maxEntries": 16,
+        "maxBytes": 262144,
+        "maxKeyBytes": 256,
+        "maxValueBytes": 8192,
+        "maxTtlSeconds": 300
+      }
+    },
+    "maxTotalEntries": 32,
+    "maxTotalBytes": 524288
+  }"#;
+
+const VALID_SEARCH: &str = r#"{
+    "docs": {
+      "kind": "query",
+      "maxResults": 5,
+      "transport": {
+        "type": "local",
+        "documents": [
+          { "id": "cache", "text": "The Krit cache is bounded and never load bearing." },
+          { "id": "search", "text": "Search connectors are provider neutral." }
+        ]
+      }
+    }
+  }"#;
+
+fn cache_search_package(directory: &TestDirectory) {
+    directory.file("main.krit", CACHE_SEARCH_SOURCE);
+    directory.file("krit.pkg", CACHE_SEARCH_MANIFEST);
+    directory.file(
+        "request.json",
+        r#"{"method":"GET","path":"/","query":"cache","headers":[],"body":""}"#,
+    );
+}
+
+#[test]
+fn schema_six_cache_and_search_report_exact_permissions_and_privacy() {
+    let directory = TestDirectory::new("schema-six-cache");
+    cache_search_package(&directory);
+    directory.file("host.json", &cache_search_config(VALID_CACHE, VALID_SEARCH));
+
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("package should build");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let artifact = directory.path.join("target/krit/cached-search.wasm");
+    assert_valid_artifact(&artifact);
+
+    let permissions = krit_in(&directory)
+        .args(["permissions", "--json", "--artifact"])
+        .arg(&artifact)
+        .output()
+        .expect("permissions should run");
+    assert!(permissions.status.success());
+    let permissions: serde_json::Value =
+        serde_json::from_slice(&permissions.stdout).expect("permissions should be JSON");
+    assert_eq!(
+        permissions["required"],
+        serde_json::json!([
+            { "capability": "cache.read", "resource": "lookups" },
+            { "capability": "cache.write", "resource": "lookups" },
+            { "capability": "search.query", "resource": "docs" }
+        ])
+    );
+    assert_eq!(
+        permissions["imports"],
+        serde_json::json!([
+            "krit:runtime/cache-read@0.2.0",
+            "krit:runtime/cache-write@0.2.0",
+            "krit:runtime/search-query@0.2.0"
+        ])
+    );
+    let rendered = serde_json::to_string(&permissions).expect("permissions should serialise");
+    assert!(
+        !rendered.contains("load bearing") && !rendered.contains("provider neutral"),
+        "permissions must never disclose connector documents: {rendered}"
+    );
+
+    let explain = krit_in(&directory)
+        .args(["explain", "--json", "main.krit"])
+        .output()
+        .expect("explain should run");
+    assert!(explain.status.success());
+    let explain: serde_json::Value =
+        serde_json::from_slice(&explain.stdout).expect("explain should be JSON");
+    let operations = explain["durableState"]["operations"]
+        .as_array()
+        .expect("operations should be an array")
+        .iter()
+        .map(|operation| operation["kind"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert!(operations.contains(&"cache-get".to_owned()));
+    assert!(operations.contains(&"cache-put".to_owned()));
+    assert!(operations.contains(&"search-query".to_owned()));
+}
+
+#[test]
+fn schema_six_invocations_are_correct_with_a_process_local_cache() {
+    let directory = TestDirectory::new("schema-six-invoke");
+    cache_search_package(&directory);
+    directory.file("host.json", &cache_search_config(VALID_CACHE, VALID_SEARCH));
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("package should build");
+    assert!(build.status.success());
+
+    // Each `invoke` is a separate process, so the process-local cache starts
+    // empty every time. The answer is identical either way, which is the whole
+    // point: correctness never depends on the cache.
+    let mut bodies = Vec::new();
+    for _ in 0..2 {
+        let output = krit_in(&directory)
+            .args([
+                "invoke",
+                "--host-config",
+                "host.json",
+                "--request",
+                "request.json",
+            ])
+            .output()
+            .expect("invocation should run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("response should be JSON");
+        assert_eq!(response["status"], 200);
+        assert_eq!(
+            response["headers"][0]["value"], "miss",
+            "a fresh process must always miss"
+        );
+        bodies.push(response["body"].as_str().unwrap_or_default().to_owned());
+    }
+    assert_eq!(
+        bodies[0], bodies[1],
+        "the answer must not depend on the cache"
+    );
+    assert!(bodies[0].starts_with("{\"results\":["));
+}
+
+#[test]
+fn schema_six_runs_the_same_artifact_with_the_cache_disabled() {
+    let directory = TestDirectory::new("schema-six-disabled");
+    cache_search_package(&directory);
+    // No cache section at all: the deployment simply has no cache.
+    directory.file("host.json", &cache_search_config("{}", VALID_SEARCH));
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("package should build");
+    assert!(build.status.success());
+
+    let output = krit_in(&directory)
+        .args([
+            "invoke",
+            "--host-config",
+            "host.json",
+            "--request",
+            "request.json",
+        ])
+        .output()
+        .expect("invocation should run");
+
+    assert!(
+        output.status.success(),
+        "a disabled cache must not stop the program: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("response should be JSON");
+    assert_eq!(response["status"], 200);
+    // The read outage sent the guest down its fallback path, and the write
+    // outage was handled there too, so the response reports `uncached`. Both
+    // failures were explicit values; neither changed the answer.
+    assert_eq!(
+        response["headers"][0]["value"], "uncached",
+        "the guest must observe both cache outages and handle each explicitly"
+    );
+    assert!(
+        response["body"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("{\"results\":["),
+        "the fallback answer must still be correct"
+    );
+
+    // The identical artifact, with the cache configured, produces the identical
+    // answer: correctness cannot depend on cache availability.
+    directory.file(
+        "enabled.host.json",
+        &cache_search_config(VALID_CACHE, VALID_SEARCH),
+    );
+    let enabled = krit_in(&directory)
+        .args([
+            "invoke",
+            "--host-config",
+            "enabled.host.json",
+            "--request",
+            "request.json",
+        ])
+        .output()
+        .expect("invocation should run");
+    assert!(enabled.status.success());
+    let enabled: serde_json::Value =
+        serde_json::from_slice(&enabled.stdout).expect("response should be JSON");
+    assert_eq!(enabled["body"], response["body"]);
+    assert_eq!(enabled["headers"][0]["value"], "miss");
+}
+
+#[test]
+fn schema_six_rejects_invalid_configuration_without_side_effects() {
+    let directory = TestDirectory::new("schema-six-rejects");
+    cache_search_package(&directory);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+            .expect("test root should be owner-only");
+    }
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("package should build");
+    assert!(build.status.success());
+
+    let state_store = directory.path.join("state/agent-work.db");
+    let rejected = [
+        // A namespace the manifest never granted.
+        (
+            "ungranted.host.json",
+            cache_search_config(&VALID_CACHE.replace("lookups", "other"), VALID_SEARCH),
+        ),
+        // A namespace budget that cannot hold one maximum-size entry.
+        (
+            "unusable.host.json",
+            cache_search_config(
+                &VALID_CACHE.replace("\"maxBytes\": 262144", "\"maxBytes\": 64"),
+                VALID_SEARCH,
+            ),
+        ),
+        // A time to live beyond the Phase 7 ceiling.
+        (
+            "ttl.host.json",
+            cache_search_config(
+                &VALID_CACHE.replace("\"maxTtlSeconds\": 300", "\"maxTtlSeconds\": 99999999"),
+                VALID_SEARCH,
+            ),
+        ),
+        // Cache totals declared with no namespace at all.
+        (
+            "orphan-totals.host.json",
+            cache_search_config(
+                "{ \"maxTotalEntries\": 32, \"maxTotalBytes\": 524288 }",
+                VALID_SEARCH,
+            ),
+        ),
+        // A connector the manifest never granted.
+        (
+            "ungranted-search.host.json",
+            cache_search_config(VALID_CACHE, &VALID_SEARCH.replace("\"docs\"", "\"other\"")),
+        ),
+        // A text connector that wrongly declares vector dimensions.
+        (
+            "dimensions.host.json",
+            cache_search_config(
+                VALID_CACHE,
+                &VALID_SEARCH.replace(
+                    "\"kind\": \"query\",",
+                    "\"kind\": \"query\",\n      \"dimensions\": 8,",
+                ),
+            ),
+        ),
+        // A result bound beyond the Phase 7 ceiling.
+        (
+            "results.host.json",
+            cache_search_config(
+                VALID_CACHE,
+                &VALID_SEARCH.replace("\"maxResults\": 5", "\"maxResults\": 9999"),
+            ),
+        ),
+        // An unknown field is refused rather than ignored.
+        (
+            "unknown.host.json",
+            cache_search_config(VALID_CACHE, VALID_SEARCH).replace(
+                "\"schema\": 6,",
+                "\"schema\": 6,\n  \"provider\": \"acme\",",
+            ),
+        ),
+        // An http-json connector reaching an origin the manifest never granted.
+        (
+            "ungranted-origin.host.json",
+            cache_search_config(
+                VALID_CACHE,
+                r#"{
+    "docs": {
+      "kind": "query",
+      "maxResults": 5,
+      "transport": {
+        "type": "http-json",
+        "origin": "https://search.example",
+        "path": "/query",
+        "maxResponseBytes": 4096,
+        "timeoutMs": 1000
+      }
+    }
+  }"#,
+            ),
+        ),
+    ];
+
+    for (name, config) in rejected {
+        directory.file(name, &config);
+        let output = krit_in(&directory)
+            .args(["invoke", "--host-config", name, "--request", "request.json"])
+            .output()
+            .expect("invocation should run");
+        assert!(
+            !output.status.success(),
+            "`{name}` must be rejected: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            !state_store.exists(),
+            "`{name}` must not create durable state"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("load bearing"),
+            "`{name}` must not echo connector documents: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn schemas_one_through_five_remain_accepted_alongside_schema_six() {
+    let directory = TestDirectory::new("schema-six-compat");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.body }
+}
+"#,
+    );
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/plain"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+"#,
+    );
+    directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":"plain"}"#,
+    );
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("package should build");
+    assert!(build.status.success());
+
+    for (name, config) in [
+        ("v1.host.json", r#"{"schema": 1}"#.to_owned()),
+        ("v2.host.json", r#"{"schema": 2}"#.to_owned()),
+        (
+            "v3.host.json",
+            r#"{"schema": 3, "state": { "stores": {} }}"#.to_owned(),
+        ),
+        (
+            "v4.host.json",
+            r#"{"schema": 4, "state": { "stores": {} }}"#.to_owned(),
+        ),
+        (
+            "v5.host.json",
+            r#"{"schema": 5, "state": { "stores": {} }}"#.to_owned(),
+        ),
+        (
+            "v6.host.json",
+            r#"{"schema": 6, "state": { "stores": {} }}"#.to_owned(),
+        ),
+    ] {
+        directory.file(name, &config);
+        let output = krit_in(&directory)
+            .args(["invoke", "--host-config", name, "--request", "request.json"])
+            .output()
+            .expect("invocation should run");
+        assert!(
+            output.status.success(),
+            "`{name}` should still load: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("response should be JSON");
+        assert_eq!(response["body"], "plain");
+    }
+
+    // An unknown schema is still refused, and the message lists exactly the
+    // supported set.
+    directory.file("v7.host.json", r#"{"schema": 7}"#);
+    let output = krit_in(&directory)
+        .args([
+            "invoke",
+            "--host-config",
+            "v7.host.json",
+            "--request",
+            "request.json",
+        ])
+        .output()
+        .expect("invocation should run");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("1, 2, 3, 4, 5, or 6"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_served_host_serves_a_hit_from_the_shared_cache() {
+    let directory = TestDirectory::new("schema-six-serve");
+    cache_search_package(&directory);
+    directory.file("host.json", &cache_search_config(VALID_CACHE, VALID_SEARCH));
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("package should build");
+    assert!(build.status.success());
+
+    let mut child = krit_in(&directory)
+        .args([
+            "serve",
+            "--host-config",
+            "host.json",
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("serve should start");
+    let stderr = child.stderr.take().expect("server stderr should be piped");
+    let mut stderr = BufReader::new(stderr);
+    let mut listening = String::new();
+    stderr
+        .read_line(&mut listening)
+        .expect("listening line should read");
+    let address = listening
+        .trim()
+        .strip_prefix("krit serve listening on http://")
+        .expect("listening prefix should exist")
+        .to_owned();
+
+    // One host process, one shared cache, a fresh Wasm store per request.
+    let first = serve_get(&address, "/lookup?cache");
+    let second = serve_get(&address, "/lookup?cache");
+    let third = serve_get(&address, "/lookup?search");
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(first.contains("x-cache: miss"), "first response: {first}");
+    assert!(
+        second.contains("x-cache: hit"),
+        "a shared host must serve a hit: {second}"
+    );
+    assert!(third.contains("x-cache: miss"), "third response: {third}");
+}
+
+/// Sends one bounded GET over a fresh connection and returns the response text.
+fn serve_get(address: &str, target: &str) -> String {
+    let mut stream = TcpStream::connect(address).expect("server should accept connections");
+    stream
+        .write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("request should write");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("response should read");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+#[test]
+fn schema_six_rejects_duplicate_cache_and_search_keys_without_side_effects() {
+    let directory = TestDirectory::new("schema-six-duplicates");
+    cache_search_package(&directory);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+            .expect("test root should be owner-only");
+    }
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("package should build");
+    assert!(build.status.success());
+    let state_store = directory.path.join("state/agent-work.db");
+
+    // A duplicate namespace with conflicting bounds: keeping the last value
+    // would silently discard the stricter definition.
+    let duplicate_namespace = r#"{
+    "namespaces": {
+      "lookups": {
+        "mode": "read-only",
+        "maxEntries": 1,
+        "maxBytes": 262144,
+        "maxKeyBytes": 256,
+        "maxValueBytes": 8192,
+        "maxTtlSeconds": 5
+      },
+      "lookups": {
+        "mode": "read-write",
+        "maxEntries": 16,
+        "maxBytes": 262144,
+        "maxKeyBytes": 256,
+        "maxValueBytes": 8192,
+        "maxTtlSeconds": 300
+      }
+    },
+    "maxTotalEntries": 32,
+    "maxTotalBytes": 524288
+  }"#;
+    // A duplicate connector with a conflicting endpoint and credential policy.
+    let duplicate_connector = r#"{
+    "docs": {
+      "kind": "query",
+      "maxResults": 5,
+      "transport": {
+        "type": "http-json",
+        "origin": "https://first.example",
+        "path": "/query",
+        "secret": "search-token",
+        "maxResponseBytes": 4096,
+        "timeoutMs": 1000
+      }
+    },
+    "docs": {
+      "kind": "query",
+      "maxResults": 5,
+      "transport": {
+        "type": "local",
+        "documents": []
+      }
+    }
+  }"#;
+
+    for (name, config) in [
+        (
+            "duplicate-namespace.host.json",
+            cache_search_config(duplicate_namespace, VALID_SEARCH),
+        ),
+        (
+            "duplicate-connector.host.json",
+            cache_search_config(VALID_CACHE, duplicate_connector),
+        ),
+    ] {
+        directory.file(name, &config);
+        let output = krit_in(&directory)
+            .args(["invoke", "--host-config", name, "--request", "request.json"])
+            .output()
+            .expect("invocation should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "`{name}` must be rejected: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains("duplicate key"),
+            "`{name}` must name the duplicate: {stderr}"
+        );
+        assert!(
+            !state_store.exists(),
+            "`{name}` must not create durable state"
+        );
+    }
+}
+
+#[test]
+fn schema_six_requires_https_for_an_http_json_connector() {
+    let directory = TestDirectory::new("schema-six-https");
+    cache_search_package(&directory);
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/cached-search"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+cacheNamespaces = ["lookups"]
+searchIndexes = ["docs"]
+http = ["http://search.example", "https://search.example"]
+"#,
+    );
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("package should build");
+    assert!(build.status.success());
+
+    for (name, origin, path, accepted) in [
+        (
+            "plaintext.host.json",
+            "http://search.example",
+            "/query",
+            false,
+        ),
+        ("secure.host.json", "https://search.example", "/query", true),
+        // The path is held to the same origin-form rule as any host-owned path.
+        (
+            "authority.host.json",
+            "https://search.example",
+            "//evil.example/query",
+            false,
+        ),
+        (
+            "query.host.json",
+            "https://search.example",
+            "/query?inject=1",
+            false,
+        ),
+        (
+            "fragment.host.json",
+            "https://search.example",
+            "/query#f",
+            false,
+        ),
+        (
+            "relative.host.json",
+            "https://search.example",
+            "query",
+            false,
+        ),
+    ] {
+        let search = format!(
+            r#"{{
+    "docs": {{
+      "kind": "query",
+      "maxResults": 5,
+      "transport": {{
+        "type": "http-json",
+        "origin": "{origin}",
+        "path": "{path}",
+        "maxResponseBytes": 4096,
+        "timeoutMs": 1000
+      }}
+    }}
+  }}"#
+        );
+        directory.file(name, &cache_search_config(VALID_CACHE, &search));
+        let output = krit_in(&directory)
+            .args(["invoke", "--host-config", name, "--request", "request.json"])
+            .output()
+            .expect("invocation should run");
+        if accepted {
+            // A well-formed connector loads; the call itself then fails because
+            // the origin is unreachable, which is a handled guest value.
+            assert!(
+                output.status.success(),
+                "`{name}` should load: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        } else {
+            assert!(
+                !output.status.success(),
+                "`{name}` must be rejected: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+}

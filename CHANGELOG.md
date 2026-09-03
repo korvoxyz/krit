@@ -9,6 +9,63 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 
 ### Added
 
+- Updated the provider-neutral generation prompt to version 0.2.15 for the
+  optional cache and search capabilities
+- Bounded namespaced TTL cache with `cache_get`, `cache_put`, and `cache_delete`
+  where a hit, a miss, and an outage are three distinct guest-visible values, so
+  correctness never depends on cache availability
+- Process-local LRU cache backend with per-namespace and whole-cache entry and
+  byte budgets, exact replacement accounting, strict inclusive expiry, bounded
+  opportunistic cleanup, and no background thread
+- Provider-neutral `search_query` and `vector_search` connectors with a strict
+  generic `http-json` transport, a deterministic local transport, host-side
+  vector dimension validation, and host re-encoded bounded results
+- `cache.read`, `cache.write`, `search.query`, and `search.vector` effects with
+  four separate least-authority WIT interfaces, so a reader never imports a
+  write surface
+- Host config schema 6 for cache namespaces and search connectors, validated
+  entirely before any durable store, application database, or cache is created
+- `cacheNamespaces`, `readOnlyCacheNamespaces`, `searchIndexes`, and
+  `vectorIndexes` manifest capabilities with permission, explain, LSP, and
+  assist redaction coverage
+- Reference `examples/cached-search.krit` proving miss, search, store, and hit
+  on a shared host, and identical answers with the cache disabled
+- Complete search connector authority: the exact `http.request` origin and the
+  `secret.read` credential are validated at setup and rechecked at dispatch, and
+  a credentialed connector requires default-deny `http.bearer` approval before
+  every attempt including every retry
+- Mandatory HTTPS and shared origin-form path rules for `http-json` connectors
+- Bounded read-only retry for search, marked internally rather than by inventing
+  or transmitting an `Idempotency-Key`
+- Search connector retry and rate selection identical to guest HTTP, with an
+  exact-origin override and one shared per-origin rate bucket, while a rate
+  denial still names only the connector's index
+- Rejection of duplicate cache namespace and search connector keys in schema-6
+  configuration, during phase-one validation
+- Host-only cache seeding so a read-only namespace can hold reference data while
+  guest write authority stays refused
+- Exact global least-recently-used eviction under whole-cache pressure, instead
+  of penalising the namespace being written
+- Monotonic cache expiry that never reads a wall clock, so a clock jump cannot
+  extend a time to live and a clock fault cannot reach guest code
+- Numerically stable vector similarity that cannot overflow for finite input and
+  never encodes a non-finite score
+- Guided-authoring redaction of cache keys, cached values, search queries, and
+  encoded vectors, propagating conservatively through nested expressions and
+  immutable `let` aliases, in both parsed and malformed source
+- Pre-execution rate-resource counting that includes host-owned search connector
+  origins, so LRU replacement cannot reset a live rate counter
+- Approval denials that name a connector's index rather than its endpoint, on
+  the first attempt and on every retry
+- Endpoint-neutral outbound HTTP failure messages: the driver's error text,
+  which can carry a host, port, resolved address, proxy, URL, or certificate
+  detail, is replaced by a fixed category while retry classification is kept
+- Tolerant guided-authoring redaction that follows `let` alias chains and closes
+  a binding at a statement-terminating newline as well as a semicolon
+- Lexical binding scopes in the tolerant redaction fallback, restoring shadowed
+  outer bindings after a block and installing parameters as untraceable shadows
+- Whole-value redaction when a tolerant binding exceeds its exact-tracking
+  bound, so an oversized value is over-redacted rather than partly exposed
 - Draft agent application and guided AI authoring specifications plus the
   WebAssembly sandbox design now backed by an artifact-policy baseline
 - Narrow reference-agent MVP and explicit deferred scope

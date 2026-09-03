@@ -539,6 +539,8 @@ impl fmt::Display for FunctionType {
 #[non_exhaustive]
 pub enum Effect {
     AiInvoke,
+    CacheRead,
+    CacheWrite,
     ConfigRead,
     DatabaseRead,
     DatabaseWrite,
@@ -550,6 +552,8 @@ pub enum Effect {
     QueueConsume,
     QueuePublish,
     ScheduleTrigger,
+    SearchQuery,
+    SearchVector,
     SecretRead,
     StateTransaction,
 }
@@ -558,6 +562,8 @@ impl Effect {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::AiInvoke => "ai.invoke",
+            Self::CacheRead => "cache.read",
+            Self::CacheWrite => "cache.write",
             Self::ConfigRead => "config.read",
             Self::DatabaseRead => "database.read",
             Self::DatabaseWrite => "database.write",
@@ -569,6 +575,8 @@ impl Effect {
             Self::QueueConsume => "queue.consume",
             Self::QueuePublish => "queue.publish",
             Self::ScheduleTrigger => "schedule.trigger",
+            Self::SearchQuery => "search.query",
+            Self::SearchVector => "search.vector",
             Self::SecretRead => "secret.read",
             Self::StateTransaction => "state.transaction",
         }
@@ -1220,6 +1228,11 @@ impl Analyzer {
                             | Builtin::DatabaseExecute
                             | Builtin::DatabaseCommit
                             | Builtin::DatabaseRollback
+                            | Builtin::CacheGet
+                            | Builtin::CachePut
+                            | Builtin::CacheDelete
+                            | Builtin::SearchQuery
+                            | Builtin::VectorSearch
                     )
                 ) {
                     let ResolvedName::Builtin(builtin) = resolution else {
@@ -1563,6 +1576,26 @@ impl Analyzer {
                     };
                     let bucket = require_canonical_literal(bucket, builtin, "object bucket")?;
                     vec![CapabilityRequirement::new(effect, bucket)]
+                }
+                (Builtin::CacheGet | Builtin::CacheDelete, [namespace, _])
+                | (Builtin::CachePut, [namespace, _, _, _]) => {
+                    let effect = if builtin == Builtin::CacheGet {
+                        Effect::CacheRead
+                    } else {
+                        Effect::CacheWrite
+                    };
+                    let namespace =
+                        require_canonical_literal(namespace, builtin, "cache namespace")?;
+                    vec![CapabilityRequirement::new(effect, namespace)]
+                }
+                (Builtin::SearchQuery | Builtin::VectorSearch, [index, _, _]) => {
+                    let effect = if builtin == Builtin::SearchQuery {
+                        Effect::SearchQuery
+                    } else {
+                        Effect::SearchVector
+                    };
+                    let index = require_canonical_literal(index, builtin, "search index")?;
+                    vec![CapabilityRequirement::new(effect, index)]
                 }
                 (Builtin::DatabaseBeginRead | Builtin::DatabaseBeginWrite, [database]) => {
                     let effect = if builtin == Builtin::DatabaseBeginRead {
@@ -2940,6 +2973,71 @@ impl Analyzer {
                     effect,
                 }
             }
+            Builtin::CacheGet => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::CacheRead);
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Option(Box::new(InferType::String))),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::CachePut => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::CacheWrite);
+                InferType::Function {
+                    parameters: vec![
+                        InferType::String,
+                        InferType::String,
+                        InferType::String,
+                        InferType::Int,
+                    ],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Unit),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::CacheDelete => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize]
+                    .direct
+                    .insert(Effect::CacheWrite);
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Unit),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::SearchQuery | Builtin::VectorSearch => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize].direct.insert(
+                    if builtin == Builtin::SearchQuery {
+                        Effect::SearchQuery
+                    } else {
+                        Effect::SearchVector
+                    },
+                );
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String, InferType::Int],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::String),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
             Builtin::ObjectGet => {
                 let effect = self.fresh_effect();
                 self.effect_definitions[effect as usize]
@@ -3362,7 +3460,12 @@ fn direct_host_builtin(callee: &Expression) -> Option<Builtin> {
             | Builtin::DatabaseQuery
             | Builtin::DatabaseExecute
             | Builtin::DatabaseCommit
-            | Builtin::DatabaseRollback),
+            | Builtin::DatabaseRollback
+            | Builtin::CacheGet
+            | Builtin::CachePut
+            | Builtin::CacheDelete
+            | Builtin::SearchQuery
+            | Builtin::VectorSearch),
         ) => Some(builtin),
         _ => None,
     }

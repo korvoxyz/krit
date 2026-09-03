@@ -161,6 +161,22 @@ For every cache:
 A cache that is incorrect, secret-dependent, host-path-dependent, or slower
 than recomputation is removed.
 
+### Runtime cache and search
+
+The Phase 7 runtime cache is measured the same way, with one extra rule: a
+benchmark must record the result **with the cache disabled** as well as enabled,
+and the two answers must be identical. Only the amount of work may differ.
+
+Report cache hits, misses, writes, deletes, and errors separately; an error is
+never counted as a miss. Report search and vector calls separately from cache
+counters so a fallback path is visible. Because the cache is process local,
+cross-process figures measure a cold cache by construction, and a warm figure
+requires one long-lived host such as `krit serve`.
+
+Cache operations are O(log n) in namespace size for lookup, insertion, and
+eviction, and expiry reclamation is bounded to eight entries per write, so no
+single call can be made slow by a large expired backlog.
+
 ## Baseline file
 
 `benchmarks/baseline.json` stores the initial direct-CLI environment metadata

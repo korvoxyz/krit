@@ -28,6 +28,9 @@ pub struct HostInputs {
 pub struct NetworkPolicy {
     allow_loopback: bool,
     allow_plaintext_bearer: bool,
+    /// Whether a configured connector may use a plaintext origin. Only a
+    /// loopback test policy sets this; a default policy requires HTTPS.
+    allow_plaintext_origin: bool,
 }
 
 pub(crate) struct SecretBytes(Vec<u8>);
@@ -117,6 +120,7 @@ impl NetworkPolicy {
         Self {
             allow_loopback: true,
             allow_plaintext_bearer: false,
+            allow_plaintext_origin: true,
         }
     }
 
@@ -127,6 +131,10 @@ impl NetworkPolicy {
 
     pub(crate) const fn permits_plaintext_bearer(self) -> bool {
         self.allow_plaintext_bearer
+    }
+
+    pub(crate) const fn permits_plaintext_origin(self) -> bool {
+        self.allow_plaintext_origin
     }
 
     pub(crate) fn permits_address(self, address: IpAddr) -> bool {

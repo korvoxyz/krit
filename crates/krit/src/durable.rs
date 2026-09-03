@@ -22,6 +22,11 @@ pub enum DurableOperationKind {
     DatabaseExecute,
     DatabaseCommit,
     DatabaseRollback,
+    CacheGet,
+    CachePut,
+    CacheDelete,
+    SearchQuery,
+    VectorSearch,
 }
 
 impl DurableOperationKind {
@@ -44,6 +49,11 @@ impl DurableOperationKind {
             Self::DatabaseExecute => "database-execute",
             Self::DatabaseCommit => "database-commit",
             Self::DatabaseRollback => "database-rollback",
+            Self::CacheGet => "cache-get",
+            Self::CachePut => "cache-put",
+            Self::CacheDelete => "cache-delete",
+            Self::SearchQuery => "search-query",
+            Self::VectorSearch => "vector-search",
         }
     }
 }
@@ -262,6 +272,26 @@ fn operation_fact(
             None,
             None,
         ),
+        "cache_get" => (
+            DurableOperationKind::CacheGet,
+            string_argument(arguments, 1).map(str::to_owned),
+            None,
+            None,
+        ),
+        "cache_put" => (
+            DurableOperationKind::CachePut,
+            string_argument(arguments, 1).map(str::to_owned),
+            None,
+            None,
+        ),
+        "cache_delete" => (
+            DurableOperationKind::CacheDelete,
+            string_argument(arguments, 1).map(str::to_owned),
+            None,
+            None,
+        ),
+        "search_query" => (DurableOperationKind::SearchQuery, None, None, None),
+        "vector_search" => (DurableOperationKind::VectorSearch, None, None, None),
         "db_begin_read" => (DurableOperationKind::DatabaseBeginRead, None, None, None),
         "db_begin_write" => (DurableOperationKind::DatabaseBeginWrite, None, None, None),
         _ => return None,

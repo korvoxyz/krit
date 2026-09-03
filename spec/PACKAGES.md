@@ -149,7 +149,12 @@ and consume authority are separately reviewable.
 `schedule.trigger("hourly-sweep")` requires one exact `schedules` entry.
 `object.write("render-output")` requires one exact `buckets` entry, and
 `object.read("render-output")` is satisfied by `buckets` or the disjoint
-read-only `readOnlyBuckets` list. `database.write("catalog")` requires one exact
+read-only `readOnlyBuckets` list, and `search.query("docs")` requires an
+exact `searchIndexes` entry while `search.vector("embeddings")` requires an exact
+`vectorIndexes` entry.
+`cache.write("lookups")` requires one exact `cacheNamespaces` entry, and
+`cache.read("lookups")` is satisfied by `cacheNamespaces` or the disjoint
+read-only `readOnlyCacheNamespaces` list. `database.write("catalog")` requires one exact
 `databases` entry, and `database.read("catalog")` is satisfied by `databases` or
 the disjoint `readOnlyDatabases` list. Replay
 operations separately retain their exact HTTP/AI requirement. Manifest state,

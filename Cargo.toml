@@ -4,6 +4,7 @@ members = [
     "crates/krit-capability",
     "crates/krit-assist",
     "crates/krit-cli",
+    "crates/krit-cache",
     "crates/krit-database",
     "crates/krit-lsp",
     "crates/krit-package",
@@ -25,6 +26,7 @@ repository = "https://github.com/akshay-bhardwaj/Krit"
 krit = { path = "crates/krit" }
 krit-assist = { path = "crates/krit-assist" }
 krit-capability = { path = "crates/krit-capability" }
+krit-cache = { path = "crates/krit-cache" }
 krit-database = { path = "crates/krit-database" }
 krit-lsp = { path = "crates/krit-lsp" }
 krit-package = { path = "crates/krit-package" }

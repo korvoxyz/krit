@@ -114,6 +114,10 @@ Initial required codes:
 | `K5301` | Application database file, schema, catalog, or connection is invalid |
 | `K5302` | Database transaction lifecycle, handle, or lock-safety rule was violated |
 | `K5303` | Configured database count, byte, row, time, or busy bound was exceeded |
+| `K5401` | Cache namespace is not configured, or refuses the requested operation |
+| `K5402` | Configured cache key, value, entry, byte, or time-to-live bound was exceeded |
+| `K5403` | Cache backend is unavailable |
+| `K5404` | Search connector is missing, misconfigured, or returned invalid output |
 | `K6001` | Invalid package manifest |
 | `K6002` | Lockfile is stale or invalid |
 | `K7001` | Residual or unresolved type requires specialization before layout |

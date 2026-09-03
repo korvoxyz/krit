@@ -57,6 +57,8 @@ impl FromStr for PermissionKey {
         let resource_required = matches!(
             capability,
             "ai.invoke"
+                | "cache.read"
+                | "cache.write"
                 | "config.read"
                 | "database.read"
                 | "database.write"
@@ -66,6 +68,8 @@ impl FromStr for PermissionKey {
                 | "queue.consume"
                 | "queue.publish"
                 | "schedule.trigger"
+                | "search.query"
+                | "search.vector"
                 | "secret.read"
                 | "state.transaction"
         );

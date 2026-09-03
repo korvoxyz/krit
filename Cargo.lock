@@ -995,6 +995,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "krit-cache"
+version = "0.2.0"
+
+[[package]]
 name = "krit-capability"
 version = "0.2.0"
 dependencies = [
@@ -1060,6 +1064,7 @@ dependencies = [
  "curl",
  "http",
  "krit",
+ "krit-cache",
  "krit-capability",
  "krit-database",
  "krit-package",

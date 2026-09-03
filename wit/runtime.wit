@@ -662,6 +662,23 @@ interface database {
     db-rollback: func(transaction: borrow<transaction>) -> result<_, string>;
 }
 
+interface cache-read {
+    cache-get: func(namespace: string, key: string) -> result<option<string>, string>;
+}
+
+interface cache-write {
+    cache-put: func(namespace: string, key: string, value: string, ttl-seconds: s64) -> result<_, string>;
+    cache-delete: func(namespace: string, key: string) -> result<_, string>;
+}
+
+interface search-query {
+    search-query: func(index: string, query: string, limit: s64) -> result<string, string>;
+}
+
+interface search-vector {
+    vector-search: func(index: string, vector: string, limit: s64) -> result<string, string>;
+}
+
 world webhook-host-program {
     import stdout;
     import config;
@@ -675,6 +692,10 @@ world webhook-host-program {
     import objects-read;
     import objects-write;
     import database;
+    import cache-read;
+    import cache-write;
+    import search-query;
+    import search-vector;
     export webhook;
 }
 
@@ -691,6 +712,10 @@ world job-host-program {
     import objects-read;
     import objects-write;
     import database;
+    import cache-read;
+    import cache-write;
+    import search-query;
+    import search-vector;
     export job;
 }
 
@@ -707,5 +732,9 @@ world schedule-host-program {
     import objects-read;
     import objects-write;
     import database;
+    import cache-read;
+    import cache-write;
+    import search-query;
+    import search-vector;
     export schedule;
 }

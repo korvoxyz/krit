@@ -13,7 +13,9 @@ use krit_wasm::ArtifactMetadata;
 
 use crate::{
     DatabaseCatalog, DurableState, HostInputs, HttpRequest, HttpResponse, RuntimeError,
-    RuntimeLimits, state::StoreBinding,
+    RuntimeLimits,
+    cache::{CacheHandle, SearchCatalog},
+    state::StoreBinding,
 };
 
 pub const MAX_POLICY_RESOURCES: usize = 256;
@@ -310,11 +312,28 @@ struct AgentHostInner {
     idempotency: Mutex<IdempotencyState>,
     durable_state: DurableState,
     database_catalog: DatabaseCatalog,
+    cache: CacheHandle,
+    search_catalog: SearchCatalog,
+}
+
+/// Optional shared services one host exposes to every invocation.
+///
+/// Durable state and application databases are transactional; the cache and the
+/// search connectors are not. Grouping them here keeps that difference explicit
+/// at the construction site.
+#[derive(Clone, Default)]
+pub struct AgentHostServices {
+    pub durable_state: DurableState,
+    pub database_catalog: DatabaseCatalog,
+    pub cache: CacheHandle,
+    pub search_catalog: SearchCatalog,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum RateResource {
     Ai(String),
+    /// Every outbound HTTP request to one origin, whether it came from guest
+    /// code or from a host-owned search connector, shares this bucket.
     Http(String),
 }
 
@@ -394,6 +413,25 @@ impl AgentHost {
         durable_state: DurableState,
         database_catalog: DatabaseCatalog,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_services(
+            inputs,
+            policy,
+            approvals,
+            AgentHostServices {
+                durable_state,
+                database_catalog,
+                ..AgentHostServices::default()
+            },
+        )
+    }
+
+    /// Builds a host over the full set of optional shared services.
+    pub fn new_with_services(
+        inputs: HostInputs,
+        policy: AgentHostPolicy,
+        approvals: Arc<dyn ApprovalPolicy>,
+        services: AgentHostServices,
+    ) -> Result<Self, RuntimeError> {
         validate_policy(&policy)?;
         Ok(Self {
             inner: Arc::new(AgentHostInner {
@@ -404,8 +442,10 @@ impl AgentHost {
                 operation_sequence: AtomicU64::new(0),
                 rates: Mutex::new(RateState::default()),
                 idempotency: Mutex::new(IdempotencyState::default()),
-                durable_state,
-                database_catalog,
+                durable_state: services.durable_state,
+                database_catalog: services.database_catalog,
+                cache: services.cache,
+                search_catalog: services.search_catalog,
             }),
         })
     }
@@ -424,6 +464,16 @@ impl AgentHost {
 
     pub(crate) fn database_catalog(&self) -> &DatabaseCatalog {
         &self.inner.database_catalog
+    }
+
+    /// The shared process-local cache. Present on every host; an unconfigured
+    /// cache simply reports every namespace as unconfigured.
+    pub fn cache(&self) -> &CacheHandle {
+        &self.inner.cache
+    }
+
+    pub fn search_catalog(&self) -> &SearchCatalog {
+        &self.inner.search_catalog
     }
 
     pub(crate) fn durable_state(&self) -> &DurableState {
@@ -488,10 +538,17 @@ impl AgentHost {
         Ok(())
     }
 
+    /// Charges one attempt against `resource` and reports a denial as `label`.
+    ///
+    /// The bucket identity and the guest-visible name are deliberately
+    /// separate. A search connector shares its origin's bucket, but the guest
+    /// only ever knows the connector's index name, so the origin must not
+    /// appear in the message it receives.
     pub(crate) fn check_rate(
         &self,
         resource: RateResource,
         policy: RateLimitPolicy,
+        label: &str,
     ) -> Result<(), String> {
         let mut state = self
             .inner
@@ -532,12 +589,7 @@ impl AgentHost {
         }
         entry.last_used = sequence;
         if entry.count >= policy.capacity {
-            return Err(format!(
-                "rate limit exceeded for `{}`",
-                match &resource {
-                    RateResource::Ai(name) | RateResource::Http(name) => name,
-                }
-            ));
+            return Err(format!("rate limit exceeded for `{label}`"));
         }
         entry.count += 1;
         Ok(())

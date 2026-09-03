@@ -1,0 +1,50 @@
+// A cached search webhook.
+//
+// The cache is an optimisation, never a source of truth. Every outcome is an
+// explicit value this source handles:
+//
+//   Ok(Some(value))  a live hit, returned directly
+//   Ok(None)         a miss, an expiry, or an eviction, all indistinguishable
+//   Err(reason)      a cache outage, which falls back exactly like a miss
+//
+// The fallback path queries a named search connector and stores the result with
+// an explicit time to live. A failed store is not fatal: the response is still
+// correct, only uncached. Search results are untrusted external input and are
+// returned as data, never executed.
+// Runs the authoritative lookup and refreshes the cache.
+fn lookup(query: String, reason: String) -> HttpResponse {
+    match search_query("docs", query, 3) {
+        Ok(results) => match cache_put("lookups", query, results, 60) {
+            Ok(stored) => record {
+                status: 200,
+                headers: [record { name: "x-krit-cache", value: reason }],
+                body: results,
+            },
+            // A cache write failure never changes the answer.
+            Err(problem) => record {
+                status: 200,
+                headers: [record { name: "x-krit-cache", value: "uncached" }],
+                body: results,
+            },
+        },
+        Err(failure) => record {
+            status: 503,
+            headers: [record { name: "x-krit-cache", value: reason }],
+            body: failure,
+        },
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match cache_get("lookups", request.query) {
+        Ok(cached) => match cached {
+            Some(value) => record {
+                status: 200,
+                headers: [record { name: "x-krit-cache", value: "hit" }],
+                body: value,
+            },
+            None => lookup(request.query, "miss"),
+        },
+        Err(outage) => lookup(request.query, "unavailable"),
+    }
+}

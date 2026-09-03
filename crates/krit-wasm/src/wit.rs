@@ -24,6 +24,10 @@ pub(crate) const OBJECT_READ_EFFECT: &str = "object.read";
 pub(crate) const OBJECT_WRITE_EFFECT: &str = "object.write";
 pub(crate) const DATABASE_READ_EFFECT: &str = "database.read";
 pub(crate) const DATABASE_WRITE_EFFECT: &str = "database.write";
+pub(crate) const CACHE_READ_EFFECT: &str = "cache.read";
+pub(crate) const CACHE_WRITE_EFFECT: &str = "cache.write";
+pub(crate) const SEARCH_QUERY_EFFECT: &str = "search.query";
+pub(crate) const SEARCH_VECTOR_EFFECT: &str = "search.vector";
 pub const AI_INTERFACE: &str = "krit:runtime/ai@0.2.0";
 pub const STDOUT_INTERFACE: &str = "krit:runtime/stdout@0.2.0";
 pub const CONFIG_INTERFACE: &str = "krit:runtime/config@0.2.0";
@@ -36,6 +40,10 @@ pub const QUEUE_INTERFACE: &str = "krit:runtime/queue@0.2.0";
 pub const OBJECTS_READ_INTERFACE: &str = "krit:runtime/objects-read@0.2.0";
 pub const OBJECTS_WRITE_INTERFACE: &str = "krit:runtime/objects-write@0.2.0";
 pub const DATABASE_INTERFACE: &str = "krit:runtime/database@0.2.0";
+pub const CACHE_READ_INTERFACE: &str = "krit:runtime/cache-read@0.2.0";
+pub const CACHE_WRITE_INTERFACE: &str = "krit:runtime/cache-write@0.2.0";
+pub const SEARCH_QUERY_INTERFACE: &str = "krit:runtime/search-query@0.2.0";
+pub const SEARCH_VECTOR_INTERFACE: &str = "krit:runtime/search-vector@0.2.0";
 pub const WEBHOOK_INTERFACE: &str = "krit:runtime/webhook@0.2.0";
 pub const JOB_INTERFACE: &str = "krit:runtime/job@0.2.0";
 pub const SCHEDULE_INTERFACE: &str = "krit:runtime/schedule@0.2.0";
@@ -78,7 +86,7 @@ impl ProgramKind {
 }
 
 /// Ordered import surfaces. The bit order fixes every generated world name.
-const IMPORT_SURFACES: [(u16, &str, &str, &str); 11] = [
+const IMPORT_SURFACES: [(u16, &str, &str, &str); 15] = [
     (1 << 0, "stdout", "stdout", STDOUT_INTERFACE),
     (1 << 1, "config", "config", CONFIG_INTERFACE),
     (1 << 2, "secrets", "secrets", SECRETS_INTERFACE),
@@ -90,6 +98,20 @@ const IMPORT_SURFACES: [(u16, &str, &str, &str); 11] = [
     (1 << 8, "objread", "objects-read", OBJECTS_READ_INTERFACE),
     (1 << 9, "objwrite", "objects-write", OBJECTS_WRITE_INTERFACE),
     (1 << 10, "db", "database", DATABASE_INTERFACE),
+    (1 << 11, "cacheread", "cache-read", CACHE_READ_INTERFACE),
+    (1 << 12, "cachewrite", "cache-write", CACHE_WRITE_INTERFACE),
+    (
+        1 << 13,
+        "searchquery",
+        "search-query",
+        SEARCH_QUERY_INTERFACE,
+    ),
+    (
+        1 << 14,
+        "searchvector",
+        "search-vector",
+        SEARCH_VECTOR_INTERFACE,
+    ),
 ];
 
 const SECRETS_BIT: u16 = 1 << 2;
@@ -406,6 +428,13 @@ fn select_world(kind: ProgramKind, effects: &[String]) -> Result<WorldSelection,
             // Read and write database authority share one narrow interface: the
             // host enforces the distinction per transaction and per statement.
             DATABASE_READ_EFFECT | DATABASE_WRITE_EFFECT => 1 << 10,
+            // Cache and search authority each split into a read surface and a
+            // write or vector surface, so every effect maps to its own
+            // least-authority interface with no shared-interface compromise.
+            CACHE_READ_EFFECT => 1 << 11,
+            CACHE_WRITE_EFFECT => 1 << 12,
+            SEARCH_QUERY_EFFECT => 1 << 13,
+            SEARCH_VECTOR_EFFECT => 1 << 14,
             _ => {
                 return Err(BuildError::artifact(
                     "checked entrypoint effects contain an unknown host surface",

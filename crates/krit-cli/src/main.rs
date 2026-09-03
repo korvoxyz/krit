@@ -182,6 +182,20 @@ fn build_command(arguments: &[String]) -> u8 {
     {
         options.grant_effect("object.read");
     }
+    if !manifest.capabilities.cache_namespaces.is_empty() {
+        options.grant_effect("cache.write");
+    }
+    if !manifest.capabilities.cache_namespaces.is_empty()
+        || !manifest.capabilities.read_only_cache_namespaces.is_empty()
+    {
+        options.grant_effect("cache.read");
+    }
+    if !manifest.capabilities.search_indexes.is_empty() {
+        options.grant_effect("search.query");
+    }
+    if !manifest.capabilities.vector_indexes.is_empty() {
+        options.grant_effect("search.vector");
+    }
     if !manifest.capabilities.databases.is_empty() {
         options.grant_effect("database.write");
     }
@@ -2614,6 +2628,6 @@ mod tests {
             count += 1;
             remaining = &code[end + "\n```".len()..];
         }
-        assert_eq!(count, 11, "prompt should contain eleven canonical examples");
+        assert_eq!(count, 12, "prompt should contain twelve canonical examples");
     }
 }

@@ -734,6 +734,68 @@ fn check_builtin(
         {
             Ok(())
         }
+        Builtin::CacheGet
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if matches!(
+                            value.as_ref(),
+                            Type::Option(element) if element.as_ref() == &Type::String
+                        ) && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::CachePut
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::Int),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::Unit && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::CacheDelete
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::Unit && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::SearchQuery | Builtin::VectorSearch
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::Int),
+                ]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::String && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
         Builtin::DatabaseBeginRead | Builtin::DatabaseBeginWrite
             if function.parameters() == [std::sync::Arc::new(Type::String)]
                 && matches!(
