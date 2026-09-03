@@ -1295,18 +1295,6 @@ fn frame_category(frames: &[CallFrame<'_>]) -> Option<&'static str> {
     })
 }
 
-/// Resolves a name innermost scope first, stopping at an untraceable shadow.
-fn resolve_tolerant<'a>(
-    scopes: &'a [BTreeMap<&str, RedactionTargets>],
-    name: &str,
-) -> Option<&'a RedactionTargets> {
-    scopes
-        .iter()
-        .rev()
-        .find_map(|frame| frame.get(name))
-        .filter(|value| !value.opaque)
-}
-
 fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static str)> {
     let bytes = source.as_bytes();
     let mut spans = Vec::new();
@@ -1378,41 +1366,49 @@ fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static
                 expect_parameter_name = false;
                 parameters.push(identifier);
             } else {
-                // `let token = token;` is a legal shadow: the right-hand side
-                // names the *outer* binding, not the one being declared. The
-                // outer binding is therefore resolved first. An unfinished
-                // binding is still visible too, which is what protects
-                // truncated source, so when both exist the union is used: it
-                // covers either reading and cannot under-redact.
-                let outer = pending
-                    .iter()
-                    .rev()
-                    .skip_while(|binding| binding.name != identifier)
-                    .skip(1)
-                    .find(|binding| binding.name == identifier)
-                    .map(|binding| binding.in_progress(source))
-                    .or_else(|| resolve_tolerant(&scopes, identifier).cloned());
-                let in_progress = pending
-                    .iter()
-                    .rev()
-                    .find(|binding| binding.name == identifier)
-                    .map(|binding| binding.in_progress(source));
-                let inherited = match (outer, in_progress) {
-                    (Some(mut outer), Some(in_progress)) => {
-                        outer.merge(&in_progress);
-                        Some(outer)
-                    }
-                    (Some(outer), None) => Some(outer),
-                    (None, in_progress) => in_progress,
+                // Under sequential `let` semantics a declaration is not
+                // visible from its own initializer, so the real contributor is
+                // always the nearest *finalized* lexical binding. That is
+                // resolved independently here: letting a pending declaration
+                // short-circuit the lookup would hide the finalized outer
+                // value whenever two same-named declarations are open at once.
+                //
+                // Every same-named pending declaration is then unioned in as a
+                // conservative safety net, because in truncated source the
+                // reference may sit inside an initializer whose text is
+                // already written.
+                let barrier =
+                    scopes.iter().enumerate().rev().find_map(|(index, frame)| {
+                        frame.get(identifier).map(|value| (index, value))
+                    });
+                // A parameter shadows everything further out. The barrier
+                // applies to pending declarations too, so one from outside the
+                // parameter's scope can never slip past it.
+                let (mut inherited, floor) = match barrier {
+                    Some((index, value)) if value.opaque => (None, Some(index)),
+                    Some((_, value)) => (Some(value.clone()), None),
+                    None => (None, None),
                 };
+                for binding in pending
+                    .iter()
+                    .rev()
+                    .filter(|binding| binding.name == identifier)
+                {
+                    if floor.is_some_and(|floor| binding.scope < floor) {
+                        continue;
+                    }
+                    let candidate = binding.in_progress(source);
+                    match inherited.as_mut() {
+                        Some(existing) => existing.merge(&candidate),
+                        None => inherited = Some(candidate),
+                    }
+                }
                 // An alias inside a binding's value inherits the referenced
                 // binding's contributions, so a chain of aliases stays
-                // protected. A binding never inherits from itself, so a chain
-                // is bounded and cannot cycle.
-                // Every enclosing binding inherits, including a rebind of the
-                // same name: `let token = token;` really does take the outer
-                // value. Merging is idempotent and deduplicated, so a
-                // self-reference cannot grow without bound or loop.
+                // protected. Every enclosing binding inherits, including a
+                // rebind of the same name: `let token = token;` really does
+                // take the outer value. Merging is idempotent and
+                // deduplicated, so a self-reference cannot grow or loop.
                 if let Some(inherited) = inherited.as_ref() {
                     for binding in &mut pending {
                         binding.inherit(inherited);
@@ -3008,6 +3004,115 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
         assert!(
             !spans.iter().any(|(content, _)| content == "caller-token"),
             "a parameter must remain opaque: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn simultaneous_same_name_pending_declarations_keep_the_finalized_outer() {
+        // Two same-named declarations are open at once. Neither is visible from
+        // its own initializer, so the contributor is the finalized outer
+        // binding; a pending declaration must not hide it.
+        for (label, call) in [
+            ("search", "search_query(\"docs\", token, 3"),
+            ("cache value", "cache_put(\"lookups\", \"k\", token, 60"),
+            ("cache key", "cache_put(\"lookups\", token, \"v\", 60"),
+            ("cache delete", "cache_delete(\"lookups\", token"),
+            ("cache get", "cache_get(\"lookups\", token"),
+            ("vector", "vector_search(\"vectors\", token, 3"),
+        ] {
+            // Two nested pending declarations.
+            let two = format!(
+                "let token = \"customer payload\";\n{{\n    let token = {{\n                         let token = token;\n        {call}"
+            );
+            // Three nested pending declarations.
+            let three = format!(
+                "let token = \"customer payload\";\n{{\n    let token = {{\n                         let token = {{\n            let token = token;\n            {call}"
+            );
+            for (depth, source) in [("two", two), ("three", three)] {
+                let redacted_text = redact_all_tolerant(&source);
+                assert!(
+                    !redacted_text.contains("customer payload"),
+                    "{depth} nested pending shadows leaked through the {label} position:\n                     {redacted_text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_parameter_barrier_blocks_an_outer_pending_declaration() {
+        // The outer `token` declaration is still open, but a parameter of the
+        // same name shadows it. The barrier must apply to the pending
+        // declaration as well as to finalized bindings.
+        let source = "let outer = \"caller-token\";\nlet token = [outer,\n                      fn lookup(token: String) -> HttpResponse {\n                          search_query(\"docs\", token, 3)\n}";
+        let spans = redacted_tolerant(source);
+
+        assert!(
+            !spans.iter().any(|(content, _)| content == "caller-token"),
+            "a pending declaration bypassed a parameter barrier: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn a_sibling_scope_binding_is_not_visible_after_it_closes() {
+        // `token` is declared and finalized inside a sibling block, so it is
+        // out of scope at the later use and must not be redacted.
+        let source = "{\n    let token = \"sibling-only\";\n}\n                      search_query(\"docs\", token, 3";
+        let spans = redacted_tolerant(source);
+
+        assert!(
+            !spans.iter().any(|(content, _)| content == "sibling-only"),
+            "an out-of-scope sibling binding was redacted: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn nested_same_name_pending_shadows_match_the_parsed_path() {
+        // The well-formed equivalent of the nested-pending fixture.
+        let source = r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let token = "customer payload";
+    let outer = {
+        let token = {
+            let token = token;
+            token
+        };
+        token
+    };
+    match search_query("docs", outer, 3) {
+        Ok(hits) => record { status: 200, headers: [], body: hits },
+        Err(problem) => record { status: 500, headers: [], body: problem },
+    }
+}
+"#;
+        let parsed = redacted(source);
+        let tolerant = redacted_tolerant(source);
+
+        assert!(
+            parsed
+                .iter()
+                .any(|(content, _)| content == "customer payload"),
+            "the parsed path must redact the outer value: {parsed:?}"
+        );
+        for (content, _) in &parsed {
+            assert!(
+                tolerant.iter().any(|(other, _)| other == content),
+                "the fallback redacted less than the parsed path: `{content}`"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_scopes_are_not_over_redacted_by_pending_union() {
+        let source = "let unrelated = \"visible-copy\";\n                      let token = \"private-token\";\n{\n    let token = token;\n                          search_query(\"docs\", token, 3";
+        let redacted_text = redact_all_tolerant(source);
+
+        assert!(
+            !redacted_text.contains("private-token"),
+            "the private token leaked: {redacted_text}"
+        );
+        assert!(
+            redacted_text.contains("visible-copy"),
+            "an unrelated binding was over-redacted: {redacted_text}"
         );
     }
 
