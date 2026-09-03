@@ -182,6 +182,14 @@ fn build_command(arguments: &[String]) -> u8 {
     {
         options.grant_effect("object.read");
     }
+    if !manifest.capabilities.databases.is_empty() {
+        options.grant_effect("database.write");
+    }
+    if !manifest.capabilities.databases.is_empty()
+        || !manifest.capabilities.read_only_databases.is_empty()
+    {
+        options.grant_effect("database.read");
+    }
     let artifact = match build_component(&module, &options) {
         Ok(artifact) => artifact,
         Err(error) => {
@@ -447,7 +455,8 @@ struct JsonDurableFacts {
 #[serde(rename_all = "camelCase")]
 struct JsonDurableOperation {
     kind: &'static str,
-    store: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -658,11 +667,10 @@ fn render_explanation_human(program: &krit::Program, analysis: &Analysis, module
         println!("  (none)");
     } else {
         for operation in durable {
-            print!(
-                "  {} store={}",
-                operation.kind().as_str(),
-                operation.store()
-            );
+            print!("  {}", operation.kind().as_str());
+            if let Some(store) = operation.store() {
+                print!(" store={store}");
+            }
             if let Some(identity) = operation.identity() {
                 print!(" identity={identity}");
             }
@@ -771,7 +779,7 @@ fn render_explanation_json(
                     let span = operation.span();
                     JsonDurableOperation {
                         kind: operation.kind().as_str(),
-                        store: operation.store().to_owned(),
+                        store: operation.store().map(str::to_owned),
                         identity: operation.identity().map(str::to_owned),
                         external_capability: operation.external_capability(),
                         external_resource: operation.external_resource().map(str::to_owned),
@@ -2606,6 +2614,6 @@ mod tests {
             count += 1;
             remaining = &code[end + "\n```".len()..];
         }
-        assert_eq!(count, 10, "prompt should contain ten canonical examples");
+        assert_eq!(count, 11, "prompt should contain eleven canonical examples");
     }
 }

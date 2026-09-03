@@ -59,6 +59,10 @@ pub struct Capabilities {
     pub buckets: Vec<String>,
     #[serde(default, rename = "readOnlyBuckets")]
     pub read_only_buckets: Vec<String>,
+    #[serde(default)]
+    pub databases: Vec<String>,
+    #[serde(default, rename = "readOnlyDatabases")]
+    pub read_only_databases: Vec<String>,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -201,6 +205,13 @@ impl Manifest {
                 )));
             }
         }
+        for name in &self.capabilities.read_only_databases {
+            if self.capabilities.databases.contains(name) {
+                return Err(ManifestError::new(format!(
+                    "application database `{name}` cannot request both read-only and write authority"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -285,6 +296,7 @@ impl Manifest {
             ("queue.consume", &self.capabilities.consumes),
             ("schedule.trigger", &self.capabilities.schedules),
             ("object.write", &self.capabilities.buckets),
+            ("database.write", &self.capabilities.databases),
         ] {
             requested.extend(names.iter().cloned().map(|resource| PermissionRequest {
                 capability,
@@ -299,6 +311,17 @@ impl Manifest {
                 .cloned()
                 .map(|resource| PermissionRequest {
                     capability: "object.read",
+                    resource: Some(resource),
+                }),
+        );
+        requested.extend(
+            self.capabilities
+                .databases
+                .iter()
+                .chain(&self.capabilities.read_only_databases)
+                .cloned()
+                .map(|resource| PermissionRequest {
+                    capability: "database.read",
                     resource: Some(resource),
                 }),
         );
@@ -374,6 +397,19 @@ impl Manifest {
                     .buckets
                     .iter()
                     .chain(&self.capabilities.read_only_buckets)
+                    .any(|granted| granted == resource)
+            }),
+            "database.write" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .databases
+                    .iter()
+                    .any(|granted| granted == resource)
+            }),
+            "database.read" => resource.is_some_and(|resource| {
+                self.capabilities
+                    .databases
+                    .iter()
+                    .chain(&self.capabilities.read_only_databases)
                     .any(|granted| granted == resource)
             }),
             _ => false,

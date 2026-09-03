@@ -440,14 +440,20 @@ impl Runtime {
             DeliveryCall::Job(event) => self.call_job(component, &mut store, event),
             DeliveryCall::Schedule(event) => self.call_schedule(component, &mut store, event),
         };
-        let timed_out = deadline
-            .finish()
-            .map_err(|error| error.with_events(store.data().events.clone()))?;
+        let elapsed = deadline.finish();
+        // Cleanup runs before any early return below so a trapped, timed-out,
+        // or failed delivery cannot leak an open database transaction into the
+        // next delivery on this worker.
+        let transactions = crate::finalize_transactions(store.data_mut());
+        let timed_out = elapsed.map_err(|error| error.with_events(store.data().events.clone()))?;
         if timed_out {
             return Err(RuntimeError::deadline("Wasm wall deadline exceeded")
                 .with_events(store.data().events.clone()));
         }
         let result = outcome.map_err(|error| error.with_events(store.data().events.clone()))?;
+        if let Err(error) = transactions {
+            return Err(error.with_events(store.data().events.clone()));
+        }
         if store.data().cancellation.is_cancelled() {
             return Err(RuntimeError::cancelled(
                 "embedding cancellation requested before durable outcome commit",
@@ -492,6 +498,12 @@ impl Runtime {
             object_reads: state.state.object_reads(),
             object_writes: state.state.object_writes(),
             queue_publishes: state.state.queue_publishes(),
+            database_queries: state.databases.queries(),
+            database_executes: state.databases.executes(),
+            database_commits: state.databases.commits(),
+            database_rollbacks: state.databases.rollbacks(),
+            database_write_committed: state.databases.published_write_commit(),
+            database_transactions_abandoned: state.databases.abandoned(),
             output_bytes: state.output.len(),
             elapsed_micros: started.elapsed().as_micros(),
         };

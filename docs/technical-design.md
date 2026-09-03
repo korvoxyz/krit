@@ -1,6 +1,6 @@
 # Krit Rust technical design
 
-**Status:** Accepted; Phase 6 durable local state, jobs, and object storage implemented
+**Status:** Accepted; Phase 6 durable state and jobs plus Phase 7 database access implemented
 **Owner:** Akshay Bhardwaj
 
 ## Decision
@@ -62,6 +62,7 @@ crates/
   krit-wasm/         Core IR to WebAssembly component lowering
   krit-state/        transactional SQLite state, replay, idempotency, queue,
                      schedule, and object records
+  krit-database/     capability-scoped parameterized application database access
   krit-runtime/      component runtime, limits, and capability handles
   krit-package/      manifests, lockfiles, resolver, store
   krit-cli/          user command and orchestration
@@ -428,6 +429,36 @@ names onto already-configured stores. It can only narrow the manifest. A store
 that backs job resources alone is host-owned and requires no
 `state.transaction` grant, which keeps an ingress publisher free of state
 authority.
+
+## Application database access
+
+`krit-database` owns general database semantics and deliberately shares no
+schema, table, or migration code with `krit-state`. It opens an operator-owned
+SQLite file read-only or read-write, never with `SQLITE_OPEN_CREATE` and never
+through a URI, so a path can never smuggle driver options. Defensive mode,
+`trusted_schema = OFF`, non-writable schema, double-quoted-string rejection, a
+page ceiling derived from the byte budget, and `PRAGMA quick_check` all run at
+open.
+
+The statement catalog is validated by preparing every entry against the live
+schema. `sqlite3_stmt_readonly` classifies queries versus mutations, the
+placeholder count must match the declared parameter types, the returned column
+names must match the declared contract, and a lexical scanner that understands
+literals, quoted identifiers, and comments rejects any second statement. Guests
+name statements; they never supply SQL.
+
+`InvocationDatabases` tracks one open transaction at a time. Handles live in the
+component resource table as an opaque resource, mirroring `Secret`. External
+effects are refused while a transaction is open so a database lock can never
+span a network round trip, and every transaction carries a wall bound below the
+invocation deadline. An invocation that ends with an open transaction rolls it
+back and then fails closed.
+
+`db_commit` publishes immediately rather than joining the Krit outcome commit:
+two SQLite files cannot share one atomic transaction, and holding a write lock
+across the rest of guest execution would be worse. The resulting two-resource
+window is reported through `databaseWriteCommitted` and documented instead of
+being implied away.
 
 ## CLI
 

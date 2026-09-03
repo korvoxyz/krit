@@ -12,8 +12,8 @@ use krit_capability::{HttpOrigin, is_valid_resource_name};
 use krit_wasm::ArtifactMetadata;
 
 use crate::{
-    DurableState, HostInputs, HttpRequest, HttpResponse, RuntimeError, RuntimeLimits,
-    state::StoreBinding,
+    DatabaseCatalog, DurableState, HostInputs, HttpRequest, HttpResponse, RuntimeError,
+    RuntimeLimits, state::StoreBinding,
 };
 
 pub const MAX_POLICY_RESOURCES: usize = 256;
@@ -309,6 +309,7 @@ struct AgentHostInner {
     rates: Mutex<RateState>,
     idempotency: Mutex<IdempotencyState>,
     durable_state: DurableState,
+    database_catalog: DatabaseCatalog,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -377,6 +378,22 @@ impl AgentHost {
         approvals: Arc<dyn ApprovalPolicy>,
         durable_state: DurableState,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_resources(
+            inputs,
+            policy,
+            approvals,
+            durable_state,
+            DatabaseCatalog::default(),
+        )
+    }
+
+    pub fn new_with_resources(
+        inputs: HostInputs,
+        policy: AgentHostPolicy,
+        approvals: Arc<dyn ApprovalPolicy>,
+        durable_state: DurableState,
+        database_catalog: DatabaseCatalog,
+    ) -> Result<Self, RuntimeError> {
         validate_policy(&policy)?;
         Ok(Self {
             inner: Arc::new(AgentHostInner {
@@ -388,6 +405,7 @@ impl AgentHost {
                 rates: Mutex::new(RateState::default()),
                 idempotency: Mutex::new(IdempotencyState::default()),
                 durable_state,
+                database_catalog,
             }),
         })
     }
@@ -402,6 +420,10 @@ impl AgentHost {
 
     pub(crate) fn inputs(&self) -> &HostInputs {
         &self.inner.inputs
+    }
+
+    pub(crate) fn database_catalog(&self) -> &DatabaseCatalog {
+        &self.inner.database_catalog
     }
 
     pub(crate) fn durable_state(&self) -> &DurableState {
@@ -802,7 +824,12 @@ impl fmt::Debug for AgentHost {
     }
 }
 
-fn validate_policy(policy: &AgentHostPolicy) -> Result<(), RuntimeError> {
+/// Validates a host policy without building a host.
+///
+/// Exposed so a configuration loader can reject an invalid policy during its
+/// pure validation phase, before any durable store or application database is
+/// created, opened, or migrated.
+pub fn validate_policy(policy: &AgentHostPolicy) -> Result<(), RuntimeError> {
     for count in [
         policy.ai_adapters.len(),
         policy.http_retries.len(),

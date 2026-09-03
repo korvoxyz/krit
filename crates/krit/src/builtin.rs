@@ -27,10 +27,16 @@ pub enum Builtin {
     ObjectGet,
     ObjectPut,
     ObjectDelete,
+    DatabaseBeginRead,
+    DatabaseBeginWrite,
+    DatabaseQuery,
+    DatabaseExecute,
+    DatabaseCommit,
+    DatabaseRollback,
 }
 
 impl Builtin {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 31] = [
         Self::AiInvoke,
         Self::ConfigString,
         Self::Err,
@@ -56,6 +62,12 @@ impl Builtin {
         Self::ObjectDelete,
         Self::ObjectGet,
         Self::ObjectPut,
+        Self::DatabaseBeginRead,
+        Self::DatabaseBeginWrite,
+        Self::DatabaseCommit,
+        Self::DatabaseExecute,
+        Self::DatabaseQuery,
+        Self::DatabaseRollback,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -85,6 +97,12 @@ impl Builtin {
             "object_get" => Some(Self::ObjectGet),
             "object_put" => Some(Self::ObjectPut),
             "object_delete" => Some(Self::ObjectDelete),
+            "db_begin_read" => Some(Self::DatabaseBeginRead),
+            "db_begin_write" => Some(Self::DatabaseBeginWrite),
+            "db_query" => Some(Self::DatabaseQuery),
+            "db_execute" => Some(Self::DatabaseExecute),
+            "db_commit" => Some(Self::DatabaseCommit),
+            "db_rollback" => Some(Self::DatabaseRollback),
             _ => None,
         }
     }
@@ -116,6 +134,12 @@ impl Builtin {
             Self::ObjectGet => "object_get",
             Self::ObjectPut => "object_put",
             Self::ObjectDelete => "object_delete",
+            Self::DatabaseBeginRead => "db_begin_read",
+            Self::DatabaseBeginWrite => "db_begin_write",
+            Self::DatabaseQuery => "db_query",
+            Self::DatabaseExecute => "db_execute",
+            Self::DatabaseCommit => "db_commit",
+            Self::DatabaseRollback => "db_rollback",
         }
     }
 
@@ -139,7 +163,13 @@ impl Builtin {
             | Self::QueuePublish
             | Self::ObjectGet
             | Self::ObjectPut
-            | Self::ObjectDelete => BuiltinCategory::HostEffect,
+            | Self::ObjectDelete
+            | Self::DatabaseBeginRead
+            | Self::DatabaseBeginWrite
+            | Self::DatabaseQuery
+            | Self::DatabaseExecute
+            | Self::DatabaseCommit
+            | Self::DatabaseRollback => BuiltinCategory::HostEffect,
         }
     }
 
@@ -187,6 +217,21 @@ impl Builtin {
             }
             Self::ObjectDelete => {
                 "fn(String, String) -> Result<Unit, String> effects {object.write}"
+            }
+            Self::DatabaseBeginRead => {
+                "fn(String) -> Result<DatabaseTransaction, String> effects {database.read}"
+            }
+            Self::DatabaseBeginWrite => {
+                "fn(String) -> Result<DatabaseTransaction, String> effects {database.write}"
+            }
+            Self::DatabaseQuery => {
+                "fn(DatabaseTransaction, String, List<String>) -> Result<String, String> effects {}"
+            }
+            Self::DatabaseExecute => {
+                "fn(DatabaseTransaction, String, List<String>) -> Result<Int, String> effects {}"
+            }
+            Self::DatabaseCommit | Self::DatabaseRollback => {
+                "fn(DatabaseTransaction) -> Result<Unit, String> effects {}"
             }
         }
     }
@@ -244,6 +289,20 @@ impl Builtin {
             Self::ObjectDelete => {
                 "Stages one bounded object deletion for the successful outcome commit."
             }
+            Self::DatabaseBeginRead => {
+                "Begins one bounded read transaction on a manifest-granted database. The name must be a direct string literal."
+            }
+            Self::DatabaseBeginWrite => {
+                "Begins one bounded write transaction on a manifest-granted database. The name must be a direct string literal."
+            }
+            Self::DatabaseQuery => {
+                "Runs one host-catalogued parameterized query and returns bounded deterministic JSON rows."
+            }
+            Self::DatabaseExecute => {
+                "Runs one host-catalogued parameterized mutation and returns its affected-row count."
+            }
+            Self::DatabaseCommit => "Commits and closes one open database transaction.",
+            Self::DatabaseRollback => "Rolls back and closes one open database transaction.",
         }
     }
 }

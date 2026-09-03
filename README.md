@@ -82,6 +82,9 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
   acknowledgement in one transaction
 - bounded `krit worker --once` and `krit schedule --once` dispatch with
   host-supplied wall time
+- opaque `DatabaseTransaction` handles with explicit begin/commit/rollback,
+  host-catalogued parameterized statements, and no guest SQL, path, DSN, or
+  credential
 - recursive function declarations
 - exhaustive empty/cons list matching
 - deterministic comment-preserving canonical source formatting
@@ -452,6 +455,74 @@ contract, state machine, limits, and crash model are normative in
 enqueue -> worker -> object flow; create an owner-only `examples/state`
 directory before running them.
 
+### Capability-scoped database access
+
+A package requests databases by logical name; the host owns the file, the mode,
+and every statement:
+
+```toml
+[capabilities]
+databases = ["catalog"]              # database.read and database.write
+readOnlyDatabases = ["reference"]    # database.read only
+```
+
+```krit
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match db_begin_write("catalog") {
+        Ok(transaction) => match db_execute(transaction, "record-visit", [request.path]) {
+            Ok(changed) => match db_query(transaction, "count-visits", []) {
+                Ok(rows) => match db_commit(transaction) {
+                    Ok(committed) => record { status: 200, headers: [], body: rows },
+                    Err(error) => record { status: 500, headers: [], body: error },
+                },
+                Err(error) => match db_rollback(transaction) {
+                    Ok(undone) => record { status: 500, headers: [], body: error },
+                    Err(fatal) => record { status: 500, headers: [], body: fatal },
+                },
+            },
+            Err(error) => match db_rollback(transaction) {
+                Ok(undone) => record { status: 500, headers: [], body: error },
+                Err(fatal) => record { status: 500, headers: [], body: fatal },
+            },
+        },
+        Err(error) => record { status: 503, headers: [], body: error },
+    }
+}
+```
+
+`DatabaseTransaction` is opaque exactly like `Secret`: it cannot be printed,
+compared, encoded, logged, or stored, and it may appear only as the first
+argument of a database operation. Statement text lives in schema-5 host config,
+so parameters are always bound and an injection payload stays ordinary data. A
+transaction must be explicitly completed; an invocation that ends with one open
+rolls it back and fails closed, and no external HTTP or AI call is allowed while
+one is open. Query results are bounded deterministic JSON text.
+
+The complete contract is normative in
+[the database specification](spec/DATABASE.md).
+[`examples/database-webhook.krit`](examples/database-webhook.krit) runs against
+an owner-only database the operator provisions from
+[`examples/database-webhook.schema.sql`](examples/database-webhook.schema.sql);
+Krit never creates, migrates, or resets an application schema.
+
+```sh
+mkdir -p examples/data && chmod 700 examples/data
+sqlite3 examples/data/catalog.db < examples/database-webhook.schema.sql
+chmod 600 examples/data/catalog.db
+krit build --manifest examples/database-webhook.krit.pkg
+krit invoke \
+  --manifest examples/database-webhook.krit.pkg \
+  --host-config examples/database-webhook.host.json \
+  --request examples/webhook-agent.request.json
+```
+
+Krit does not claim atomicity between an application database and its own
+durable state: they are separate SQLite files, `db_commit` publishes
+immediately, and the two-resource window is documented rather than hidden. Every
+invocation exit rolls back any transaction the guest left open, SQLite work is
+interrupted at a bounded deadline, and write-ahead logging is refused because
+its on-disk size cannot be bounded.
+
 Krit does not lose or silently duplicate committed queue, schedule, or object
 state on one host. It does not provide distributed queues, brokers, consumer
 groups, cron expressions, guest-visible listing, or provider-side exactly
@@ -716,6 +787,8 @@ The specification is the semantic authority:
   stores, checkpoints, replay, and durable idempotency
 - [Jobs and object storage](spec/JOBS-AND-STORAGE.md) — durable queues,
   host-owned scheduled triggers, and bounded object buckets
+- [Database access](spec/DATABASE.md) — catalogued parameterized transactions
+  against an operator-owned database
 - [Narrow product MVP](docs/mvp.md)
 - [Agent platform roadmap](docs/agent-roadmap.md)
 - [Rust technical design](docs/technical-design.md)
@@ -762,7 +835,9 @@ The accepted implementation path is:
    (complete for local single-host coordination)
 10. typed durable queues, host-owned scheduled triggers, and bounded object
     storage (complete for local single-host coordination)
-11. capability-scoped database and cache services (Phase 7; next)
+11. capability-scoped catalogued parameterized database transactions (complete
+    for the local SQLite connector)
+12. cache and search services (Phase 7; next)
 
 Performance claims follow [docs/performance.md](docs/performance.md), not
 implementation-language assumptions.

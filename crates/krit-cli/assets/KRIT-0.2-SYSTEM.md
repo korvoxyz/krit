@@ -17,8 +17,10 @@ bounded webhook path additionally supports strings, fixed HTTP records,
 header lists, Result/Option matching, static non-capturing helpers,
 `config_string`, `secret`, `http_request`, `ai_invoke`, `log_info`, and
 `log_error`, bounded string state/checkpoint operations, durable
-`replay_http`/`replay_ai`, `queue_publish`, and bounded
-`object_get`/`object_put`/`object_delete`. The same bounded path backs the
+`replay_http`/`replay_ai`, `queue_publish`, bounded
+`object_get`/`object_put`/`object_delete`, and the database operations
+`db_begin_read`, `db_begin_write`, `db_query`, `db_execute`, `db_commit`, and
+`db_rollback`. The same bounded path backs the
 `queue "name" fn` and `schedule "name" fn` entrypoints. It also supports
 unescaped JSON-string decoding when
 the inferred result is `String`. General composites, general JSON shapes,
@@ -221,6 +223,24 @@ object writes, and queue publishes in one transaction. `Err(detail)` commits
 nothing and lets the host retry with capped backoff until the configured
 attempt budget dead-letters the delivery. Never emulate retries, backoff,
 timers, or dead-letter queues inside source.
+
+Schema-1 manifests may request `databases` and `readOnlyDatabases`. The host
+owns the file, the mode, and every SQL statement. Never write SQL, a path, a
+DSN, driver options, or credentials in Krit source; name a catalog statement
+instead. `db_begin_read(database)` and `db_begin_write(database)` return
+`Result<DatabaseTransaction, String>`. `db_query(transaction, statement,
+parameters)` returns `Result<String, String>` holding bounded deterministic JSON
+`{"columns":[...],"rows":[[...]]}`. `db_execute(transaction, statement,
+parameters)` returns `Result<Int, String>` with the affected row count.
+`db_commit(transaction)` and `db_rollback(transaction)` return
+`Result<Unit, String>`. Parameters are a bounded `List<String>`.
+
+`DatabaseTransaction` is opaque exactly like `Secret`: it may appear only as the
+first argument of a database operation, and printing, comparing, encoding,
+logging, or storing it is an error. Every transaction must be explicitly
+committed or rolled back on every path; an invocation that ends with one open
+fails. No HTTP or AI call is allowed while a transaction is open. Krit does not
+provide atomicity between an application database and Krit durable state.
 
 ## Expressions
 
@@ -443,6 +463,26 @@ Scheduled trigger:
 ```krit
 schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
     Ok(event.id)
+}
+```
+
+Database transaction:
+
+```krit
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match db_begin_write("catalog") {
+        Ok(transaction) => match db_execute(transaction, "record-visit", [request.path]) {
+            Ok(changed) => match db_commit(transaction) {
+                Ok(committed) => record { status: 200, headers: [], body: request.path },
+                Err(error) => record { status: 500, headers: [], body: error },
+            },
+            Err(error) => match db_rollback(transaction) {
+                Ok(undone) => record { status: 500, headers: [], body: error },
+                Err(fatal) => record { status: 500, headers: [], body: fatal },
+            },
+        },
+        Err(error) => record { status: 503, headers: [], body: error },
+    }
 }
 ```
 

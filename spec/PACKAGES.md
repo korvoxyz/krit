@@ -149,11 +149,14 @@ and consume authority are separately reviewable.
 `schedule.trigger("hourly-sweep")` requires one exact `schedules` entry.
 `object.write("render-output")` requires one exact `buckets` entry, and
 `object.read("render-output")` is satisfied by `buckets` or the disjoint
-read-only `readOnlyBuckets` list. Replay
+read-only `readOnlyBuckets` list. `database.write("catalog")` requires one exact
+`databases` entry, and `database.read("catalog")` is satisfied by `databases` or
+the disjoint `readOnlyDatabases` list. Replay
 operations separately retain their exact HTTP/AI requirement. Manifest state,
 queue, schedule, and bucket names are logical authority only; database paths,
 durability settings, lease durations, attempt budgets, and byte bounds are
-strict host configuration and never package data.
+strict host configuration and never package data. Database files, SQL text,
+statement catalogs, and schemas are likewise strict host configuration.
 Matching resources permit the bounded webhook backend only; unsupported
 general composite layouts still fail closed. Host-config adapter origins,
 secrets, retry/rate keys, and approval resources must also be manifest-granted

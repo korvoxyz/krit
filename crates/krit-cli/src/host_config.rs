@@ -10,10 +10,12 @@ use std::{
 use krit_package::Manifest;
 use krit_runtime::{
     AgentHost, AgentHostPolicy, AiAdapterConfig, ApprovalOperation, BucketDefinition, BucketPolicy,
-    Durability, DurableState, DurableStoreDefinition, DurableStoreLimits, ExplicitApprovalPolicy,
-    HostInputs, HttpJsonAdapterConfig, IdempotencyPolicy, QueueDefinition, QueuePolicy,
+    DatabaseCatalog, DatabaseDefinition, DatabaseLimits, DatabaseMode, Durability, DurableState,
+    DurableStoreDefinition, DurableStoreLimits, ExplicitApprovalPolicy, HostInputs,
+    HttpJsonAdapterConfig, IdempotencyPolicy, MAX_CATALOG_STATEMENTS, MAX_DATABASES,
+    MAX_PARAMETERS, MAX_RESULT_COLUMNS, ParameterType, QueueDefinition, QueuePolicy,
     RateLimitPolicy, RetentionPolicy, RetryPolicy, RuntimeLimits, ScheduleDefinition,
-    SchedulePolicy, SecretStore,
+    SchedulePolicy, SecretStore, StatementKind, StatementRequest,
 };
 use serde::Deserialize;
 
@@ -107,6 +109,85 @@ struct HostConfigV4 {
     state: StateFile,
     #[serde(default)]
     jobs: JobsFile,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostConfigV5 {
+    schema: u32,
+    #[serde(default)]
+    config: BTreeMap<String, String>,
+    #[serde(default)]
+    secrets: BTreeMap<String, SecretReference>,
+    #[serde(default)]
+    ai_adapters: BTreeMap<String, AiAdapterFile>,
+    #[serde(default)]
+    approvals: Vec<ApprovalFile>,
+    #[serde(default)]
+    retries: RetriesFile,
+    #[serde(default)]
+    rate_limits: RateLimitsFile,
+    #[serde(default)]
+    idempotency: IdempotencyFile,
+    state: StateFile,
+    #[serde(default)]
+    jobs: JobsFile,
+    #[serde(default)]
+    databases: BTreeMap<String, DatabaseFile>,
+    #[serde(default = "default_max_transactions")]
+    max_transactions_per_invocation: usize,
+}
+
+const fn default_max_transactions() -> usize {
+    1
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DatabaseFile {
+    path: PathBuf,
+    mode: DatabaseModeFile,
+    busy_timeout_ms: u64,
+    max_database_bytes: u64,
+    max_transaction_millis: u64,
+    max_operations_per_transaction: usize,
+    max_parameter_bytes: usize,
+    max_rows: usize,
+    max_columns: usize,
+    max_result_bytes: usize,
+    statements: BTreeMap<String, StatementFile>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum DatabaseModeFile {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StatementFile {
+    kind: StatementKindFile,
+    sql: String,
+    #[serde(default)]
+    parameters: Vec<ParameterTypeFile>,
+    #[serde(default)]
+    columns: Vec<String>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum StatementKindFile {
+    Query,
+    Execute,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ParameterTypeFile {
+    Text,
+    Integer,
 }
 
 #[derive(Default, Deserialize)]
@@ -440,7 +521,9 @@ pub(crate) fn load(
                 ))
             })?;
             debug_assert_eq!(file.schema, 2);
-            load_configured_host(path, manifest, limits, file, DurableState::default())
+            load_configured_host(path, manifest, limits, file, || {
+                Ok((DurableState::default(), DatabaseCatalog::default()))
+            })
         }
         3 => {
             let file: HostConfigV3 = serde_json::from_slice(&bytes).map_err(|error| {
@@ -450,7 +533,7 @@ pub(crate) fn load(
                 ))
             })?;
             debug_assert_eq!(file.schema, 3);
-            let durable = load_durable_state(path, manifest, file.state, &BTreeSet::new())?;
+            let resolved = resolve_durable_state(path, manifest, file.state, &BTreeSet::new())?;
             let compatible = HostConfigV2 {
                 schema: 2,
                 config: file.config,
@@ -461,7 +544,9 @@ pub(crate) fn load(
                 rate_limits: file.rate_limits,
                 idempotency: file.idempotency,
             };
-            load_configured_host(path, manifest, limits, compatible, durable)
+            load_configured_host(path, manifest, limits, compatible, || {
+                Ok((open_durable_state(resolved)?, DatabaseCatalog::default()))
+            })
         }
         4 => {
             let file: HostConfigV4 = serde_json::from_slice(&bytes).map_err(|error| {
@@ -474,10 +559,7 @@ pub(crate) fn load(
             let configured_stores = file.state.stores.keys().cloned().collect();
             let jobs = validate_jobs(manifest, file.jobs, &configured_stores)?;
             let host_owned = jobs.store_names();
-            let durable = load_durable_state(path, manifest, file.state, &host_owned)?;
-            let durable = durable
-                .with_jobs(jobs.queues, jobs.schedules, jobs.buckets)
-                .map_err(HostConfigError::durable)?;
+            let resolved = resolve_durable_state(path, manifest, file.state, &host_owned)?;
             let compatible = HostConfigV2 {
                 schema: 2,
                 config: file.config,
@@ -488,20 +570,70 @@ pub(crate) fn load(
                 rate_limits: file.rate_limits,
                 idempotency: file.idempotency,
             };
-            load_configured_host(path, manifest, limits, compatible, durable)
+            load_configured_host(path, manifest, limits, compatible, || {
+                let durable = open_durable_state(resolved)?
+                    .with_jobs(jobs.queues, jobs.schedules, jobs.buckets)
+                    .map_err(HostConfigError::durable)?;
+                Ok((durable, DatabaseCatalog::default()))
+            })
+        }
+        5 => {
+            let file: HostConfigV5 = serde_json::from_slice(&bytes).map_err(|error| {
+                HostConfigError::input(format!(
+                    "invalid strict schema-5 host config {}: {error}",
+                    path.display()
+                ))
+            })?;
+            debug_assert_eq!(file.schema, 5);
+            // Every database and job definition is resolved and validated
+            // before any store or application database is created or opened.
+            let prepared = validate_databases(manifest, &file.databases)?;
+            let configured_stores = file.state.stores.keys().cloned().collect();
+            let jobs = validate_jobs(manifest, file.jobs, &configured_stores)?;
+            let host_owned = jobs.store_names();
+            let resolved = resolve_durable_state(path, manifest, file.state, &host_owned)?;
+            let root = config_root(path)?;
+            reject_aliased_paths(&resolved.definitions, &prepared, &root)?;
+            let max_transactions = file.max_transactions_per_invocation;
+            let compatible = HostConfigV2 {
+                schema: 2,
+                config: file.config,
+                secrets: file.secrets,
+                ai_adapters: file.ai_adapters,
+                approvals: file.approvals,
+                retries: file.retries,
+                rate_limits: file.rate_limits,
+                idempotency: file.idempotency,
+            };
+            load_configured_host(path, manifest, limits, compatible, || {
+                // Application databases open first. Opening one never creates a
+                // file, so a catalog or live-schema failure cannot leave a
+                // freshly created or migrated durable state store behind.
+                let databases = open_databases(path, prepared, max_transactions)?;
+                let durable = open_durable_state(resolved)?
+                    .with_jobs(jobs.queues, jobs.schedules, jobs.buckets)
+                    .map_err(HostConfigError::durable)?;
+                Ok((durable, databases))
+            })
         }
         unsupported => Err(HostConfigError::input(format!(
-            "unsupported host config schema {unsupported}; expected 1, 2, 3, or 4"
+            "unsupported host config schema {unsupported}; expected 1, 2, 3, 4, or 5"
         ))),
     }
 }
 
+/// Validates every host policy and only then performs the durable side effects.
+///
+/// `open_durable` is a thunk deliberately: config inputs, secrets, AI adapters,
+/// retries, rate limits, idempotency, and approvals are all validated *before*
+/// any durable store or application database is created, opened, or migrated.
+/// An invalid policy therefore leaves the filesystem untouched.
 fn load_configured_host(
     path: &Path,
     manifest: &Manifest,
     limits: RuntimeLimits,
     file: HostConfigV2,
-    durable: DurableState,
+    open_durable: impl FnOnce() -> Result<(DurableState, DatabaseCatalog), HostConfigError>,
 ) -> Result<AgentHost, HostConfigError> {
     let inputs = load_inputs(path, manifest, limits, file.config, file.secrets)?;
     let mut policy = AgentHostPolicy::default();
@@ -578,7 +710,15 @@ fn load_configured_host(
     }
     let approvals = ExplicitApprovalPolicy::new(approvals)
         .map_err(|error| HostConfigError::input(error.message().to_owned()))?;
-    AgentHost::new_with_state(inputs, policy, Arc::new(approvals), durable)
+    // The assembled policy is validated here rather than inside the host
+    // constructor, so an invalid retry, rate, or idempotency bound is rejected
+    // before anything durable is touched.
+    krit_runtime::validate_policy(&policy)
+        .map_err(|error| HostConfigError::input(error.message().to_owned()))?;
+    // Everything above this line is pure validation; the durable side effects
+    // happen only once the whole configuration is known to be valid.
+    let (durable, databases) = open_durable()?;
+    AgentHost::new_with_resources(inputs, policy, Arc::new(approvals), durable, databases)
         .map_err(|error| HostConfigError::input(error.message().to_owned()))
 }
 
@@ -785,23 +925,36 @@ fn validate_jobs(
     })
 }
 
-fn load_durable_state(
+/// Canonical directory that every configured relative path resolves against.
+fn config_root(host_config_path: &Path) -> Result<PathBuf, HostConfigError> {
+    host_config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()
+        .map_err(|_| HostConfigError::input("host config directory is not accessible"))
+}
+
+/// Fully resolved durable state, before any file is created or migrated.
+struct ResolvedState {
+    definitions: BTreeMap<String, DurableStoreDefinition>,
+    idempotency_store: Option<String>,
+}
+
+/// Resolves and validates every durable store without touching the filesystem
+/// beyond reading what already exists.
+fn resolve_durable_state(
     host_config_path: &Path,
     manifest: &Manifest,
     state: StateFile,
     host_owned: &BTreeSet<String>,
-) -> Result<DurableState, HostConfigError> {
+) -> Result<ResolvedState, HostConfigError> {
     if state.stores.len() > MAX_STATE_STORES {
         return Err(HostConfigError::input(format!(
             "too many durable stores; maximum is {MAX_STATE_STORES}"
         )));
     }
-    let root = host_config_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .canonicalize()
-        .map_err(|_| HostConfigError::input("host config directory is not accessible"))?;
+    let root = config_root(host_config_path)?;
     let mut definitions = BTreeMap::new();
     let mut paths = BTreeMap::<PathBuf, String>::new();
     // Pass one validates and resolves every store without creating a file.
@@ -855,13 +1008,247 @@ fn load_durable_state(
             ));
         }
     }
-    // Pass two performs the side effects: create missing files, then open,
-    // validate, and migrate each database.
-    for definition in definitions.values() {
+    Ok(ResolvedState {
+        definitions,
+        idempotency_store: state.durable_idempotency_store,
+    })
+}
+
+/// Creates, opens, validates, and migrates every resolved durable store.
+///
+/// This is the first mutating step in loading a host configuration and runs
+/// only after every definition, limit, grant, and policy has been validated.
+fn open_durable_state(resolved: ResolvedState) -> Result<DurableState, HostConfigError> {
+    for definition in resolved.definitions.values() {
         create_state_database_file(&definition.path)?;
     }
-    DurableState::open(definitions, state.durable_idempotency_store)
+    DurableState::open(resolved.definitions, resolved.idempotency_store)
         .map_err(HostConfigError::durable)
+}
+
+/// Rejects any durable store and application database that would share a file.
+///
+/// A `database.write` grant must never reach Krit's own internal schema, and an
+/// application database must never be silently migrated by the state store. The
+/// comparison uses the canonical path plus, on Unix, the device and inode so
+/// that relative aliases, case aliases on case-insensitive filesystems, and
+/// hard links are all caught.
+fn reject_aliased_paths(
+    state: &BTreeMap<String, DurableStoreDefinition>,
+    databases: &[PreparedDatabase],
+    root: &Path,
+) -> Result<(), HostConfigError> {
+    let mut seen = BTreeMap::<FileIdentity, String>::new();
+    for definition in state.values() {
+        for identity in file_identities(&definition.path) {
+            if seen.insert(identity, "durable state".to_owned()).is_some() {
+                return Err(HostConfigError::input(
+                    "two durable stores resolve to the same file",
+                ));
+            }
+        }
+    }
+    for database in databases {
+        let path = root.join(&database.relative_path);
+        for identity in file_identities(&path) {
+            if let Some(previous) = seen.insert(identity, "application database".to_owned())
+                && previous == "durable state"
+            {
+                return Err(HostConfigError::input(
+                    "an application database and a durable state store resolve to the same file; \
+                     Krit's internal schema is never reachable through `database` grants",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Strongest available identity for one file path.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum FileIdentity {
+    /// Device and inode: catches hard links and every path alias.
+    Unix(u64, u64),
+    /// Canonical path: the strongest portable identity.
+    Canonical(PathBuf),
+    /// Lowercased canonical path, for case-insensitive filesystems.
+    CaseFolded(String),
+}
+
+/// Every identity a path is known by. A collision on any one is a collision.
+fn file_identities(path: &Path) -> Vec<FileIdentity> {
+    let mut identities = Vec::new();
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    identities.push(FileIdentity::Canonical(canonical.clone()));
+    if let Some(text) = canonical.to_str() {
+        let folded = text.to_lowercase();
+        if folded != text {
+            // Only meaningful when the filesystem folds case; an extra
+            // identity is harmless because it is compared against other
+            // folded identities only.
+            identities.push(FileIdentity::CaseFolded(folded));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if let Ok(metadata) = fs::metadata(&canonical) {
+            identities.push(FileIdentity::Unix(metadata.dev(), metadata.ino()));
+        }
+    }
+    identities
+}
+
+/// One validated database definition awaiting its file path.
+struct PreparedDatabase {
+    name: String,
+    relative_path: PathBuf,
+    mode: DatabaseMode,
+    limits: DatabaseLimits,
+    statements: BTreeMap<String, StatementRequest>,
+}
+
+/// Validates every database definition, grant, and limit with no I/O.
+fn validate_databases(
+    manifest: &Manifest,
+    databases: &BTreeMap<String, DatabaseFile>,
+) -> Result<Vec<PreparedDatabase>, HostConfigError> {
+    if databases.len() > MAX_DATABASES {
+        return Err(HostConfigError::input(
+            "configured application databases exceed the Phase 7 bound",
+        ));
+    }
+    let mut prepared = Vec::with_capacity(databases.len());
+    for (name, file) in databases {
+        let mode = match file.mode {
+            DatabaseModeFile::ReadOnly => DatabaseMode::ReadOnly,
+            DatabaseModeFile::ReadWrite => DatabaseMode::ReadWrite,
+        };
+        let granted = match mode {
+            DatabaseMode::ReadOnly => manifest.grants_permission("database.read", Some(name)),
+            DatabaseMode::ReadWrite => manifest.grants_permission("database.write", Some(name)),
+        };
+        if !granted {
+            return Err(HostConfigError::authorization(format!(
+                "application database `{name}` is not granted by the package manifest"
+            )));
+        }
+        validate_relative_database_path(&file.path)?;
+        let busy_timeout = milliseconds(file.busy_timeout_ms, "database busy timeout")?;
+        let max_transaction_duration =
+            milliseconds(file.max_transaction_millis, "database transaction bound")?;
+        if file.statements.is_empty() || file.statements.len() > MAX_CATALOG_STATEMENTS {
+            return Err(HostConfigError::input(
+                "application database must declare 1..=64 catalog statements",
+            ));
+        }
+        let database_limits = DatabaseLimits {
+            busy_timeout,
+            max_database_bytes: file.max_database_bytes,
+            max_transaction_duration,
+            max_operations_per_transaction: file.max_operations_per_transaction,
+            max_parameter_bytes: file.max_parameter_bytes,
+            max_rows: file.max_rows,
+            max_columns: file.max_columns,
+            max_result_bytes: file.max_result_bytes,
+        };
+        // Rejected here, in the pure phase, rather than at open time.
+        database_limits
+            .validate()
+            .map_err(|error| HostConfigError::input(error.message().to_owned()))?;
+        let mut statements = BTreeMap::new();
+        for (statement_name, statement) in &file.statements {
+            if !krit_capability::is_valid_resource_name(statement_name) {
+                return Err(HostConfigError::input(
+                    "database statement name must use the canonical resource grammar",
+                ));
+            }
+            if statement.parameters.len() > MAX_PARAMETERS
+                || statement.columns.len() > MAX_RESULT_COLUMNS
+            {
+                return Err(HostConfigError::input(
+                    "database statement parameters or columns exceed the Phase 7 bounds",
+                ));
+            }
+            statements.insert(
+                statement_name.clone(),
+                StatementRequest {
+                    kind: match statement.kind {
+                        StatementKindFile::Query => StatementKind::Query,
+                        StatementKindFile::Execute => StatementKind::Execute,
+                    },
+                    sql: statement.sql.clone(),
+                    parameters: statement
+                        .parameters
+                        .iter()
+                        .map(|parameter| match parameter {
+                            ParameterTypeFile::Text => ParameterType::Text,
+                            ParameterTypeFile::Integer => ParameterType::Integer,
+                        })
+                        .collect(),
+                    columns: statement.columns.clone(),
+                },
+            );
+        }
+        prepared.push(PreparedDatabase {
+            name: name.clone(),
+            relative_path: file.path.clone(),
+            mode,
+            limits: database_limits,
+            statements,
+        });
+    }
+    Ok(prepared)
+}
+
+/// Resolves paths and opens each validated database.
+fn open_databases(
+    host_config_path: &Path,
+    prepared: Vec<PreparedDatabase>,
+    max_transactions_per_invocation: usize,
+) -> Result<DatabaseCatalog, HostConfigError> {
+    if prepared.is_empty() {
+        return Ok(DatabaseCatalog::default());
+    }
+    let root = config_root(host_config_path)?;
+    let mut definitions = BTreeMap::new();
+    let mut paths = BTreeMap::<PathBuf, String>::new();
+    for database in prepared {
+        let path = resolve_state_database_path(
+            &root,
+            &database.relative_path,
+            database.limits.max_database_bytes,
+        )?;
+        if !path.exists() {
+            return Err(HostConfigError::input(
+                "application database file must already exist; Krit never creates or migrates an application schema",
+            ));
+        }
+        if let Some(previous) = paths.insert(path.clone(), database.name.clone()) {
+            return Err(HostConfigError::input(format!(
+                "application databases `{previous}` and `{}` use the same file",
+                database.name
+            )));
+        }
+        definitions.insert(
+            database.name,
+            DatabaseDefinition {
+                path,
+                mode: database.mode,
+                limits: database.limits,
+                statements: database.statements,
+            },
+        );
+    }
+    DatabaseCatalog::open(definitions, max_transactions_per_invocation)
+        .map_err(HostConfigError::durable)
+}
+
+/// Application database paths follow the same strict relative-path policy as
+/// durable state files.
+fn validate_relative_database_path(path: &Path) -> Result<(), HostConfigError> {
+    validate_relative_state_path(path)
 }
 
 fn validate_state_store_file(file: &StateStoreFile) -> Result<(), HostConfigError> {

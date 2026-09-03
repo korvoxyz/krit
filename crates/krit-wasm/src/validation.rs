@@ -9,16 +9,16 @@ use wit_component::DecodedWasm;
 
 use crate::{
     AI_INTERFACE, ARTIFACT_METADATA_SCHEMA, ApprovalRequirementMetadata, ArtifactMetadata,
-    BuildError, COMPILER_NAME, CONFIG_INTERFACE, EmbeddedMetadata, HTTP_ANONYMOUS_INTERFACE,
-    HTTP_INTERFACE, JOB_INTERFACE, LANGUAGE_NAME, LANGUAGE_VERSION, LOGGING_INTERFACE,
-    OBJECTS_READ_INTERFACE, OBJECTS_WRITE_INTERFACE, QUEUE_INTERFACE, ResourceRequirementMetadata,
-    SCHEDULE_INTERFACE, SECRETS_INTERFACE, STATE_INTERFACE, STDOUT_INTERFACE,
-    WASM_COMPONENT_TARGET, WEBHOOK_INTERFACE, artifact_policy_version,
+    BuildError, COMPILER_NAME, CONFIG_INTERFACE, DATABASE_INTERFACE, EmbeddedMetadata,
+    HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, JOB_INTERFACE, LANGUAGE_NAME, LANGUAGE_VERSION,
+    LOGGING_INTERFACE, OBJECTS_READ_INTERFACE, OBJECTS_WRITE_INTERFACE, QUEUE_INTERFACE,
+    ResourceRequirementMetadata, SCHEDULE_INTERFACE, SECRETS_INTERFACE, STATE_INTERFACE,
+    STDOUT_INTERFACE, WASM_COMPONENT_TARGET, WEBHOOK_INTERFACE, artifact_policy_version,
     wit::{
-        AI_EFFECT, CONFIG_EFFECT, HTTP_EFFECT, LOGGING_EFFECT, OBJECT_READ_EFFECT,
-        OBJECT_WRITE_EFFECT, ProgramKind, QUEUE_CONSUME_EFFECT, QUEUE_PUBLISH_EFFECT,
-        SCHEDULE_TRIGGER_EFFECT, SECRETS_EFFECT, STATE_EFFECT, STDOUT_EFFECT, WitContract,
-        contract_from_world, load_contract,
+        AI_EFFECT, CONFIG_EFFECT, DATABASE_READ_EFFECT, DATABASE_WRITE_EFFECT, HTTP_EFFECT,
+        LOGGING_EFFECT, OBJECT_READ_EFFECT, OBJECT_WRITE_EFFECT, ProgramKind, QUEUE_CONSUME_EFFECT,
+        QUEUE_PUBLISH_EFFECT, SCHEDULE_TRIGGER_EFFECT, SECRETS_EFFECT, STATE_EFFECT, STDOUT_EFFECT,
+        WitContract, contract_from_world, load_contract,
     },
 };
 
@@ -409,8 +409,18 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
             "component imports must be sorted and unique",
         ));
     }
-    let mut effects = Vec::with_capacity(imports.len());
+    let embedded =
+        embedded.ok_or_else(|| BuildError::artifact("component metadata section is missing"))?;
+    let mut effects = Vec::with_capacity(imports.len() + 1);
     for import in &imports {
+        // The narrow database interface is shared by read and write authority.
+        // The structural import proves database access exists; the exact split
+        // comes from the embedded requirement contract and is re-validated
+        // below, and the runtime still refuses any operation whose capability
+        // is absent from that contract.
+        if import == DATABASE_INTERFACE {
+            continue;
+        }
         effects.push(
             match import.as_str() {
                 STDOUT_INTERFACE => STDOUT_EFFECT,
@@ -436,7 +446,26 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
     if let Some(effect) = kind.export_effect() {
         effects.push(effect.to_owned());
     }
+    let database_imported = imports.iter().any(|import| import == DATABASE_INTERFACE);
+    let declared_database = embedded
+        .effects
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect.as_str(),
+                DATABASE_READ_EFFECT | DATABASE_WRITE_EFFECT
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if database_imported != !declared_database.is_empty() {
+        return Err(BuildError::artifact(
+            "component database imports and declared database effects disagree",
+        ));
+    }
+    effects.extend(declared_database);
     effects.sort();
+    effects.dedup();
     let (_, _, contract) = load_contract(kind, &effects)?;
     if contract.component_imports != imports || contract.component_export != exports[0] {
         return Err(BuildError::artifact(
@@ -464,8 +493,6 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
         )));
     }
 
-    let embedded =
-        embedded.ok_or_else(|| BuildError::artifact("component metadata section is missing"))?;
     if embedded.schema != ARTIFACT_METADATA_SCHEMA
         || embedded.compiler_version != env!("CARGO_PKG_VERSION")
         || embedded.edition != "2026"
@@ -610,7 +637,9 @@ fn valid_requirements(requirements: &[ResourceRequirementMetadata], effects: &[S
                     | QUEUE_CONSUME_EFFECT
                     | SCHEDULE_TRIGGER_EFFECT
                     | OBJECT_READ_EFFECT
-                    | OBJECT_WRITE_EFFECT => {
+                    | OBJECT_WRITE_EFFECT
+                    | DATABASE_READ_EFFECT
+                    | DATABASE_WRITE_EFFECT => {
                         krit_capability::is_valid_resource_name(&requirement.resource)
                     }
                     HTTP_EFFECT => {

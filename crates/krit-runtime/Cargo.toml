@@ -13,6 +13,7 @@ blake3.workspace = true
 curl.workspace = true
 http.workspace = true
 krit-capability.workspace = true
+krit-database.workspace = true
 krit-package.workspace = true
 krit-state.workspace = true
 krit-wasm.workspace = true
@@ -22,6 +23,7 @@ wasmtime.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 krit.workspace = true
 wasm-encoder.workspace = true
 wasm-metadata.workspace = true

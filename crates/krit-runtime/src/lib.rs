@@ -1,5 +1,6 @@
 mod ai;
 mod bindings;
+mod database;
 mod error;
 mod host;
 mod jobs;
@@ -33,12 +34,20 @@ use wasmtime::{
 };
 
 use ai::AiAdapter;
+pub use database::{
+    DatabaseCatalog, DatabaseDefinition, MAX_APPLICATION_DATABASE_BYTES, MAX_CATALOG_STATEMENTS,
+    MAX_DATABASE_BUSY_TIMEOUT, MAX_DATABASES, MAX_OPERATIONS_PER_TRANSACTION, MAX_PARAMETER_BYTES,
+    MAX_PARAMETERS, MAX_RESULT_BYTES, MAX_RESULT_COLUMNS, MAX_RESULT_ROWS,
+    MAX_TRANSACTION_DURATION, MAX_TRANSACTIONS_PER_INVOCATION, MINIMUM_APPLICATION_DATABASE_BYTES,
+    ParameterType, StatementKind,
+};
 use error::HostLimitError;
 pub use error::{RuntimeError, RuntimeErrorKind};
 pub use host::{HostInputs, MAX_HOST_INPUT_ENTRIES, NetworkPolicy, SecretStore};
 pub use jobs::{
     DeliveryExecutionResult, DeliveryOutcome, DeliveryRequest, MAX_OUTCOME_DETAIL_BYTES,
 };
+pub use krit_database::{DatabaseLimits, DatabaseMode, StatementRequest, TransactionMode};
 pub use krit_state::{JobDisposition, MINIMUM_DATABASE_BYTES, ScheduleCatchUp};
 pub use limits::{
     DEFAULT_LIMITS, HARD_MAX_LIMITS, HOST_POLICY_VERSION, HOST_STACK_HEADROOM_BYTES, RuntimeLimits,
@@ -52,6 +61,7 @@ pub use policy::{
     HttpJsonAdapterConfig, IdempotencyPolicy, MAX_IDEMPOTENCY_BYTES, MAX_IDEMPOTENCY_ENTRIES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDEMPOTENCY_TTL, MAX_POLICY_RESOURCES, MAX_RATE_CAPACITY,
     MAX_RATE_WINDOW, MAX_RETRY_ATTEMPTS, MAX_RETRY_DELAY, RateLimitPolicy, RetryPolicy,
+    validate_policy,
 };
 pub use state::{
     BucketDefinition, BucketPolicy, Durability, DurableState, DurableStoreDefinition,
@@ -99,6 +109,13 @@ pub struct ExecutionStats {
     pub object_reads: u64,
     pub object_writes: u64,
     pub queue_publishes: u64,
+    pub database_queries: u64,
+    pub database_executes: u64,
+    pub database_commits: u64,
+    pub database_rollbacks: u64,
+    pub database_write_committed: bool,
+    /// Transactions the host rolled back because the guest left them open.
+    pub database_transactions_abandoned: u64,
     pub output_bytes: usize,
     pub elapsed_micros: u128,
 }
@@ -135,6 +152,8 @@ struct HostState {
     active_dns_workers: Arc<AtomicUsize>,
     artifact_identity: [u8; 32],
     state: state::InvocationState,
+    databases: database::InvocationDatabases,
+    transaction_slots: usize,
 }
 
 struct HostStateConfig {
@@ -447,9 +466,11 @@ impl Runtime {
             Arc::clone(&self.active_deadline_workers),
         )?;
         let call = self.call_webhook(component, &mut store, request);
-        let timed_out = deadline
-            .finish()
-            .map_err(|error| error.with_events(store.data().events.clone()))?;
+        let elapsed = deadline.finish();
+        // Cleanup runs before any early return below so a trapped, timed-out,
+        // or invalid invocation cannot leak an open database transaction.
+        let transactions = finalize_transactions(store.data_mut());
+        let timed_out = elapsed.map_err(|error| error.with_events(store.data().events.clone()))?;
         if timed_out {
             return Err(RuntimeError::deadline("Wasm wall deadline exceeded")
                 .with_events(store.data().events.clone()));
@@ -458,6 +479,9 @@ impl Runtime {
         response
             .validate(self.limits)
             .map_err(|error| error.with_events(store.data().events.clone()))?;
+        if let Err(error) = transactions {
+            return Err(error.with_events(store.data().events.clone()));
+        }
         if store.data().state.touched() && store.data().cancellation.is_cancelled() {
             return Err(RuntimeError::cancelled(
                 "embedding cancellation requested before durable state commit",
@@ -513,6 +537,12 @@ impl Runtime {
                 object_reads: state.state.object_reads(),
                 object_writes: state.state.object_writes(),
                 queue_publishes: state.state.queue_publishes(),
+                database_queries: state.databases.queries(),
+                database_executes: state.databases.executes(),
+                database_commits: state.databases.commits(),
+                database_rollbacks: state.databases.rollbacks(),
+                database_write_committed: state.databases.published_write_commit(),
+                database_transactions_abandoned: state.databases.abandoned(),
                 output_bytes: state.output.len(),
                 elapsed_micros: started.elapsed().as_micros(),
             },
@@ -560,11 +590,16 @@ impl Runtime {
                 "validated artifact selected unsupported world `{world}`"
             ))),
         };
-        let timed_out = deadline.finish()?;
+        let elapsed = deadline.finish();
+        // These worlds import no database interface, but cleanup is
+        // unconditional so no exit path depends on that staying true.
+        let transactions = finalize_transactions(store.data_mut());
+        let timed_out = elapsed?;
         if timed_out {
             return Err(RuntimeError::deadline("Wasm wall deadline exceeded"));
         }
         call?;
+        transactions?;
 
         let remaining = store.get_fuel().map_err(|error| {
             RuntimeError::setup(format!("could not read remaining fuel: {error}"))
@@ -593,6 +628,12 @@ impl Runtime {
                 object_reads: 0,
                 object_writes: 0,
                 queue_publishes: 0,
+                database_queries: 0,
+                database_executes: 0,
+                database_commits: 0,
+                database_rollbacks: 0,
+                database_write_committed: false,
+                database_transactions_abandoned: 0,
                 output_bytes: state.output.len(),
                 elapsed_micros: started.elapsed().as_micros(),
             },
@@ -640,6 +681,12 @@ impl Runtime {
             object_reads: 0,
             object_writes: 0,
             queue_publishes: 0,
+            database_queries: 0,
+            database_executes: 0,
+            database_commits: 0,
+            database_rollbacks: 0,
+            database_write_committed: false,
+            database_transactions_abandoned: 0,
             output_bytes: 0,
             elapsed_micros: 0,
         }
@@ -816,6 +863,45 @@ impl Runtime {
                 )));
             }
         }
+        agent_host
+            .database_catalog()
+            .validate_for_runtime(self.limits.deadline())?;
+        for name in agent_host.database_catalog().names() {
+            let writable = agent_host.database_catalog().mode(name)
+                == Some(krit_database::DatabaseMode::ReadWrite);
+            let granted = grants.grants("database.read", Some(name))
+                || (writable && grants.grants("database.write", Some(name)));
+            if !granted {
+                return Err(RuntimeError::authorization(format!(
+                    "application database `{name}` is not granted by the manifest"
+                )));
+            }
+            if writable && !grants.grants("database.write", Some(name)) {
+                return Err(RuntimeError::authorization(format!(
+                    "application database `{name}` is configured writable without a write grant"
+                )));
+            }
+        }
+        for requirement in &metadata.requirements {
+            match requirement.capability.as_str() {
+                "database.read" => {
+                    agent_host
+                        .database_catalog()
+                        .database(&requirement.resource)?;
+                }
+                "database.write" => {
+                    let database = agent_host
+                        .database_catalog()
+                        .database(&requirement.resource)?;
+                    if database.mode() != krit_database::DatabaseMode::ReadWrite {
+                        return Err(RuntimeError::authorization(
+                            "artifact requires write authority on a read-only database",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
         let job_stores = agent_host.durable_state().job_store_names();
         for name in agent_host.durable_state().store_names() {
             if !grants.grants("state.transaction", Some(name)) && !job_stores.contains(name) {
@@ -939,6 +1025,8 @@ impl Runtime {
             active_dns_workers: Arc::clone(&self.active_dns_workers),
             artifact_identity,
             state: state::InvocationState::default(),
+            databases: database::InvocationDatabases::default(),
+            transaction_slots: 0,
         }
     }
 
@@ -1667,6 +1755,186 @@ impl bindings::webhook::krit::runtime::objects_write::Host for HostState {
     }
 }
 
+impl bindings::webhook::krit::runtime::database::HostTransaction for HostState {
+    fn drop(&mut self, handle: Resource<database::TransactionHandle>) -> wasmtime::Result<()> {
+        // Dropping a live handle is a guest-side abandonment. The transaction
+        // itself is owned by the invocation, not by this resource, so the
+        // rollback happens here *and* is guaranteed again at every invocation
+        // exit; the invocation still fails at its outcome boundary.
+        if let Ok(transaction) = self.resources.get(&handle) {
+            let slot = transaction.slot();
+            self.databases
+                .abandon_slot(slot)
+                .map_err(wasmtime::Error::new)?;
+        }
+        self.resources.delete(handle).map(|_| ()).map_err(|error| {
+            wasmtime::Error::msg(format!("database transaction drop failed: {error}"))
+        })
+    }
+}
+
+impl bindings::webhook::krit::runtime::database::Host for HostState {
+    fn begin_read(
+        &mut self,
+        database: String,
+    ) -> wasmtime::Result<Result<Resource<database::TransactionHandle>, String>> {
+        self.begin_transaction(database, krit_database::TransactionMode::Read)
+    }
+
+    fn begin_write(
+        &mut self,
+        database: String,
+    ) -> wasmtime::Result<Result<Resource<database::TransactionHandle>, String>> {
+        self.begin_transaction(database, krit_database::TransactionMode::Write)
+    }
+
+    fn db_query(
+        &mut self,
+        transaction: Resource<database::TransactionHandle>,
+        statement: String,
+        parameters: Vec<String>,
+    ) -> wasmtime::Result<Result<String, String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_statement_name(&statement)?;
+        let bounds = self.operation_bounds();
+        // `resources` and `databases` are disjoint fields, so the handle can be
+        // borrowed in place instead of being removed from the table.
+        let handle = self.resources.get(&transaction).map_err(|error| {
+            wasmtime::Error::new(RuntimeError::database_transaction(format!(
+                "database transaction handle is invalid: {error}"
+            )))
+        })?;
+        let slot = handle.slot();
+        let outcome = self
+            .databases
+            .query(slot, &statement, &parameters, &bounds)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(outcome))
+    }
+
+    fn db_execute(
+        &mut self,
+        transaction: Resource<database::TransactionHandle>,
+        statement: String,
+        parameters: Vec<String>,
+    ) -> wasmtime::Result<Result<i64, String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        self.require_statement_name(&statement)?;
+        let bounds = self.operation_bounds();
+        // `resources` and `databases` are disjoint fields, so the handle can be
+        // borrowed in place instead of being removed from the table.
+        let handle = self.resources.get(&transaction).map_err(|error| {
+            wasmtime::Error::new(RuntimeError::database_transaction(format!(
+                "database transaction handle is invalid: {error}"
+            )))
+        })?;
+        let slot = handle.slot();
+        let outcome = self
+            .databases
+            .execute(slot, &statement, &parameters, &bounds)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(outcome))
+    }
+
+    fn db_commit(
+        &mut self,
+        transaction: Resource<database::TransactionHandle>,
+    ) -> wasmtime::Result<Result<(), String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        let bounds = self.operation_bounds();
+        let handle = self.resources.get(&transaction).map_err(|error| {
+            wasmtime::Error::new(RuntimeError::database_transaction(format!(
+                "database transaction handle is invalid: {error}"
+            )))
+        })?;
+        let slot = handle.slot();
+        self.databases
+            .commit(slot, &bounds)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(()))
+    }
+
+    fn db_rollback(
+        &mut self,
+        transaction: Resource<database::TransactionHandle>,
+    ) -> wasmtime::Result<Result<(), String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        let handle = self.resources.get(&transaction).map_err(|error| {
+            wasmtime::Error::new(RuntimeError::database_transaction(format!(
+                "database transaction handle is invalid: {error}"
+            )))
+        })?;
+        let slot = handle.slot();
+        self.databases
+            .rollback(slot)
+            .map_err(wasmtime::Error::new)?;
+        Ok(Ok(()))
+    }
+}
+
+impl HostState {
+    fn begin_transaction(
+        &mut self,
+        database: String,
+        mode: krit_database::TransactionMode,
+    ) -> wasmtime::Result<Result<Resource<database::TransactionHandle>, String>> {
+        if let Some(error) = self.record_fallible_host_call()? {
+            return Ok(Err(error));
+        }
+        let capability = match mode {
+            krit_database::TransactionMode::Read => "database.read",
+            krit_database::TransactionMode::Write => "database.write",
+        };
+        self.require_grant(capability, &database)?;
+        let catalog = self.agent_host.database_catalog().clone();
+        let slot = self
+            .transaction_slots
+            .checked_add(1)
+            .ok_or_else(|| wasmtime::Error::new(HostLimitError::Calls))?;
+        self.transaction_slots = slot;
+        let bounds = self.operation_bounds();
+        let handle = self
+            .databases
+            .begin(&catalog, &database, mode, slot, &bounds)
+            .map_err(wasmtime::Error::new)?;
+        let resource = self.resources.push(handle).map_err(|error| {
+            wasmtime::Error::new(RuntimeError::resource(format!(
+                "database transaction table is full: {error}"
+            )))
+        })?;
+        Ok(Ok(resource))
+    }
+
+    /// Cooperative bounds handed to every database operation.
+    ///
+    /// SQLite work is interrupted at whichever comes first: the transaction's
+    /// own bound, the invocation deadline, or embedding cancellation.
+    fn operation_bounds(&self) -> krit_database::OperationBounds {
+        let cancellation = self.cancellation.clone();
+        krit_database::OperationBounds::new(
+            self.invocation_deadline,
+            Arc::new(move || cancellation.is_cancelled()),
+        )
+    }
+
+    fn require_statement_name(&self, statement: &str) -> wasmtime::Result<()> {
+        if krit_capability::is_valid_resource_name(statement) {
+            Ok(())
+        } else {
+            Err(wasmtime::Error::new(RuntimeError::database(
+                "database statement name is invalid",
+            )))
+        }
+    }
+}
 impl HostState {
     fn record_host_call(&mut self) -> wasmtime::Result<()> {
         let next = self
@@ -1705,6 +1973,19 @@ impl HostState {
         }
     }
 
+    /// Refuses an external effect while a database transaction is open.
+    ///
+    /// A SQLite write transaction holds a database lock; allowing a network
+    /// round trip inside one would make that lock window unbounded.
+    fn require_no_open_transaction(&self, operation: &str) -> wasmtime::Result<()> {
+        if self.databases.has_open_transaction() {
+            return Err(wasmtime::Error::new(RuntimeError::database_transaction(
+                format!("{operation} is not allowed while a database transaction is open"),
+            )));
+        }
+        Ok(())
+    }
+
     fn require_effect(&self, capability: &str) -> wasmtime::Result<()> {
         if self
             .grants
@@ -1738,6 +2019,7 @@ impl HostState {
         request: HttpRequest,
         bearer: Option<Resource<SecretHandle>>,
     ) -> wasmtime::Result<Result<HttpResponse, String>> {
+        self.require_no_open_transaction("outbound HTTP")?;
         self.require_grant("http.request", &origin)?;
         let parsed = krit_capability::HttpOrigin::parse_exact(&origin).map_err(|error| {
             wasmtime::Error::new(RuntimeError::authorization(format!(
@@ -1822,6 +2104,7 @@ impl HostState {
         input: String,
         stable_idempotency_key: Option<&str>,
     ) -> wasmtime::Result<Result<String, String>> {
+        self.require_no_open_transaction("AI invocation")?;
         self.require_grant("ai.invoke", &adapter_name)?;
         let next_ai_calls = self
             .ai_calls
@@ -2202,6 +2485,26 @@ fn stable_replay_idempotency_key(
 fn hash_replay_part(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(&(value.len() as u64).to_le_bytes());
     hasher.update(value);
+}
+
+/// Rejects an invocation that left a database transaction open.
+///
+/// Every still-open transaction is rolled back first, so no exit path - trap,
+/// deadline, cancellation, invalid response, or outcome failure - can leave a
+/// SQLite connection inside a transaction for the next invocation to inherit.
+/// Reporting success for work the guest never completed would be a
+/// success-shaped error, so the invocation then fails closed.
+pub(crate) fn finalize_transactions(state: &mut HostState) -> Result<(), RuntimeError> {
+    let unclosed = state.databases.has_open_transaction();
+    let cleanup = state.databases.abandon_all();
+    if unclosed {
+        // A cleanup failure is the more serious fact and is reported first.
+        cleanup?;
+        return Err(RuntimeError::database_transaction(
+            "invocation ended with an open database transaction",
+        ));
+    }
+    cleanup
 }
 
 /// Renders one durable identity as lowercase hexadecimal. Identities are

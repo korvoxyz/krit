@@ -2242,6 +2242,18 @@ impl<'a> Verifier<'a> {
                     resource(0)?,
                 )])
             }
+            Builtin::DatabaseBeginRead => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::DatabaseRead,
+                resource(0)?,
+            )]),
+            Builtin::DatabaseBeginWrite => Ok(vec![crate::CapabilityRequirement::new(
+                crate::Effect::DatabaseWrite,
+                resource(0)?,
+            )]),
+            Builtin::DatabaseQuery
+            | Builtin::DatabaseExecute
+            | Builtin::DatabaseCommit
+            | Builtin::DatabaseRollback => Ok(Vec::new()),
             Builtin::Print
             | Builtin::Println
             | Builtin::Some
@@ -2279,7 +2291,7 @@ impl<'a> Verifier<'a> {
                 ty,
                 &[Type::String, Type::String],
                 &Type::Result(Arc::new(Type::String), Arc::new(Type::String)),
-                crate::Effect::QueuePublish,
+                Some(crate::Effect::QueuePublish),
             ),
             Builtin::ObjectGet => verify_host_builtin(
                 builtin,
@@ -2289,21 +2301,64 @@ impl<'a> Verifier<'a> {
                     Arc::new(Type::Option(Arc::new(Type::String))),
                     Arc::new(Type::String),
                 ),
-                crate::Effect::ObjectRead,
+                Some(crate::Effect::ObjectRead),
             ),
             Builtin::ObjectPut => verify_host_builtin(
                 builtin,
                 ty,
                 &[Type::String, Type::String, Type::String],
                 &Type::Result(Arc::new(Type::Unit), Arc::new(Type::String)),
-                crate::Effect::ObjectWrite,
+                Some(crate::Effect::ObjectWrite),
             ),
             Builtin::ObjectDelete => verify_host_builtin(
                 builtin,
                 ty,
                 &[Type::String, Type::String],
                 &Type::Result(Arc::new(Type::Unit), Arc::new(Type::String)),
-                crate::Effect::ObjectWrite,
+                Some(crate::Effect::ObjectWrite),
+            ),
+            Builtin::DatabaseBeginRead => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::String],
+                &Type::Result(Arc::new(Type::DatabaseTransaction), Arc::new(Type::String)),
+                Some(crate::Effect::DatabaseRead),
+            ),
+            Builtin::DatabaseBeginWrite => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::String],
+                &Type::Result(Arc::new(Type::DatabaseTransaction), Arc::new(Type::String)),
+                Some(crate::Effect::DatabaseWrite),
+            ),
+            Builtin::DatabaseQuery => verify_host_builtin(
+                builtin,
+                ty,
+                &[
+                    Type::DatabaseTransaction,
+                    Type::String,
+                    Type::List(Arc::new(Type::String)),
+                ],
+                &Type::Result(Arc::new(Type::String), Arc::new(Type::String)),
+                None,
+            ),
+            Builtin::DatabaseExecute => verify_host_builtin(
+                builtin,
+                ty,
+                &[
+                    Type::DatabaseTransaction,
+                    Type::String,
+                    Type::List(Arc::new(Type::String)),
+                ],
+                &Type::Result(Arc::new(Type::Int), Arc::new(Type::String)),
+                None,
+            ),
+            Builtin::DatabaseCommit | Builtin::DatabaseRollback => verify_host_builtin(
+                builtin,
+                ty,
+                &[Type::DatabaseTransaction],
+                &Type::Result(Arc::new(Type::Unit), Arc::new(Type::String)),
+                None,
             ),
             Builtin::Print | Builtin::Println => {
                 let Type::Function(function) = ty else {
@@ -2837,7 +2892,7 @@ fn type_contains_no_function(ty: &Type) -> bool {
         | Type::QueueJob
         | Type::ScheduleEvent
         | Type::Variable(_) => true,
-        Type::Secret => false,
+        Type::DatabaseTransaction | Type::Secret => false,
     }
 }
 
@@ -2864,6 +2919,7 @@ fn type_contains_secret(ty: &Type) -> bool {
         | Type::LogField
         | Type::QueueJob
         | Type::ScheduleEvent
+        | Type::DatabaseTransaction
         | Type::Variable(_) => false,
     }
 }
@@ -2961,6 +3017,7 @@ fn type_has_residual(ty: &Type, visited: &mut HashSet<*const Type>) -> bool {
         | Type::LogField
         | Type::QueueJob
         | Type::ScheduleEvent
+        | Type::DatabaseTransaction
         | Type::Secret => false,
     }
 }
@@ -2970,7 +3027,7 @@ fn verify_host_builtin(
     ty: &Type,
     parameters: &[Type],
     result: &Type,
-    effect: crate::Effect,
+    effect: Option<crate::Effect>,
 ) -> Result<(), IrError> {
     let Type::Function(function) = ty else {
         return Err(IrError::new(format!("{builtin} has non-function type")));
@@ -2978,7 +3035,7 @@ fn verify_host_builtin(
     let expected = parameters.iter().cloned().map(Arc::new).collect::<Vec<_>>();
     if function.parameters() == expected.as_slice()
         && function.return_type() == result
-        && function.effects().contains(&effect)
+        && effect.is_none_or(|effect| function.effects().contains(&effect))
     {
         Ok(())
     } else {

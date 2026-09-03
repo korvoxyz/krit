@@ -407,6 +407,8 @@ impl Document {
             Builtin::ObjectGet | Builtin::ObjectPut | Builtin::ObjectDelete => {
                 &package.manifest.capabilities.buckets
             }
+            Builtin::DatabaseBeginWrite => &package.manifest.capabilities.databases,
+            Builtin::DatabaseBeginRead => &package.manifest.capabilities.read_only_databases,
             _ => return Vec::new(),
         };
         let replacement = self.lines.range(
@@ -791,7 +793,7 @@ impl Document {
                     .iter()
                     .map(|operation| DurableOperationFact {
                         kind: operation.kind().as_str(),
-                        store: operation.store().to_owned(),
+                        store: operation.store().map(str::to_owned),
                         identity: operation.identity().map(str::to_owned),
                         external_capability: operation.external_capability(),
                         external_resource: operation.external_resource().map(str::to_owned),
@@ -1101,6 +1103,8 @@ fn builtin_capability(builtin: Builtin) -> Option<&'static str> {
         Builtin::QueuePublish => Some("queue.publish"),
         Builtin::ObjectGet => Some("object.read"),
         Builtin::ObjectPut | Builtin::ObjectDelete => Some("object.write"),
+        Builtin::DatabaseBeginRead => Some("database.read"),
+        Builtin::DatabaseBeginWrite => Some("database.write"),
         _ => None,
     }
 }
@@ -1201,6 +1205,7 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
             | krit::TypeKind::LogField
             | krit::TypeKind::QueueJob
             | krit::TypeKind::ScheduleEvent
+            | krit::TypeKind::DatabaseTransaction
             | krit::TypeKind::Secret => {}
         }
     }
@@ -2171,7 +2176,8 @@ struct DurableStateFact {
 #[serde(rename_all = "camelCase")]
 struct DurableOperationFact {
     kind: &'static str,
-    store: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

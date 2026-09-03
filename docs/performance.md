@@ -43,6 +43,7 @@ The baseline suite contains:
 - queue publish, reservation, acknowledgement, retry, and dead-letter commits
 - schedule materialization, catch-up, and fire acknowledgement
 - object put/get/delete with replacement accounting and bucket byte checks
+- database begin, parameterized query, parameterized execute, and commit
 
 Inputs and expected checksums are versioned. Benchmarks do not print large
 results during timing.
@@ -131,6 +132,13 @@ Durable-state measurements separate SQLite open/integrity validation, indexed
 read, busy wait, WAL commit/fsync, replay serialization, and component/runtime
 overhead. FULL and NORMAL synchronization are reported separately. Replay-hit
 latency is never compared directly with provider/network latency.
+
+Database measurements separate catalog validation at configuration time, which
+happens once per host start, from per-transaction begin, statement, and commit
+cost. Row encoding is measured separately from SQLite execution because the
+bounded JSON document is Krit's own cost. Application database numbers are never
+reported as a server database benchmark: the connector is one local SQLite file
+with one connection.
 
 Delivery measurements separate reservation, guest execution, and the outcome
 commit, because only the last one is a durable write. Queue throughput is

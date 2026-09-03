@@ -58,6 +58,8 @@ impl FromStr for PermissionKey {
             capability,
             "ai.invoke"
                 | "config.read"
+                | "database.read"
+                | "database.write"
                 | "http.request"
                 | "object.read"
                 | "object.write"

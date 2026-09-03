@@ -1,0 +1,16 @@
+[package]
+name = "krit-database"
+description = "Capability-scoped parameterized SQLite database connector for Krit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

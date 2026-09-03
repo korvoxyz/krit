@@ -1,0 +1,11 @@
+schema = 1
+
+[package]
+name = "akshay/database-webhook"
+version = "0.2.0"
+edition = "2026"
+entry = "database-webhook.krit"
+license = "Apache-2.0"
+
+[capabilities]
+databases = ["catalog"]

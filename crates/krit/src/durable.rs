@@ -16,6 +16,12 @@ pub enum DurableOperationKind {
     ObjectGet,
     ObjectPut,
     ObjectDelete,
+    DatabaseBeginRead,
+    DatabaseBeginWrite,
+    DatabaseQuery,
+    DatabaseExecute,
+    DatabaseCommit,
+    DatabaseRollback,
 }
 
 impl DurableOperationKind {
@@ -32,6 +38,12 @@ impl DurableOperationKind {
             Self::ObjectGet => "object-get",
             Self::ObjectPut => "object-put",
             Self::ObjectDelete => "object-delete",
+            Self::DatabaseBeginRead => "database-begin-read",
+            Self::DatabaseBeginWrite => "database-begin-write",
+            Self::DatabaseQuery => "database-query",
+            Self::DatabaseExecute => "database-execute",
+            Self::DatabaseCommit => "database-commit",
+            Self::DatabaseRollback => "database-rollback",
         }
     }
 }
@@ -40,7 +52,7 @@ impl DurableOperationKind {
 pub struct DurableOperationFact {
     kind: DurableOperationKind,
     /// Durable store, queue, or bucket named by the first literal argument.
-    store: String,
+    store: Option<String>,
     identity: Option<String>,
     external_capability: Option<&'static str>,
     external_resource: Option<String>,
@@ -52,8 +64,12 @@ impl DurableOperationFact {
         self.kind
     }
 
-    pub fn store(&self) -> &str {
-        &self.store
+    /// The database, store, or bucket a durable operation names directly.
+    /// Database operations that receive an opaque transaction handle instead of
+    /// a literal database name report `None`; the handle's origin is reported by
+    /// the corresponding `database-begin-*` fact.
+    pub fn store(&self) -> Option<&str> {
+        self.store.as_deref()
     }
 
     pub fn identity(&self) -> Option<&str> {
@@ -171,7 +187,19 @@ fn operation_fact(
     arguments: &[Expression],
     span: Span,
 ) -> Option<DurableOperationFact> {
-    let store = string_argument(arguments, 0)?.to_owned();
+    // Operations that receive an opaque transaction handle carry the statement
+    // name, not a database name, so they are reported without a store.
+    if let Some(kind) = transaction_operation_kind(name) {
+        return Some(DurableOperationFact {
+            kind,
+            store: None,
+            identity: string_argument(arguments, 1).map(str::to_owned),
+            external_capability: None,
+            external_resource: None,
+            span,
+        });
+    }
+    let store = Some(string_argument(arguments, 0)?.to_owned());
     let (kind, identity, external_capability, external_resource) = match name {
         "state_get" => (
             DurableOperationKind::StateGet,
@@ -234,6 +262,8 @@ fn operation_fact(
             None,
             None,
         ),
+        "db_begin_read" => (DurableOperationKind::DatabaseBeginRead, None, None, None),
+        "db_begin_write" => (DurableOperationKind::DatabaseBeginWrite, None, None, None),
         _ => return None,
     };
     Some(DurableOperationFact {
@@ -243,6 +273,16 @@ fn operation_fact(
         external_capability,
         external_resource,
         span,
+    })
+}
+
+const fn transaction_operation_kind(name: &str) -> Option<DurableOperationKind> {
+    Some(match name.as_bytes() {
+        b"db_query" => DurableOperationKind::DatabaseQuery,
+        b"db_execute" => DurableOperationKind::DatabaseExecute,
+        b"db_commit" => DurableOperationKind::DatabaseCommit,
+        b"db_rollback" => DurableOperationKind::DatabaseRollback,
+        _ => return None,
     })
 }
 

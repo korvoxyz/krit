@@ -745,7 +745,10 @@ fn ast_sensitive_literal_spans(
                             (1, "replay-operation"),
                             (2, "capability-resource"),
                         ],
-                        "queue_publish" => &[(0, "capability-resource")],
+                        "queue_publish" | "db_begin_read" | "db_begin_write" => {
+                            &[(0, "capability-resource")]
+                        }
+                        "db_execute" | "db_query" => &[(1, "database-statement")],
                         "object_delete" | "object_get" | "object_put" => {
                             &[(0, "capability-resource"), (1, "object-key")]
                         }

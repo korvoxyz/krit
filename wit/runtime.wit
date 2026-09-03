@@ -639,6 +639,29 @@ interface schedule {
     handle: func(trigger: trigger) -> result<string, string>;
 }
 
+interface database {
+    /// Opaque host-owned transaction handle.
+    ///
+    /// The guest can only pass it to the operations below: it is never
+    /// serializable, comparable, storable, or loggable.
+    resource transaction;
+
+    begin-read: func(database: string) -> result<transaction, string>;
+    begin-write: func(database: string) -> result<transaction, string>;
+    db-query: func(
+        transaction: borrow<transaction>,
+        statement: string,
+        parameters: list<string>,
+    ) -> result<string, string>;
+    db-execute: func(
+        transaction: borrow<transaction>,
+        statement: string,
+        parameters: list<string>,
+    ) -> result<s64, string>;
+    db-commit: func(transaction: borrow<transaction>) -> result<_, string>;
+    db-rollback: func(transaction: borrow<transaction>) -> result<_, string>;
+}
+
 world webhook-host-program {
     import stdout;
     import config;
@@ -651,6 +674,7 @@ world webhook-host-program {
     import queue;
     import objects-read;
     import objects-write;
+    import database;
     export webhook;
 }
 
@@ -666,6 +690,7 @@ world job-host-program {
     import queue;
     import objects-read;
     import objects-write;
+    import database;
     export job;
 }
 
@@ -681,5 +706,6 @@ world schedule-host-program {
     import queue;
     import objects-read;
     import objects-write;
+    import database;
     export schedule;
 }

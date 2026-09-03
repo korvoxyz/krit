@@ -941,6 +941,78 @@ fn encode_builtin_call(
             load_value(function, context, operation.result)?;
             call_import(function, context, "object-delete")?;
         }
+        Builtin::DatabaseBeginRead | Builtin::DatabaseBeginWrite => {
+            let [database] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "database begin call does not have one argument",
+                ));
+            };
+            // `result<transaction, string>` flattens to a discriminant plus one
+            // i32 payload word, so the return area is 12 bytes with the payload
+            // at offset 4.
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_string_flat(function, context, *database)?;
+            load_value(function, context, operation.result)?;
+            call_import(
+                function,
+                context,
+                if builtin == Builtin::DatabaseBeginRead {
+                    "begin-read"
+                } else {
+                    "begin-write"
+                },
+            )?;
+        }
+        Builtin::DatabaseQuery | Builtin::DatabaseExecute => {
+            let [transaction, statement, parameters] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "database operation call does not have three arguments",
+                ));
+            };
+            let size = if builtin == Builtin::DatabaseQuery {
+                12
+            } else {
+                16
+            };
+            let align = if builtin == Builtin::DatabaseQuery {
+                4
+            } else {
+                8
+            };
+            allocate_result(function, context, operation.result, size, align)?;
+            load_value(function, context, *transaction)?;
+            load_string_flat(function, context, *statement)?;
+            load_string_flat(function, context, *parameters)?;
+            load_value(function, context, operation.result)?;
+            call_import(
+                function,
+                context,
+                if builtin == Builtin::DatabaseQuery {
+                    "db-query"
+                } else {
+                    "db-execute"
+                },
+            )?;
+        }
+        Builtin::DatabaseCommit | Builtin::DatabaseRollback => {
+            let [transaction] = arguments else {
+                return Err(BuildError::invalid_core(
+                    "database completion call does not have one argument",
+                ));
+            };
+            allocate_result(function, context, operation.result, 12, 4)?;
+            load_value(function, context, *transaction)?;
+            load_value(function, context, operation.result)?;
+            call_import(
+                function,
+                context,
+                if builtin == Builtin::DatabaseCommit {
+                    "db-commit"
+                } else {
+                    "db-rollback"
+                },
+            )?;
+        }
         Builtin::Print | Builtin::Println => {
             let argument = arguments
                 .first()
@@ -1201,21 +1273,22 @@ fn encode_header_list(
     operation: &CoreOperation,
     values: &[ValueId],
 ) -> Result<(), BuildError> {
+    let element = list_element_layout(&operation.ty)?;
     let byte_size = u32::try_from(values.len())
         .ok()
-        .and_then(|length| length.checked_mul(16))
-        .ok_or_else(|| BuildError::artifact("header list is too large"))?;
+        .and_then(|length| length.checked_mul(element.size))
+        .ok_or_else(|| BuildError::artifact("list is too large"))?;
     if byte_size == 0 {
         function.instruction(&Instruction::I32Const(0));
         function.instruction(&Instruction::LocalSet(context.scratch_i32));
     } else {
-        allocate_to_scratch(function, context, byte_size, 4)?;
+        allocate_to_scratch(function, context, byte_size, element.align)?;
         for (index, value) in values.iter().enumerate() {
             let offset = u32::try_from(index)
                 .ok()
-                .and_then(|index| index.checked_mul(16))
-                .ok_or_else(|| BuildError::artifact("header list offset overflow"))?;
-            for word in [0u32, 4, 8, 12] {
+                .and_then(|index| index.checked_mul(element.size))
+                .ok_or_else(|| BuildError::artifact("list offset overflow"))?;
+            for word in (0..element.size).step_by(4) {
                 function.instruction(&Instruction::LocalGet(context.scratch_i32));
                 load_value(function, context, *value)?;
                 function.instruction(&Instruction::I32Load(memarg(word, 2)));
@@ -1229,8 +1302,7 @@ fn encode_header_list(
     function.instruction(&Instruction::I32Store(memarg(0, 2)));
     load_value(function, context, operation.result)?;
     function.instruction(&Instruction::I32Const(
-        i32::try_from(values.len())
-            .map_err(|_| BuildError::artifact("header list length exceeds i32"))?,
+        i32::try_from(values.len()).map_err(|_| BuildError::artifact("list length exceeds i32"))?,
     ));
     function.instruction(&Instruction::I32Store(memarg(4, 2)));
     Ok(())
@@ -2151,6 +2223,7 @@ fn value_layout(ty: &Type) -> Result<Option<Scalar>, BuildError> {
         | Type::LogField
         | Type::QueueJob
         | Type::ScheduleEvent
+        | Type::DatabaseTransaction
         | Type::Secret
         | Type::List(_)
         | Type::Record(_)
@@ -2172,7 +2245,7 @@ struct Layout {
 }
 
 fn memory_layout(ty: &Type) -> Result<Layout, BuildError> {
-    if is_string(ty) || is_header_list(ty) || is_log_field_list(ty) {
+    if is_string(ty) || is_header_list(ty) || is_log_field_list(ty) || is_string_list(ty) {
         return Ok(Layout {
             size: 8,
             align: 4,
@@ -2258,6 +2331,24 @@ fn variant_layout(ty: &Type) -> Result<Layout, BuildError> {
                 size: 12,
                 align: 4,
                 payload_offset: 4,
+            })
+        }
+        Type::Result(value, error)
+            if value.as_ref() == &Type::DatabaseTransaction && error.as_ref() == &Type::String =>
+        {
+            Ok(Layout {
+                size: 12,
+                align: 4,
+                payload_offset: 4,
+            })
+        }
+        Type::Result(value, error)
+            if value.as_ref() == &Type::Int && error.as_ref() == &Type::String =>
+        {
+            Ok(Layout {
+                size: 16,
+                align: 8,
+                payload_offset: 8,
             })
         }
         Type::Result(value, error)
@@ -2368,6 +2459,37 @@ fn is_pointer_value(ty: &Type) -> bool {
             | Type::Option(_)
             | Type::Result(_, _)
     )
+}
+
+/// Element layout of a bounded list the webhook ABI supports.
+fn list_element_layout(ty: &Type) -> Result<Layout, BuildError> {
+    let Type::List(element) = ty else {
+        return Err(BuildError::invalid_core(
+            "list operation has a non-list type",
+        ));
+    };
+    if is_header(element) || is_log_field(element) {
+        return Ok(Layout {
+            size: 16,
+            align: 4,
+            payload_offset: 0,
+        });
+    }
+    if is_string(element) {
+        return Ok(Layout {
+            size: 8,
+            align: 4,
+            payload_offset: 0,
+        });
+    }
+    Err(BuildError::unsupported(
+        format!("list of `{element}` is outside the bounded webhook ABI"),
+        None,
+    ))
+}
+
+fn is_string_list(ty: &Type) -> bool {
+    matches!(ty, Type::List(element) if is_string(element))
 }
 
 fn is_string(ty: &Type) -> bool {

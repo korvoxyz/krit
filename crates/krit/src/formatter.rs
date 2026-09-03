@@ -653,6 +653,7 @@ impl SyntaxCollector {
             | TypeKind::LogField
             | TypeKind::QueueJob
             | TypeKind::ScheduleEvent
+            | TypeKind::DatabaseTransaction
             | TypeKind::Secret => {}
         }
     }

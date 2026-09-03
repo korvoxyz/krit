@@ -249,8 +249,41 @@ exactly once remain explicitly unclaimed.
 
 ## Phase 7: data services
 
-- capability-scoped parameterized database operations
-- explicit transaction boundaries
+**Status:** In progress
+
+### `phase7-database`
+
+**Status:** Complete
+
+- opaque non-serializable `DatabaseTransaction` handles with explicit
+  `db_begin_read`/`db_begin_write`, named parameterized query and execute, and
+  explicit `db_commit`/`db_rollback`
+- host-owned strict statement catalog validated against the live schema:
+  one statement, ordinal placeholders, declared parameter types and result
+  columns, read-only queries versus mutating executes, and rejected
+  `PRAGMA`/`ATTACH`/`DETACH`/`VACUUM`/transaction-control/schema SQL
+- separate `database.read` and `database.write` authority per named database
+  through parser, analyzer, Core, WIT, manifest, permissions, explain, LSP, and
+  assist redaction
+- strict host config schema 5 that can only narrow manifest-granted databases
+  and owns every path, mode, bound, and statement
+- an isolated `krit-database` crate that shares no schema or migration logic
+  with the Krit durable-state store and adds no dependency
+
+Gate met: `crates/krit-runtime/tests/database.rs` and the checked-in
+`examples/database-webhook.krit` and its operator-owned
+`examples/database-webhook.schema.sql` run a parameterized mutation and query inside
+one explicit transaction, prove injection payloads stay data, and prove an
+unclosed, trapped, or cancelled invocation rolls the transaction back.
+
+Krit does not claim atomicity between an application database and Krit state:
+they are separate SQLite files, `db_commit` publishes immediately, and the
+two-resource window is documented rather than hidden.
+
+### `phase7-cache-search`
+
+**Status:** Not started
+
 - cache with namespace, TTL, size, and miss behavior
 - search/vector connectors as libraries
 

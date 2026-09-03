@@ -109,12 +109,15 @@ queue.consume
 schedule.trigger
 object.read
 object.write
+database.read
+database.write
 ```
 
 Implemented analysis recognizes `io.stdout`, `config.read`, `secret.read`,
 `http.request`, `ai.invoke`, `observe.log`, `state.transaction`,
-`queue.publish`, `queue.consume`, `schedule.trigger`, `object.read`, and
-`object.write`. Pure functions have an empty
+`queue.publish`, `queue.consume`, `schedule.trigger`, `object.read`,
+`object.write`, `database.read`, and `database.write`. Pure functions have an
+empty
 effect set. Calling a function adds its effects to the caller,
 including recursive and higher-order propagation. Branch and match effects
 are conservative unions. JSON conversion is pure.
@@ -129,8 +132,11 @@ is the ordered pair `(capability, resource)`, currently
 `http.request`/exact-origin, `ai.invoke`/adapter-name,
 `state.transaction`/store-name, `queue.publish`/queue-name,
 `queue.consume`/queue-name, `schedule.trigger`/schedule-name, or
-`object.read`/`object.write`/bucket-name. Replay operations carry the state
-effect and both the store and exact external HTTP/AI requirements.
+`object.read`/`object.write`/bucket-name, or
+`database.read`/`database.write`/database-name. Replay operations carry the
+state effect and both the store and exact external HTTP/AI requirements.
+Database query, execute, commit, and rollback carry no effect of their own:
+their authority is the opaque transaction handle they receive.
 `queue.consume` and `schedule.trigger` come from the entrypoint declaration
 rather than a call. Coarse effects
 never erase or replace these resource identities. `Analysis` also exposes

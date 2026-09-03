@@ -1007,14 +1007,24 @@ version = "0.2.0"
 dependencies = [
  "krit",
  "krit-assist",
+ "krit-capability",
  "krit-lsp",
  "krit-package",
  "krit-runtime",
  "krit-wasm",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",
  "tiny_http",
+]
+
+[[package]]
+name = "krit-database"
+version = "0.2.0"
+dependencies = [
+ "rusqlite",
+ "serde_json",
 ]
 
 [[package]]
@@ -1051,9 +1061,11 @@ dependencies = [
  "http",
  "krit",
  "krit-capability",
+ "krit-database",
  "krit-package",
  "krit-state",
  "krit-wasm",
+ "rusqlite",
  "serde",
  "serde_json",
  "wasm-encoder 0.258.0",

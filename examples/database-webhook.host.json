@@ -1,0 +1,33 @@
+{
+  "schema": 5,
+  "state": { "stores": {} },
+  "maxTransactionsPerInvocation": 1,
+  "databases": {
+    "catalog": {
+      "path": "data/catalog.db",
+      "mode": "read-write",
+      "busyTimeoutMs": 250,
+      "maxDatabaseBytes": 16777216,
+      "maxTransactionMillis": 500,
+      "maxOperationsPerTransaction": 16,
+      "maxParameterBytes": 4096,
+      "maxRows": 64,
+      "maxColumns": 8,
+      "maxResultBytes": 65536,
+      "statements": {
+        "record-visit": {
+          "kind": "execute",
+          "sql": "INSERT INTO visits(path) VALUES(?1)",
+          "parameters": ["text"],
+          "columns": []
+        },
+        "count-visits": {
+          "kind": "query",
+          "sql": "SELECT COUNT(*) AS total FROM visits",
+          "parameters": [],
+          "columns": ["total"]
+        }
+      }
+    }
+  }
+}

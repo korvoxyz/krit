@@ -842,6 +842,7 @@ impl Parser {
             "LogField" => TypeKind::LogField,
             "QueueJob" => TypeKind::QueueJob,
             "ScheduleEvent" => TypeKind::ScheduleEvent,
+            "DatabaseTransaction" => TypeKind::DatabaseTransaction,
             "Secret" => TypeKind::Secret,
             "List" => {
                 self.expect(TokenKind::Less)?;

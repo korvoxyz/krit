@@ -1,0 +1,21 @@
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match db_begin_write("catalog") {
+        Ok(transaction) => match db_execute(transaction, "record-visit", [request.path]) {
+            Ok(changed) => match db_query(transaction, "count-visits", []) {
+                Ok(rows) => match db_commit(transaction) {
+                    Ok(committed) => record { status: 200, headers: [], body: rows },
+                    Err(error) => record { status: 500, headers: [], body: error },
+                },
+                Err(error) => match db_rollback(transaction) {
+                    Ok(undone) => record { status: 500, headers: [], body: error },
+                    Err(fatal) => record { status: 500, headers: [], body: fatal },
+                },
+            },
+            Err(error) => match db_rollback(transaction) {
+                Ok(undone) => record { status: 500, headers: [], body: error },
+                Err(fatal) => record { status: 500, headers: [], body: fatal },
+            },
+        },
+        Err(error) => record { status: 503, headers: [], body: error },
+    }
+}

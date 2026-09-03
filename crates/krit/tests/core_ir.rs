@@ -282,7 +282,7 @@ fn every_valid_repository_program_lowers_and_verifies() {
         count += 1;
         remaining = &code[end + "\n```".len()..];
     }
-    assert_eq!(count, 10);
+    assert_eq!(count, 11);
 }
 
 #[test]

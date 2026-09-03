@@ -35,6 +35,8 @@ queue.consume
 schedule.trigger
 object.read
 object.write
+database.read
+database.write
 ```
 
 Unknown capability identifiers are errors. Names are versioned through the
@@ -58,6 +60,8 @@ consumes = ["render-jobs"]
 schedules = ["hourly-sweep"]
 buckets = ["render-output"]
 readOnlyBuckets = ["reference"]
+databases = ["catalog"]
+readOnlyDatabases = ["reference-data"]
 ```
 
 The schema-1 manifest implements requests for `stdout`, `config`, `http`,
@@ -70,9 +74,14 @@ the two lists are disjoint). The language emits literal-resource facts for
 `schedule.trigger` come from the `queue` and `schedule` entrypoint
 declarations, and `observe.log` is resource-free. Files, generic sockets,
 processes, environment variables, clocks, and randomness remain unavailable.
+Application databases add `databases` (read and write) and `readOnlyDatabases`
+(read only); the two lists are disjoint and yield `database.read` and
+`database.write` requirements per named database.
 Durable state, queues, schedules, and buckets are available only through exact
 named resources that a host configuration binds to owner-only stores; see
-[JOBS-AND-STORAGE.md](JOBS-AND-STORAGE.md).
+[JOBS-AND-STORAGE.md](JOBS-AND-STORAGE.md). Application databases are
+operator-owned files with a host-owned statement catalog; see
+[DATABASE.md](DATABASE.md).
 
 Paths are package-root-relative and resolved before execution. A lexical path
 that escapes the granted root is rejected. Symlink and platform-specific path

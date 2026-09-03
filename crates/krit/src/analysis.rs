@@ -259,6 +259,7 @@ pub enum Type {
     LogField,
     QueueJob,
     ScheduleEvent,
+    DatabaseTransaction,
     Secret,
     List(Arc<Self>),
     Record(Vec<RecordType>),
@@ -282,6 +283,7 @@ impl Type {
             | Self::Bool
             | Self::String
             | Self::Unit
+            | Self::DatabaseTransaction
             | Self::Secret
             | Self::List(_)
             | Self::Option(_)
@@ -343,6 +345,7 @@ fn render_type_bounded(ty: &Type, writer: &mut BoundedTypeWriter, depth: usize) 
         Type::LogField => writer.write_str("LogField"),
         Type::QueueJob => writer.write_str("QueueJob"),
         Type::ScheduleEvent => writer.write_str("ScheduleEvent"),
+        Type::DatabaseTransaction => writer.write_str("DatabaseTransaction"),
         Type::Secret => writer.write_str("Secret"),
         Type::List(element) => {
             writer.write_str("List<")?;
@@ -423,6 +426,7 @@ impl fmt::Display for Type {
             Self::LogField => formatter.write_str("LogField"),
             Self::QueueJob => formatter.write_str("QueueJob"),
             Self::ScheduleEvent => formatter.write_str("ScheduleEvent"),
+            Self::DatabaseTransaction => formatter.write_str("DatabaseTransaction"),
             Self::Secret => formatter.write_str("Secret"),
             Self::List(element) => write!(formatter, "List<{element}>"),
             Self::Record(fields) => {
@@ -536,6 +540,8 @@ impl fmt::Display for FunctionType {
 pub enum Effect {
     AiInvoke,
     ConfigRead,
+    DatabaseRead,
+    DatabaseWrite,
     HttpRequest,
     IoStdout,
     ObjectRead,
@@ -553,6 +559,8 @@ impl Effect {
         match self {
             Self::AiInvoke => "ai.invoke",
             Self::ConfigRead => "config.read",
+            Self::DatabaseRead => "database.read",
+            Self::DatabaseWrite => "database.write",
             Self::HttpRequest => "http.request",
             Self::IoStdout => "io.stdout",
             Self::ObjectRead => "object.read",
@@ -715,6 +723,7 @@ enum InferType {
     LogField,
     QueueJob,
     ScheduleEvent,
+    DatabaseTransaction,
     Secret,
     List(Box<Self>),
     Record {
@@ -1205,6 +1214,12 @@ impl Analyzer {
                             | Builtin::ObjectGet
                             | Builtin::ObjectPut
                             | Builtin::ObjectDelete
+                            | Builtin::DatabaseBeginRead
+                            | Builtin::DatabaseBeginWrite
+                            | Builtin::DatabaseQuery
+                            | Builtin::DatabaseExecute
+                            | Builtin::DatabaseCommit
+                            | Builtin::DatabaseRollback
                     )
                 ) {
                     let ResolvedName::Builtin(builtin) = resolution else {
@@ -1549,6 +1564,23 @@ impl Analyzer {
                     let bucket = require_canonical_literal(bucket, builtin, "object bucket")?;
                     vec![CapabilityRequirement::new(effect, bucket)]
                 }
+                (Builtin::DatabaseBeginRead | Builtin::DatabaseBeginWrite, [database]) => {
+                    let effect = if builtin == Builtin::DatabaseBeginRead {
+                        Effect::DatabaseRead
+                    } else {
+                        Effect::DatabaseWrite
+                    };
+                    let database =
+                        require_canonical_literal(database, builtin, "application database")?;
+                    vec![CapabilityRequirement::new(effect, database)]
+                }
+                (Builtin::DatabaseQuery | Builtin::DatabaseExecute, [_, statement, _]) => {
+                    // The database authority comes from the transaction handle;
+                    // the statement identity must still be a direct literal so
+                    // the catalog entry is auditable in source.
+                    require_canonical_literal(statement, builtin, "database statement")?;
+                    Vec::new()
+                }
                 (Builtin::ReplayAi, [store, operation, adapter, _]) => {
                     let store = require_canonical_literal(store, builtin, "durable state store")?;
                     require_canonical_literal(operation, builtin, "replay operation")?;
@@ -1643,7 +1675,18 @@ impl Analyzer {
                     direct_builtin,
                     Some(Builtin::HttpRequest) if index == 2
                 ) || self.allowed_secret_constructor_spans.contains(&callee.span);
-            if !approved_secret_use {
+            // A transaction handle may appear only as the first argument of a
+            // database operation; every other position rejects it.
+            let approved_transaction_use = matches!(
+                direct_builtin,
+                Some(
+                    Builtin::DatabaseQuery
+                        | Builtin::DatabaseExecute
+                        | Builtin::DatabaseCommit
+                        | Builtin::DatabaseRollback
+                ) if index == 0
+            );
+            if !approved_secret_use && !approved_transaction_use {
                 self.constraints.push(TypeConstraint {
                     ty: argument.clone(),
                     span: arguments[index].span,
@@ -1839,6 +1882,7 @@ impl Analyzer {
             TypeKind::LogField => InferType::LogField,
             TypeKind::QueueJob => InferType::QueueJob,
             TypeKind::ScheduleEvent => InferType::ScheduleEvent,
+            TypeKind::DatabaseTransaction => InferType::DatabaseTransaction,
             TypeKind::Secret => InferType::Secret,
             TypeKind::List(element) => InferType::List(Box::new(self.annotation(element))),
             TypeKind::Option(element) => InferType::Option(Box::new(self.annotation(element))),
@@ -2071,6 +2115,9 @@ impl Analyzer {
             (InferType::HttpResponse, InferType::HttpResponse) => Ok(InferType::HttpResponse),
             (InferType::LogField, InferType::LogField) => Ok(InferType::LogField),
             (InferType::Secret, InferType::Secret) => Ok(InferType::Secret),
+            (InferType::DatabaseTransaction, InferType::DatabaseTransaction) => {
+                Ok(InferType::DatabaseTransaction)
+            }
             (
                 nominal @ (InferType::HttpHeader
                 | InferType::HttpRequest
@@ -2343,6 +2390,7 @@ impl Analyzer {
             | InferType::LogField
             | InferType::QueueJob
             | InferType::ScheduleEvent
+            | InferType::DatabaseTransaction
             | InferType::Secret => false,
         }
     }
@@ -2380,6 +2428,7 @@ impl Analyzer {
                 ConstraintKind::JsonValue => self.is_json_value(&constraint.ty),
                 ConstraintKind::OpaqueArgument | ConstraintKind::Printable => {
                     !self.contains_secret(&constraint.ty, &mut BTreeSet::new())
+                        && !self.contains_transaction(&constraint.ty, &mut BTreeSet::new())
                 }
                 ConstraintKind::StructuralValue
                     if self
@@ -2390,9 +2439,27 @@ impl Analyzer {
                 }
                 ConstraintKind::StructuralValue => {
                     !self.contains_secret(&constraint.ty, &mut BTreeSet::new())
+                        && !self.contains_transaction(&constraint.ty, &mut BTreeSet::new())
                 }
             };
             if !valid {
+                if self.contains_transaction(&constraint.ty, &mut BTreeSet::new()) {
+                    let operation = match constraint.kind {
+                        ConstraintKind::Comparable => "compared",
+                        ConstraintKind::JsonValue => "encoded as JSON",
+                        ConstraintKind::OpaqueArgument => {
+                            "passed outside the first argument of a database operation"
+                        }
+                        ConstraintKind::Printable => "printed",
+                        ConstraintKind::StructuralValue => "placed into ordinary structural data",
+                        ConstraintKind::Addable => "used by `+`",
+                    };
+                    return Err(Diagnostic::new(
+                        "K3010",
+                        format!("opaque `DatabaseTransaction` values cannot be {operation}"),
+                        constraint.span,
+                    ));
+                }
                 if self.contains_secret(&constraint.ty, &mut BTreeSet::new()) {
                     let operation = match constraint.kind {
                         ConstraintKind::Comparable => "compared",
@@ -2500,7 +2567,58 @@ impl Analyzer {
             | InferType::LogField
             | InferType::QueueJob
             | InferType::ScheduleEvent => true,
-            InferType::Secret => false,
+            InferType::DatabaseTransaction | InferType::Secret => false,
+        }
+    }
+
+    /// Whether an opaque database transaction handle is reachable in `ty`.
+    ///
+    /// Handles mirror `Secret`: they are host-owned, never serializable, and
+    /// may appear only in the approved argument position of a database
+    /// built-in.
+    fn contains_transaction(&self, ty: &InferType, visited: &mut BTreeSet<TypeVariable>) -> bool {
+        match ty {
+            InferType::DatabaseTransaction => true,
+            InferType::List(element) | InferType::Option(element) => {
+                self.contains_transaction(element, visited)
+            }
+            InferType::Record { fields, .. } => fields
+                .values()
+                .any(|ty| self.contains_transaction(ty, visited)),
+            InferType::Result(value, error) => {
+                self.contains_transaction(value, visited)
+                    || self.contains_transaction(error, visited)
+            }
+            InferType::Function {
+                parameters,
+                return_type,
+                ..
+            } => {
+                parameters
+                    .iter()
+                    .any(|ty| self.contains_transaction(ty, visited))
+                    || self.contains_transaction(return_type, visited)
+            }
+            InferType::Variable(variable) => {
+                let variable = self.root_variable(*variable);
+                if !visited.insert(variable) {
+                    return false;
+                }
+                self.substitutions
+                    .get(&variable)
+                    .is_some_and(|ty| self.contains_transaction(ty, visited))
+            }
+            InferType::Int
+            | InferType::Bool
+            | InferType::String
+            | InferType::Unit
+            | InferType::HttpHeader
+            | InferType::HttpRequest
+            | InferType::HttpResponse
+            | InferType::LogField
+            | InferType::QueueJob
+            | InferType::ScheduleEvent
+            | InferType::Secret => false,
         }
     }
 
@@ -2544,7 +2662,8 @@ impl Analyzer {
             | InferType::HttpResponse
             | InferType::LogField
             | InferType::QueueJob
-            | InferType::ScheduleEvent => false,
+            | InferType::ScheduleEvent
+            | InferType::DatabaseTransaction => false,
         }
     }
 
@@ -2863,6 +2982,56 @@ impl Analyzer {
                     effect,
                 }
             }
+            Builtin::DatabaseBeginRead | Builtin::DatabaseBeginWrite => {
+                let effect = self.fresh_effect();
+                self.effect_definitions[effect as usize].direct.insert(
+                    if builtin == Builtin::DatabaseBeginRead {
+                        Effect::DatabaseRead
+                    } else {
+                        Effect::DatabaseWrite
+                    },
+                );
+                InferType::Function {
+                    parameters: vec![InferType::String],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::DatabaseTransaction),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::DatabaseQuery | Builtin::DatabaseExecute => {
+                // Authority already came from the transaction, so these carry no
+                // additional effect of their own.
+                let effect = self.fresh_effect();
+                InferType::Function {
+                    parameters: vec![
+                        InferType::DatabaseTransaction,
+                        InferType::String,
+                        InferType::List(Box::new(InferType::String)),
+                    ],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(if builtin == Builtin::DatabaseQuery {
+                            InferType::String
+                        } else {
+                            InferType::Int
+                        }),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
+            Builtin::DatabaseCommit | Builtin::DatabaseRollback => {
+                let effect = self.fresh_effect();
+                InferType::Function {
+                    parameters: vec![InferType::DatabaseTransaction],
+                    return_type: Box::new(InferType::Result(
+                        Box::new(InferType::Unit),
+                        Box::new(InferType::String),
+                    )),
+                    effect,
+                }
+            }
         };
         Some((ty, ResolvedName::Builtin(builtin)))
     }
@@ -3046,6 +3215,7 @@ impl<'a> TypeNormalizer<'a> {
             InferType::LogField => Arc::new(Type::LogField),
             InferType::QueueJob => Arc::new(Type::QueueJob),
             InferType::ScheduleEvent => Arc::new(Type::ScheduleEvent),
+            InferType::DatabaseTransaction => Arc::new(Type::DatabaseTransaction),
             InferType::Secret => Arc::new(Type::Secret),
             InferType::List(element) => Arc::new(Type::List(self.normalize(element))),
             InferType::Record { fields, .. } => Arc::new(Type::Record(
@@ -3186,7 +3356,13 @@ fn direct_host_builtin(callee: &Expression) -> Option<Builtin> {
             | Builtin::QueuePublish
             | Builtin::ObjectGet
             | Builtin::ObjectPut
-            | Builtin::ObjectDelete),
+            | Builtin::ObjectDelete
+            | Builtin::DatabaseBeginRead
+            | Builtin::DatabaseBeginWrite
+            | Builtin::DatabaseQuery
+            | Builtin::DatabaseExecute
+            | Builtin::DatabaseCommit
+            | Builtin::DatabaseRollback),
         ) => Some(builtin),
         _ => None,
     }

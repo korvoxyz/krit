@@ -58,6 +58,12 @@ pub enum BuiltinFunction {
     ObjectGet,
     ObjectPut,
     ObjectDelete,
+    DatabaseBeginRead,
+    DatabaseBeginWrite,
+    DatabaseQuery,
+    DatabaseExecute,
+    DatabaseCommit,
+    DatabaseRollback,
 }
 
 impl fmt::Debug for Value {
@@ -124,6 +130,16 @@ impl Value {
             Self::Builtin(BuiltinFunction::ObjectGet) => "<function object_get>".to_owned(),
             Self::Builtin(BuiltinFunction::ObjectPut) => "<function object_put>".to_owned(),
             Self::Builtin(BuiltinFunction::ObjectDelete) => "<function object_delete>".to_owned(),
+            Self::Builtin(BuiltinFunction::DatabaseBeginRead) => {
+                "<function db_begin_read>".to_owned()
+            }
+            Self::Builtin(BuiltinFunction::DatabaseBeginWrite) => {
+                "<function db_begin_write>".to_owned()
+            }
+            Self::Builtin(BuiltinFunction::DatabaseQuery) => "<function db_query>".to_owned(),
+            Self::Builtin(BuiltinFunction::DatabaseExecute) => "<function db_execute>".to_owned(),
+            Self::Builtin(BuiltinFunction::DatabaseCommit) => "<function db_commit>".to_owned(),
+            Self::Builtin(BuiltinFunction::DatabaseRollback) => "<function db_rollback>".to_owned(),
         }
     }
 
@@ -314,6 +330,12 @@ impl Evaluator<'_> {
                 "object_get" => Ok(Value::Builtin(BuiltinFunction::ObjectGet)),
                 "object_put" => Ok(Value::Builtin(BuiltinFunction::ObjectPut)),
                 "object_delete" => Ok(Value::Builtin(BuiltinFunction::ObjectDelete)),
+                "db_begin_read" => Ok(Value::Builtin(BuiltinFunction::DatabaseBeginRead)),
+                "db_begin_write" => Ok(Value::Builtin(BuiltinFunction::DatabaseBeginWrite)),
+                "db_query" => Ok(Value::Builtin(BuiltinFunction::DatabaseQuery)),
+                "db_execute" => Ok(Value::Builtin(BuiltinFunction::DatabaseExecute)),
+                "db_commit" => Ok(Value::Builtin(BuiltinFunction::DatabaseCommit)),
+                "db_rollback" => Ok(Value::Builtin(BuiltinFunction::DatabaseRollback)),
                 _ => environment.lookup(name).ok_or_else(|| {
                     Diagnostic::new("K2001", format!("undefined name `{name}`"), expression.span)
                 }),
@@ -503,7 +525,9 @@ impl Evaluator<'_> {
                     BuiltinFunction::ReplayHttp | BuiltinFunction::ReplayAi => 4,
                     BuiltinFunction::StatePut
                     | BuiltinFunction::CheckpointPut
-                    | BuiltinFunction::ObjectPut => 3,
+                    | BuiltinFunction::ObjectPut
+                    | BuiltinFunction::DatabaseQuery
+                    | BuiltinFunction::DatabaseExecute => 3,
                     BuiltinFunction::AiInvoke
                     | BuiltinFunction::LogInfo
                     | BuiltinFunction::LogError
@@ -563,13 +587,19 @@ impl Evaluator<'_> {
                         | BuiltinFunction::ObjectGet
                         | BuiltinFunction::ObjectPut
                         | BuiltinFunction::ObjectDelete
+                        | BuiltinFunction::DatabaseBeginRead
+                        | BuiltinFunction::DatabaseBeginWrite
+                        | BuiltinFunction::DatabaseQuery
+                        | BuiltinFunction::DatabaseExecute
+                        | BuiltinFunction::DatabaseCommit
+                        | BuiltinFunction::DatabaseRollback
                 ) {
                     for argument in arguments {
                         self.expression(argument, environment)?;
                     }
                     return Err(Diagnostic::new(
                         "K5003",
-                        "durable state, queue, schedule, object, and replay operations are unavailable in direct source execution",
+                        "durable state, queue, schedule, object, database, and replay operations are unavailable in direct source execution",
                         span,
                     ));
                 }
@@ -629,7 +659,13 @@ impl Evaluator<'_> {
                     | BuiltinFunction::QueuePublish
                     | BuiltinFunction::ObjectGet
                     | BuiltinFunction::ObjectPut
-                    | BuiltinFunction::ObjectDelete => {
+                    | BuiltinFunction::ObjectDelete
+                    | BuiltinFunction::DatabaseBeginRead
+                    | BuiltinFunction::DatabaseBeginWrite
+                    | BuiltinFunction::DatabaseQuery
+                    | BuiltinFunction::DatabaseExecute
+                    | BuiltinFunction::DatabaseCommit
+                    | BuiltinFunction::DatabaseRollback => {
                         unreachable!("binary host operations return before unary builtin dispatch")
                     }
                 }

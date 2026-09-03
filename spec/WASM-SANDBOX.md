@@ -173,11 +173,39 @@ interface schedule {
 }
 ```
 
+Phase 7 adds one further import interface:
+
+```wit
+interface database {
+    resource transaction;
+
+    begin-read: func(database: string) -> result<transaction, string>;
+    begin-write: func(database: string) -> result<transaction, string>;
+    db-query: func(
+        transaction: borrow<transaction>,
+        statement: string,
+        parameters: list<string>,
+    ) -> result<string, string>;
+    db-execute: func(
+        transaction: borrow<transaction>,
+        statement: string,
+        parameters: list<string>,
+    ) -> result<s64, string>;
+    db-commit: func(transaction: borrow<transaction>) -> result<_, string>;
+    db-rollback: func(transaction: borrow<transaction>) -> result<_, string>;
+}
+```
+
 Object read and write are separate interfaces so that read-only authority never
-implies write authority. Worlds are named
+implies write authority. Database read and write share one interface because
+both need the same lifecycle operations; validation therefore re-derives the
+read/write split from the embedded requirement contract and rejects an artifact
+whose database imports and declared database effects disagree, while the runtime
+still checks every call against both the manifest grant and the artifact's own
+requirement set. Worlds are named
 `{webhook|job|schedule}-<sorted import tokens>-program@0.2.0` over the fixed
 import order `stdout, config, secrets, http, ai, logs, state, queue, objread,
-objwrite`, with bearer `http` selected only alongside `secrets`. The finite
+objwrite, db`, with bearer `http` selected only alongside `secrets`. The finite
 world set is deterministic: the checked-in package carries every world that
 existed before Phase 6, and any other least-authority world is generated
 byte-identically from its mask at build and validation time. Validation
@@ -383,7 +411,10 @@ serving to `tiny_http` 0.12.0. Unix secret opens use `rustix` 1.1.4 with
 `O_NOFOLLOW`. Default features are disabled except curl's rustls and static-libcurl
 backends. The ignored `trusted_public_https_smoke_test` exercises platform
 Durable state, queues, schedules, and object buckets use locked `rusqlite`
-0.40.2 with bundled SQLite through the isolated `krit-state` crate. SQLite paths
+0.40.2 with bundled SQLite through the isolated `krit-state` crate. Application
+databases use the same locked bundled SQLite through the separate
+`krit-database` crate, which shares no schema, table, or migration logic with
+`krit-state`; Phase 7 adds no new dependency. SQLite paths
 are never guest-visible and no system SQLite linkage is used. Phase 6 jobs and
 object storage add no new dependency. The ignored `trusted_public_https_smoke_test` exercises platform
 roots when public DNS/network access is available. Every curl/libcurl upgrade requires an audited
@@ -459,6 +490,19 @@ the bounded policy-2 webhook surface:
 | Deliveries per CLI dispatch | 1 | 1,024 |
 | Delivery lease minimum | — | deadline + store busy timeout |
 | Collected `--json` guest output | — | twice the output limit |
+| Configured application databases | none | 8 |
+| Catalog statements per database | none | 64 |
+| Statement SQL | none | 4 KiB |
+| Database parameters per statement | none | 16 |
+| Database result columns | none | 32 |
+| Database parameter bytes | none | 64 KiB |
+| Database result rows | none | 4,096 |
+| Encoded database result | none | 256 KiB |
+| Operations per transaction | none | 256 |
+| Transactions per invocation | 1 | 8 |
+| Open transactions at once | — | 1 |
+| Transaction wall bound | none | 5 s |
+| Application database bytes | none | 64 KiB .. 1 GiB |
 
 The embedded authority document is capped at 48 KiB, leaving deterministic
 headroom for package, compiler, digest, import, and entry fields in the

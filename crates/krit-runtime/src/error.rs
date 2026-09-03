@@ -26,6 +26,9 @@ pub enum RuntimeErrorKind {
     Replay,
     DurableIdempotency,
     Delivery,
+    Database,
+    DatabaseTransaction,
+    DatabaseLimit,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +116,18 @@ impl RuntimeError {
 
     pub(crate) fn delivery(message: impl Into<String>) -> Self {
         Self::new("K5205", RuntimeErrorKind::Delivery, message)
+    }
+
+    pub(crate) fn database(message: impl Into<String>) -> Self {
+        Self::new("K5301", RuntimeErrorKind::Database, message)
+    }
+
+    pub(crate) fn database_transaction(message: impl Into<String>) -> Self {
+        Self::new("K5302", RuntimeErrorKind::DatabaseTransaction, message)
+    }
+
+    pub(crate) fn database_limit(message: impl Into<String>) -> Self {
+        Self::new("K5303", RuntimeErrorKind::DatabaseLimit, message)
     }
 
     pub const fn code(&self) -> &'static str {

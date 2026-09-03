@@ -4175,3 +4175,774 @@ consumes = ["render-jobs"]
     );
     assert!(database.is_file());
 }
+
+const DATABASE_STATEMENTS: &str = r#"
+      "statements": {
+        "record-visit": {
+          "kind": "execute",
+          "sql": "INSERT INTO visits(path) VALUES(?1)",
+          "parameters": ["text"],
+          "columns": []
+        },
+        "count-visits": {
+          "kind": "query",
+          "sql": "SELECT COUNT(*) AS total FROM visits",
+          "parameters": [],
+          "columns": ["total"]
+        }
+      }"#;
+
+/// Builds a schema-5 host configuration around one application database.
+fn database_host_config(path: &str, mode: &str, statements: &str) -> String {
+    format!(
+        r#"{{
+  "schema": 5,
+  "state": {{ "stores": {{}} }},
+  "maxTransactionsPerInvocation": 1,
+  "databases": {{
+    "catalog": {{
+      "path": "{path}",
+      "mode": "{mode}",
+      "busyTimeoutMs": 250,
+      "maxDatabaseBytes": 16777216,
+      "maxTransactionMillis": 500,
+      "maxOperationsPerTransaction": 16,
+      "maxParameterBytes": 4096,
+      "maxRows": 64,
+      "maxColumns": 8,
+      "maxResultBytes": 65536,{statements}
+    }}
+  }}
+}}"#
+    )
+}
+
+/// Creates the owner-only application database fixture that the operator, not
+/// Krit, is responsible for provisioning and migrating.
+fn create_database_fixture(directory: &TestDirectory) -> PathBuf {
+    let data = directory.path.join("data");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&data)
+            .expect("fixture directory should be owner-only");
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(&data).expect("fixture directory should exist");
+
+    let path = data.join("catalog.db");
+    let connection = rusqlite::Connection::open(&path).expect("fixture database should open");
+    connection
+        .execute_batch(
+            "CREATE TABLE visits(id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL);",
+        )
+        .expect("fixture schema should apply");
+    drop(connection);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("fixture database should be owner-only");
+    }
+    path
+}
+
+fn database_package(directory: &TestDirectory, capability: &str) {
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match db_begin_write("catalog") {
+        Ok(transaction) => match db_execute(transaction, "record-visit", [request.body]) {
+            Ok(changed) => match db_query(transaction, "count-visits", []) {
+                Ok(rows) => match db_commit(transaction) {
+                    Ok(committed) => record { status: 200, headers: [], body: rows },
+                    Err(error) => record { status: 500, headers: [], body: error },
+                },
+                Err(error) => match db_rollback(transaction) {
+                    Ok(undone) => record { status: 500, headers: [], body: error },
+                    Err(fatal) => record { status: 500, headers: [], body: fatal },
+                },
+            },
+            Err(error) => match db_rollback(transaction) {
+                Ok(undone) => record { status: 500, headers: [], body: error },
+                Err(fatal) => record { status: 500, headers: [], body: fatal },
+            },
+        },
+        Err(error) => record { status: 503, headers: [], body: error },
+    }
+}
+"#,
+    );
+    directory.file(
+        "krit.pkg",
+        &format!(
+            r#"
+schema = 1
+
+[package]
+name = "example/database"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+{capability} = ["catalog"]
+"#
+        ),
+    );
+}
+
+fn invoke_database(directory: &TestDirectory, config: &str, request: &str) -> std::process::Output {
+    krit_in(directory)
+        .args(["invoke", "--host-config", config, "--request", request])
+        .output()
+        .expect("database invocation should run")
+}
+
+#[test]
+fn schema_five_database_transactions_commit_across_invoke_processes() {
+    let directory = TestDirectory::new("schema-five-database");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+            .expect("test root should be owner-only");
+    }
+    let database = create_database_fixture(&directory);
+    database_package(&directory, "databases");
+    directory.file(
+        "host.json",
+        &database_host_config("data/catalog.db", "read-write", DATABASE_STATEMENTS),
+    );
+    directory.file(
+        "request-one.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":"first"}"#,
+    );
+    // The payload below is stored as an ordinary bound parameter; it can never
+    // reach the SQL text because the operator owns the statement catalog.
+    directory.file(
+        "request-two.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":"x'); DROP TABLE visits; --"}"#,
+    );
+
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("database package should build");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let artifact = directory.path.join("target/krit/database.wasm");
+    assert_valid_artifact(&artifact);
+
+    let permissions = krit_in(&directory)
+        .args(["permissions", "--json", "--artifact"])
+        .arg(&artifact)
+        .output()
+        .expect("database permissions should run");
+    assert!(permissions.status.success());
+    let permissions: serde_json::Value =
+        serde_json::from_slice(&permissions.stdout).expect("permissions should be JSON");
+    assert_eq!(
+        permissions["required"],
+        serde_json::json!([{ "capability": "database.write", "resource": "catalog" }])
+    );
+    assert_eq!(
+        permissions["imports"],
+        serde_json::json!(["krit:runtime/database@0.2.0"])
+    );
+    let rendered = serde_json::to_string(&permissions).expect("permissions should serialise");
+    assert!(
+        !rendered.contains("catalog.db")
+            && !rendered.contains("INSERT")
+            && !rendered.contains("data/")
+            && !rendered.contains(".db"),
+        "permissions must never disclose host paths or SQL: {rendered}"
+    );
+
+    let explain = krit_in(&directory)
+        .args(["explain", "--json", "main.krit"])
+        .output()
+        .expect("database explanation should run");
+    assert!(explain.status.success());
+    let explain: serde_json::Value =
+        serde_json::from_slice(&explain.stdout).expect("explanation should be JSON");
+    let operations = explain["durableState"]["operations"]
+        .as_array()
+        .expect("durable operations should be an array")
+        .iter()
+        .map(|operation| {
+            (
+                operation["kind"].as_str().unwrap_or_default().to_owned(),
+                operation["store"].as_str().map(str::to_owned),
+                operation["identity"].as_str().map(str::to_owned),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Every transaction boundary and every named statement is auditable, and a
+    // handle-taking operation never invents a database name it cannot prove.
+    assert_eq!(
+        operations,
+        [
+            (
+                "database-begin-write".to_owned(),
+                Some("catalog".to_owned()),
+                None
+            ),
+            (
+                "database-execute".to_owned(),
+                None,
+                Some("record-visit".to_owned())
+            ),
+            (
+                "database-query".to_owned(),
+                None,
+                Some("count-visits".to_owned())
+            ),
+            ("database-commit".to_owned(), None, None),
+            ("database-rollback".to_owned(), None, None),
+            ("database-rollback".to_owned(), None, None),
+        ]
+    );
+    let rendered = serde_json::to_string(&explain).expect("explanation should serialise");
+    assert!(
+        !rendered.contains("catalog.db") && !rendered.contains("INSERT"),
+        "explanations must never disclose host paths or SQL: {rendered}"
+    );
+
+    let first = invoke_database(&directory, "host.json", "request-one.json");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value =
+        serde_json::from_slice(&first.stdout).expect("response should be JSON");
+    assert_eq!(first["status"], 200);
+    assert_eq!(first["body"], "{\"columns\":[\"total\"],\"rows\":[[1]]}");
+
+    // A separate process observes the committed row, proving durability.
+    let second = invoke_database(&directory, "host.json", "request-two.json");
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second: serde_json::Value =
+        serde_json::from_slice(&second.stdout).expect("response should be JSON");
+    assert_eq!(second["body"], "{\"columns\":[\"total\"],\"rows\":[[2]]}");
+
+    let connection = rusqlite::Connection::open(&database).expect("fixture should reopen");
+    let stored: String = connection
+        .query_row(
+            "SELECT path FROM visits ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the injection payload should be stored as literal data");
+    assert_eq!(stored, "x'); DROP TABLE visits; --");
+    let total: i64 = connection
+        .query_row("SELECT COUNT(*) FROM visits", [], |row| row.get(0))
+        .expect("the table must still exist");
+    assert_eq!(total, 2);
+}
+
+#[test]
+fn schema_five_rejects_unsafe_database_configuration_without_touching_the_file() {
+    let directory = TestDirectory::new("schema-five-database-rejects");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+            .expect("test root should be owner-only");
+    }
+    let database = create_database_fixture(&directory);
+    database_package(&directory, "databases");
+    directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":"first"}"#,
+    );
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("database package should build");
+    assert!(build.status.success());
+
+    let before = fs::read(&database).expect("fixture should be readable");
+    let mut rejected = vec![
+        // The manifest grants `database.write`, never read-only authority.
+        (
+            "read-only.host.json",
+            database_host_config("data/catalog.db", "read-only", DATABASE_STATEMENTS),
+        ),
+        // Krit never creates or migrates an application database.
+        (
+            "missing.host.json",
+            database_host_config("data/absent.db", "read-write", DATABASE_STATEMENTS),
+        ),
+        // Host paths may not escape the host configuration directory.
+        (
+            "escape.host.json",
+            database_host_config("../catalog.db", "read-write", DATABASE_STATEMENTS),
+        ),
+        // Transaction control is host-owned and cannot be smuggled in.
+        (
+            "forbidden.host.json",
+            database_host_config(
+                "data/catalog.db",
+                "read-write",
+                r#"
+      "statements": {
+        "record-visit": {
+          "kind": "execute",
+          "sql": "BEGIN IMMEDIATE",
+          "parameters": [],
+          "columns": []
+        }
+      }"#,
+            ),
+        ),
+        // Exactly one statement per catalog entry.
+        (
+            "multiple.host.json",
+            database_host_config(
+                "data/catalog.db",
+                "read-write",
+                r#"
+      "statements": {
+        "record-visit": {
+          "kind": "execute",
+          "sql": "INSERT INTO visits(path) VALUES(?1); DELETE FROM visits",
+          "parameters": ["text"],
+          "columns": []
+        }
+      }"#,
+            ),
+        ),
+        // The declared placeholder count must match the SQL exactly.
+        (
+            "placeholders.host.json",
+            database_host_config(
+                "data/catalog.db",
+                "read-write",
+                r#"
+      "statements": {
+        "record-visit": {
+          "kind": "execute",
+          "sql": "INSERT INTO visits(path) VALUES(?1)",
+          "parameters": ["text", "text"],
+          "columns": []
+        }
+      }"#,
+            ),
+        ),
+        // A mutation may not be declared as a read-only query.
+        (
+            "kind.host.json",
+            database_host_config(
+                "data/catalog.db",
+                "read-write",
+                r#"
+      "statements": {
+        "record-visit": {
+          "kind": "query",
+          "sql": "INSERT INTO visits(path) VALUES(?1)",
+          "parameters": ["text"],
+          "columns": []
+        }
+      }"#,
+            ),
+        ),
+        // Unknown configuration fields are rejected rather than ignored.
+        (
+            "unknown.host.json",
+            database_host_config("data/catalog.db", "read-write", DATABASE_STATEMENTS).replace(
+                "\"schema\": 5,",
+                "\"schema\": 5,\n  \"driver\": \"postgres\",",
+            ),
+        ),
+    ];
+    #[cfg(unix)]
+    {
+        // A symbolic link must never be followed into another file.
+        std::os::unix::fs::symlink(&database, directory.path.join("data/link.db"))
+            .expect("symlink fixture should be created");
+        rejected.push((
+            "symlink.host.json",
+            database_host_config("data/link.db", "read-write", DATABASE_STATEMENTS),
+        ));
+    }
+
+    for (name, config) in rejected {
+        directory.file(name, &config);
+        let output = invoke_database(&directory, name, "request.json");
+        assert!(
+            !output.status.success(),
+            "`{name}` must be rejected: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("INSERT INTO visits"),
+            "`{name}` must not echo catalog SQL: {stderr}"
+        );
+        assert_eq!(
+            fs::read(&database).expect("fixture should be readable"),
+            before,
+            "`{name}` must not modify the application database"
+        );
+    }
+    assert!(!directory.path.join("data/absent.db").exists());
+}
+
+#[test]
+fn database_free_programs_still_run_under_schema_five_configuration() {
+    let directory = TestDirectory::new("schema-five-no-database");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.body }
+}
+"#,
+    );
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/plain"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+"#,
+    );
+    directory.file(
+        "host.json",
+        r#"{
+  "schema": 5,
+  "state": { "stores": {} }
+}"#,
+    );
+    directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":"plain"}"#,
+    );
+
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("plain package should build");
+    assert!(build.status.success());
+    let output = invoke_database(&directory, "host.json", "request.json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("response should be JSON");
+    assert_eq!(response["body"], "plain");
+}
+
+/// Builds a schema-5 config with both a durable store and an application
+/// database, so ordering and aliasing rules can be exercised together.
+fn state_and_database_config(database_path: &str, extra: &str) -> String {
+    format!(
+        r#"{{
+  "schema": 5,
+  "state": {{
+    "stores": {{
+      "agent-work": {{
+        "path": "state/agent-work.db",
+        "durability": "full",
+        "busyTimeoutMs": 250,
+        "maxOperations": 128,
+        "maxKeyBytes": 256,
+        "maxValueBytes": 65536,
+        "maxTransactionBytes": 1048576,
+        "maxDatabaseBytes": 67108864,
+        "maxReplayEntries": 1024,
+        "maxReplayBytes": 16777216,
+        "replayTtlSeconds": 604800,
+        "leaseSeconds": 30
+      }}
+    }}
+  }},
+  "maxTransactionsPerInvocation": 1,{extra}
+  "databases": {{
+    "catalog": {{
+      "path": "{database_path}",
+      "mode": "read-write",
+      "busyTimeoutMs": 250,
+      "maxDatabaseBytes": 16777216,
+      "maxTransactionMillis": 500,
+      "maxOperationsPerTransaction": 16,
+      "maxParameterBytes": 4096,
+      "maxRows": 64,
+      "maxColumns": 8,
+      "maxResultBytes": 65536,{DATABASE_STATEMENTS}
+    }}
+  }}
+}}"#
+    )
+}
+
+#[test]
+fn schema_five_validates_every_policy_before_creating_any_durable_store() {
+    let directory = TestDirectory::new("schema-five-ordering");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+            .expect("test root should be owner-only");
+    }
+    create_database_fixture(&directory);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(directory.path.join("state"))
+            .expect("state directory should be owner-only");
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(directory.path.join("state")).expect("state directory should exist");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match db_begin_write("catalog") {
+        Ok(transaction) => match db_execute(transaction, "record-visit", [request.body]) {
+            Ok(changed) => match db_commit(transaction) {
+                Ok(committed) => record { status: 200, headers: [], body: "ok" },
+                Err(error) => record { status: 500, headers: [], body: error },
+            },
+            Err(error) => match db_rollback(transaction) {
+                Ok(undone) => record { status: 500, headers: [], body: error },
+                Err(fatal) => record { status: 500, headers: [], body: fatal },
+            },
+        },
+        Err(error) => record { status: 503, headers: [], body: error },
+    }
+}
+"#,
+    );
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/ordering"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+databases = ["catalog"]
+state = ["agent-work"]
+secrets = ["token"]
+"#,
+    );
+    directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":"one"}"#,
+    );
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("package should build");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let state_database = directory.path.join("state/agent-work.db");
+    // Every rejection below is a *later* validation step than the durable store
+    // creation used to be, so each one proves the reordering.
+    let rejected = [
+        // Invalid database limit.
+        (
+            "bad-limit.host.json",
+            state_and_database_config("data/catalog.db", "").replace(
+                "\"maxResultBytes\": 65536,",
+                "\"maxResultBytes\": 999999999,",
+            ),
+        ),
+        // Statement that does not match the live application schema.
+        (
+            "bad-statement.host.json",
+            state_and_database_config("data/catalog.db", "").replace(
+                "INSERT INTO visits(path) VALUES(?1)",
+                "INSERT INTO absent_table(path) VALUES(?1)",
+            ),
+        ),
+        // Application database the manifest never granted.
+        (
+            "ungranted.host.json",
+            state_and_database_config("data/catalog.db", "")
+                .replace("\"catalog\": {", "\"other\": {"),
+        ),
+        // Invalid rate-limit policy, validated after every database rule.
+        (
+            "bad-rate.host.json",
+            state_and_database_config(
+                "data/catalog.db",
+                "\n  \"rateLimits\": { \"maxTrackedResources\": 0 },",
+            ),
+        ),
+        // Secret file that does not exist.
+        (
+            "bad-secret.host.json",
+            state_and_database_config(
+                "data/catalog.db",
+                "\n  \"secrets\": { \"token\": { \"file\": \"absent.secret\" } },",
+            ),
+        ),
+    ];
+
+    for (name, config) in rejected {
+        directory.file(name, &config);
+        let output = invoke_database(&directory, name, "request.json");
+        assert!(
+            !output.status.success(),
+            "`{name}` must be rejected: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            !state_database.exists(),
+            "`{name}` must not create the durable state store: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // A valid configuration still creates the store and runs.
+    directory.file(
+        "valid.host.json",
+        &state_and_database_config("data/catalog.db", ""),
+    );
+    let output = invoke_database(&directory, "valid.host.json", "request.json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(state_database.is_file());
+
+    // The state store now exists at schema 2; a later invalid configuration
+    // must leave its bytes untouched.
+    let before = fs::read(&state_database).expect("state store should be readable");
+    directory.file(
+        "late-invalid.host.json",
+        &state_and_database_config(
+            "data/catalog.db",
+            "\n  \"rateLimits\": { \"maxTrackedResources\": 0 },",
+        ),
+    );
+    let output = invoke_database(&directory, "late-invalid.host.json", "request.json");
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read(&state_database).expect("state store should be readable"),
+        before,
+        "a rejected configuration must not migrate or rewrite the state store"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_five_rejects_state_and_application_database_aliases() {
+    let directory = TestDirectory::new("schema-five-alias");
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+        .expect("test root should be owner-only");
+    create_database_fixture(&directory);
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(directory.path.join("state"))
+        .expect("state directory should be owner-only");
+    database_package(&directory, "databases");
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/alias"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+databases = ["catalog"]
+state = ["agent-work"]
+"#,
+    );
+    directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":"one"}"#,
+    );
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("package should build");
+    assert!(build.status.success());
+
+    // Create the state store so the aliasing checks have a real file to match.
+    directory.file(
+        "seed.host.json",
+        &state_and_database_config("data/catalog.db", ""),
+    );
+    let seed = invoke_database(&directory, "seed.host.json", "request.json");
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let state_database = directory.path.join("state/agent-work.db");
+    assert!(state_database.is_file());
+    let before = fs::read(&state_database).expect("state store should be readable");
+
+    fs::hard_link(&state_database, directory.path.join("state/linked.db"))
+        .expect("hard link fixture should be created");
+
+    for (name, database_path) in [
+        // The application database is literally Krit's own internal store.
+        ("same.host.json", "state/agent-work.db"),
+        // The same file reached through a `.` alias.
+        ("dot.host.json", "state/./agent-work.db"),
+        // The same inode reached through a hard link under another name.
+        ("link.host.json", "state/linked.db"),
+    ] {
+        directory.file(name, &state_and_database_config(database_path, ""));
+        let output = invoke_database(&directory, name, "request.json");
+        assert!(
+            !output.status.success(),
+            "`{name}` must not expose Krit's internal schema to `database.write`: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            fs::read(&state_database).expect("state store should be readable"),
+            before,
+            "`{name}` must not touch the durable state store"
+        );
+    }
+}

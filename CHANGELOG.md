@@ -330,6 +330,11 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Updated the provider-neutral generation prompt to version 0.2.13 for durable
   queues, scheduled triggers, bounded object storage, and schema-4 host
   configuration
+- Completed `phase7-database` for the local SQLite connector while explicitly
+  refusing to claim atomicity between an application database and Krit state
+- Updated the provider-neutral generation prompt to version 0.2.14 for
+  catalogued parameterized database transactions and schema-5 host
+  configuration
 - Committed terminal queue and schedule transitions when a reservation reaches
   its scan bound, so a depth-one or single-attempt resource dead-letters and
   stays usable instead of wedging
@@ -354,6 +359,61 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 - Kept `krit worker --json` and `krit schedule --json` standard output a single
   machine-readable report by moving bounded guest output into an explicit
   `outputs` array
+- Normative capability-scoped database specification with authority, typed API,
+  transaction lifecycle, isolation, statement catalog, encoding, atomicity,
+  filesystem, privacy, limit, and non-goal contracts
+- `krit-database`, an isolated bundled-SQLite connector that shares no schema or
+  migration logic with the durable-state store and adds no dependency
+- Opaque non-serializable `DatabaseTransaction` handles enforced like `Secret`,
+  with `K3010` for any revealing, structural, or out-of-position use
+- Edition-2026 `db_begin_read`, `db_begin_write`, `db_query`, `db_execute`,
+  `db_commit`, and `db_rollback` built-ins with direct canonical database and
+  statement literals and bounded `List<String>` parameters
+- Bounded `List<String>` values in the webhook ABI so database parameters are a
+  typed list rather than encoded text
+- Host-owned statement catalog validated against the live schema: exactly one
+  statement, ordinal placeholders, declared parameter types and result columns,
+  read-only queries versus mutating executes, and rejected `PRAGMA`, `ATTACH`,
+  `DETACH`, `VACUUM`, `ANALYZE`, `REINDEX`, `EXPLAIN`, transaction-control, and
+  schema statements
+- Deterministic bounded JSON result encoding restricted to INTEGER, TEXT, and
+  NULL, with REAL, BLOB, and non-UTF-8 values failing closed
+- Separate `database.read` and `database.write` manifest grants (`databases`,
+  `readOnlyDatabases`), effects, Core requirements, permissions, explain facts,
+  LSP completion, and assist redaction
+- Typed `krit:runtime/database@0.2.0` interface, least-authority world masks,
+  and artifact validation that rejects disagreeing database imports and effects
+- Runtime transaction safety: one open transaction per invocation, refused
+  external HTTP and AI effects while open, bounded transaction wall time below
+  the invocation deadline, completed-handle reuse rejection, and fail-closed
+  rollback when an invocation ends with a transaction open
+- Strict host config schema 5 that validates every database definition, grant,
+  limit, and statement before opening any file, requires an existing owner-only
+  database, and never creates, migrates, or resets an application schema
+- Reference database webhook example with an operator-owned schema script, and
+  store, compiler, artifact, runtime, and real-process CLI coverage including
+  injection-as-data, handle misuse, catalog rejection, limit, concurrency, and
+  restart cases
+- Auditable database facts in `explain` and the LSP durable-fact stream, with an
+  optional `store` so a handle-taking operation reports its statement name
+  instead of a database name it cannot prove
+- Guaranteed database transaction cleanup on every invocation exit path, a
+  `Drop` fail-safe, connection poisoning when cleanup cannot restore a known
+  state, and a `databaseTransactionsAbandoned` statistic
+- SQLite progress-handler interruption bounded by the transaction deadline, the
+  invocation deadline, and embedding cancellation, with busy waiting clamped to
+  the remaining time
+- Incremental result encoding that checks each JSON escape against the byte
+  budget before copying, keeping host memory bounded at the hard maxima
+- Comment- and quote-aware SQL statement classification, so a leading comment
+  can no longer disguise a forbidden `PRAGMA`, `ATTACH`, `DROP`, or transaction
+  control statement
+- Refusal of write-ahead-logging application databases, a bounded rollback
+  journal, and a disk budget that accounts for `-journal`, `-wal`, and `-shm`
+- Strictly ordered host config loading: all validation, including host policy,
+  runs before any durable store or application database is created or opened
+- Rejection of any durable state store and application database that resolve to
+  the same file by canonical path, or by device and inode on Unix
 
 ## [0.2.0] - 2026-09-01
 

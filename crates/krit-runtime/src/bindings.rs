@@ -23,6 +23,7 @@ pub(crate) mod webhook {
         path: "../../wit/runtime.wit",
         with: {
             "krit:runtime/secrets.secret": crate::SecretHandle,
+            "krit:runtime/database.transaction": crate::database::TransactionHandle,
         },
         imports: { default: trappable },
     });
@@ -45,6 +46,7 @@ pub(crate) mod job {
             "krit:runtime/queue": crate::bindings::webhook::krit::runtime::queue,
             "krit:runtime/objects-read": crate::bindings::webhook::krit::runtime::objects_read,
             "krit:runtime/objects-write": crate::bindings::webhook::krit::runtime::objects_write,
+            "krit:runtime/database": crate::bindings::webhook::krit::runtime::database,
         },
         imports: { default: trappable },
     });
@@ -67,6 +69,7 @@ pub(crate) mod schedule {
             "krit:runtime/queue": crate::bindings::webhook::krit::runtime::queue,
             "krit:runtime/objects-read": crate::bindings::webhook::krit::runtime::objects_read,
             "krit:runtime/objects-write": crate::bindings::webhook::krit::runtime::objects_write,
+            "krit:runtime/database": crate::bindings::webhook::krit::runtime::database,
         },
         imports: { default: trappable },
     });

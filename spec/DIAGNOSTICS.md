@@ -87,6 +87,7 @@ Initial required codes:
 | `K3007` | Webhook signature is not exactly `(HttpRequest) -> HttpResponse` |
 | `K3008` | Host capability resource is not a direct valid string literal |
 | `K3009` | Opaque secret is used by a revealing or structural operation |
+| `K3010` | Opaque database transaction handle is used outside a database operation |
 | `K4001` | Generic guest trap or wrong runtime value kind |
 | `K4002` | Calling a non-function |
 | `K4003` | Function argument count mismatch |
@@ -110,6 +111,9 @@ Initial required codes:
 | `K5203` | Replay operation is unsafe, in progress, expired incorrectly, or conflicts with recorded input |
 | `K5204` | Durable inbound idempotency reservation or completion failed |
 | `K5205` | Durable delivery lease, acknowledgement, or outcome detail is invalid |
+| `K5301` | Application database file, schema, catalog, or connection is invalid |
+| `K5302` | Database transaction lifecycle, handle, or lock-safety rule was violated |
+| `K5303` | Configured database count, byte, row, time, or busy bound was exceeded |
 | `K6001` | Invalid package manifest |
 | `K6002` | Lockfile is stale or invalid |
 | `K7001` | Residual or unresolved type requires specialization before layout |

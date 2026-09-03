@@ -39,7 +39,7 @@ else false fn if let match record true webhook
 Reserved built-in names:
 
 ```text
-Err None Ok Some ai_invoke checkpoint_get checkpoint_put config_string http_request json_decode json_encode log_error log_info object_delete object_get object_put print println queue_publish replay_ai replay_http secret state_delete state_get state_put
+Err None Ok Some ai_invoke checkpoint_get checkpoint_put config_string db_begin_read db_begin_write db_commit db_execute db_query db_rollback http_request json_decode json_encode log_error log_info object_delete object_get object_put print println queue_publish replay_ai replay_http secret state_delete state_get state_put
 ```
 
 A binding cannot use a keyword or reserved built-in name.
@@ -438,8 +438,9 @@ Output rendering is deterministic:
 Output is the only host effect executable by the direct evaluator. It is
 modeled as `io.stdout`. The component runtime additionally provides bounded
 `config.read`, `secret.read`, `http.request`, `ai.invoke`, and `observe.log`
-interfaces plus `state.transaction`, `queue.publish`, `object.read`, and
-`object.write` to typed webhook, queue, and schedule artifacts.
+interfaces plus `state.transaction`, `queue.publish`, `object.read`,
+`object.write`, `database.read`, and `database.write` to typed webhook, queue,
+and schedule artifacts.
 
 ## 13. JSON conversion
 
@@ -499,6 +500,12 @@ queue_publish("render-jobs", body) // Result<String, String>
 object_get("render-output", key) // Result<Option<String>, String>
 object_put("render-output", key, value) // Result<Unit, String>
 object_delete("render-output", key) // Result<Unit, String>
+db_begin_read("catalog") // Result<DatabaseTransaction, String>
+db_begin_write("catalog") // Result<DatabaseTransaction, String>
+db_query(transaction, "count-visits", []) // Result<String, String>
+db_execute(transaction, "record-visit", [path]) // Result<Int, String>
+db_commit(transaction) // Result<Unit, String>
+db_rollback(transaction) // Result<Unit, String>
 ```
 
 Config and secret operations require exactly one direct string-literal
@@ -540,6 +547,16 @@ transaction and commit only at the successful outcome boundary. `Secret` cannot
 enter a job body, an object key, or an object value. Guest-visible object
 listing is not part of protocol 1. The complete queue, schedule, and object
 semantics are normative in `JOBS-AND-STORAGE.md`.
+
+Database and statement names are direct canonical literals; parameters are a
+bounded `List<String>` the host binds by declared type. `DatabaseTransaction` is
+opaque exactly as `Secret` is: it may appear only as the first argument of
+`db_query`, `db_execute`, `db_commit`, or `db_rollback`, and printing,
+comparing, encoding, logging, or storing it is `K3010`. A transaction must be
+explicitly committed or rolled back; an invocation that ends with one open fails
+closed. Query results are bounded deterministic JSON text because protocol 1 has
+no richer typed row value. The complete transaction, catalog, and crash
+semantics are normative in `DATABASE.md`.
 
 ## 13.2 Typed delivery entrypoints
 

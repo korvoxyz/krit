@@ -2,10 +2,10 @@ use std::collections::BTreeSet;
 
 use krit_package::Manifest;
 use krit_wasm::{
-    AI_INTERFACE, ArtifactMetadata, CONFIG_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE,
-    LOGGING_INTERFACE, OBJECTS_READ_INTERFACE, OBJECTS_WRITE_INTERFACE, PROGRAM_WORLD,
-    PURE_PROGRAM_WORLD, QUEUE_INTERFACE, SECRETS_INTERFACE, STATE_INTERFACE, STDOUT_INTERFACE,
-    WEBHOOK_PROGRAM_WORLD,
+    AI_INTERFACE, ArtifactMetadata, CONFIG_INTERFACE, DATABASE_INTERFACE, HTTP_ANONYMOUS_INTERFACE,
+    HTTP_INTERFACE, LOGGING_INTERFACE, OBJECTS_READ_INTERFACE, OBJECTS_WRITE_INTERFACE,
+    PROGRAM_WORLD, PURE_PROGRAM_WORLD, QUEUE_INTERFACE, SECRETS_INTERFACE, STATE_INTERFACE,
+    STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD,
 };
 use serde::Serialize;
 
@@ -116,6 +116,39 @@ impl GrantSet {
             effects.insert("object.read".to_owned());
             imports.insert(OBJECTS_READ_INTERFACE.to_owned());
         }
+        if !manifest.capabilities.databases.is_empty() {
+            effects.insert("database.write".to_owned());
+            imports.insert(DATABASE_INTERFACE.to_owned());
+        }
+        if !manifest.capabilities.databases.is_empty()
+            || !manifest.capabilities.read_only_databases.is_empty()
+        {
+            effects.insert("database.read".to_owned());
+            imports.insert(DATABASE_INTERFACE.to_owned());
+        }
+        requested.extend(
+            manifest
+                .capabilities
+                .databases
+                .iter()
+                .cloned()
+                .map(|resource| PermissionFact {
+                    capability: "database.write".to_owned(),
+                    resource: Some(resource),
+                }),
+        );
+        requested.extend(
+            manifest
+                .capabilities
+                .databases
+                .iter()
+                .chain(&manifest.capabilities.read_only_databases)
+                .cloned()
+                .map(|resource| PermissionFact {
+                    capability: "database.read".to_owned(),
+                    resource: Some(resource),
+                }),
+        );
         for (capability, names) in [
             ("queue.publish", &manifest.capabilities.queues),
             ("queue.consume", &manifest.capabilities.consumes),
@@ -444,10 +477,13 @@ fn valid_policy_world(metadata: &ArtifactMetadata) -> bool {
             "queue.publish" => Some(QUEUE_INTERFACE.to_owned()),
             "object.read" => Some(OBJECTS_READ_INTERFACE.to_owned()),
             "object.write" => Some(OBJECTS_WRITE_INTERFACE.to_owned()),
+            "database.read" | "database.write" => Some(DATABASE_INTERFACE.to_owned()),
             _ => None,
         })
         .collect::<Vec<_>>();
     expected_imports.sort();
+    // Read and write database authority share one narrow interface.
+    expected_imports.dedup();
     if expected_imports != metadata.imports {
         return false;
     }

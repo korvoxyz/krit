@@ -22,6 +22,8 @@ pub(crate) const QUEUE_CONSUME_EFFECT: &str = "queue.consume";
 pub(crate) const SCHEDULE_TRIGGER_EFFECT: &str = "schedule.trigger";
 pub(crate) const OBJECT_READ_EFFECT: &str = "object.read";
 pub(crate) const OBJECT_WRITE_EFFECT: &str = "object.write";
+pub(crate) const DATABASE_READ_EFFECT: &str = "database.read";
+pub(crate) const DATABASE_WRITE_EFFECT: &str = "database.write";
 pub const AI_INTERFACE: &str = "krit:runtime/ai@0.2.0";
 pub const STDOUT_INTERFACE: &str = "krit:runtime/stdout@0.2.0";
 pub const CONFIG_INTERFACE: &str = "krit:runtime/config@0.2.0";
@@ -33,6 +35,7 @@ pub const STATE_INTERFACE: &str = "krit:runtime/state@0.2.0";
 pub const QUEUE_INTERFACE: &str = "krit:runtime/queue@0.2.0";
 pub const OBJECTS_READ_INTERFACE: &str = "krit:runtime/objects-read@0.2.0";
 pub const OBJECTS_WRITE_INTERFACE: &str = "krit:runtime/objects-write@0.2.0";
+pub const DATABASE_INTERFACE: &str = "krit:runtime/database@0.2.0";
 pub const WEBHOOK_INTERFACE: &str = "krit:runtime/webhook@0.2.0";
 pub const JOB_INTERFACE: &str = "krit:runtime/job@0.2.0";
 pub const SCHEDULE_INTERFACE: &str = "krit:runtime/schedule@0.2.0";
@@ -75,7 +78,7 @@ impl ProgramKind {
 }
 
 /// Ordered import surfaces. The bit order fixes every generated world name.
-const IMPORT_SURFACES: [(u16, &str, &str, &str); 10] = [
+const IMPORT_SURFACES: [(u16, &str, &str, &str); 11] = [
     (1 << 0, "stdout", "stdout", STDOUT_INTERFACE),
     (1 << 1, "config", "config", CONFIG_INTERFACE),
     (1 << 2, "secrets", "secrets", SECRETS_INTERFACE),
@@ -86,6 +89,7 @@ const IMPORT_SURFACES: [(u16, &str, &str, &str); 10] = [
     (1 << 7, "queue", "queue", QUEUE_INTERFACE),
     (1 << 8, "objread", "objects-read", OBJECTS_READ_INTERFACE),
     (1 << 9, "objwrite", "objects-write", OBJECTS_WRITE_INTERFACE),
+    (1 << 10, "db", "database", DATABASE_INTERFACE),
 ];
 
 const SECRETS_BIT: u16 = 1 << 2;
@@ -399,6 +403,9 @@ fn select_world(kind: ProgramKind, effects: &[String]) -> Result<WorldSelection,
             QUEUE_PUBLISH_EFFECT => 1 << 7,
             OBJECT_READ_EFFECT => 1 << 8,
             OBJECT_WRITE_EFFECT => 1 << 9,
+            // Read and write database authority share one narrow interface: the
+            // host enforces the distinction per transaction and per statement.
+            DATABASE_READ_EFFECT | DATABASE_WRITE_EFFECT => 1 << 10,
             _ => {
                 return Err(BuildError::artifact(
                     "checked entrypoint effects contain an unknown host surface",

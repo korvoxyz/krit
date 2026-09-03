@@ -444,7 +444,10 @@ fn check_operation(
         }
         OperationKind::Variant { .. } => {}
         OperationKind::List(_)
-            if webhook && (is_header_list(&operation.ty) || is_log_field_list(&operation.ty)) => {}
+            if webhook
+                && (is_header_list(&operation.ty)
+                    || is_log_field_list(&operation.ty)
+                    || is_string_list(&operation.ty)) => {}
         OperationKind::List(_) | OperationKind::MatchList { .. } => {
             return Err(unsupported_layout("List", operation.source));
         }
@@ -731,6 +734,47 @@ fn check_builtin(
         {
             Ok(())
         }
+        Builtin::DatabaseBeginRead | Builtin::DatabaseBeginWrite
+            if function.parameters() == [std::sync::Arc::new(Type::String)]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::DatabaseTransaction
+                            && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::DatabaseQuery
+            if database_operation_parameters(function)
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::String && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::DatabaseExecute
+            if database_operation_parameters(function)
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::Int && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::DatabaseCommit | Builtin::DatabaseRollback
+            if function.parameters() == [std::sync::Arc::new(Type::DatabaseTransaction)]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::Unit && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
         Builtin::JsonDecode
             if function.parameters() == [std::sync::Arc::new(Type::String)]
                 && function.return_type() == &Type::String =>
@@ -781,6 +825,7 @@ fn check_type_inner(
         | Type::LogField
         | Type::QueueJob
         | Type::ScheduleEvent
+        | Type::DatabaseTransaction
         | Type::Secret
             if webhook =>
         {
@@ -798,6 +843,7 @@ fn check_type_inner(
         Type::LogField => Err(unsupported_layout("LogField", span)),
         Type::QueueJob => Err(unsupported_layout("QueueJob", span)),
         Type::ScheduleEvent => Err(unsupported_layout("ScheduleEvent", span)),
+        Type::DatabaseTransaction => Err(unsupported_layout("DatabaseTransaction", span)),
         Type::Secret => Err(unsupported_layout("Secret", span)),
         Type::List(_) => Err(unsupported_layout("List", span)),
         Type::Record(_) => Err(unsupported_layout("Record", span)),
@@ -1027,6 +1073,16 @@ fn collect_restricted_uses(
         .push(RestrictedUse::Other);
 }
 
+/// Whether a database operation carries the fixed `(handle, name, params)` shape.
+fn database_operation_parameters(function: &krit::FunctionType) -> bool {
+    function.parameters()
+        == [
+            std::sync::Arc::new(Type::DatabaseTransaction),
+            std::sync::Arc::new(Type::String),
+            std::sync::Arc::new(Type::List(std::sync::Arc::new(Type::String))),
+        ]
+}
+
 fn is_supported_webhook_type(ty: &Type) -> bool {
     match ty {
         Type::Int
@@ -1039,15 +1095,21 @@ fn is_supported_webhook_type(ty: &Type) -> bool {
         | Type::LogField
         | Type::QueueJob
         | Type::ScheduleEvent
+        | Type::DatabaseTransaction
         | Type::Secret => true,
-        Type::List(_) => is_header_list(ty) || is_log_field_list(ty),
+        Type::List(_) => is_header_list(ty) || is_log_field_list(ty) || is_string_list(ty),
         Type::Record(_) => is_http_contract_type(ty) || is_log_field(ty),
         Type::Option(element) => matches!(element.as_ref(), Type::Secret | Type::String),
         Type::Result(value, error) => {
             error.as_ref() == &Type::String
                 && (matches!(
                     value.as_ref(),
-                    Type::Unit | Type::String | Type::Secret | Type::HttpResponse
+                    Type::Unit
+                        | Type::Int
+                        | Type::String
+                        | Type::Secret
+                        | Type::HttpResponse
+                        | Type::DatabaseTransaction
                 ) || matches!(
                     value.as_ref(),
                     Type::Option(element) if element.as_ref() == &Type::String
@@ -1062,6 +1124,10 @@ fn is_supported_webhook_type(ty: &Type) -> bool {
         }
         Type::Variable(_) => false,
     }
+}
+
+fn is_string_list(ty: &Type) -> bool {
+    matches!(ty, Type::List(element) if element.as_ref() == &Type::String)
 }
 
 fn is_header_list(ty: &Type) -> bool {
@@ -1257,6 +1323,7 @@ fn contains_residual(ty: &Type) -> bool {
         | Type::LogField
         | Type::QueueJob
         | Type::ScheduleEvent
+        | Type::DatabaseTransaction
         | Type::Secret => false,
     }
 }
