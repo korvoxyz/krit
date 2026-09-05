@@ -127,7 +127,9 @@ def bundle_notices(metadata, root_id, payload):
             }
         )
     (payload / "THIRD-PARTY-LICENSES.json").write_text(
-        json.dumps(third_party, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(third_party, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
     )
 
 
@@ -255,15 +257,16 @@ def main():
                 sort_keys=True,
             ) + "\n",
             encoding="utf-8",
+            newline="\n",
         )
         make_archive(payload, archive_path, epoch, windows)
     smoke_archive(archive_path, name, version, windows)
     checksum = sha256(archive_path)
     archive_path.with_name(archive_path.name + ".sha256").write_text(
-        f"{checksum}  {archive_path.name}\n", encoding="ascii"
+        f"{checksum}  {archive_path.name}\n", encoding="ascii", newline="\n"
     )
     if output_path := os.environ.get("GITHUB_OUTPUT"):
-        with open(output_path, "a", encoding="utf-8") as output:
+        with open(output_path, "a", encoding="utf-8", newline="\n") as output:
             output.write(f"archive={archive_path}\n")
     print(f"Packaged {archive_path.name} ({checksum})")
 

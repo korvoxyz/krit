@@ -359,6 +359,8 @@ completed bounded agent roadmap.
 - Removed platform-dependent port-order assumptions from reference-agent
   approval expectations and made the backoff cancellation fixture use a
   retry-eligible request
+- Enforced LF checkouts and generated release metadata on every platform so
+  Windows archives preserve canonical source formatting
 - Reserve queue jobs and schedule fires only after acquiring the Runtime's
   execution scheduler, retain ownership through acknowledgement, and recheck
   cancellation after scheduler and schedule-materialization waits
