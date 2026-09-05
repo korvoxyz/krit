@@ -327,6 +327,31 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   exhaustion, schedule fire recovery, object bounds, schema migration, and
   non-repeated completed external effects
 
+### Fixed
+
+- Reserve queue jobs and schedule fires only after acquiring the Runtime's
+  execution scheduler, retain ownership through acknowledgement, and recheck
+  cancellation after scheduler and schedule-materialization waits
+- Advance delivery lease/outcome timestamps from host time using monotonic
+  elapsed time, preserve the exact schedule tick cutoff, and refuse guest work
+  when a reservation no longer covers its execution deadline
+- Release delivery leases after failed outcome commits or malformed job bodies
+  instead of leaving work unavailable until lease expiry
+- Reject HTTP/AI replay inside an application-database transaction before
+  approval or durable access; release replay leases after provider failures,
+  cancellation, approval denial, host traps, and completion errors
+- Preserve the original failure when durable reservation cleanup also fails
+- Revalidate cached inbound responses and durable AI output against current
+  runtime/adapter limits, including inclusive byte and header boundaries
+- Enforce durable-state and job/storage protocol maxima in public lower-layer
+  APIs, with the CLI sharing the same validation
+- Reject duplicate keys across every host-configuration map and supported
+  schema before resource initialization
+- Apply direct-run rejection and editor/compiler facts consistently to webhook,
+  queue, and schedule deployment entrypoints
+- Distinguish implemented phases from planned package/build infrastructure and
+  still-unmeasured performance and product-validation goals in the documentation
+
 ### Changed
 
 - Selected WebAssembly components instead of custom bytecode as the first

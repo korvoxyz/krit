@@ -153,7 +153,18 @@ published --reserve--> leased --Ok--> committed and removed
   which bounds poison-job redelivery.
 - **Leases.** Reservation records a 16-byte owner and an expiry instant. Only
   the recorded owner may acknowledge or fail a delivery; a stale owner receives
-  a `Lost` disposition and mutates nothing.
+  a `Lost` disposition and mutates nothing. Expiry permits another reservation;
+  it does not by itself replace the owner. A late, still-current owner may
+  complete, but a replaced owner cannot commit staged state or acknowledgement.
+- **Scheduler ownership.** A Runtime acquires its execution scheduler before
+  queue reservation or schedule materialization/reservation and retains it
+  through the outcome commit. Cancellation while waiting is checked before
+  consuming an attempt. Lease and outcome instants advance from the supplied
+  host timestamp by monotonic elapsed time, including compilation and scheduler
+  waiting; the original schedule tick remains the materialization cutoff.
+  The host checks the remaining lease again before guest execution, after any
+  SQLite wait. A failed outcome commit follows the same bounded retry/dead-letter
+  path as a failed invocation, without publishing staged state or output.
 - **Backoff.** Retry visibility is `now + min(backoff * 2^(attempts - 1),
   maxBackoff)`.
 - **Dead letters.** Exhausting the attempt budget moves the job body, attempt
@@ -164,7 +175,8 @@ published --reserve--> leased --Ok--> committed and removed
   guest execution or network access. Because no lock spans execution, a
   configured delivery lease must be at least the runtime execution deadline plus
   the backing store's busy timeout; a shorter lease is rejected at host
-  validation so two workers can never hold the same delivery at once.
+  validation. This protects the bounded execution window, not arbitrary process
+  suspension or cross-host exactly-once delivery; replaced owners cannot commit.
 - **Bounded terminalization.** One reservation call inspects at most
   `min(bound, 1024)` candidates, where `bound` is the queue depth or the
   schedule's retained-fire count. Terminal transitions discovered during that

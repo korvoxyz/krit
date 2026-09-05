@@ -653,27 +653,28 @@ fn render_explanation_human(program: &krit::Program, analysis: &Analysis, module
     );
     println!("result: {}", entrypoint.signature.result);
     println!("effects: {}", entrypoint.signature.effects);
-    if let Some(webhook) = module
+    for entrypoint in module
         .entrypoints()
         .iter()
-        .find(|entrypoint| entrypoint.kind == EntrypointKind::Webhook)
+        .filter(|entrypoint| entrypoint.kind.is_exported())
     {
-        let function = &module.functions()[webhook.function.as_u32() as usize];
-        let name = function.debug_name.as_deref().unwrap_or("<anonymous>");
-        println!("webhook contract (schema 1):");
+        let function = &module.functions()[entrypoint.function.as_u32() as usize];
+        println!("{} contract (schema 1):", entrypoint.kind.as_str());
         println!(
-            "  signature: webhook fn {}(request: HttpRequest) -> HttpResponse",
-            name
+            "  signature: {}",
+            normalized_entrypoint_signature(entrypoint, function)
         );
         println!("  effects: {}", function.signature.effects);
         println!("  capabilities: {}", function.signature.requirements);
-        println!(
-            "  request: HttpRequest {{ method: String, path: String, query: String, headers: List<HttpHeader>, body: String }}"
-        );
-        println!(
-            "  response: HttpResponse {{ status: Int, headers: List<HttpHeader>, body: String }}"
-        );
-        println!("  JSON Schema: draft 2020-12 request/response contract v1");
+        if entrypoint.kind == EntrypointKind::Webhook {
+            println!(
+                "  request: HttpRequest {{ method: String, path: String, query: String, headers: List<HttpHeader>, body: String }}"
+            );
+            println!(
+                "  response: HttpResponse {{ status: Int, headers: List<HttpHeader>, body: String }}"
+            );
+            println!("  JSON Schema: draft 2020-12 request/response contract v1");
+        }
     }
     println!("durable operations:");
     let durable = krit::durable_operations(program);
@@ -1177,15 +1178,22 @@ fn execute_source(source: &Source, format: DiagnosticFormat) -> u8 {
         Ok(program) => program,
         Err(diagnostic) => return report(&diagnostic, source, format),
     };
-    if let Some(statement) = program
-        .statements
-        .iter()
-        .find(|statement| matches!(statement.kind, krit::StatementKind::Webhook { .. }))
-    {
+    if let Some((kind, span)) = program.statements.iter().find_map(|statement| {
+        let kind = match statement.kind {
+            krit::StatementKind::Webhook { .. } => EntrypointKind::Webhook,
+            krit::StatementKind::QueueConsumer { .. } => EntrypointKind::QueueConsumer,
+            krit::StatementKind::ScheduleHandler { .. } => EntrypointKind::ScheduleHandler,
+            _ => return None,
+        };
+        Some((kind, statement.span))
+    }) {
         let diagnostic = Diagnostic::new(
             "K5003",
-            "webhook entrypoints are unavailable in direct source execution",
-            statement.span,
+            format!(
+                "{} entrypoints are unavailable in direct source execution",
+                kind.as_str()
+            ),
+            span,
         );
         let _ = report(&diagnostic, source, format);
         return 4;

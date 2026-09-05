@@ -44,9 +44,9 @@ struct HostConfigSchema {
 #[serde(deny_unknown_fields)]
 struct HostConfigV1 {
     schema: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     config: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     secrets: BTreeMap<String, SecretReference>,
 }
 
@@ -54,11 +54,11 @@ struct HostConfigV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HostConfigV2 {
     schema: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     config: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     secrets: BTreeMap<String, SecretReference>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     ai_adapters: BTreeMap<String, AiAdapterFile>,
     #[serde(default)]
     approvals: Vec<ApprovalFile>,
@@ -74,11 +74,11 @@ struct HostConfigV2 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HostConfigV3 {
     schema: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     config: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     secrets: BTreeMap<String, SecretReference>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     ai_adapters: BTreeMap<String, AiAdapterFile>,
     #[serde(default)]
     approvals: Vec<ApprovalFile>,
@@ -95,11 +95,11 @@ struct HostConfigV3 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HostConfigV4 {
     schema: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     config: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     secrets: BTreeMap<String, SecretReference>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     ai_adapters: BTreeMap<String, AiAdapterFile>,
     #[serde(default)]
     approvals: Vec<ApprovalFile>,
@@ -118,11 +118,11 @@ struct HostConfigV4 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HostConfigV5 {
     schema: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     config: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     secrets: BTreeMap<String, SecretReference>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     ai_adapters: BTreeMap<String, AiAdapterFile>,
     #[serde(default)]
     approvals: Vec<ApprovalFile>,
@@ -135,7 +135,7 @@ struct HostConfigV5 {
     state: StateFile,
     #[serde(default)]
     jobs: JobsFile,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     databases: BTreeMap<String, DatabaseFile>,
     #[serde(default = "default_max_transactions")]
     max_transactions_per_invocation: usize,
@@ -145,11 +145,11 @@ struct HostConfigV5 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HostConfigV6 {
     schema: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     config: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     secrets: BTreeMap<String, SecretReference>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     ai_adapters: BTreeMap<String, AiAdapterFile>,
     #[serde(default)]
     approvals: Vec<ApprovalFile>,
@@ -162,14 +162,13 @@ struct HostConfigV6 {
     state: StateFile,
     #[serde(default)]
     jobs: JobsFile,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     databases: BTreeMap<String, DatabaseFile>,
     #[serde(default = "default_max_transactions")]
     max_transactions_per_invocation: usize,
     #[serde(default)]
     cache: CacheFile,
-    #[serde(default)]
-    #[serde(deserialize_with = "unique_keys")]
+    #[serde(default, deserialize_with = "unique_keys")]
     search: BTreeMap<String, SearchConnectorFile>,
 }
 
@@ -177,8 +176,7 @@ struct HostConfigV6 {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CacheFile {
-    #[serde(default)]
-    #[serde(deserialize_with = "unique_keys")]
+    #[serde(default, deserialize_with = "unique_keys")]
     namespaces: BTreeMap<String, CacheNamespaceFile>,
     #[serde(default)]
     max_total_entries: usize,
@@ -249,7 +247,7 @@ struct LocalDocumentFile {
 /// Deserializes a JSON object into a map, rejecting any duplicate key.
 ///
 /// `serde_json` keeps the last value for a repeated key, so a configuration
-/// could otherwise declare one namespace or connector twice with conflicting
+/// could otherwise declare one resource or policy twice with conflicting
 /// bounds, endpoints, or credentials and have the earlier definition silently
 /// discarded. This refuses the document instead, during pure phase-one
 /// validation and before any store, database, or cache is touched.
@@ -301,6 +299,7 @@ struct DatabaseFile {
     max_rows: usize,
     max_columns: usize,
     max_result_bytes: usize,
+    #[serde(deserialize_with = "unique_keys")]
     statements: BTreeMap<String, StatementFile>,
 }
 
@@ -339,11 +338,11 @@ enum ParameterTypeFile {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct JobsFile {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     queues: BTreeMap<String, QueueFile>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     schedules: BTreeMap<String, ScheduleFile>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     buckets: BTreeMap<String, BucketFile>,
 }
 
@@ -390,7 +389,7 @@ struct BucketFile {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StateFile {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     stores: BTreeMap<String, StateStoreFile>,
     #[serde(default)]
     durable_idempotency_store: Option<String>,
@@ -419,40 +418,6 @@ enum DurabilityFile {
     Full,
     Normal,
 }
-
-const MAX_STATE_STORES: usize = 16;
-const MAX_STATE_OPERATIONS: usize = 1024;
-const MAX_STATE_KEY_BYTES: usize = 4 * 1024;
-const MAX_STATE_VALUE_BYTES: usize = 1024 * 1024;
-const MAX_STATE_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
-const MAX_STATE_DATABASE_BYTES: u64 = 1024 * 1024 * 1024;
-/// Smallest budget that can hold the strict schema-2 store.
-const MIN_STATE_DATABASE_BYTES: u64 = krit_runtime::MINIMUM_DATABASE_BYTES;
-const MAX_STATE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_REPLAY_ENTRIES: usize = 65_536;
-const MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
-const MAX_REPLAY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const MAX_REPLAY_LEASE: Duration = Duration::from_secs(5 * 60);
-const MAX_QUEUES: usize = 16;
-const MAX_SCHEDULES: usize = 16;
-const MAX_BUCKETS: usize = 16;
-const MAX_QUEUE_DEPTH: usize = 65_536;
-const MAX_QUEUE_JOB_BYTES: usize = 1024 * 1024;
-const MAX_QUEUE_BYTES: usize = 256 * 1024 * 1024;
-const MAX_DELIVERY_ATTEMPTS: u32 = 16;
-const MAX_DELIVERY_LEASE: Duration = Duration::from_secs(5 * 60);
-const MAX_DELIVERY_BACKOFF: Duration = Duration::from_secs(60 * 60);
-const MAX_DEAD_LETTER_ENTRIES: usize = 4096;
-const MAX_DEAD_LETTER_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const MIN_SCHEDULE_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_SCHEDULE_INTERVAL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
-const MAX_SCHEDULE_CATCH_UP: u32 = 64;
-const MAX_SCHEDULE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const MAX_RETAINED_FIRES: usize = 4096;
-const MAX_BUCKET_OBJECTS: usize = 65_536;
-const MAX_OBJECT_KEY_BYTES: usize = 1024;
-const MAX_OBJECT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_BUCKET_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -521,9 +486,9 @@ struct RetriesFile {
     default_http: RetryPolicyFile,
     #[serde(default)]
     default_ai: RetryPolicyFile,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     http: BTreeMap<String, RetryPolicyFile>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     ai: BTreeMap<String, RetryPolicyFile>,
 }
 
@@ -541,9 +506,9 @@ struct RateLimitsFile {
     default_http: RatePolicyFile,
     #[serde(default = "default_ai_rate")]
     default_ai: RatePolicyFile,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     http: BTreeMap<String, RatePolicyFile>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     ai: BTreeMap<String, RatePolicyFile>,
     #[serde(default = "default_max_tracked_resources")]
     max_tracked_resources: usize,
@@ -680,6 +645,7 @@ pub(crate) fn load(
             })?;
             debug_assert_eq!(file.schema, 3);
             let resolved = resolve_durable_state(path, manifest, file.state, &BTreeSet::new())?;
+            resolved.validate_for_runtime(&PreparedJobs::default(), limits)?;
             let compatible = HostConfigV2 {
                 schema: 2,
                 config: file.config,
@@ -691,7 +657,10 @@ pub(crate) fn load(
                 idempotency: file.idempotency,
             };
             load_configured_host(path, manifest, limits, compatible, || {
-                Ok((open_durable_state(resolved)?, DatabaseCatalog::default()))
+                Ok((
+                    open_durable_state(resolved, PreparedJobs::default())?,
+                    DatabaseCatalog::default(),
+                ))
             })
         }
         4 => {
@@ -706,6 +675,7 @@ pub(crate) fn load(
             let jobs = validate_jobs(manifest, file.jobs, &configured_stores)?;
             let host_owned = jobs.store_names();
             let resolved = resolve_durable_state(path, manifest, file.state, &host_owned)?;
+            resolved.validate_for_runtime(&jobs, limits)?;
             let compatible = HostConfigV2 {
                 schema: 2,
                 config: file.config,
@@ -717,9 +687,7 @@ pub(crate) fn load(
                 idempotency: file.idempotency,
             };
             load_configured_host(path, manifest, limits, compatible, || {
-                let durable = open_durable_state(resolved)?
-                    .with_jobs(jobs.queues, jobs.schedules, jobs.buckets)
-                    .map_err(HostConfigError::durable)?;
+                let durable = open_durable_state(resolved, jobs)?;
                 Ok((durable, DatabaseCatalog::default()))
             })
         }
@@ -738,6 +706,7 @@ pub(crate) fn load(
             let jobs = validate_jobs(manifest, file.jobs, &configured_stores)?;
             let host_owned = jobs.store_names();
             let resolved = resolve_durable_state(path, manifest, file.state, &host_owned)?;
+            resolved.validate_for_runtime(&jobs, limits)?;
             let root = config_root(path)?;
             reject_aliased_paths(&resolved.definitions, &prepared, &root)?;
             let max_transactions = file.max_transactions_per_invocation;
@@ -756,9 +725,7 @@ pub(crate) fn load(
                 // file, so a catalog or live-schema failure cannot leave a
                 // freshly created or migrated durable state store behind.
                 let databases = open_databases(path, prepared, max_transactions)?;
-                let durable = open_durable_state(resolved)?
-                    .with_jobs(jobs.queues, jobs.schedules, jobs.buckets)
-                    .map_err(HostConfigError::durable)?;
+                let durable = open_durable_state(resolved, jobs)?;
                 Ok((durable, databases))
             })
         }
@@ -778,6 +745,7 @@ pub(crate) fn load(
             let jobs = validate_jobs(manifest, file.jobs, &configured_stores)?;
             let host_owned = jobs.store_names();
             let resolved = resolve_durable_state(path, manifest, file.state, &host_owned)?;
+            resolved.validate_for_runtime(&jobs, limits)?;
             let root = config_root(path)?;
             reject_aliased_paths(&resolved.definitions, &prepared, &root)?;
             let max_transactions = file.max_transactions_per_invocation;
@@ -794,9 +762,9 @@ pub(crate) fn load(
             load_configured_services(path, manifest, limits, compatible, move || {
                 // Phase two: the first side effects happen only here.
                 let databases = open_databases(path, prepared, max_transactions)?;
-                let durable = open_durable_state(resolved)?
-                    .with_jobs(jobs.queues, jobs.schedules, jobs.buckets)
-                    .map_err(HostConfigError::durable)?;
+                let durable = open_durable_state(resolved, jobs)?;
+                #[cfg(test)]
+                tests::service_opened();
                 let cache = CacheHandle::open(cache)
                     .map_err(|error| HostConfigError::input(error.message()))?;
                 let search_catalog = SearchCatalog::open(connectors)
@@ -936,6 +904,7 @@ fn load_configured_services(
 ///
 /// Building this value performs no I/O, so an invalid `jobs` section is
 /// rejected before any database is created, opened, or migrated.
+#[derive(Default)]
 struct PreparedJobs {
     queues: BTreeMap<String, QueueDefinition>,
     schedules: BTreeMap<String, ScheduleDefinition>,
@@ -969,9 +938,9 @@ fn validate_jobs(
     jobs: JobsFile,
     configured_stores: &BTreeSet<String>,
 ) -> Result<PreparedJobs, HostConfigError> {
-    if jobs.queues.len() > MAX_QUEUES
-        || jobs.schedules.len() > MAX_SCHEDULES
-        || jobs.buckets.len() > MAX_BUCKETS
+    if jobs.queues.len() > DurableState::MAX_QUEUES
+        || jobs.schedules.len() > DurableState::MAX_SCHEDULES
+        || jobs.buckets.len() > DurableState::MAX_BUCKETS
     {
         return Err(HostConfigError::input(
             "configured queues, schedules, or buckets exceed the Phase 6 bounds",
@@ -996,47 +965,25 @@ fn validate_jobs(
             )));
         }
         require_store(&file.store)?;
-        let lease = seconds(file.lease_seconds, "queue lease")?;
-        let backoff = seconds(file.backoff_seconds, "queue backoff")?;
-        let max_backoff = seconds(file.max_backoff_seconds, "queue maximum backoff")?;
-        let dead_letter_ttl = seconds(file.dead_letter_retention_seconds, "dead-letter retention")?;
-        if file.max_depth == 0
-            || file.max_depth > MAX_QUEUE_DEPTH
-            || file.max_job_bytes == 0
-            || file.max_job_bytes > MAX_QUEUE_JOB_BYTES
-            || file.max_queue_bytes < file.max_job_bytes
-            || file.max_queue_bytes > MAX_QUEUE_BYTES
-            || file.max_attempts == 0
-            || file.max_attempts > MAX_DELIVERY_ATTEMPTS
-            || lease.is_zero()
-            || lease > MAX_DELIVERY_LEASE
-            || backoff.is_zero()
-            || backoff > max_backoff
-            || max_backoff > MAX_DELIVERY_BACKOFF
-            || file.dead_letter_max_entries == 0
-            || file.dead_letter_max_entries > MAX_DEAD_LETTER_ENTRIES
-            || dead_letter_ttl.is_zero()
-            || dead_letter_ttl > MAX_DEAD_LETTER_RETENTION
-        {
-            return Err(HostConfigError::input(
-                "durable queue limits exceed the Phase 6 bounds",
-            ));
-        }
+        let policy = QueuePolicy {
+            max_depth: file.max_depth,
+            max_job_bytes: file.max_job_bytes,
+            max_queue_bytes: file.max_queue_bytes,
+            max_attempts: file.max_attempts,
+            lease: Duration::from_secs(file.lease_seconds),
+            backoff: Duration::from_secs(file.backoff_seconds),
+            max_backoff: Duration::from_secs(file.max_backoff_seconds),
+            dead_letter_max_entries: file.dead_letter_max_entries,
+            dead_letter_ttl: Duration::from_secs(file.dead_letter_retention_seconds),
+        };
+        policy
+            .validate()
+            .map_err(|error| HostConfigError::input(error.message()))?;
         queues.insert(
             name,
             QueueDefinition {
                 store: file.store,
-                policy: QueuePolicy {
-                    max_depth: file.max_depth,
-                    max_job_bytes: file.max_job_bytes,
-                    max_queue_bytes: file.max_queue_bytes,
-                    max_attempts: file.max_attempts,
-                    lease,
-                    backoff,
-                    max_backoff,
-                    dead_letter_max_entries: file.dead_letter_max_entries,
-                    dead_letter_ttl,
-                },
+                policy,
             },
         );
     }
@@ -1048,47 +995,25 @@ fn validate_jobs(
             )));
         }
         require_store(&file.store)?;
-        let interval = seconds(file.interval_seconds, "schedule interval")?;
-        let lease = seconds(file.lease_seconds, "schedule lease")?;
-        let backoff = seconds(file.backoff_seconds, "schedule backoff")?;
-        let max_backoff = seconds(file.max_backoff_seconds, "schedule maximum backoff")?;
-        let retention = seconds(file.retention_seconds, "schedule retention")?;
-        if interval < MIN_SCHEDULE_INTERVAL
-            || interval > MAX_SCHEDULE_INTERVAL
-            || file.start_epoch_millis < 0
-            || file.max_catch_up == 0
-            || file.max_catch_up > MAX_SCHEDULE_CATCH_UP
-            || file.max_attempts == 0
-            || file.max_attempts > MAX_DELIVERY_ATTEMPTS
-            || lease.is_zero()
-            || lease > MAX_DELIVERY_LEASE
-            || backoff.is_zero()
-            || backoff > max_backoff
-            || max_backoff > MAX_DELIVERY_BACKOFF
-            || retention.is_zero()
-            || retention > MAX_SCHEDULE_RETENTION
-            || file.max_retained_fires == 0
-            || file.max_retained_fires > MAX_RETAINED_FIRES
-        {
-            return Err(HostConfigError::input(
-                "durable schedule limits exceed the Phase 6 bounds",
-            ));
-        }
+        let policy = SchedulePolicy {
+            interval: Duration::from_secs(file.interval_seconds),
+            start_millis: file.start_epoch_millis,
+            max_catch_up: file.max_catch_up,
+            max_attempts: file.max_attempts,
+            lease: Duration::from_secs(file.lease_seconds),
+            backoff: Duration::from_secs(file.backoff_seconds),
+            max_backoff: Duration::from_secs(file.max_backoff_seconds),
+            retention: Duration::from_secs(file.retention_seconds),
+            max_retained_fires: file.max_retained_fires,
+        };
+        policy
+            .validate()
+            .map_err(|error| HostConfigError::input(error.message()))?;
         schedules.insert(
             name,
             ScheduleDefinition {
                 store: file.store,
-                policy: SchedulePolicy {
-                    interval,
-                    start_millis: file.start_epoch_millis,
-                    max_catch_up: file.max_catch_up,
-                    max_attempts: file.max_attempts,
-                    lease,
-                    backoff,
-                    max_backoff,
-                    retention,
-                    max_retained_fires: file.max_retained_fires,
-                },
+                policy,
             },
         );
     }
@@ -1102,29 +1027,20 @@ fn validate_jobs(
             )));
         }
         require_store(&file.store)?;
-        if file.max_objects == 0
-            || file.max_objects > MAX_BUCKET_OBJECTS
-            || file.max_key_bytes == 0
-            || file.max_key_bytes > MAX_OBJECT_KEY_BYTES
-            || file.max_object_bytes == 0
-            || file.max_object_bytes > MAX_OBJECT_BYTES
-            || file.max_bucket_bytes < file.max_object_bytes
-            || u64::try_from(file.max_bucket_bytes).unwrap_or(u64::MAX) > MAX_BUCKET_BYTES
-        {
-            return Err(HostConfigError::input(
-                "object bucket limits exceed the Phase 6 bounds",
-            ));
-        }
+        let policy = BucketPolicy {
+            max_objects: file.max_objects,
+            max_key_bytes: file.max_key_bytes,
+            max_object_bytes: file.max_object_bytes,
+            max_bucket_bytes: file.max_bucket_bytes,
+        };
+        policy
+            .validate()
+            .map_err(|error| HostConfigError::input(error.message()))?;
         buckets.insert(
             name,
             BucketDefinition {
                 store: file.store,
-                policy: BucketPolicy {
-                    max_objects: file.max_objects,
-                    max_key_bytes: file.max_key_bytes,
-                    max_object_bytes: file.max_object_bytes,
-                    max_bucket_bytes: file.max_bucket_bytes,
-                },
+                policy,
             },
         );
     }
@@ -1193,6 +1109,8 @@ fn validate_cache(manifest: &Manifest, cache: &CacheFile) -> Result<CacheConfig,
     };
     // Bounds are checked here rather than at construction so an invalid limit
     // never reaches a side-effectful step.
+    #[cfg(test)]
+    tests::service_opened();
     CacheHandle::open(config.clone()).map_err(|error| HostConfigError::input(error.message()))?;
     Ok(config)
 }
@@ -1293,6 +1211,24 @@ struct ResolvedState {
     idempotency_store: Option<String>,
 }
 
+impl ResolvedState {
+    fn validate_for_runtime(
+        &self,
+        jobs: &PreparedJobs,
+        limits: RuntimeLimits,
+    ) -> Result<(), HostConfigError> {
+        DurableState::validate_configuration_for_runtime(
+            &self.definitions,
+            self.idempotency_store.as_deref(),
+            &jobs.queues,
+            &jobs.schedules,
+            &jobs.buckets,
+            limits.deadline(),
+        )
+        .map_err(HostConfigError::durable)
+    }
+}
+
 /// Resolves and validates every durable store without touching the filesystem
 /// beyond reading what already exists.
 fn resolve_durable_state(
@@ -1301,9 +1237,10 @@ fn resolve_durable_state(
     state: StateFile,
     host_owned: &BTreeSet<String>,
 ) -> Result<ResolvedState, HostConfigError> {
-    if state.stores.len() > MAX_STATE_STORES {
+    if state.stores.len() > DurableState::MAX_STORES {
         return Err(HostConfigError::input(format!(
-            "too many durable stores; maximum is {MAX_STATE_STORES}"
+            "too many durable stores; maximum is {}",
+            DurableState::MAX_STORES,
         )));
     }
     let root = config_root(host_config_path)?;
@@ -1314,43 +1251,20 @@ fn resolve_durable_state(
         if !host_owned.contains(&name) {
             require_manifest_state(manifest, &name)?;
         }
-        validate_state_store_file(&file)?;
-        validate_relative_state_path(&file.path)?;
-        let database = resolve_state_database_path(&root, &file.path, file.max_database_bytes)?;
+        let mut definition = validate_state_store_file(file)?;
+        validate_relative_state_path(&definition.path)?;
+        let database = resolve_state_database_path(
+            &root,
+            &definition.path,
+            definition.limits.max_database_bytes,
+        )?;
         if let Some(previous) = paths.insert(database.clone(), name.clone()) {
             return Err(HostConfigError::input(format!(
                 "durable stores `{previous}` and `{name}` use the same database path"
             )));
         }
-        let busy_timeout = milliseconds(file.busy_timeout_ms, "state busy timeout")?;
-        let replay_ttl = seconds(file.replay_ttl_seconds, "state replay TTL")?;
-        let lease = seconds(file.lease_seconds, "state replay lease")?;
-        definitions.insert(
-            name,
-            DurableStoreDefinition {
-                path: database,
-                durability: match file.durability {
-                    DurabilityFile::Full => Durability::Full,
-                    DurabilityFile::Normal => Durability::Normal,
-                },
-                limits: DurableStoreLimits {
-                    busy_timeout,
-                    max_operations: file.max_operations,
-                    max_key_bytes: file.max_key_bytes,
-                    max_value_bytes: file.max_value_bytes,
-                    max_transaction_bytes: file.max_transaction_bytes,
-                    max_database_bytes: file.max_database_bytes,
-                    max_replay_entries: file.max_replay_entries,
-                    max_replay_bytes: file.max_replay_bytes,
-                },
-                replay: RetentionPolicy {
-                    max_entries: file.max_replay_entries,
-                    max_bytes: file.max_replay_bytes,
-                    ttl: replay_ttl,
-                    lease,
-                },
-            },
-        );
+        definition.path = database;
+        definitions.insert(name, definition);
     }
     if let Some(name) = &state.durable_idempotency_store {
         require_manifest_state(manifest, name)?;
@@ -1370,12 +1284,31 @@ fn resolve_durable_state(
 ///
 /// This is the first mutating step in loading a host configuration and runs
 /// only after every definition, limit, grant, and policy has been validated.
-fn open_durable_state(resolved: ResolvedState) -> Result<DurableState, HostConfigError> {
+fn open_durable_state(
+    resolved: ResolvedState,
+    jobs: PreparedJobs,
+) -> Result<DurableState, HostConfigError> {
+    #[cfg(test)]
+    tests::service_opened();
+    DurableState::validate_configuration(
+        &resolved.definitions,
+        resolved.idempotency_store.as_deref(),
+        &jobs.queues,
+        &jobs.schedules,
+        &jobs.buckets,
+    )
+    .map_err(HostConfigError::durable)?;
     for definition in resolved.definitions.values() {
         create_state_database_file(&definition.path)?;
     }
-    DurableState::open(resolved.definitions, resolved.idempotency_store)
-        .map_err(HostConfigError::durable)
+    DurableState::open_with_jobs(
+        resolved.definitions,
+        resolved.idempotency_store,
+        jobs.queues,
+        jobs.schedules,
+        jobs.buckets,
+    )
+    .map_err(HostConfigError::durable)
 }
 
 /// Rejects any durable store and application database that would share a file.
@@ -1560,6 +1493,8 @@ fn open_databases(
     prepared: Vec<PreparedDatabase>,
     max_transactions_per_invocation: usize,
 ) -> Result<DatabaseCatalog, HostConfigError> {
+    #[cfg(test)]
+    tests::service_opened();
     if prepared.is_empty() {
         return Ok(DatabaseCatalog::default());
     }
@@ -1603,36 +1538,36 @@ fn validate_relative_database_path(path: &Path) -> Result<(), HostConfigError> {
     validate_relative_state_path(path)
 }
 
-fn validate_state_store_file(file: &StateStoreFile) -> Result<(), HostConfigError> {
-    let busy = Duration::from_millis(file.busy_timeout_ms);
-    let replay_ttl = Duration::from_secs(file.replay_ttl_seconds);
-    let lease = Duration::from_secs(file.lease_seconds);
-    if busy.is_zero()
-        || busy > MAX_STATE_BUSY_TIMEOUT
-        || file.max_operations == 0
-        || file.max_operations > MAX_STATE_OPERATIONS
-        || file.max_key_bytes == 0
-        || file.max_key_bytes > MAX_STATE_KEY_BYTES
-        || file.max_value_bytes == 0
-        || file.max_value_bytes > MAX_STATE_VALUE_BYTES
-        || file.max_transaction_bytes == 0
-        || file.max_transaction_bytes > MAX_STATE_TRANSACTION_BYTES
-        || file.max_database_bytes < MIN_STATE_DATABASE_BYTES
-        || file.max_database_bytes > MAX_STATE_DATABASE_BYTES
-        || file.max_replay_entries == 0
-        || file.max_replay_entries > MAX_REPLAY_ENTRIES
-        || file.max_replay_bytes == 0
-        || file.max_replay_bytes > MAX_REPLAY_BYTES
-        || replay_ttl.is_zero()
-        || replay_ttl > MAX_REPLAY_TTL
-        || lease.is_zero()
-        || lease > MAX_REPLAY_LEASE
-    {
-        return Err(HostConfigError::input(
-            "durable state store limits exceed the Phase 6 bounds",
-        ));
-    }
-    Ok(())
+fn validate_state_store_file(
+    file: StateStoreFile,
+) -> Result<DurableStoreDefinition, HostConfigError> {
+    let definition = DurableStoreDefinition {
+        path: file.path,
+        durability: match file.durability {
+            DurabilityFile::Full => Durability::Full,
+            DurabilityFile::Normal => Durability::Normal,
+        },
+        limits: DurableStoreLimits {
+            busy_timeout: Duration::from_millis(file.busy_timeout_ms),
+            max_operations: file.max_operations,
+            max_key_bytes: file.max_key_bytes,
+            max_value_bytes: file.max_value_bytes,
+            max_transaction_bytes: file.max_transaction_bytes,
+            max_database_bytes: file.max_database_bytes,
+            max_replay_entries: file.max_replay_entries,
+            max_replay_bytes: file.max_replay_bytes,
+        },
+        replay: RetentionPolicy {
+            max_entries: file.max_replay_entries,
+            max_bytes: file.max_replay_bytes,
+            ttl: Duration::from_secs(file.replay_ttl_seconds),
+            lease: Duration::from_secs(file.lease_seconds),
+        },
+    };
+    definition
+        .validate()
+        .map_err(|error| HostConfigError::input(error.message()))?;
+    Ok(definition)
 }
 
 fn validate_relative_state_path(path: &Path) -> Result<(), HostConfigError> {
@@ -1921,13 +1856,6 @@ fn milliseconds(value: u64, name: &str) -> Result<Duration, HostConfigError> {
     Ok(Duration::from_millis(value))
 }
 
-fn seconds(value: u64, name: &str) -> Result<Duration, HostConfigError> {
-    if value == 0 {
-        return Err(HostConfigError::input(format!("{name} must be nonzero")));
-    }
-    Ok(Duration::from_secs(value))
-}
-
 const fn default_retry_attempts() -> u8 {
     1
 }
@@ -2035,4 +1963,481 @@ fn read_file_bounded(file: fs::File, limit: usize) -> Result<Vec<u8>, String> {
         return Err(format!("file exceeds the {limit}-byte host input limit"));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::Cell,
+        ffi::OsString,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    static DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        static SERVICE_OPENS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn service_opened() {
+        SERVICE_OPENS.with(|opens| opens.set(opens.get() + 1));
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+            let path = PathBuf::from(format!(
+                ".krit-host-config-test-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            owner_only(&path, 0o700);
+            fs::write(path.join("token"), b"fixture-token").unwrap();
+            owner_only(&path.join("token"), 0o600);
+
+            let mut definition = validate_state_store_file(
+                serde_json::from_value(store_file("existing.db")).unwrap(),
+            )
+            .unwrap();
+            definition.path = path.join("existing.db");
+            drop(
+                DurableState::open(BTreeMap::from([("existing".to_owned(), definition)]), None)
+                    .unwrap(),
+            );
+            let connection = rusqlite::Connection::open(path.join("existing.db")).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode = DELETE;
+                     DROP TABLE queue_jobs;
+                     DROP TABLE queue_dead;
+                     DROP TABLE schedule_fires;
+                     DROP TABLE schedule_cursors;
+                     DROP TABLE objects;
+                     PRAGMA user_version = 1;",
+                )
+                .unwrap();
+            drop(connection);
+            owner_only(&path.join("existing.db"), 0o600);
+
+            let database = rusqlite::Connection::open(path.join("app.db")).unwrap();
+            database
+                .execute_batch("CREATE TABLE items(value TEXT NOT NULL);")
+                .unwrap();
+            drop(database);
+            owner_only(&path.join("app.db"), 0o600);
+            Self(path)
+        }
+
+        fn config(&self) -> PathBuf {
+            self.0.join("host.json")
+        }
+
+        fn snapshot(&self) -> BTreeMap<OsString, Vec<u8>> {
+            fs::read_dir(&self.0)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_name() != "host.json")
+                .map(|entry| (entry.file_name(), fs::read(entry.path()).unwrap()))
+                .collect()
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn owner_only(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn owner_only(_path: &Path, _mode: u32) {}
+
+    fn manifest() -> Manifest {
+        Manifest::parse(
+            r#"
+schema = 1
+[package]
+name = "test/configuration"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+[capabilities]
+config = ["setting"]
+secrets = ["token"]
+http = ["https://example.com"]
+ai = ["reviewer"]
+state = ["existing", "fresh"]
+queues = ["queue"]
+consumes = ["queue"]
+schedules = ["schedule"]
+buckets = ["bucket"]
+databases = ["app"]
+cacheNamespaces = ["cached"]
+searchIndexes = ["search"]
+"#,
+        )
+        .unwrap()
+    }
+
+    fn store_file(path: &str) -> Value {
+        json!({
+            "path": path, "durability": "full", "busyTimeoutMs": 250,
+            "maxOperations": 128, "maxKeyBytes": 256, "maxValueBytes": 65536,
+            "maxTransactionBytes": 1048576, "maxDatabaseBytes": 4194304,
+            "maxReplayEntries": 128, "maxReplayBytes": 1048576,
+            "replayTtlSeconds": 3600, "leaseSeconds": 30
+        })
+    }
+
+    fn document(schema: u32) -> Value {
+        let mut document = json!({
+            "schema": schema,
+            "config": {"setting": "first"},
+            "secrets": {"token": {"file": "token"}}
+        });
+        if schema >= 2 {
+            document["aiAdapters"] = json!({
+                "reviewer": {
+                    "kind": "http-json", "origin": "https://example.com", "path": "/ai",
+                    "model": "first", "secret": "token", "maxInputBytes": 1024,
+                    "maxResponseBytes": 1024, "timeoutMs": 500
+                }
+            });
+            document["retries"] = json!({
+                "http": {"https://example.com": {"maxAttempts": 1}},
+                "ai": {"reviewer": {"maxAttempts": 1}}
+            });
+            document["rateLimits"] = json!({
+                "http": {"https://example.com": {"capacity": 16, "windowMs": 1000}},
+                "ai": {"reviewer": {"capacity": 16, "windowMs": 1000}}
+            });
+        }
+        if schema >= 3 {
+            document["state"] = json!({
+                "stores": {
+                    "existing": store_file("existing.db"),
+                    "fresh": store_file("fresh.db")
+                }
+            });
+        }
+        if schema >= 4 {
+            document["jobs"] = json!({
+                "queues": {"queue": {
+                    "store": "existing", "maxDepth": 16, "maxJobBytes": 1024,
+                    "maxQueueBytes": 65536, "maxAttempts": 4, "leaseSeconds": 30,
+                    "backoffSeconds": 1, "maxBackoffSeconds": 4,
+                    "deadLetterMaxEntries": 16, "deadLetterRetentionSeconds": 3600
+                }},
+                "schedules": {"schedule": {
+                    "store": "existing", "intervalSeconds": 60, "startEpochMillis": 0,
+                    "maxCatchUp": 8, "maxAttempts": 4, "leaseSeconds": 30,
+                    "backoffSeconds": 1, "maxBackoffSeconds": 4,
+                    "retentionSeconds": 3600, "maxRetainedFires": 16
+                }},
+                "buckets": {"bucket": {
+                    "store": "existing", "maxObjects": 16, "maxKeyBytes": 128,
+                    "maxObjectBytes": 1024, "maxBucketBytes": 65536
+                }}
+            });
+        }
+        if schema >= 5 {
+            document["databases"] = json!({
+                "app": {
+                    "path": "app.db", "mode": "read-write", "busyTimeoutMs": 100,
+                    "maxDatabaseBytes": 1048576, "maxTransactionMillis": 500,
+                    "maxOperationsPerTransaction": 16, "maxParameterBytes": 1024,
+                    "maxRows": 16, "maxColumns": 4, "maxResultBytes": 4096,
+                    "statements": {"read": {
+                        "kind": "query", "sql": "SELECT value FROM items",
+                        "parameters": [], "columns": ["value"]
+                    }}
+                }
+            });
+        }
+        if schema >= 6 {
+            document["cache"] = json!({
+                "namespaces": {"cached": {
+                    "mode": "read-write", "maxEntries": 16, "maxBytes": 4096,
+                    "maxKeyBytes": 64, "maxValueBytes": 256, "maxTtlSeconds": 60
+                }},
+                "maxTotalEntries": 16, "maxTotalBytes": 4096
+            });
+            document["search"] = json!({
+                "search": {
+                    "kind": "query", "maxResults": 4,
+                    "transport": {"type": "local", "documents": [{"id": "one", "text": "first"}]}
+                }
+            });
+        }
+        document
+    }
+
+    fn duplicate_document(
+        schema: u32,
+        pointer: &str,
+        key: &str,
+        field: &str,
+        second: Value,
+        escaped: bool,
+    ) -> String {
+        let mut document = document(schema);
+        let map = document.pointer_mut(pointer).unwrap();
+        let first = map[key].clone();
+        assert!(!first.is_null());
+        let mut conflict = first.clone();
+        if field.is_empty() {
+            conflict = second;
+        } else {
+            conflict[field] = second;
+        }
+        assert_ne!(first, conflict);
+        let second_key = if escaped {
+            format!(r#""\u{:04x}{}""#, key.as_bytes()[0], &key[1..])
+        } else {
+            serde_json::to_string(key).unwrap()
+        };
+        let duplicate = format!(
+            "{{{}:{first},{second_key}:{conflict}}}",
+            serde_json::to_string(key).unwrap()
+        );
+        *map = json!("DUPLICATE_MAP");
+        serde_json::to_string(&document)
+            .unwrap()
+            .replace(r#""DUPLICATE_MAP""#, &duplicate)
+    }
+
+    fn rejects_duplicate_family(
+        first_schema: u32,
+        pointer: &str,
+        key: &str,
+        field: &str,
+        second: Value,
+    ) {
+        let directory = TestDirectory::new();
+        let before = directory.snapshot();
+        for schema in first_schema..=6 {
+            for escaped in [false, true] {
+                fs::write(
+                    directory.config(),
+                    duplicate_document(schema, pointer, key, field, second.clone(), escaped),
+                )
+                .unwrap();
+                SERVICE_OPENS.with(|opens| opens.set(0));
+                let error = load(
+                    Some(&directory.config()),
+                    &manifest(),
+                    RuntimeLimits::default(),
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), HostConfigErrorKind::Input);
+                assert_eq!(error.code(), "K7003");
+                assert!(
+                    error.message().contains(&format!("duplicate key `{key}`")),
+                    "schema {schema}, {pointer}: {error:?}",
+                );
+                assert_eq!(
+                    SERVICE_OPENS.with(Cell::get),
+                    0,
+                    "duplicate {pointer} must precede state, database, and cache construction"
+                );
+                assert_eq!(directory.snapshot(), before, "schema {schema}, {pointer}");
+            }
+        }
+    }
+
+    macro_rules! duplicate_test {
+        ($name:ident, $schema:expr, $pointer:expr, $key:expr, $field:expr, $second:expr) => {
+            #[test]
+            fn $name() {
+                rejects_duplicate_family($schema, $pointer, $key, $field, json!($second));
+            }
+        };
+    }
+
+    duplicate_test!(duplicate_config, 1, "/config", "setting", "", "second");
+    duplicate_test!(
+        duplicate_secrets,
+        1,
+        "/secrets",
+        "token",
+        "file",
+        "other-token"
+    );
+    duplicate_test!(
+        duplicate_adapters,
+        2,
+        "/aiAdapters",
+        "reviewer",
+        "model",
+        "second"
+    );
+    duplicate_test!(
+        duplicate_stores,
+        3,
+        "/state/stores",
+        "existing",
+        "maxOperations",
+        129
+    );
+    duplicate_test!(duplicate_databases, 5, "/databases", "app", "maxRows", 17);
+    duplicate_test!(
+        duplicate_statements,
+        5,
+        "/databases/app/statements",
+        "read",
+        "sql",
+        "SELECT value FROM items WHERE value <> 'second'"
+    );
+    duplicate_test!(duplicate_queues, 4, "/jobs/queues", "queue", "maxDepth", 17);
+    duplicate_test!(
+        duplicate_schedules,
+        4,
+        "/jobs/schedules",
+        "schedule",
+        "maxCatchUp",
+        9
+    );
+    duplicate_test!(
+        duplicate_buckets,
+        4,
+        "/jobs/buckets",
+        "bucket",
+        "maxObjects",
+        17
+    );
+    duplicate_test!(
+        duplicate_http_retries,
+        2,
+        "/retries/http",
+        "https://example.com",
+        "maxAttempts",
+        2
+    );
+    duplicate_test!(
+        duplicate_ai_retries,
+        2,
+        "/retries/ai",
+        "reviewer",
+        "maxAttempts",
+        2
+    );
+    duplicate_test!(
+        duplicate_http_rates,
+        2,
+        "/rateLimits/http",
+        "https://example.com",
+        "capacity",
+        17
+    );
+    duplicate_test!(
+        duplicate_ai_rates,
+        2,
+        "/rateLimits/ai",
+        "reviewer",
+        "capacity",
+        17
+    );
+    duplicate_test!(
+        duplicate_cache_namespaces,
+        6,
+        "/cache/namespaces",
+        "cached",
+        "maxValueBytes",
+        257
+    );
+    duplicate_test!(
+        duplicate_search_connectors,
+        6,
+        "/search",
+        "search",
+        "maxResults",
+        5
+    );
+
+    #[test]
+    fn all_schemas_still_load_unique_maps_and_legacy_defaults() {
+        for schema in 1..=6 {
+            let directory = TestDirectory::new();
+            fs::write(directory.config(), document(schema).to_string()).unwrap();
+            let host = load(
+                Some(&directory.config()),
+                &manifest(),
+                RuntimeLimits::default(),
+            )
+            .unwrap_or_else(|error| panic!("schema {schema}: {error:?}"));
+            if schema == 6 {
+                assert_eq!(host.cache().namespace_names(), ["cached"]);
+                assert_eq!(
+                    host.search_catalog().names().collect::<Vec<_>>(),
+                    ["search"]
+                );
+            }
+            drop(host);
+            if schema >= 3 {
+                assert!(directory.0.join("fresh.db").exists());
+                let connection =
+                    rusqlite::Connection::open(directory.0.join("existing.db")).unwrap();
+                let version: i64 = connection
+                    .pragma_query_value(None, "user_version", |row| row.get(0))
+                    .unwrap();
+                assert_eq!(version, 2);
+            }
+            let minimal = if schema >= 3 {
+                json!({"schema": schema, "state": {}})
+            } else {
+                json!({"schema": schema})
+            };
+            fs::write(directory.config(), minimal.to_string()).unwrap();
+            drop(
+                load(
+                    Some(&directory.config()),
+                    &manifest(),
+                    RuntimeLimits::default(),
+                )
+                .unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_public_bounds_and_lease_minima_precede_filesystem_side_effects() {
+        let directory = TestDirectory::new();
+        let before = directory.snapshot();
+        for (pointer, value) in [
+            ("/state/stores/fresh/maxOperations", json!(1025)),
+            ("/state/stores/fresh/replayTtlSeconds", json!(2592001)),
+            ("/state/stores/fresh/leaseSeconds", json!(1)),
+            ("/jobs/queues/queue/maxDepth", json!(65537)),
+            ("/jobs/queues/queue/leaseSeconds", json!(1)),
+            ("/jobs/schedules/schedule/maxCatchUp", json!(65)),
+            ("/jobs/schedules/schedule/leaseSeconds", json!(1)),
+            ("/jobs/buckets/bucket/maxObjectBytes", json!(4194305)),
+        ] {
+            let mut document = document(6);
+            *document.pointer_mut(pointer).unwrap() = value;
+            fs::write(directory.config(), document.to_string()).unwrap();
+            assert!(
+                load(
+                    Some(&directory.config()),
+                    &manifest(),
+                    RuntimeLimits::default()
+                )
+                .is_err(),
+                "{pointer}"
+            );
+            assert_eq!(directory.snapshot(), before, "{pointer}");
+        }
+    }
 }

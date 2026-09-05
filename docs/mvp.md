@@ -86,9 +86,10 @@ The MVP does not train or host its own model.
 These features require evidence from the reference agent rather than being
 prerequisites for it.
 
-The post-MVP service order is transactional state, queues and schedules, and
-object storage (all implemented for bounded local single-host coordination),
-then database access, cache, and search. See
+The post-MVP service order is transactional state, queues and schedules, object
+storage, database access, cache, and search. These are implemented in their
+bounded local forms; the cache is explicitly process-local and
+non-transactional. See
 [agent-roadmap.md](agent-roadmap.md).
 
 ## Acceptance criteria
@@ -117,3 +118,9 @@ remains optional and disabled without explicit provider configuration.
 Phase 6 now provides bounded local transactional state, checkpoints, replay,
 and optional durable inbound idempotency. Rate state remains process-local,
 and no distributed exactly-once claim is made.
+
+Implementation gates do not establish the product's usability or performance.
+Time to a first working agent, human review effort relative to an equivalent
+Rust service, and representative durable/data-service measurements remain
+product-validation work. New infrastructure should follow evidence from those
+applications, not substitute for it.

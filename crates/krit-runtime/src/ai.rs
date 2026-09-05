@@ -9,6 +9,7 @@ pub(crate) trait AiAdapter {
     fn secret_name(&self) -> Option<&str>;
     fn timeout(&self) -> std::time::Duration;
     fn max_input_bytes(&self) -> usize;
+    fn max_response_bytes(&self) -> usize;
     fn build_request(&self, input: &str, idempotency_key: &str) -> Result<HttpRequest, String>;
     fn parse_response(&self, response: HttpResponse) -> Result<String, String>;
 }
@@ -49,6 +50,12 @@ impl AiAdapter for Adapter {
     fn max_input_bytes(&self) -> usize {
         match self {
             Self::HttpJson(adapter) => adapter.max_input_bytes(),
+        }
+    }
+
+    fn max_response_bytes(&self) -> usize {
+        match self {
+            Self::HttpJson(adapter) => adapter.max_response_bytes(),
         }
     }
 
@@ -102,6 +109,10 @@ impl AiAdapter for HttpJsonAdapter {
 
     fn max_input_bytes(&self) -> usize {
         self.config.max_input_bytes
+    }
+
+    fn max_response_bytes(&self) -> usize {
+        self.config.max_response_bytes
     }
 
     fn build_request(&self, input: &str, idempotency_key: &str) -> Result<HttpRequest, String> {

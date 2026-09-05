@@ -709,6 +709,16 @@ fn ast_sensitive_literal_spans(
         scopes: &mut Vec<Bindings<'a>>,
         spans: &mut BTreeMap<(usize, usize), &'static str>,
     ) {
+        let resource_span = match &statement.kind {
+            StatementKind::QueueConsumer { queue_span, .. } => Some(*queue_span),
+            StatementKind::ScheduleHandler { schedule_span, .. } => Some(*schedule_span),
+            _ => None,
+        };
+        if let Some(span) = resource_span
+            && let Some(content) = literal_content_span(source, span.start, span.end)
+        {
+            spans.insert(content, "capability-resource");
+        }
         match &statement.kind {
             StatementKind::Let { value, .. } => expression_spans(source, value, scopes, spans),
             StatementKind::Function {
@@ -1594,8 +1604,14 @@ fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static
             binding.value_end = (content_end + 1).min(source.len());
             binding.record_literal((content_start, content_end));
         }
-        let category =
-            frame_category(&frames).or_else(|| looks_secret_like(content).then_some("secret-like"));
+        let category = if matches!(
+            tokens.last(),
+            Some(TolerantToken::Identifier("queue" | "schedule"))
+        ) {
+            Some("capability-resource")
+        } else {
+            frame_category(&frames).or_else(|| looks_secret_like(content).then_some("secret-like"))
+        };
         if let Some(category) = category {
             spans.push((content_start, content_end, category));
         }
@@ -1957,6 +1973,52 @@ mod tests {
             .into_iter()
             .map(|(start, end, category)| (source[start..end].to_owned(), category))
             .collect()
+    }
+
+    #[test]
+    fn deployment_entrypoint_resources_are_redacted_in_parsed_and_incomplete_source() {
+        for (keyword, ty) in [("queue", "QueueJob"), ("schedule", "ScheduleEvent")] {
+            let source = format!(
+                r#"let {keyword} = "ordinary";
+{keyword} // deployment identity
+"private-work" fn handle(input: {ty}) -> Result<String, String> {{
+    Ok(input.id)
+}}
+"#
+            );
+            krit::parse_source(&Source::new("main.krit", source.as_str()))
+                .expect("contextual names and entrypoint should parse");
+            let expected = vec![("private-work".to_owned(), "capability-resource")];
+            assert_eq!(redacted(&source), expected);
+            assert_eq!(redacted_tolerant(&source), expected);
+            assert_eq!(redacted(&format!("{source}let unfinished =")), expected);
+            assert_eq!(
+                redacted(&format!("{keyword} // deployment identity\n\"private-work")),
+                expected
+            );
+
+            let escaped = format!(
+                r#"{keyword} "private-\"work" fn handle(input: {ty}) -> Result<String, String> {{
+    Ok(input.id)
+}}"#
+            );
+            assert_eq!(
+                redacted(&escaped),
+                vec![(r#"private-\"work"#.to_owned(), "capability-resource")]
+            );
+            assert_eq!(redacted(&escaped), redacted_tolerant(&escaped));
+        }
+    }
+
+    #[test]
+    fn ordinary_queue_and_schedule_calls_and_fields_are_not_resource_declarations() {
+        let source = r#"fn queue(value: String) -> String { value }
+let schedule = record { queue: "visible field" };
+queue("visible argument");
+let value = schedule.queue;
+"#;
+        assert!(redacted(source).is_empty());
+        assert!(redacted_tolerant(source).is_empty());
     }
 
     const CACHE_CALLS: &str = r#"

@@ -15,7 +15,12 @@ mod schema;
 
 pub use jobs::{
     BucketPolicy, CommitPlan, Completion, DeadLetterEntry, FireDelivery, FireLease, JobDelivery,
-    JobDisposition, JobLease, MAX_OBJECT_LIST_KEYS, ObjectEntry, QueuePolicy, ScheduleCatchUp,
+    JobDisposition, JobLease, MAX_BUCKET_BYTES, MAX_BUCKET_OBJECTS, MAX_BUCKETS,
+    MAX_DEAD_LETTER_ENTRIES, MAX_DEAD_LETTER_RETENTION, MAX_DELIVERY_ATTEMPTS,
+    MAX_DELIVERY_BACKOFF, MAX_DELIVERY_LEASE, MAX_OBJECT_BYTES, MAX_OBJECT_KEY_BYTES,
+    MAX_OBJECT_LIST_KEYS, MAX_QUEUE_BYTES, MAX_QUEUE_DEPTH, MAX_QUEUE_JOB_BYTES, MAX_QUEUES,
+    MAX_RETAINED_FIRES, MAX_SCHEDULE_CATCH_UP, MAX_SCHEDULE_INTERVAL, MAX_SCHEDULE_RETENTION,
+    MAX_SCHEDULES, MIN_SCHEDULE_INTERVAL, ObjectEntry, QueuePolicy, ScheduleCatchUp,
     SchedulePolicy,
 };
 
@@ -35,6 +40,18 @@ pub(crate) const MAX_RESOURCE_NAME_BYTES: usize = 64;
 /// are rejected by the post-schema page check in [`DurableStore::open`].
 pub const MINIMUM_DATABASE_BYTES: u64 = 1024 * 1024;
 
+pub const MAX_STATE_OPERATIONS: usize = 1024;
+pub const MAX_STATE_KEY_BYTES: usize = 4 * 1024;
+pub const MAX_STATE_VALUE_BYTES: usize = 1024 * 1024;
+pub const MAX_STATE_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_STATE_DATABASE_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_STATE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_REPLAY_ENTRIES: usize = 65_536;
+pub const MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_REPLAY_RESULT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_REPLAY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const MAX_REPLAY_LEASE: Duration = Duration::from_secs(5 * 60);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Durability {
     Full,
@@ -53,12 +70,46 @@ pub struct StoreLimits {
     pub max_replay_bytes: usize,
 }
 
+impl StoreLimits {
+    /// Validates protocol bounds without opening or changing a database.
+    pub fn validate(self) -> Result<(), StateError> {
+        if !valid_millis(self.busy_timeout, MAX_STATE_BUSY_TIMEOUT)
+            || !(1..=MAX_STATE_OPERATIONS).contains(&self.max_operations)
+            || !(1..=MAX_STATE_KEY_BYTES).contains(&self.max_key_bytes)
+            || !(1..=MAX_STATE_VALUE_BYTES).contains(&self.max_value_bytes)
+            || !(1..=MAX_STATE_TRANSACTION_BYTES).contains(&self.max_transaction_bytes)
+            || !(MINIMUM_DATABASE_BYTES..=MAX_STATE_DATABASE_BYTES)
+                .contains(&self.max_database_bytes)
+            || !(1..=MAX_REPLAY_ENTRIES).contains(&self.max_replay_entries)
+            || !(1..=MAX_REPLAY_BYTES).contains(&self.max_replay_bytes)
+        {
+            return Err(StateError::limit("durable store limits are invalid"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetentionPolicy {
     pub max_entries: usize,
     pub max_bytes: usize,
     pub ttl: Duration,
     pub lease: Duration,
+}
+
+impl RetentionPolicy {
+    /// Validates protocol bounds and the backing store's narrower limits.
+    pub fn validate(self, limits: StoreLimits) -> Result<(), StateError> {
+        limits.validate()?;
+        if !(1..=limits.max_replay_entries).contains(&self.max_entries)
+            || !(1..=limits.max_replay_bytes).contains(&self.max_bytes)
+            || !valid_millis(self.ttl, MAX_REPLAY_TTL)
+            || !valid_millis(self.lease, MAX_REPLAY_LEASE)
+        {
+            return Err(StateError::limit("durable retention policy is invalid"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,7 +307,7 @@ impl DurableStore {
         durability: Durability,
         limits: StoreLimits,
     ) -> Result<Self, StateError> {
-        validate_limits(limits)?;
+        limits.validate()?;
         let path = resolve_database_path(path)?;
         if path
             .metadata()
@@ -392,7 +443,7 @@ impl DurableStore {
             owner,
             now_millis,
         } = request;
-        validate_retention(policy, self.limits)?;
+        policy.validate(self.limits)?;
         validate_identity(operation, self.limits.max_key_bytes)?;
         validate_digest(artifact)?;
         validate_digest(input_digest)?;
@@ -495,8 +546,8 @@ impl DurableStore {
         now_millis: i64,
         policy: RetentionPolicy,
     ) -> Result<(), StateError> {
-        validate_retention(policy, self.limits)?;
-        if result.len() > self.limits.max_replay_bytes || result.len() > policy.max_bytes {
+        policy.validate(self.limits)?;
+        if result.len() > MAX_REPLAY_RESULT_BYTES || result.len() > policy.max_bytes {
             return Err(StateError::limit(
                 "replay result exceeds the store byte limit",
             ));
@@ -561,7 +612,7 @@ impl DurableStore {
         now_millis: i64,
         policy: RetentionPolicy,
     ) -> Result<IdempotencyDecision, StateError> {
-        validate_retention(policy, self.limits)?;
+        policy.validate(self.limits)?;
         validate_identity(key, self.limits.max_key_bytes)?;
         validate_digest(artifact)?;
         validate_digest(request_digest)?;
@@ -659,7 +710,7 @@ impl DurableStore {
         now_millis: i64,
         policy: RetentionPolicy,
     ) -> Result<(), StateError> {
-        validate_retention(policy, self.limits)?;
+        policy.validate(self.limits)?;
         if response.len() > policy.max_bytes {
             return Err(StateError::limit(
                 "idempotency response exceeds the retention byte limit",
@@ -953,21 +1004,6 @@ fn enforce_table_limits(
     }
 }
 
-fn validate_limits(limits: StoreLimits) -> Result<(), StateError> {
-    if limits.busy_timeout.is_zero()
-        || limits.max_operations == 0
-        || limits.max_key_bytes == 0
-        || limits.max_value_bytes == 0
-        || limits.max_transaction_bytes == 0
-        || limits.max_database_bytes < MINIMUM_DATABASE_BYTES
-        || limits.max_replay_entries == 0
-        || limits.max_replay_bytes == 0
-    {
-        return Err(StateError::limit("durable store limits are invalid"));
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_key(key: &str, limits: StoreLimits) -> Result<(), StateError> {
     if key.is_empty() || key.len() > limits.max_key_bytes || key.contains('\0') {
         return Err(StateError::limit(
@@ -1085,17 +1121,12 @@ pub(crate) fn validate_value(value: &[u8], limits: StoreLimits) -> Result<(), St
     Ok(())
 }
 
-fn validate_retention(policy: RetentionPolicy, limits: StoreLimits) -> Result<(), StateError> {
-    if policy.max_entries == 0
-        || policy.max_bytes == 0
-        || policy.max_entries > limits.max_replay_entries
-        || policy.max_bytes > limits.max_replay_bytes
-        || policy.ttl.is_zero()
-        || policy.lease.is_zero()
-    {
-        return Err(StateError::limit("durable retention policy is invalid"));
-    }
-    Ok(())
+pub(crate) fn valid_millis(duration: Duration, maximum: Duration) -> bool {
+    // SQLite leases and deadlines are stored as integer epoch milliseconds.
+    // Refuse fractional values rather than silently shortening a valid lease.
+    duration >= Duration::from_millis(1)
+        && duration <= maximum
+        && duration.subsec_nanos().is_multiple_of(1_000_000)
 }
 
 pub(crate) fn checked_deadline(now_millis: i64, duration: Duration) -> Result<i64, StateError> {

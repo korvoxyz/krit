@@ -21,6 +21,13 @@ pub struct DurableStoreDefinition {
     pub replay: RetentionPolicy,
 }
 
+impl DurableStoreDefinition {
+    /// Validates all store and replay bounds without touching the filesystem.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        self.replay.validate(self.limits).map_err(map_state_error)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct QueueDefinition {
     pub store: String,
@@ -60,10 +67,114 @@ pub(crate) struct StoreBinding {
 }
 
 impl DurableState {
+    pub const MAX_STORES: usize = 16;
+    pub const MAX_QUEUES: usize = krit_state::MAX_QUEUES;
+    pub const MAX_SCHEDULES: usize = krit_state::MAX_SCHEDULES;
+    pub const MAX_BUCKETS: usize = krit_state::MAX_BUCKETS;
+
+    /// Validates the entire durable configuration before opening any store.
+    pub fn validate_configuration(
+        definitions: &BTreeMap<String, DurableStoreDefinition>,
+        durable_idempotency_store: Option<&str>,
+        queues: &BTreeMap<String, QueueDefinition>,
+        schedules: &BTreeMap<String, ScheduleDefinition>,
+        buckets: &BTreeMap<String, BucketDefinition>,
+    ) -> Result<(), RuntimeError> {
+        if definitions.len() > Self::MAX_STORES {
+            return Err(RuntimeError::state_conflict(
+                "configured durable stores exceed the protocol bound",
+            ));
+        }
+        for (name, definition) in definitions {
+            validate_resource_name(name)?;
+            definition.validate()?;
+        }
+        let stores = definitions.keys().map(String::as_str).collect();
+        if durable_idempotency_store.is_some_and(|name| !definitions.contains_key(name)) {
+            return Err(RuntimeError::durable_state(
+                "durable idempotency store is not configured",
+            ));
+        }
+        validate_job_definitions(&stores, queues, schedules, buckets)
+    }
+
+    /// Adds runtime-dependent lease checks to pure configuration validation.
+    ///
+    /// Scheduler ownership must precede reservation, so leases need to cover
+    /// one execution deadline plus the backing store's bounded SQLite wait.
+    pub fn validate_configuration_for_runtime(
+        definitions: &BTreeMap<String, DurableStoreDefinition>,
+        durable_idempotency_store: Option<&str>,
+        queues: &BTreeMap<String, QueueDefinition>,
+        schedules: &BTreeMap<String, ScheduleDefinition>,
+        buckets: &BTreeMap<String, BucketDefinition>,
+        deadline: Duration,
+    ) -> Result<(), RuntimeError> {
+        Self::validate_configuration(
+            definitions,
+            durable_idempotency_store,
+            queues,
+            schedules,
+            buckets,
+        )?;
+        for definition in definitions.values() {
+            validate_lease(
+                definition.replay.lease,
+                definition.limits.busy_timeout,
+                deadline,
+                "replay",
+            )?;
+        }
+        for definition in queues.values() {
+            validate_lease(
+                definition.policy.lease,
+                definitions[&definition.store].limits.busy_timeout,
+                deadline,
+                "queue",
+            )?;
+        }
+        for definition in schedules.values() {
+            validate_lease(
+                definition.policy.lease,
+                definitions[&definition.store].limits.busy_timeout,
+                deadline,
+                "schedule",
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn open(
         definitions: BTreeMap<String, DurableStoreDefinition>,
         durable_idempotency_store: Option<String>,
     ) -> Result<Self, RuntimeError> {
+        Self::open_with_jobs(
+            definitions,
+            durable_idempotency_store,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+    }
+
+    /// Opens stores only after every store, job binding, and policy validates.
+    ///
+    /// Prefer this to `open(...).with_jobs(...)` when the complete configuration
+    /// is available: an invalid job policy then cannot create or migrate stores.
+    pub fn open_with_jobs(
+        definitions: BTreeMap<String, DurableStoreDefinition>,
+        durable_idempotency_store: Option<String>,
+        queues: BTreeMap<String, QueueDefinition>,
+        schedules: BTreeMap<String, ScheduleDefinition>,
+        buckets: BTreeMap<String, BucketDefinition>,
+    ) -> Result<Self, RuntimeError> {
+        Self::validate_configuration(
+            &definitions,
+            durable_idempotency_store.as_deref(),
+            &queues,
+            &schedules,
+            &buckets,
+        )?;
         let mut stores = BTreeMap::new();
         for (name, definition) in definitions {
             let store =
@@ -77,21 +188,14 @@ impl DurableState {
                 }),
             );
         }
-        if durable_idempotency_store
-            .as_ref()
-            .is_some_and(|name| !stores.contains_key(name))
-        {
-            return Err(RuntimeError::durable_state(
-                "durable idempotency store is not configured",
-            ));
-        }
-        Ok(Self {
+        Self {
             stores: Arc::new(stores),
             durable_idempotency_store,
             queues: Arc::new(BTreeMap::new()),
             schedules: Arc::new(BTreeMap::new()),
             buckets: Arc::new(BTreeMap::new()),
-        })
+        }
+        .with_jobs(queues, schedules, buckets)
     }
 
     /// Binds manifest-granted queues, schedules, and buckets to already-opened
@@ -102,9 +206,9 @@ impl DurableState {
         schedules: BTreeMap<String, ScheduleDefinition>,
         buckets: BTreeMap<String, BucketDefinition>,
     ) -> Result<Self, RuntimeError> {
+        validate_job_definitions(&self.store_names().collect(), &queues, &schedules, &buckets)?;
         let mut queue_bindings = BTreeMap::new();
         for (name, definition) in queues {
-            self.require_store(&definition.store)?;
             queue_bindings.insert(
                 name,
                 ResourceBinding {
@@ -115,7 +219,6 @@ impl DurableState {
         }
         let mut schedule_bindings = BTreeMap::new();
         for (name, definition) in schedules {
-            self.require_store(&definition.store)?;
             schedule_bindings.insert(
                 name,
                 ResourceBinding {
@@ -126,7 +229,6 @@ impl DurableState {
         }
         let mut bucket_bindings = BTreeMap::new();
         for (name, definition) in buckets {
-            self.require_store(&definition.store)?;
             bucket_bindings.insert(
                 name,
                 ResourceBinding {
@@ -139,16 +241,6 @@ impl DurableState {
         self.schedules = Arc::new(schedule_bindings);
         self.buckets = Arc::new(bucket_bindings);
         Ok(self)
-    }
-
-    fn require_store(&self, name: &str) -> Result<(), RuntimeError> {
-        if self.stores.contains_key(name) {
-            Ok(())
-        } else {
-            Err(RuntimeError::durable_state(
-                "durable job resource names an unconfigured store",
-            ))
-        }
     }
 
     /// Stores that back at least one configured queue, schedule, or bucket.
@@ -259,45 +351,103 @@ impl DurableState {
             .cloned()
     }
 
-    pub(crate) fn validate_for_runtime(&self, deadline: Duration) -> Result<(), RuntimeError> {
+    pub fn validate_for_runtime(&self, deadline: Duration) -> Result<(), RuntimeError> {
         for binding in self.stores.values() {
-            if binding.replay.lease < self.minimum_lease(binding, deadline)? {
-                return Err(RuntimeError::durable_state(
-                    "durable replay lease must cover the runtime deadline and database busy timeout",
-                ));
-            }
+            validate_lease(
+                binding.replay.lease,
+                binding.store.limits().busy_timeout,
+                deadline,
+                "replay",
+            )?;
         }
         // A delivery lease must outlive one complete guest execution, otherwise
         // a second worker could reserve the same job while the first is still
         // running and both could reach their outcome boundary.
         for binding in self.queues.values() {
             let store = self.binding(&binding.store)?;
-            if binding.policy.lease < self.minimum_lease(&store, deadline)? {
-                return Err(RuntimeError::durable_state(
-                    "durable queue lease must cover the runtime deadline and database busy timeout",
-                ));
-            }
+            validate_lease(
+                binding.policy.lease,
+                store.store.limits().busy_timeout,
+                deadline,
+                "queue",
+            )?;
         }
         for binding in self.schedules.values() {
             let store = self.binding(&binding.store)?;
-            if binding.policy.lease < self.minimum_lease(&store, deadline)? {
-                return Err(RuntimeError::durable_state(
-                    "durable schedule lease must cover the runtime deadline and database busy timeout",
-                ));
-            }
+            validate_lease(
+                binding.policy.lease,
+                store.store.limits().busy_timeout,
+                deadline,
+                "schedule",
+            )?;
         }
         Ok(())
     }
+}
 
-    fn minimum_lease(
-        &self,
-        binding: &StoreBinding,
-        deadline: Duration,
-    ) -> Result<Duration, RuntimeError> {
-        deadline
-            .checked_add(binding.store.limits().busy_timeout)
-            .ok_or_else(|| RuntimeError::durable_state("durable lease minimum overflowed"))
+fn validate_resource_name(name: &str) -> Result<(), RuntimeError> {
+    if krit_capability::is_valid_resource_name(name) {
+        Ok(())
+    } else {
+        Err(RuntimeError::durable_state(
+            "durable resource name must use the canonical resource grammar",
+        ))
     }
+}
+
+fn validate_job_definitions(
+    stores: &BTreeSet<&str>,
+    queues: &BTreeMap<String, QueueDefinition>,
+    schedules: &BTreeMap<String, ScheduleDefinition>,
+    buckets: &BTreeMap<String, BucketDefinition>,
+) -> Result<(), RuntimeError> {
+    if queues.len() > DurableState::MAX_QUEUES
+        || schedules.len() > DurableState::MAX_SCHEDULES
+        || buckets.len() > DurableState::MAX_BUCKETS
+    {
+        return Err(RuntimeError::state_conflict(
+            "configured queues, schedules, or buckets exceed the protocol bounds",
+        ));
+    }
+    let require_store = |name: &str, store: &str| {
+        validate_resource_name(name)?;
+        if !stores.contains(store) {
+            return Err(RuntimeError::durable_state(
+                "durable job resource names an unconfigured store",
+            ));
+        }
+        Ok(())
+    };
+    for (name, definition) in queues {
+        require_store(name, &definition.store)?;
+        definition.policy.validate().map_err(map_state_error)?;
+    }
+    for (name, definition) in schedules {
+        require_store(name, &definition.store)?;
+        definition.policy.validate().map_err(map_state_error)?;
+    }
+    for (name, definition) in buckets {
+        require_store(name, &definition.store)?;
+        definition.policy.validate().map_err(map_state_error)?;
+    }
+    Ok(())
+}
+
+fn validate_lease(
+    lease: Duration,
+    busy_timeout: Duration,
+    deadline: Duration,
+    resource: &str,
+) -> Result<(), RuntimeError> {
+    let minimum = deadline
+        .checked_add(busy_timeout)
+        .ok_or_else(|| RuntimeError::durable_state("durable lease minimum overflowed"))?;
+    if lease < minimum {
+        return Err(RuntimeError::durable_state(format!(
+            "durable {resource} lease must cover the runtime deadline and database busy timeout",
+        )));
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for DurableState {

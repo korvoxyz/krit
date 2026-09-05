@@ -4,18 +4,23 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use krit::{Source, analyze, lower, parse_source};
 use krit_package::Manifest;
 use krit_runtime::{
-    AgentHost, AgentHostPolicy, AiAdapterConfig, ApprovalOperation, CancellationHandle,
-    DenyAllApprovalPolicy, Durability, DurableState, DurableStoreDefinition, DurableStoreLimits,
-    ExplicitApprovalPolicy, GrantSet, HostInputs, HttpHeader, HttpJsonAdapterConfig, HttpRequest,
-    NetworkPolicy, RetentionPolicy, Runtime, SecretStore,
+    AgentHost, AgentHostPolicy, AiAdapterConfig, ApprovalOperation, ApprovalPolicy,
+    ApprovalRequest, CancellationHandle, DatabaseCatalog, DatabaseDefinition, DatabaseLimits,
+    DatabaseMode, DenyAllApprovalPolicy, Durability, DurableState, DurableStoreDefinition,
+    DurableStoreLimits, ExplicitApprovalPolicy, GrantSet, HostInputs, HttpHeader,
+    HttpJsonAdapterConfig, HttpRequest, NetworkPolicy, RetentionPolicy, Runtime, RuntimeLimits,
+    SecretStore, StatementKind, StatementRequest,
 };
 use krit_state::DurableStore;
 use krit_wasm::{BuildOptions, BuiltComponent, build_component};
@@ -1002,4 +1007,754 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
     let store = DurableStore::open(&database, Durability::Full, store_limits()).unwrap();
     assert_eq!(store.get("failed").unwrap(), None);
     assert_eq!(store.idempotency_counts().unwrap(), (0, 0));
+}
+
+#[test]
+fn inbound_replays_revalidate_current_body_and_header_limits() {
+    let header_value = "v".repeat(64);
+    let artifact = compile(
+        &format!(
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    record {{
+        status: 200,
+        headers: [
+            record {{ name: "x-first", value: "{header_value}" }},
+            record {{ name: "x-second", value: "{header_value}" }},
+        ],
+        body: "stored-response",
+    }}
+}}
+"#
+        ),
+        &[],
+    );
+    let grants = GrantSet::from_manifest(&manifest("state = [\"agent-work\"]"));
+    let mut incoming = request("input");
+    incoming.headers.push(HttpHeader {
+        name: "idempotency-key".to_owned(),
+        value: "limits".to_owned(),
+    });
+
+    for persistent in [false, true] {
+        let directory = TestDirectory::new("replay-limits");
+        let make_host = || {
+            host(
+                HostInputs::default(),
+                if persistent {
+                    durable(directory.database(), true)
+                } else {
+                    DurableState::default()
+                },
+            )
+        };
+        let mut agent_host = make_host();
+        let first = Runtime::default()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &agent_host,
+                incoming.clone(),
+            )
+            .expect("broad policy should cache the response");
+        assert!(!first.stats.idempotency_replayed);
+        let header_bytes = first
+            .response
+            .headers
+            .iter()
+            .map(|header| header.name.len() + header.value.len())
+            .sum::<usize>();
+        let mut exact = RuntimeLimits::default();
+        exact
+            .narrow_response_body_bytes(first.response.body.len())
+            .unwrap();
+        exact.narrow_header_count(2).unwrap();
+        exact.narrow_header_bytes(header_bytes).unwrap();
+        let mut body_below = exact;
+        body_below
+            .narrow_response_body_bytes(first.response.body.len() - 1)
+            .unwrap();
+        let mut count_below = exact;
+        count_below.narrow_header_count(1).unwrap();
+        let mut bytes_below = exact;
+        bytes_below.narrow_header_bytes(header_bytes - 1).unwrap();
+
+        for limits in [body_below, count_below, bytes_below] {
+            if persistent {
+                drop(agent_host);
+                agent_host = make_host();
+            }
+            let error = Runtime::new(limits)
+                .unwrap()
+                .invoke_webhook_with_host(
+                    &artifact.bytes,
+                    &artifact.metadata,
+                    &grants,
+                    &agent_host,
+                    incoming.clone(),
+                )
+                .expect_err("cached responses must not bypass current limits");
+            assert_eq!(error.code(), "K5103");
+            assert!(error.events().is_empty());
+        }
+
+        let replayed = Runtime::new(exact)
+            .unwrap()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &agent_host,
+                incoming.clone(),
+            )
+            .expect("all response bounds are inclusive");
+        assert!(replayed.stats.idempotency_replayed);
+        assert_eq!(replayed.response, first.response);
+        assert_eq!(replayed.stats.fuel_consumed, 0);
+        assert!(replayed.output.is_empty());
+    }
+}
+
+#[test]
+fn idempotency_conflicts_and_rejections_obey_response_limits() {
+    let artifact = compile(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: "" }
+}
+"#,
+        &[],
+    );
+    let grants = GrantSet::from_manifest(&manifest(""));
+    let agent_host = host(HostInputs::default(), DurableState::default());
+    let mut incoming = request("original");
+    incoming.headers.push(HttpHeader {
+        name: "idempotency-key".to_owned(),
+        value: "one".to_owned(),
+    });
+    let mut limits = RuntimeLimits::default();
+    limits.narrow_response_body_bytes(0).unwrap();
+    let runtime = Runtime::new(limits).unwrap();
+    runtime
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &grants,
+            &agent_host,
+            incoming.clone(),
+        )
+        .expect("empty successful response fits a zero-byte bound");
+    let mut conflict = incoming.clone();
+    conflict.body = "changed".to_owned();
+    let mut invalid = incoming.clone();
+    invalid.headers[0].value = "invalid key".to_owned();
+    let mut duplicate = incoming;
+    duplicate.headers.push(duplicate.headers[0].clone());
+    for request in [conflict, invalid, duplicate] {
+        let error = runtime
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &agent_host,
+                request,
+            )
+            .expect_err("host-generated responses must obey the same response limit");
+        assert_eq!(error.code(), "K5103");
+    }
+}
+
+enum ReplayReply {
+    Body(&'static str),
+    Broken,
+    Cancel(CancellationHandle),
+}
+
+fn replay_mock(replies: Vec<ReplayReply>) -> (String, thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let worker = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut requests = Vec::new();
+        for reply in replies {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "expected replay call never arrived"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("mock accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0, "request ended before its body");
+                bytes.extend_from_slice(&chunk[..count]);
+                assert!(bytes.len() <= 16 * 1024);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let content_length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map_or(0, |(_, value)| value.trim().parse::<usize>().unwrap());
+                    if bytes.len() >= end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            requests.push(String::from_utf8(bytes).unwrap());
+            match reply {
+                ReplayReply::Body(body) => stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap(),
+                ReplayReply::Broken => stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort")
+                    .unwrap(),
+                ReplayReply::Cancel(cancellation) => cancellation.cancel(),
+            }
+        }
+        requests
+    });
+    (origin, worker)
+}
+
+fn replay_artifact(origin: &str, ai: bool) -> BuiltComponent {
+    let operation = if ai {
+        r#"replay_ai("agent-work", "operation", "reviewer", request.body)"#.to_owned()
+    } else {
+        format!(
+            r#"replay_http("agent-work", "operation", "{origin}", record {{
+                method: "GET", path: "/work", query: "", headers: [], body: "",
+            }})"#
+        )
+    };
+    let body = if ai { "value" } else { "value.body" };
+    compile(
+        &format!(
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    match {operation} {{
+        Ok(value) => record {{ status: 200, headers: [], body: {body} }},
+        Err(error) => record {{ status: 502, headers: [], body: error }},
+    }}
+}}
+"#
+        ),
+        &["state.transaction"],
+    )
+}
+
+fn replay_grants(origin: &str) -> GrantSet {
+    GrantSet::from_manifest(&manifest(&format!(
+        "http = [\"{origin}\"]\nai = [\"reviewer\"]\nstate = [\"agent-work\"]"
+    )))
+}
+
+fn replay_policy(origin: &str, max_response_bytes: usize) -> AgentHostPolicy {
+    let mut policy = AgentHostPolicy::default();
+    policy.ai_adapters.insert(
+        "reviewer".to_owned(),
+        AiAdapterConfig::HttpJson(HttpJsonAdapterConfig {
+            origin: origin.to_owned(),
+            path: "/ai".to_owned(),
+            model: "test".to_owned(),
+            secret: None,
+            max_input_bytes: 1024,
+            max_response_bytes,
+            timeout: Duration::from_millis(500),
+        }),
+    );
+    policy
+}
+
+fn replay_approvals() -> Arc<dyn ApprovalPolicy> {
+    Arc::new(
+        ExplicitApprovalPolicy::new([(ApprovalOperation::AiInvoke, "reviewer".to_owned())])
+            .unwrap(),
+    )
+}
+
+fn replay_host(
+    origin: &str,
+    state: DurableState,
+    max_response_bytes: usize,
+    approvals: Arc<dyn ApprovalPolicy>,
+) -> AgentHost {
+    AgentHost::new_with_state(
+        HostInputs::default().with_network_policy(NetworkPolicy::loopback_for_tests()),
+        replay_policy(origin, max_response_bytes),
+        approvals,
+        state,
+    )
+    .unwrap()
+}
+
+#[test]
+fn durable_ai_replay_rechecks_narrowed_adapter_and_runtime_byte_bounds() {
+    let directory = TestDirectory::new("ai-replay-limits");
+    let (origin, mock) = replay_mock(vec![ReplayReply::Body(r#"{"output":"summary"}"#)]);
+    let artifact = replay_artifact(&origin, true);
+    let grants = replay_grants(&origin);
+    let initial_host = replay_host(
+        &origin,
+        durable(directory.database(), false),
+        1024,
+        replay_approvals(),
+    );
+    let first = Runtime::default()
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &grants,
+            &initial_host,
+            request("input"),
+        )
+        .unwrap();
+    assert_eq!(first.response.body, "summary");
+    drop(initial_host);
+    assert_eq!(mock.join().unwrap().len(), 1);
+
+    for (adapter_bound, runtime_bound, expected_status) in [(6, 7, 502), (7, 7, 200)] {
+        let mut limits = RuntimeLimits::default();
+        limits.narrow_ai_response_bytes(runtime_bound).unwrap();
+        let restarted_host = replay_host(
+            &origin,
+            durable(directory.database(), false),
+            adapter_bound,
+            replay_approvals(),
+        );
+        let replayed = Runtime::new(limits)
+            .unwrap()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &restarted_host,
+                request("input"),
+            )
+            .unwrap();
+        assert_eq!(replayed.response.status, expected_status);
+        assert_eq!(replayed.stats.ai_calls, 0);
+        assert_eq!(replayed.stats.replay_hits, 1);
+        if expected_status == 200 {
+            assert_eq!(replayed.response.body, "summary");
+        } else {
+            assert!(replayed.response.body.contains("size limit"));
+            assert!(!replayed.response.body.contains("summary"));
+        }
+    }
+}
+
+#[test]
+fn replay_host_call_traps_release_http_and_ai_leases_for_immediate_retry() {
+    for ai in [false, true] {
+        let directory = TestDirectory::new("replay-trap-cleanup");
+        let body = if ai { r#"{"output":"ok"}"# } else { "ok" };
+        let (origin, mock) = replay_mock(vec![ReplayReply::Body(body)]);
+        let artifact = replay_artifact(&origin, ai);
+        let grants = replay_grants(&origin);
+        let agent_host = replay_host(
+            &origin,
+            durable(directory.database(), false),
+            1024,
+            replay_approvals(),
+        );
+        let mut limits = RuntimeLimits::default();
+        if ai {
+            limits.narrow_ai_calls(0).unwrap();
+        } else {
+            limits.narrow_http_calls(0).unwrap();
+        }
+        for _ in 0..2 {
+            let error = Runtime::new(limits)
+                .unwrap()
+                .invoke_webhook_with_host(
+                    &artifact.bytes,
+                    &artifact.metadata,
+                    &grants,
+                    &agent_host,
+                    request("input"),
+                )
+                .expect_err("call-limit trap must not strand a replay lease");
+            assert_eq!(error.code(), "K5104");
+            let store = DurableStore::open(&directory.database(), Durability::Full, store_limits())
+                .unwrap();
+            assert_eq!(store.replay_counts().unwrap(), (0, 0));
+        }
+        let retried = Runtime::default()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &agent_host,
+                request("input"),
+            )
+            .expect("same identity must be immediately reusable");
+        assert_eq!(retried.response.body, "ok");
+        assert_eq!(retried.stats.replay_misses, 1);
+        assert_eq!(mock.join().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn replay_transport_failures_release_http_and_ai_leases_for_immediate_retry() {
+    for ai in [false, true] {
+        let directory = TestDirectory::new("replay-transport-cleanup");
+        let body = if ai { r#"{"output":"ok"}"# } else { "ok" };
+        let (origin, mock) = replay_mock(vec![ReplayReply::Broken, ReplayReply::Body(body)]);
+        let artifact = replay_artifact(&origin, ai);
+        let grants = replay_grants(&origin);
+        let agent_host = replay_host(
+            &origin,
+            durable(directory.database(), false),
+            1024,
+            replay_approvals(),
+        );
+        let runtime = Runtime::default();
+        let failed = runtime
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &agent_host,
+                request("input"),
+            )
+            .expect("transport failure is a typed guest error");
+        assert_eq!(failed.response.status, 502);
+        let store =
+            DurableStore::open(&directory.database(), Durability::Full, store_limits()).unwrap();
+        assert_eq!(store.replay_counts().unwrap(), (0, 0));
+        let retried = runtime
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &agent_host,
+                request("input"),
+            )
+            .unwrap();
+        assert_eq!(retried.response.body, "ok");
+        let requests = mock.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        if ai {
+            let key = |request: &str| {
+                request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("idempotency-key:"))
+                    .unwrap()
+                    .to_owned()
+            };
+            assert_eq!(key(&requests[0]), key(&requests[1]));
+        }
+    }
+}
+
+#[test]
+fn replay_completion_failures_release_http_and_ai_leases_for_immediate_retry() {
+    for ai in [false, true] {
+        let directory = TestDirectory::new("replay-completion-cleanup");
+        let body = if ai { r#"{"output":"ok"}"# } else { "ok" };
+        let (origin, mock) = replay_mock(vec![ReplayReply::Body(body), ReplayReply::Body(body)]);
+        let artifact = replay_artifact(&origin, ai);
+        let grants = replay_grants(&origin);
+        let state = DurableState::open(
+            BTreeMap::from([(
+                "agent-work".to_owned(),
+                DurableStoreDefinition {
+                    path: directory.database(),
+                    durability: Durability::Full,
+                    limits: store_limits(),
+                    replay: RetentionPolicy {
+                        max_bytes: 1,
+                        ..retention()
+                    },
+                },
+            )]),
+            None,
+        )
+        .unwrap();
+        let first_host = replay_host(&origin, state, 1024, replay_approvals());
+        let runtime = Runtime::default();
+        let error = runtime
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &first_host,
+                request("input"),
+            )
+            .expect_err("completion above retention bytes must fail");
+        assert_eq!(error.code(), "K5202");
+        drop(first_host);
+        let store =
+            DurableStore::open(&directory.database(), Durability::Full, store_limits()).unwrap();
+        assert_eq!(store.replay_counts().unwrap(), (0, 0));
+        let restarted_host = replay_host(
+            &origin,
+            durable(directory.database(), false),
+            1024,
+            replay_approvals(),
+        );
+        let retried = runtime
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &restarted_host,
+                request("input"),
+            )
+            .unwrap();
+        assert_eq!(retried.response.body, "ok");
+        assert_eq!(mock.join().unwrap().len(), 2);
+    }
+}
+
+struct CallbackApproval<F>(F);
+
+impl<F: Fn(&ApprovalRequest) -> bool + Send + Sync> ApprovalPolicy for CallbackApproval<F> {
+    fn approve(&self, request: &ApprovalRequest) -> bool {
+        (self.0)(request)
+    }
+}
+
+#[test]
+fn ai_approval_denial_and_cancellation_after_reservation_release_the_lease() {
+    for cancel in [false, true] {
+        let directory = TestDirectory::new("replay-approval-cleanup");
+        let (origin, mock) = replay_mock(vec![ReplayReply::Body(r#"{"output":"ok"}"#)]);
+        let artifact = replay_artifact(&origin, true);
+        let grants = replay_grants(&origin);
+        let cancellation = CancellationHandle::new();
+        let cancel_at_approval = cancellation.clone();
+        let approvals = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&approvals);
+        let first_host = replay_host(
+            &origin,
+            durable(directory.database(), false),
+            1024,
+            Arc::new(CallbackApproval(move |_: &ApprovalRequest| {
+                if counted.fetch_add(1, Ordering::AcqRel) == 1 {
+                    if cancel {
+                        cancel_at_approval.cancel();
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            })),
+        );
+        let runtime = Runtime::default();
+        let result = runtime.invoke_webhook_with_cancellation(
+            &artifact.bytes,
+            &artifact.metadata,
+            &grants,
+            &first_host,
+            &cancellation,
+            request("input"),
+        );
+        if cancel {
+            assert_eq!(
+                result.expect_err("cancelled invocation must fail").code(),
+                "K5106"
+            );
+        } else {
+            let rejected = result.expect("approval denial is a typed guest error");
+            assert_eq!(rejected.response.status, 502);
+            assert!(rejected.response.body.contains("approval denied"));
+        }
+        assert_eq!(approvals.load(Ordering::Acquire), 2);
+        drop(first_host);
+        let store =
+            DurableStore::open(&directory.database(), Durability::Full, store_limits()).unwrap();
+        assert_eq!(store.replay_counts().unwrap(), (0, 0));
+        let retried = runtime
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &replay_host(
+                    &origin,
+                    durable(directory.database(), false),
+                    1024,
+                    replay_approvals(),
+                ),
+                request("input"),
+            )
+            .unwrap();
+        assert_eq!(retried.response.body, "ok");
+        assert_eq!(mock.join().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn cancellation_during_http_replay_releases_the_lease() {
+    let directory = TestDirectory::new("replay-http-cancel");
+    let cancellation = CancellationHandle::new();
+    let (origin, mock) = replay_mock(vec![
+        ReplayReply::Cancel(cancellation.clone()),
+        ReplayReply::Body("ok"),
+    ]);
+    let artifact = replay_artifact(&origin, false);
+    let grants = replay_grants(&origin);
+    let agent_host = replay_host(
+        &origin,
+        durable(directory.database(), false),
+        1024,
+        replay_approvals(),
+    );
+    let runtime = Runtime::default();
+    let error = runtime
+        .invoke_webhook_with_cancellation(
+            &artifact.bytes,
+            &artifact.metadata,
+            &grants,
+            &agent_host,
+            &cancellation,
+            request("input"),
+        )
+        .expect_err("cancelled transfer must fail the invocation");
+    assert_eq!(error.code(), "K5106");
+    let store =
+        DurableStore::open(&directory.database(), Durability::Full, store_limits()).unwrap();
+    assert_eq!(store.replay_counts().unwrap(), (0, 0));
+    let retried = runtime
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &grants,
+            &agent_host,
+            request("input"),
+        )
+        .unwrap();
+    assert_eq!(retried.response.body, "ok");
+    assert_eq!(mock.join().unwrap().len(), 2);
+}
+
+#[test]
+fn replay_refuses_open_database_transactions_before_approval_or_reservation() {
+    for ai in [false, true] {
+        let directory = TestDirectory::new("replay-transaction");
+        let app_database = directory.path.join("application.db");
+        let connection = rusqlite::Connection::open(&app_database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE visits(value INTEGER);")
+            .unwrap();
+        let catalog = DatabaseCatalog::open(
+            BTreeMap::from([(
+                "catalog".to_owned(),
+                DatabaseDefinition {
+                    path: app_database,
+                    mode: DatabaseMode::ReadWrite,
+                    limits: DatabaseLimits {
+                        busy_timeout: Duration::from_millis(100),
+                        max_database_bytes: 4 * 1024 * 1024,
+                        max_transaction_duration: Duration::from_millis(400),
+                        max_operations_per_transaction: 8,
+                        max_parameter_bytes: 1024,
+                        max_rows: 16,
+                        max_columns: 4,
+                        max_result_bytes: 4096,
+                    },
+                    statements: BTreeMap::from([(
+                        "insert".to_owned(),
+                        StatementRequest {
+                            kind: StatementKind::Execute,
+                            sql: "INSERT INTO visits(value) VALUES (1)".to_owned(),
+                            parameters: Vec::new(),
+                            columns: Vec::new(),
+                        },
+                    )]),
+                },
+            )]),
+            1,
+        )
+        .unwrap();
+        let origin = "http://127.0.0.1:9";
+        let replay = if ai {
+            r#"replay_ai("agent-work", "operation", "reviewer", request.body)"#.to_owned()
+        } else {
+            format!(
+                r#"replay_http("agent-work", "operation", "{origin}", record {{
+                    method: "GET", path: "/work", query: "", headers: [], body: "",
+                }})"#
+            )
+        };
+        let artifact = compile(
+            &format!(
+                r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    match db_begin_write("catalog") {{
+        Ok(transaction) => {{
+            let written = db_execute(transaction, "insert", []);
+            let replayed = {replay};
+            let rolled_back = db_rollback(transaction);
+            record {{ status: 200, headers: [], body: "must not execute" }}
+        }},
+        Err(error) => record {{ status: 500, headers: [], body: error }},
+    }}
+}}
+"#
+            ),
+            &["database.write", "state.transaction"],
+        );
+        let grants = GrantSet::from_manifest(&manifest(&format!(
+            "http = [\"{origin}\"]\nai = [\"reviewer\"]\nstate = [\"agent-work\"]\ndatabases = [\"catalog\"]"
+        )));
+        let approvals = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&approvals);
+        let agent_host = AgentHost::new_with_resources(
+            HostInputs::default().with_network_policy(NetworkPolicy::loopback_for_tests()),
+            replay_policy(origin, 1024),
+            Arc::new(CallbackApproval(move |_: &ApprovalRequest| {
+                counted.fetch_add(1, Ordering::AcqRel);
+                true
+            })),
+            durable(directory.database(), false),
+            catalog,
+        )
+        .unwrap();
+        let runtime = Runtime::default();
+        for _ in 0..2 {
+            let error = runtime
+                .invoke_webhook_with_host(
+                    &artifact.bytes,
+                    &artifact.metadata,
+                    &grants,
+                    &agent_host,
+                    request("input"),
+                )
+                .expect_err("replay must fail before it can reserve or read a result");
+            assert_eq!(error.code(), "K5302");
+            assert_eq!(approvals.load(Ordering::Acquire), 0);
+            let count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM visits", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "transaction must roll back after the trap");
+            let store = DurableStore::open(&directory.database(), Durability::Full, store_limits())
+                .unwrap();
+            assert_eq!(store.replay_counts().unwrap(), (0, 0));
+        }
+    }
 }

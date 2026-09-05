@@ -599,6 +599,7 @@ impl AgentHost {
         &self,
         metadata: &ArtifactMetadata,
         request: &HttpRequest,
+        limits: RuntimeLimits,
     ) -> Result<IdempotencyDecision, RuntimeError> {
         if matches!(
             request.method.as_str(),
@@ -662,9 +663,10 @@ impl AgentHost {
                     IdempotencyDecision::Execute(Some(IdempotencyToken::Durable { binding, lease }))
                 }
                 krit_state::IdempotencyDecision::Replay(bytes) => {
-                    let response = serde_json::from_slice(&bytes).map_err(|_| {
+                    let response: HttpResponse = serde_json::from_slice(&bytes).map_err(|_| {
                         RuntimeError::durable_idempotency("durable idempotency response is invalid")
                     })?;
+                    response.validate(limits)?;
                     IdempotencyDecision::Replay(response)
                 }
                 krit_state::IdempotencyDecision::Conflict => IdempotencyDecision::Conflict,
@@ -688,6 +690,7 @@ impl AgentHost {
         if let Some(entry) = state.entries.get_mut(&key) {
             entry.last_used = sequence;
             if entry.digest == digest {
+                entry.response.validate(limits)?;
                 return Ok(IdempotencyDecision::Replay(entry.response.clone()));
             }
             return Ok(IdempotencyDecision::Conflict);

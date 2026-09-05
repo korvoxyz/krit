@@ -175,7 +175,7 @@ impl RuntimeError {
 
     pub(crate) fn with_cleanup_failure(mut self, cleanup: &RuntimeError) -> Self {
         self.message
-            .push_str("; durable idempotency reservation cleanup also failed: ");
+            .push_str("; durable reservation cleanup also failed: ");
         self.message.push_str(cleanup.message());
         self
     }

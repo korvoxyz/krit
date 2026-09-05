@@ -4,13 +4,35 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::{
     DurableStore, MAX_RESOURCE_NAME_BYTES, Mutation, StateError, checked_deadline, map_database,
-    map_transaction, next_sequence, query_revision, validate_identity, validate_mutations,
+    map_transaction, next_sequence, query_revision, valid_millis, validate_identity,
+    validate_mutations,
 };
 
 /// Hard bound on the number of rows one reservation scan may skip.
 const MAX_RESERVATION_SCAN: usize = 1024;
 /// Hard bound on the number of keys one deterministic listing may return.
 pub const MAX_OBJECT_LIST_KEYS: usize = 1024;
+
+pub const MAX_QUEUES: usize = 16;
+pub const MAX_SCHEDULES: usize = 16;
+pub const MAX_BUCKETS: usize = 16;
+pub const MAX_QUEUE_DEPTH: usize = 65_536;
+pub const MAX_QUEUE_JOB_BYTES: usize = 1024 * 1024;
+pub const MAX_QUEUE_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_DELIVERY_ATTEMPTS: u32 = 16;
+pub const MAX_DELIVERY_LEASE: Duration = Duration::from_secs(5 * 60);
+pub const MAX_DELIVERY_BACKOFF: Duration = Duration::from_secs(60 * 60);
+pub const MAX_DEAD_LETTER_ENTRIES: usize = 4096;
+pub const MAX_DEAD_LETTER_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const MIN_SCHEDULE_INTERVAL: Duration = Duration::from_secs(1);
+pub const MAX_SCHEDULE_INTERVAL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+pub const MAX_SCHEDULE_CATCH_UP: u32 = 64;
+pub const MAX_SCHEDULE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const MAX_RETAINED_FIRES: usize = 4096;
+pub const MAX_BUCKET_OBJECTS: usize = 65_536;
+pub const MAX_OBJECT_KEY_BYTES: usize = 1024;
+pub const MAX_OBJECT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BUCKET_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueuePolicy {
@@ -26,16 +48,19 @@ pub struct QueuePolicy {
 }
 
 impl QueuePolicy {
-    fn validate(self) -> Result<(), StateError> {
-        if self.max_depth == 0
-            || self.max_job_bytes == 0
-            || self.max_queue_bytes == 0
-            || self.max_attempts == 0
-            || self.lease.is_zero()
-            || self.backoff.is_zero()
+    /// Validates every protocol bound without accessing a store.
+    pub fn validate(self) -> Result<(), StateError> {
+        if !(1..=MAX_QUEUE_DEPTH).contains(&self.max_depth)
+            || !(1..=MAX_QUEUE_JOB_BYTES).contains(&self.max_job_bytes)
+            || self.max_queue_bytes < self.max_job_bytes
+            || self.max_queue_bytes > MAX_QUEUE_BYTES
+            || !(1..=MAX_DELIVERY_ATTEMPTS).contains(&self.max_attempts)
+            || !valid_millis(self.lease, MAX_DELIVERY_LEASE)
+            || !valid_millis(self.backoff, MAX_DELIVERY_BACKOFF)
             || self.backoff > self.max_backoff
-            || self.dead_letter_max_entries == 0
-            || self.dead_letter_ttl.is_zero()
+            || !valid_millis(self.max_backoff, MAX_DELIVERY_BACKOFF)
+            || !(1..=MAX_DEAD_LETTER_ENTRIES).contains(&self.dead_letter_max_entries)
+            || !valid_millis(self.dead_letter_ttl, MAX_DEAD_LETTER_RETENTION)
         {
             return Err(StateError::limit("durable queue policy is invalid"));
         }
@@ -56,11 +81,13 @@ pub struct BucketPolicy {
 }
 
 impl BucketPolicy {
-    fn validate(self) -> Result<(), StateError> {
-        if self.max_objects == 0
-            || self.max_key_bytes == 0
-            || self.max_object_bytes == 0
+    /// Validates every protocol bound without accessing a store.
+    pub fn validate(self) -> Result<(), StateError> {
+        if !(1..=MAX_BUCKET_OBJECTS).contains(&self.max_objects)
+            || !(1..=MAX_OBJECT_KEY_BYTES).contains(&self.max_key_bytes)
+            || !(1..=MAX_OBJECT_BYTES).contains(&self.max_object_bytes)
             || self.max_bucket_bytes < self.max_object_bytes
+            || self.max_bucket_bytes > MAX_BUCKET_BYTES
         {
             return Err(StateError::limit("durable bucket policy is invalid"));
         }
@@ -82,20 +109,29 @@ pub struct SchedulePolicy {
 }
 
 impl SchedulePolicy {
-    fn validate(self) -> Result<(), StateError> {
-        if self.interval.is_zero()
-            || self.max_catch_up == 0
-            || self.max_attempts == 0
-            || self.lease.is_zero()
-            || self.backoff.is_zero()
+    /// Validates every protocol bound without accessing a store.
+    pub fn validate(self) -> Result<(), StateError> {
+        if self.interval < MIN_SCHEDULE_INTERVAL
+            || !valid_millis(self.interval, MAX_SCHEDULE_INTERVAL)
+            || self.start_millis < 0
+            || !(1..=MAX_SCHEDULE_CATCH_UP).contains(&self.max_catch_up)
+            || !(1..=MAX_DELIVERY_ATTEMPTS).contains(&self.max_attempts)
+            || !valid_millis(self.lease, MAX_DELIVERY_LEASE)
+            || !valid_millis(self.backoff, MAX_DELIVERY_BACKOFF)
             || self.backoff > self.max_backoff
-            || self.retention.is_zero()
-            || self.max_retained_fires == 0
-            || self.interval_millis().is_none()
+            || !valid_millis(self.max_backoff, MAX_DELIVERY_BACKOFF)
+            || !valid_millis(self.retention, MAX_SCHEDULE_RETENTION)
+            || !(1..=MAX_RETAINED_FIRES).contains(&self.max_retained_fires)
         {
             return Err(StateError::limit("durable schedule policy is invalid"));
         }
         Ok(())
+    }
+
+    /// Checks every lease, retry, and retention instant before a tick or reservation.
+    pub fn validate_instant(self, now_millis: i64) -> Result<(), StateError> {
+        self.validate()?;
+        preflight_instants(now_millis, &[self.lease, self.max_backoff, self.retention])
     }
 
     fn interval_millis(self) -> Option<i64> {
@@ -240,6 +276,11 @@ impl DurableStore {
             completion,
         } = plan;
         validate_mutations(mutations, self.limits())?;
+        if queues.len() > MAX_QUEUES || buckets.len() > MAX_BUCKETS {
+            return Err(StateError::limit(
+                "configured queues or buckets exceed the protocol bounds",
+            ));
+        }
         for policy in queues.values() {
             policy.validate()?;
         }
@@ -544,17 +585,11 @@ impl DurableStore {
         policy: SchedulePolicy,
         now_millis: i64,
     ) -> Result<ScheduleCatchUp, StateError> {
-        policy.validate()?;
+        policy.validate_instant(now_millis)?;
         validate_identity(schedule, MAX_RESOURCE_NAME_BYTES)?;
         let interval = policy
             .interval_millis()
             .ok_or_else(|| StateError::limit("durable schedule interval is invalid"))?;
-        // Every instant this tick can record must be representable before the
-        // cursor or any fire row moves.
-        preflight_instants(
-            now_millis,
-            &[policy.lease, policy.max_backoff, policy.retention],
-        )?;
         let horizon = occurrence_bounds(policy, interval, now_millis)?;
         let mut connection = self.lock()?;
         let transaction = connection
@@ -648,12 +683,8 @@ impl DurableStore {
         owner: &[u8; 16],
         now_millis: i64,
     ) -> Result<Option<FireDelivery>, StateError> {
-        policy.validate()?;
+        policy.validate_instant(now_millis)?;
         validate_identity(schedule, MAX_RESOURCE_NAME_BYTES)?;
-        preflight_instants(
-            now_millis,
-            &[policy.lease, policy.max_backoff, policy.retention],
-        )?;
         let mut connection = self.lock()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -726,11 +757,7 @@ impl DurableStore {
         policy: SchedulePolicy,
         now_millis: i64,
     ) -> Result<JobDisposition, StateError> {
-        policy.validate()?;
-        preflight_instants(
-            now_millis,
-            &[policy.lease, policy.max_backoff, policy.retention],
-        )?;
+        policy.validate_instant(now_millis)?;
         let mut connection = self.lock()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)

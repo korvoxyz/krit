@@ -1,6 +1,6 @@
 # Krit Rust technical design
 
-**Status:** Accepted; Phase 6 durable state and jobs plus Phase 7 database access implemented
+**Status:** Accepted; bounded Phase 6 durable execution and Phase 7 data services implemented
 **Owner:** Akshay Bhardwaj
 
 ## Decision
@@ -274,8 +274,11 @@ The embedding creates one reusable `AgentHost` for policy state while every
 component Store remains fresh. `AgentHost` owns strict AI adapter definitions,
 fixed-window rate counters, completed-response idempotency entries, and an
 approval callback. All maps have hard bounds and LRU replacement where
-specified. The CLI accepts legacy host config schema 1 and strict schema 2;
-schema 2 can only configure resources already granted by the manifest.
+specified. The CLI accepts host config schemas 1 through 6; later schemas add durable
+state, jobs/storage, databases, and cache/search without widening manifest
+authority. All schemas reject duplicate map keys as well as unknown fields.
+Protocol maxima are also enforced by public service constructors, not only
+the CLI loader.
 
 One provider-neutral `AiAdapter` trait hides the milestone `http-json`
 provider mapping. Prompts and responses cross only the typed AI call and
@@ -286,8 +289,9 @@ Retries wrap individual network attempts, never guest execution. They are
 restricted by method/idempotency, retryable transport/status classes, capped
 backoff, approval, finite rates, cancellation, and the total deadline. An
 atomic cancellation handle is checked at host boundaries and drives libcurl's
-progress callback. Inbound response idempotency is process-local bounded
-TTL/LRU state and is deliberately not the durable Phase 6 design.
+progress callback. Inbound response idempotency defaults to process-local bounded TTL/LRU state;
+Phase 6 adds explicit opt-in durable storage. Both replay paths validate
+responses against the current invocation's body and header limits.
 
 Wasmtime 47 is a short-supported non-LTS line. `Cargo.toml` accepts security
 patches compatible with 47.0.4, and `Cargo.lock` records the exact tested
@@ -333,6 +337,12 @@ not serializable into components or cache artifacts.
 
 ## Package and build system
 
+The bootstrap implements strict local manifests, entry containment,
+deterministic component artifacts, and safe artifact replacement. Module
+resolution, lockfile generation, incremental builds, and build caching remain
+planned; the following describes that target architecture, not shipped
+functionality.
+
 The package resolver produces a deterministic graph before compiling source.
 Source fetching, checksum verification, resolution, compilation, and
 execution are separate phases with separate errors.
@@ -368,6 +378,11 @@ the bounded external call. They are keyed by artifact identity, operation
 kind/name, and exact input digest. Matching results survive process restart;
 conflicts and active leases fail closed. Replay hits recheck current artifact
 requirements, manifest grants, configured adapters, and AI approval.
+Recorded HTTP responses and AI output must also fit current runtime and
+adapter limits. Replay refuses an open application-database transaction before
+approval or durable-store access. Every failed reserved attempt, including a
+host trap or completion failure, explicitly aborts its owned replay lease;
+cleanup failure is reported without losing the original failure.
 
 Anonymous replay HTTP permits GET/HEAD or one valid ordinary
 `Idempotency-Key`. Replay AI derives one stable provider key from artifact,
@@ -402,6 +417,15 @@ increments the attempt counter, so a killed worker consumes exactly one bounded
 attempt when its lease expires. Retry visibility uses exponential backoff capped
 by configuration, and attempt exhaustion moves the job into a bounded
 dead-letter table with a 256-byte reason.
+
+Queue and schedule dispatch acquire the Runtime's epoch scheduler before
+reservation and retain it through the outcome commit. Cancellation is rechecked
+after waiting. Lease and outcome instants use the supplied host time plus
+monotonic elapsed time, so compilation or scheduler contention cannot start a
+lease in the past; schedule materialization retains the exact supplied tick
+cutoff. Before guest execution, the remaining lease must still cover the
+execution deadline. A failed outcome commit releases the owned delivery into
+its bounded retry/dead-letter path rather than waiting for lease expiry.
 
 Scheduled occurrences are `start + k * interval` UTC epoch instants owned by the
 host. A tick materializes every occurrence in `(cursor, now]` up to a catch-up

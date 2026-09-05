@@ -6,7 +6,7 @@ use std::{
 };
 
 use krit::{
-    Analysis, Block, Builtin, Diagnostic as CompilerDiagnostic, Effect, EffectSet, Expression,
+    Analysis, Block, Builtin, Diagnostic as CompilerDiagnostic, Effect, EntrypointKind, Expression,
     ExpressionKind, MatchKind, Program, RequirementSet, ResolvedName, Source, Span, Statement,
     StatementKind, SymbolKind as CompilerSymbolKind, Type, TypeAnnotation,
 };
@@ -874,8 +874,8 @@ impl Document {
         }
         let (effects, requirements) = type_effects(symbol.ty());
         append_effects_and_requirements(&mut output, effects, requirements, self.package.as_ref());
-        if symbol.kind() == CompilerSymbolKind::Webhook {
-            output.push_str("\n\n**Entrypoint:** `webhook`");
+        if let Some((kind, _)) = deployment_entrypoint_kind(symbol.kind()) {
+            output.push_str(&format!("\n\n**Entrypoint:** `{}`", kind.as_str()));
         }
         if symbol.is_top_level()
             && let Some(package) = &self.package
@@ -1056,18 +1056,6 @@ fn type_effects(ty: &Type) -> (Vec<String>, &RequirementSet) {
         ),
         _ => (Vec::new(), empty_requirements()),
     }
-}
-
-fn function_effects(ty: &Type) -> &EffectSet {
-    match ty {
-        Type::Function(function) => function.effects(),
-        _ => empty_effects(),
-    }
-}
-
-fn empty_effects() -> &'static EffectSet {
-    static EMPTY: std::sync::OnceLock<EffectSet> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(EffectSet::default)
 }
 
 fn empty_requirements() -> &'static RequirementSet {
@@ -1420,8 +1408,10 @@ fn type_completions() -> Vec<CompletionItem> {
         "List",
         "LogField",
         "Option",
+        "QueueJob",
         "Record",
         "Result",
+        "ScheduleEvent",
         "Secret",
         "String",
         "Unit",
@@ -1459,7 +1449,8 @@ fn builtin_completions() -> Vec<CompletionItem> {
 
 fn keyword_completions() -> Vec<CompletionItem> {
     [
-        "else", "false", "fn", "if", "let", "match", "record", "true", "webhook",
+        "else", "false", "fn", "if", "let", "match", "queue", "record", "schedule", "true",
+        "webhook",
     ]
     .into_iter()
     .map(|keyword| CompletionItem {
@@ -1812,11 +1803,20 @@ impl<'a> DeclarationCollector<'a> {
                     StatementKind::ScheduleHandler { .. } => CompilerSymbolKind::ScheduleHandler,
                     _ => CompilerSymbolKind::Function,
                 };
+                let name_search_span = match &statement.kind {
+                    StatementKind::QueueConsumer { queue_span, .. } => {
+                        Span::new(queue_span.end, statement.span.end)
+                    }
+                    StatementKind::ScheduleHandler { schedule_span, .. } => {
+                        Span::new(schedule_span.end, statement.span.end)
+                    }
+                    _ => statement.span,
+                };
                 self.add(
                     name,
                     kind,
                     statement.span,
-                    find_identifier_span(self.text, statement.span, name),
+                    find_identifier_span(self.text, name_search_span, name),
                     Span::new(statement.span.start, scope_end),
                     Some(declared_function_type(
                         kind,
@@ -1986,11 +1986,10 @@ fn declared_function_type<'a>(
         .map(|annotation| annotation.map_or_else(|| "_".to_owned(), ToString::to_string))
         .collect::<Vec<_>>()
         .join(", ");
-    let prefix = if kind == CompilerSymbolKind::Webhook {
-        "webhook fn"
-    } else {
-        "fn"
-    };
+    let prefix = deployment_entrypoint_kind(kind).map_or_else(
+        || "fn".to_owned(),
+        |(kind, _)| format!("{} fn", kind.as_str()),
+    );
     format!(
         "{prefix}({parameters}) -> {}",
         return_type.map_or_else(|| "_".to_owned(), ToString::to_string)
@@ -2120,7 +2119,7 @@ fn all_entrypoint_permissions(
 ) -> Vec<RequiredPermissionFact> {
     let mut permissions =
         permission_facts(analysis.effects().iter(), analysis.requirements(), package);
-    for function in webhook_function_types(analysis) {
+    for (_, _, _, function) in deployment_entrypoints(analysis) {
         permissions.extend(permission_facts(
             function.effects().iter(),
             function.requirements(),
@@ -2144,7 +2143,7 @@ fn all_entrypoint_effects(analysis: &Analysis) -> Vec<String> {
         .iter()
         .map(|effect| effect.as_str().to_owned())
         .collect::<BTreeSet<_>>();
-    for function in webhook_function_types(analysis) {
+    for (_, _, _, function) in deployment_entrypoints(analysis) {
         effects.extend(
             function
                 .effects()
@@ -2155,14 +2154,38 @@ fn all_entrypoint_effects(analysis: &Analysis) -> Vec<String> {
     effects.into_iter().collect()
 }
 
-fn webhook_function_types(analysis: &Analysis) -> impl Iterator<Item = &krit::FunctionType> {
+fn deployment_entrypoint_kind(kind: CompilerSymbolKind) -> Option<(EntrypointKind, &'static str)> {
+    match kind {
+        CompilerSymbolKind::Webhook => Some((EntrypointKind::Webhook, "request")),
+        CompilerSymbolKind::QueueConsumer => Some((EntrypointKind::QueueConsumer, "job")),
+        CompilerSymbolKind::ScheduleHandler => Some((EntrypointKind::ScheduleHandler, "event")),
+        CompilerSymbolKind::Let
+        | CompilerSymbolKind::Function
+        | CompilerSymbolKind::Parameter
+        | CompilerSymbolKind::Match => None,
+    }
+}
+
+fn deployment_entrypoints(
+    analysis: &Analysis,
+) -> impl Iterator<
+    Item = (
+        &krit::SymbolAnalysis,
+        EntrypointKind,
+        &'static str,
+        &krit::FunctionType,
+    ),
+> {
     analysis
         .symbols()
         .iter()
-        .filter(|symbol| symbol.is_top_level() && symbol.kind() == CompilerSymbolKind::Webhook)
-        .filter_map(|symbol| match symbol.ty() {
-            Type::Function(function) => Some(function),
-            _ => None,
+        .filter(|symbol| symbol.is_top_level())
+        .filter_map(|symbol| {
+            let (kind, parameter) = deployment_entrypoint_kind(symbol.kind())?;
+            let Type::Function(function) = symbol.ty() else {
+                return None;
+            };
+            Some((symbol, kind, parameter, function))
         })
 }
 
@@ -2182,23 +2205,25 @@ fn entrypoint_facts(analysis: &Analysis, package: Option<&PackageContext>) -> Ve
             package,
         ),
     }];
-    for symbol in analysis
-        .symbols()
-        .iter()
-        .filter(|symbol| symbol.is_top_level() && symbol.kind() == CompilerSymbolKind::Webhook)
-    {
-        let (effects, requirements) = type_effects(symbol.ty());
+    for (symbol, kind, parameter, function) in deployment_entrypoints(analysis) {
         entrypoints.push(EntrypointFact {
             name: symbol.name().to_owned(),
-            kind: "webhook",
+            kind: kind.as_str(),
             signature: format!(
-                "webhook fn {}(request: HttpRequest) -> HttpResponse",
-                symbol.name()
+                "{} fn {}({parameter}: {}) -> {}",
+                kind.as_str(),
+                symbol.name(),
+                function.parameters()[0],
+                function.return_type()
             ),
-            effects,
+            effects: function
+                .effects()
+                .iter()
+                .map(|effect| effect.as_str().to_owned())
+                .collect(),
             capability_requirements: permission_facts(
-                function_effects(symbol.ty()).iter(),
-                requirements,
+                function.effects().iter(),
+                function.requirements(),
                 package,
             ),
         });
@@ -2756,6 +2781,172 @@ stdout = true
             facts["package"]["requestedPermissions"][1],
             serde_json::json!({"capability": "io.stdout", "used": true})
         );
+    }
+
+    #[test]
+    fn reports_queue_and_schedule_contracts_and_transitive_module_permissions() {
+        for (kind, parameter, ty, capability, manifest_key) in [
+            ("queue", "job", "QueueJob", "queue.consume", "consumes"),
+            (
+                "schedule",
+                "event",
+                "ScheduleEvent",
+                "schedule.trigger",
+                "schedules",
+            ),
+        ] {
+            for granted in [None, Some(false), Some(true)] {
+                let directory = TestDirectory::new();
+                fs::write(directory.path.join("main.krit"), "").expect("entry should exist");
+                if let Some(granted) = granted {
+                    let requested = if granted { kind } else { "other" };
+                    fs::write(
+                        directory.path.join("krit.pkg"),
+                        format!(
+                            r#"schema = 1
+[package]
+name = "example/deployment"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+[capabilities]
+config = ["agent.model", "unused.model"]
+stdout = true
+{manifest_key} = ["{requested}"]
+"#
+                        ),
+                    )
+                    .expect("manifest should be written");
+                }
+                let source = format!(
+                    r#"println("module init");
+fn model() -> Result<String, String> {{
+    config_string("agent.model")
+}}
+fn unused() -> Result<String, String> {{
+    config_string("unused.model")
+}}
+{kind} "{kind}" fn {kind}(input: {ty}) -> Result<String, String> {{
+    let configured = model();
+    println(input.id);
+    Ok(input.id)
+}}
+"#
+                );
+                let uri = directory.uri("main.krit");
+                let mut state = ServerState::new(vec![directory.path.clone()]);
+                let diagnostics = state.open(uri.clone(), 1, source.clone());
+                assert!(diagnostics.diagnostics.is_empty());
+                let facts = serde_json::to_value(state.compiler_facts(&uri).unwrap()).unwrap();
+                assert_eq!(
+                    facts,
+                    serde_json::to_value(state.compiler_facts(&uri).unwrap()).unwrap(),
+                    "compiler facts must be deterministic"
+                );
+                assert_eq!(facts["schema"], 1);
+                assert_eq!(facts["valid"], true);
+                let mut required = serde_json::json!([
+                    {"capability": "config.read", "resource": "agent.model", "granted": true},
+                    {"capability": "io.stdout", "granted": true},
+                    {"capability": capability, "resource": kind, "granted": granted}
+                ]);
+                if granted.is_none() {
+                    for permission in required.as_array_mut().unwrap() {
+                        permission.as_object_mut().unwrap().remove("granted");
+                    }
+                }
+                assert_eq!(
+                    facts["module"]["effects"],
+                    serde_json::json!(["config.read", "io.stdout", capability])
+                );
+                assert_eq!(facts["module"]["capabilityRequirements"], required);
+                assert_eq!(
+                    facts["module"]["entrypoints"],
+                    serde_json::json!([
+                        {
+                            "name": "<module-init>",
+                            "kind": "module-init",
+                            "signature": "fn() -> Unit",
+                            "effects": ["io.stdout"],
+                            "capabilityRequirements": [required[1].clone()]
+                        },
+                        {
+                            "name": kind,
+                            "kind": kind,
+                            "signature": format!("{kind} fn {kind}({parameter}: {ty}) -> Result<String, String>"),
+                            "effects": ["config.read", "io.stdout", capability],
+                            "capabilityRequirements": required
+                        }
+                    ])
+                );
+                if let Some(granted) = granted {
+                    assert_eq!(facts["package"]["requiredPermissions"], required);
+                    assert_eq!(facts["package"]["allRequiredGranted"], granted);
+                    let requested = facts["package"]["requestedPermissions"].as_array().unwrap();
+                    assert!(requested.iter().any(|permission| {
+                        permission["resource"] == "agent.model" && permission["used"] == true
+                    }));
+                    assert!(requested.iter().any(|permission| {
+                        permission["resource"] == "unused.model" && permission["used"] == false
+                    }));
+                    assert!(requested.iter().any(|permission| {
+                        permission["capability"] == capability && permission["used"] == granted
+                    }));
+                } else {
+                    assert!(facts.get("package").is_none());
+                }
+
+                let name_start = source.find(&format!("fn {kind}(")).unwrap() + 3;
+                let name_range = LineIndex::new(&source)
+                    .range(&source, Span::new(name_start, name_start + kind.len()));
+                let hover = state.hover(&uri, name_range.start).unwrap().unwrap();
+                assert_eq!(hover.range, Some(name_range));
+                let HoverContents::Markup(markup) = hover.contents else {
+                    panic!("hover should use markdown")
+                };
+                assert!(markup.value.contains(&format!("**Entrypoint:** `{kind}`")));
+                assert!(markup.value.contains(capability));
+                assert!(markup.value.contains("config.read"));
+                assert!(markup.value.contains("agent.model"));
+                let symbol = facts["symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|symbol| symbol["name"] == kind)
+                    .unwrap();
+                assert_eq!(
+                    symbol["declaredType"],
+                    format!("{kind} fn({ty}) -> Result<String, String>")
+                );
+                assert_eq!(
+                    symbol["selectionRange"],
+                    serde_json::to_value(name_range).unwrap()
+                );
+                let Some(DocumentSymbolResponse::Nested(symbols)) =
+                    state.document_symbols(&uri).unwrap()
+                else {
+                    panic!("document symbols should be available")
+                };
+                let symbol = symbols.iter().find(|symbol| symbol.name == kind).unwrap();
+                assert_eq!(symbol.kind, SymbolKind::FUNCTION);
+                assert_eq!(symbol.selection_range, name_range);
+            }
+        }
+    }
+
+    #[test]
+    fn completes_every_deployment_entrypoint_keyword_and_contract_type() {
+        for keyword in ["webhook", "queue", "schedule"] {
+            assert!(
+                keyword_completions()
+                    .iter()
+                    .any(|item| item.label == keyword)
+            );
+        }
+        for ty in ["HttpRequest", "HttpResponse", "QueueJob", "ScheduleEvent"] {
+            assert!(type_completions().iter().any(|item| item.label == ty));
+        }
     }
 
     #[test]

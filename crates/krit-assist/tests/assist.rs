@@ -172,6 +172,84 @@ let leaked = "ghp_SUPERSECRET";
 }
 
 #[test]
+fn deployment_entrypoint_context_and_compiler_facts_never_expose_resources() {
+    for (keyword, ty, capability, manifest_key) in [
+        ("queue", "QueueJob", "queue.consume", "consumes"),
+        ("schedule", "ScheduleEvent", "schedule.trigger", "schedules"),
+    ] {
+        let directory = TestDirectory::new("deployment-redaction");
+        directory.file(
+            "krit.pkg",
+            &manifest(&format!(
+                "config = [\"private.config\"]\n{manifest_key} = [\"private-work\"]"
+            )),
+        );
+        let source = format!(
+            r#"let {keyword} = "visible context";
+fn model() -> Result<String, String> {{
+    config_string("private.config")
+}}
+{keyword} "private-work" fn handle(input: {ty}) -> Result<String, String> {{
+    let configured = model();
+    Ok(input.id)
+}}
+"#
+        );
+        for (valid, source) in [
+            (true, source.clone()),
+            (false, format!("{source}let unfinished =")),
+            (false, format!("{source}let invalid: Int = handle;\n")),
+            (false, format!("{keyword} // identity\n\"private-work")),
+        ] {
+            let path = directory.file("main.krit", &source);
+            let prepare = || {
+                prepare_request(
+                    provider(),
+                    options(
+                        &directory,
+                        SuggestionKind::DiagnosticRepair,
+                        RequestedRange::WholeDocument,
+                    ),
+                )
+                .expect("deployment context should prepare")
+            };
+            let prepared = prepare();
+            assert_eq!(prepared.request(), prepare().request());
+            assert_eq!(prepared.request().compiler_facts["valid"], valid);
+            let request = serde_json::to_string(prepared.request()).unwrap();
+            assert!(!request.contains("private-work"), "{request}");
+            assert!(!request.contains("private.config"), "{request}");
+            assert!(request.contains("<redacted:capability-resource>"));
+            if valid {
+                assert!(request.contains("visible context"));
+                assert_eq!(
+                    prepared.request().compiler_facts["module"]["effects"],
+                    serde_json::json!(["config.read", capability])
+                );
+                let entrypoint = &prepared.request().compiler_facts["module"]["entrypoints"][1];
+                assert_eq!(entrypoint["kind"], keyword);
+                assert_eq!(
+                    entrypoint["capabilityRequirements"],
+                    serde_json::json!([
+                        {
+                            "capability": "config.read",
+                            "resource": "<redacted:capability-resource>",
+                            "granted": true
+                        },
+                        {
+                            "capability": capability,
+                            "resource": "<redacted:capability-resource>",
+                            "granted": true
+                        }
+                    ])
+                );
+            }
+            assert_eq!(fs::read_to_string(path).unwrap(), source);
+        }
+    }
+}
+
+#[test]
 fn eof_diagnostics_are_included_for_whole_document_repair_context() {
     let directory = TestDirectory::new("eof-diagnostic");
     directory.file("krit.pkg", &manifest(""));
@@ -911,6 +989,177 @@ fn reference_webhook_authority_expansion_requires_exact_separate_approval() {
     let source = krit::Source::new("main.krit", accepted);
     let program = krit::parse_source(&source).expect("accepted source should parse");
     krit::analyze(&program).expect("accepted source should analyze");
+}
+
+#[test]
+fn deployment_entrypoint_authority_requires_exact_approval_and_manifest_grants() {
+    for (keyword, ty, capability, manifest_key) in [
+        ("queue", "QueueJob", "queue.consume", "consumes"),
+        ("schedule", "ScheduleEvent", "schedule.trigger", "schedules"),
+    ] {
+        for granted in [false, true] {
+            let directory = TestDirectory::new("deployment-authority");
+            let resources = if granted { r#"["private-work"]"# } else { "[]" };
+            let manifest_path = directory.file(
+                "krit.pkg",
+                &manifest(&format!("{manifest_key} = {resources}")),
+            );
+            let original = "let value = 1;\n";
+            let source_path = directory.file("main.krit", original);
+            let prepared = prepare_request(
+                provider(),
+                options(
+                    &directory,
+                    SuggestionKind::Completion,
+                    RequestedRange::WholeDocument,
+                ),
+            )
+            .expect("request should prepare");
+            let request = prepared.request().clone();
+            let candidate = format!(
+                "{keyword} \"private-work\" fn handle(input: {ty}) -> Result<String, String> {{\n    Ok(input.id)\n}}\n"
+            );
+            let proposal = build_proposal(
+                prepared,
+                response(
+                    &request,
+                    vec![ProposedTextEdit {
+                        range: request.target.selection.clone(),
+                        new_text: candidate.clone(),
+                    }],
+                ),
+            )
+            .expect("deployment proposal should validate");
+            let permission = PermissionKey {
+                capability: capability.to_owned(),
+                resource: Some("private-work".to_owned()),
+            };
+            assert_eq!(proposal.review.after.effects, [capability]);
+            assert_eq!(proposal.review.effect_delta.added, [capability]);
+            assert!(proposal.review.effect_delta.removed.is_empty());
+            assert_eq!(proposal.review.permissions.added_required.len(), 1);
+            assert_eq!(
+                proposal.review.permissions.approval_required.as_slice(),
+                std::slice::from_ref(&permission)
+            );
+            assert_eq!(
+                proposal.review.permissions.missing_after.is_empty(),
+                granted
+            );
+            assert_eq!(
+                proposal.review.after.required_permissions[0].granted,
+                granted
+            );
+
+            for approvals in [
+                BTreeSet::new(),
+                [PermissionKey {
+                    capability: capability.to_owned(),
+                    resource: Some("other-work".to_owned()),
+                }]
+                .into_iter()
+                .collect(),
+            ] {
+                let reviewed = review_loaded_proposal(&manifest_path, proposal.clone())
+                    .expect("proposal should review");
+                assert_eq!(
+                    accept_reviewed(reviewed, &approvals)
+                        .expect_err("missing or inexact approval must fail")
+                        .code(),
+                    "K8106"
+                );
+                assert_eq!(fs::read_to_string(&source_path).unwrap(), original);
+            }
+            let reviewed =
+                review_loaded_proposal(&manifest_path, proposal).expect("proposal should review");
+            let accepted = accept_reviewed(reviewed, &[permission].into_iter().collect());
+            if granted {
+                accepted.expect("exact manifest-granted authority should be accepted");
+                assert_eq!(fs::read_to_string(&source_path).unwrap(), candidate);
+            } else {
+                assert_eq!(
+                    accepted
+                        .expect_err("approval cannot grant missing deployment authority")
+                        .code(),
+                    "K8106"
+                );
+                assert_eq!(fs::read_to_string(&source_path).unwrap(), original);
+            }
+        }
+    }
+}
+
+#[test]
+fn deployment_resource_changes_have_exact_added_and_removed_authority() {
+    for (keyword, ty, capability, manifest_key) in [
+        ("queue", "QueueJob", "queue.consume", "consumes"),
+        ("schedule", "ScheduleEvent", "schedule.trigger", "schedules"),
+    ] {
+        let directory = TestDirectory::new("deployment-resource-change");
+        directory.file(
+            "krit.pkg",
+            &manifest(&format!(
+                "{manifest_key} = [\"original-work\", \"replacement-work\"]"
+            )),
+        );
+        let source = format!(
+            "{keyword} \"original-work\" fn handle(input: {ty}) -> Result<String, String> {{\n    Ok(input.id)\n}}\n"
+        );
+        directory.file("main.krit", &source);
+        let prepared = prepare_request(
+            provider(),
+            options(
+                &directory,
+                SuggestionKind::SemanticCleanup,
+                RequestedRange::WholeDocument,
+            ),
+        )
+        .expect("request should prepare");
+        let request = prepared.request().clone();
+        let proposal = build_proposal(
+            prepared,
+            response(
+                &request,
+                vec![ProposedTextEdit {
+                    range: request.target.selection.clone(),
+                    new_text: source.replace("original-work", "replacement-work"),
+                }],
+            ),
+        )
+        .expect("resource change should create a proposal");
+        assert_eq!(proposal.review.before.effects, [capability]);
+        assert_eq!(proposal.review.after.effects, [capability]);
+        assert!(proposal.review.effect_delta.added.is_empty());
+        assert!(proposal.review.effect_delta.removed.is_empty());
+        let permissions = &proposal.review.permissions;
+        assert_eq!(permissions.added_required.len(), 1);
+        assert_eq!(permissions.removed_required.len(), 1);
+        assert_eq!(
+            permissions.removed_required[0].resource.as_deref(),
+            Some("original-work")
+        );
+        assert_eq!(
+            permissions.added_required[0].resource.as_deref(),
+            Some("replacement-work")
+        );
+        assert_eq!(
+            permissions.approval_required,
+            [PermissionKey {
+                capability: capability.to_owned(),
+                resource: Some("replacement-work".to_owned())
+            }]
+        );
+        assert!(permissions.requested.iter().any(|permission| {
+            permission.resource.as_deref() == Some("original-work")
+                && permission.used_before
+                && !permission.used_after
+        }));
+        assert!(permissions.requested.iter().any(|permission| {
+            permission.resource.as_deref() == Some("replacement-work")
+                && !permission.used_before
+                && permission.used_after
+        }));
+    }
 }
 
 #[test]

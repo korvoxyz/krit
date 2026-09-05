@@ -1018,6 +1018,162 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
 }
 
 #[test]
+fn direct_run_rejects_all_deployment_entrypoints_before_module_execution() {
+    for (kind, declaration) in [
+        (
+            "webhook",
+            r#"webhook fn handle(input: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: input.path }
+}"#,
+        ),
+        (
+            "queue",
+            r#"queue "private-jobs" fn handle(input: QueueJob) -> Result<String, String> {
+    Ok(input.id)
+}"#,
+        ),
+        (
+            "schedule",
+            r#"schedule "private-tick" fn handle(input: ScheduleEvent) -> Result<String, String> {
+    Ok(input.id)
+}"#,
+        ),
+    ] {
+        for prefix in [
+            "println(\"must not run\");\n",
+            "println(\"must not run\");\nlet invalid = 1 + true;\n",
+        ] {
+            let directory = TestDirectory::new("run-deployment-entrypoint");
+            let source = format!("{prefix}{declaration}\nprintln(\"must not run either\");\n");
+            let path = directory.file("main.krit", &source);
+            let message = format!("{kind} entrypoints are unavailable in direct source execution");
+            let human = krit_in(&directory)
+                .args(["run", "main.krit"])
+                .output()
+                .expect("Krit should start");
+            assert_eq!(human.status.code(), Some(4), "{kind}");
+            assert!(human.stdout.is_empty(), "{kind}");
+            assert_eq!(
+                String::from_utf8(human.stderr).unwrap(),
+                format!(
+                    "main.krit:{}:1: error[K5003]: {message}\n",
+                    prefix.lines().count() + 1
+                )
+            );
+
+            let mut previous = None;
+            for _ in 0..2 {
+                let output = krit_in(&directory)
+                    .args(["run", "--diagnostic-format=json", "main.krit"])
+                    .output()
+                    .expect("Krit should start");
+                assert_eq!(output.status.code(), Some(4), "{kind}");
+                assert!(output.stdout.is_empty(), "{kind}");
+                let diagnostic: serde_json::Value =
+                    serde_json::from_slice(&output.stderr).expect("diagnostic should be JSON");
+                assert_eq!(diagnostic["schema"], 1);
+                assert_eq!(diagnostic["code"], "K5003");
+                assert_eq!(diagnostic["message"], message);
+                assert_eq!(diagnostic["span"]["start"]["byte"], prefix.len());
+                assert_eq!(
+                    diagnostic["span"]["end"]["byte"],
+                    prefix.len() + declaration.len()
+                );
+                if let Some(previous) = previous.replace(output.stderr.clone()) {
+                    assert_eq!(previous, output.stderr, "diagnostics must be deterministic");
+                }
+            }
+            assert_eq!(fs::read_to_string(path).unwrap(), source);
+            assert_eq!(fs::read_dir(&directory.path).unwrap().count(), 1);
+        }
+    }
+}
+
+#[test]
+fn direct_run_keeps_queue_and_schedule_contextual() {
+    let directory = TestDirectory::new("run-contextual-entrypoint-names");
+    let source = directory.file(
+        "main.krit",
+        r#"fn queue(value: String) -> String { value }
+let schedule = record { queue: "ordinary" };
+println(queue(schedule.queue));
+"#,
+    );
+    let output = krit()
+        .arg("run")
+        .arg(source)
+        .output()
+        .expect("Krit should start");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"ordinary\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn explains_queue_and_schedule_entrypoint_contracts() {
+    for (kind, parameter, ty, capability) in [
+        ("queue", "job", "QueueJob", "queue.consume"),
+        ("schedule", "event", "ScheduleEvent", "schedule.trigger"),
+    ] {
+        let directory = TestDirectory::new("explain-deployment-entrypoint");
+        let source = directory.file(
+            "main.krit",
+            &format!(
+                r#"fn model() -> Result<String, String> {{
+    config_string("agent.model")
+}}
+{kind} "private-work" fn handle(input: {ty}) -> Result<String, String> {{
+    let configured = model();
+    Ok(input.id)
+}}
+"#
+            ),
+        );
+        let signature = format!("{kind} fn handle({parameter}: {ty}) -> Result<String, String>");
+        let json = krit()
+            .args(["explain", "--json"])
+            .arg(&source)
+            .output()
+            .expect("Krit should start");
+        assert!(json.status.success());
+        assert!(json.stderr.is_empty());
+        let facts: serde_json::Value =
+            serde_json::from_slice(&json.stdout).expect("explanation should be JSON");
+        assert_eq!(facts["entrypoints"]["items"].as_array().unwrap().len(), 2);
+        let entrypoint = &facts["entrypoints"]["items"][1];
+        assert_eq!(entrypoint["kind"], kind);
+        assert_eq!(entrypoint["signature"], signature);
+        assert_eq!(
+            entrypoint["effects"],
+            serde_json::json!(["config.read", capability])
+        );
+        assert_eq!(
+            entrypoint["capabilityRequirements"],
+            serde_json::json!([
+                {"capability": "config.read", "resource": "agent.model"},
+                {"capability": capability, "resource": "private-work"}
+            ])
+        );
+        assert!(entrypoint.get("contract").is_none());
+
+        let human = krit()
+            .arg("explain")
+            .arg(&source)
+            .output()
+            .expect("Krit should start");
+        assert!(human.status.success());
+        assert!(human.stderr.is_empty());
+        let human = String::from_utf8(human.stdout).unwrap();
+        assert!(human.contains(&format!("{kind} contract (schema 1):\n")));
+        assert!(human.contains(&format!("  signature: {signature}\n")));
+        assert!(human.contains(&format!("  effects: {{config.read, {capability}}}\n")));
+        assert!(human.contains(&format!(r#"{capability}("private-work")"#)));
+        assert!(!human.contains("webhook contract"));
+        assert!(!human.contains("JSON Schema:"));
+    }
+}
+
+#[test]
 fn direct_run_fails_closed_for_unavailable_agent_hosts() {
     let directory = TestDirectory::new("run-agent-host-unavailable");
     let config = directory.file(

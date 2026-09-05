@@ -22,7 +22,10 @@ Network or model latency is measured separately from language overhead.
 
 ## Workloads
 
-The baseline suite contains:
+The published baselines cover direct CLI startup, factorial evaluation,
+manifest checking, and policy-1 artifact startup/execution/inspection. The
+following is the required workload coverage, not a claim that all runners or
+measurements already exist:
 
 - empty program startup
 - parse-only 1 KiB, 100 KiB, and 1 MiB sources
@@ -44,6 +47,9 @@ The baseline suite contains:
 - schedule materialization, catch-up, and fire acknowledgement
 - object put/get/delete with replacement accounting and bucket byte checks
 - database begin, parameterized query, parameterized execute, and commit
+- cache hit, miss, expiry, replacement, deletion, and cross-namespace eviction
+- cache-disabled versus warm-cache execution with identical application output
+- local and HTTP text-search calls plus bounded vector-search validation
 
 Inputs and expected checksums are versioned. Benchmarks do not print large
 results during timing.
@@ -189,8 +195,8 @@ targets or steady-state runtime throughput. The host file preserves every raw
 sample and states that process startup, validation, JIT compilation,
 instantiation, execution, and cleanup are included.
 
-No Phase 6 latency baseline is published yet, for state or for jobs.
-Correctness tests cover bounded
-local transaction/replay behavior without introducing noisy wall-clock CI
-thresholds; representative 30-sample release measurements remain a dedicated
-benchmark-runner task.
+No Phase 6 or Phase 7 latency baseline is published yet: durable state, jobs,
+objects, application databases, cache, and search still need representative
+30-sample release measurements on a recorded benchmark runner. Correctness
+coverage is not performance evidence and introduces no noisy wall-clock CI
+thresholds.

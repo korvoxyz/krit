@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     sync::{Arc, atomic::Ordering},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use krit_state::{Completion, JobDisposition, ScheduleCatchUp};
@@ -92,7 +92,8 @@ struct ScheduleEvent {
 /// One bounded delivery dispatch request.
 ///
 /// `now_millis` is the host-supplied UTC wall instant; guests never read a
-/// clock. Every state change commits only at the outcome boundary.
+/// clock. Schedule materialization uses this exact cutoff; lease and outcome
+/// times advance from it using monotonic elapsed time, including scheduler waits.
 #[derive(Clone, Copy)]
 pub struct DeliveryRequest<'a> {
     pub bytes: &'a [u8],
@@ -111,49 +112,121 @@ struct DeliveryPlan<'a> {
     call: DeliveryCall,
 }
 
+struct DeliveryClock {
+    reference_millis: i64,
+    started: Instant,
+}
+
+impl DeliveryClock {
+    fn new(reference_millis: i64) -> Result<Self, RuntimeError> {
+        if reference_millis < 0 {
+            return Err(RuntimeError::state_conflict(
+                "delivery timestamp must be a nonnegative UTC instant",
+            ));
+        }
+        Ok(Self {
+            reference_millis,
+            started: Instant::now(),
+        })
+    }
+
+    fn now_millis(&self) -> Result<i64, RuntimeError> {
+        self.at(Instant::now())
+    }
+
+    fn at(&self, instant: Instant) -> Result<i64, RuntimeError> {
+        let elapsed = instant
+            .checked_duration_since(self.started)
+            .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok());
+        elapsed
+            .and_then(|elapsed| self.reference_millis.checked_add(elapsed))
+            .ok_or_else(|| {
+                RuntimeError::state_conflict("delivery timestamp exceeds the durable range")
+            })
+    }
+
+    fn require_execution_window(
+        &self,
+        reserved_at: i64,
+        lease: Duration,
+        deadline: Duration,
+    ) -> Result<(), RuntimeError> {
+        let required = reserved_at
+            .checked_sub(self.reference_millis)
+            .and_then(|offset| u64::try_from(offset).ok())
+            .and_then(|offset| {
+                self.started
+                    .elapsed()
+                    .checked_sub(Duration::from_millis(offset))
+            })
+            .and_then(|elapsed| elapsed.checked_add(deadline));
+        if required.is_none_or(|required| required > lease) {
+            return Err(RuntimeError::delivery(
+                "delivery lease no longer covers the execution deadline",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Runtime {
     /// Reserves and dispatches at most one durable queue delivery.
     pub fn dispatch_job(
         &self,
         request: DeliveryRequest<'_>,
     ) -> Result<DeliveryExecutionResult, RuntimeError> {
+        let clock = DeliveryClock::new(request.now_millis)?;
         let DeliveryRequest {
             agent_host,
             resource: queue,
-            now_millis,
             ..
         } = request;
         let component = self.prepare_delivery(request, JOB_INTERFACE, "queue.consume")?;
         let durable = agent_host.durable_state().clone();
         let (binding, policy) = durable.queue(queue)?;
         let store_name = durable.queue_store(queue)?;
+        // A lease starts only after scheduler ownership, which is retained
+        // through the outcome commit so a waiting dispatch cannot lose its work.
+        let scheduler = self.own_scheduler()?;
+        if request.cancellation.is_cancelled() {
+            return Err(RuntimeError::cancelled(
+                "embedding cancellation requested before delivery reservation",
+            ));
+        }
         let owner = agent_host.next_lease_owner();
+        let reserved_at = clock.now_millis()?;
         let Some(delivery) = binding
             .store()
-            .reserve_job(queue, policy, &owner, now_millis)
+            .reserve_job(queue, policy, &owner, reserved_at)
             .map_err(crate::state::map_state_error)?
         else {
             return Ok(self.idle_result());
         };
         let identity = hex_identity(delivery.lease.id());
-        let body = String::from_utf8(delivery.body.clone()).map_err(|_| {
-            RuntimeError::durable_state("durable queue job body is not valid UTF-8")
-        })?;
-        let event = JobEvent {
-            queue: queue.to_owned(),
-            id: identity.clone(),
-            body,
-            attempt: i64::from(delivery.attempt),
-            max_attempts: i64::from(delivery.max_attempts),
-        };
-        let execution = self.run_delivery(
-            &component,
-            DeliveryPlan {
-                request,
-                store: store_name,
-                call: DeliveryCall::Job(event),
-            },
-        );
+        let execution = clock
+            .require_execution_window(reserved_at, policy.lease, self.limits.deadline())
+            .and_then(|()| {
+                String::from_utf8(delivery.body.clone()).map_err(|_| {
+                    RuntimeError::durable_state("durable queue job body is not valid UTF-8")
+                })
+            })
+            .and_then(|body| {
+                self.run_delivery(
+                    &component,
+                    DeliveryPlan {
+                        request,
+                        store: store_name,
+                        call: DeliveryCall::Job(JobEvent {
+                            queue: queue.to_owned(),
+                            id: identity.clone(),
+                            body,
+                            attempt: i64::from(delivery.attempt),
+                            max_attempts: i64::from(delivery.max_attempts),
+                        }),
+                    },
+                    &scheduler,
+                )
+            });
         let failure_reason = |detail: &str| {
             if detail.is_empty() {
                 "guest reported a delivery failure".to_owned()
@@ -165,14 +238,21 @@ impl Runtime {
             Ok(mut completed) => match completed.result {
                 Ok(detail) => {
                     let detail = bounded_detail(&detail);
-                    completed
-                        .state
-                        .commit_outcome(
-                            &durable,
-                            Some(&Completion::Job(delivery.lease.clone())),
-                            now_millis,
-                        )
-                        .map_err(|error| error.with_events(completed.events.clone()))?;
+                    if let Err(error) = completed.state.commit_outcome(
+                        &durable,
+                        Some(&Completion::Job(delivery.lease.clone())),
+                        clock.now_millis()?,
+                    ) {
+                        return Err(with_delivery_cleanup(
+                            error.with_events(completed.events),
+                            binding.store().fail_job(
+                                &delivery.lease,
+                                "durable outcome commit failed",
+                                policy,
+                                clock.now_millis()?,
+                            ),
+                        ));
+                    }
                     Ok(DeliveryExecutionResult {
                         outcome: DeliveryOutcome::Completed {
                             id: identity,
@@ -192,7 +272,7 @@ impl Runtime {
                             &delivery.lease,
                             &failure_reason(&detail),
                             policy,
-                            now_millis,
+                            clock.now_millis()?,
                         )
                         .map_err(crate::state::map_state_error)
                         .map_err(|error| error.with_events(completed.events.clone()))?;
@@ -205,18 +285,15 @@ impl Runtime {
                     })
                 }
             },
-            Err(error) => {
-                binding
-                    .store()
-                    .fail_job(
-                        &delivery.lease,
-                        "guest execution failed before acknowledgement",
-                        policy,
-                        now_millis,
-                    )
-                    .map_err(crate::state::map_state_error)?;
-                Err(error)
-            }
+            Err(error) => Err(with_delivery_cleanup(
+                error,
+                binding.store().fail_job(
+                    &delivery.lease,
+                    "guest execution failed before acknowledgement",
+                    policy,
+                    clock.now_millis()?,
+                ),
+            )),
         }
     }
 
@@ -225,6 +302,7 @@ impl Runtime {
         &self,
         request: DeliveryRequest<'_>,
     ) -> Result<(ScheduleCatchUp, DeliveryExecutionResult), RuntimeError> {
+        let clock = DeliveryClock::new(request.now_millis)?;
         let DeliveryRequest {
             agent_host,
             resource: schedule,
@@ -235,14 +313,31 @@ impl Runtime {
         let durable = agent_host.durable_state().clone();
         let (binding, policy) = durable.schedule(schedule)?;
         let store_name = durable.schedule_store(schedule)?;
+        let scheduler = self.own_scheduler()?;
+        if request.cancellation.is_cancelled() {
+            return Err(RuntimeError::cancelled(
+                "embedding cancellation requested before delivery reservation",
+            ));
+        }
+        // Reuse this instant for reservation: advancing it after materialization
+        // could fail a horizon check after the schedule cursor already committed.
+        let reserved_at = clock.now_millis()?;
+        policy
+            .validate_instant(reserved_at)
+            .map_err(crate::state::map_state_error)?;
         let catch_up = binding
             .store()
             .materialize_schedule(schedule, policy, now_millis)
             .map_err(crate::state::map_state_error)?;
+        if request.cancellation.is_cancelled() {
+            return Err(RuntimeError::cancelled(
+                "embedding cancellation requested before delivery reservation",
+            ));
+        }
         let owner = agent_host.next_lease_owner();
         let Some(delivery) = binding
             .store()
-            .reserve_schedule_fire(schedule, policy, &owner, now_millis)
+            .reserve_schedule_fire(schedule, policy, &owner, reserved_at)
             .map_err(crate::state::map_state_error)?
         else {
             return Ok((catch_up, self.idle_result()));
@@ -252,30 +347,41 @@ impl Runtime {
             schedule: schedule.to_owned(),
             id: identity.clone(),
             scheduled_at_millis: delivery.lease.due_at_millis(),
-            fired_at_millis: now_millis,
+            fired_at_millis: clock.now_millis()?,
             attempt: i64::from(delivery.attempt),
             max_attempts: i64::from(delivery.max_attempts),
         };
-        let execution = self.run_delivery(
-            &component,
-            DeliveryPlan {
-                request,
-                store: store_name,
-                call: DeliveryCall::Schedule(event),
-            },
-        );
+        let execution = clock
+            .require_execution_window(reserved_at, policy.lease, self.limits.deadline())
+            .and_then(|()| {
+                self.run_delivery(
+                    &component,
+                    DeliveryPlan {
+                        request,
+                        store: store_name,
+                        call: DeliveryCall::Schedule(event),
+                    },
+                    &scheduler,
+                )
+            });
         match execution {
             Ok(mut completed) => match completed.result {
                 Ok(detail) => {
                     let detail = bounded_detail(&detail);
-                    completed
-                        .state
-                        .commit_outcome(
-                            &durable,
-                            Some(&Completion::Fire(delivery.lease.clone())),
-                            now_millis,
-                        )
-                        .map_err(|error| error.with_events(completed.events.clone()))?;
+                    if let Err(error) = completed.state.commit_outcome(
+                        &durable,
+                        Some(&Completion::Fire(delivery.lease.clone())),
+                        clock.now_millis()?,
+                    ) {
+                        return Err(with_delivery_cleanup(
+                            error.with_events(completed.events),
+                            binding.store().fail_schedule_fire(
+                                &delivery.lease,
+                                policy,
+                                clock.now_millis()?,
+                            ),
+                        ));
+                    }
                     Ok((
                         catch_up,
                         DeliveryExecutionResult {
@@ -294,7 +400,7 @@ impl Runtime {
                     let detail = bounded_detail(&detail);
                     let disposition = binding
                         .store()
-                        .fail_schedule_fire(&delivery.lease, policy, now_millis)
+                        .fail_schedule_fire(&delivery.lease, policy, clock.now_millis()?)
                         .map_err(crate::state::map_state_error)
                         .map_err(|error| error.with_events(completed.events.clone()))?;
                     Ok((
@@ -309,13 +415,12 @@ impl Runtime {
                     ))
                 }
             },
-            Err(error) => {
+            Err(error) => Err(with_delivery_cleanup(
+                error,
                 binding
                     .store()
-                    .fail_schedule_fire(&delivery.lease, policy, now_millis)
-                    .map_err(crate::state::map_state_error)?;
-                Err(error)
-            }
+                    .fail_schedule_fire(&delivery.lease, policy, clock.now_millis()?),
+            )),
         }
     }
 
@@ -368,15 +473,18 @@ impl Runtime {
         })
     }
 
+    /// Scheduler ownership must precede reservation, not just execution.
     fn run_delivery(
         &self,
         component: &Component,
         plan: DeliveryPlan<'_>,
+        _scheduler: &crate::SchedulerOwnership<'_>,
     ) -> Result<CompletedDelivery, RuntimeError> {
-        let _epoch_guard = self
-            .epoch_lock
-            .lock()
-            .map_err(|_| RuntimeError::setup("runtime epoch scheduler lock is poisoned"))?;
+        if plan.request.cancellation.is_cancelled() {
+            return Err(RuntimeError::cancelled(
+                "embedding cancellation requested before delivery execution",
+            ));
+        }
         let worker_stack_bytes = self
             .limits
             .wasm_stack_bytes()
@@ -612,6 +720,16 @@ struct CompletedDelivery {
     state: crate::state::InvocationState,
 }
 
+fn with_delivery_cleanup(
+    error: RuntimeError,
+    cleanup: Result<JobDisposition, krit_state::StateError>,
+) -> RuntimeError {
+    match cleanup {
+        Ok(_) => error,
+        Err(cleanup) => error.with_cleanup_failure(&crate::state::map_state_error(cleanup)),
+    }
+}
+
 fn disposition_outcome(
     disposition: JobDisposition,
     id: String,
@@ -643,6 +761,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delivery_clock_includes_scheduler_wait_and_rejects_overflow() {
+        let clock = DeliveryClock::new(60_000).unwrap();
+        assert_eq!(clock.at(clock.started).unwrap(), 60_000);
+        assert_eq!(
+            clock
+                .at(clock.started + std::time::Duration::from_millis(30_001))
+                .unwrap(),
+            90_001
+        );
+        let maximum = DeliveryClock::new(i64::MAX).unwrap();
+        assert!(
+            maximum
+                .at(maximum.started + std::time::Duration::from_millis(1))
+                .is_err()
+        );
+        assert!(DeliveryClock::new(-1).is_err());
+    }
+
+    #[test]
     fn outcome_details_stay_within_their_byte_bound() {
         let detail = "é".repeat(MAX_OUTCOME_DETAIL_BYTES);
 
@@ -651,5 +788,31 @@ mod tests {
         assert!(bounded.len() <= MAX_OUTCOME_DETAIL_BYTES);
         assert!(detail.starts_with(&bounded));
         assert_eq!(bounded_detail("ok"), "ok");
+    }
+
+    #[test]
+    fn an_aged_reservation_cannot_start_a_full_execution() {
+        let clock = DeliveryClock {
+            reference_millis: 1_000,
+            started: Instant::now() - Duration::from_secs(2),
+        };
+        assert!(
+            clock
+                .require_execution_window(
+                    1_000,
+                    Duration::from_millis(1_250),
+                    Duration::from_secs(1),
+                )
+                .is_err()
+        );
+        assert!(
+            clock
+                .require_execution_window(
+                    clock.now_millis().unwrap(),
+                    Duration::from_secs(30),
+                    Duration::from_secs(1),
+                )
+                .is_ok()
+        );
     }
 }

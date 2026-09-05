@@ -119,11 +119,20 @@ Before returning a recorded result, the host rechecks:
 3. current AI approval policy where applicable
 4. the recorded input digest
 5. record TTL and schema
+6. current runtime HTTP body/header bounds or both current AI adapter and
+   runtime output-byte bounds
 
 A matching completed record returns without an external call. A differing
 input is a replay conflict. In-progress records have bounded leases; a live
 lease refuses duplicate work. An expired lease permits recovery under the
 crash rules below.
+
+Both replay operations reject an open application-database transaction before
+requesting approval or touching the durable store, including on a replay hit.
+Any failure after reservation aborts the owned replay lease, whether it is a
+typed provider failure, cancellation, approval denial, host trap, or result
+completion failure. Cleanup failures are explicit and retain the original
+failure; they are not reported as successful replay or an ordinary miss.
 
 Completed replay results commit immediately after the external operation,
 independently of the invocation's state/checkpoint transaction. This is
@@ -183,6 +192,11 @@ trap, cancellation, or state-commit failure removes the owned reservation.
 Process death leaves a lease that becomes recoverable after its bounded TTL.
 Cleanup enforces expiry, LRU entry count, and retained response-byte limits
 transactionally.
+
+Both process-local and durable responses are revalidated against current HTTP
+body, header-count, and header-byte limits before publication. Narrowing policy
+never republishes an oversized historical response or silently reruns a cached
+request. Host-generated conflict and rejection responses obey the same limits.
 
 The invocation state commit and inbound-idempotency response completion are
 two SQLite transactions. A process crash between them can leave committed

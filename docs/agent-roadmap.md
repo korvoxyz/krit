@@ -249,7 +249,7 @@ exactly once remain explicitly unclaimed.
 
 ## Phase 7: data services
 
-**Status:** In progress
+**Status:** Complete
 
 ### `phase7-database`
 
@@ -305,6 +305,42 @@ The cache is process local, non-durable, and non-transactional. It is shared
 across fresh Wasm stores on one host, lost on restart, and a trap or failed
 delivery does not undo an earlier write. That is stated plainly because it is
 exactly why a cached value may never be load bearing.
+
+## Roadmap completion gate
+
+**Status:** Complete for the bounded local roadmap
+
+The six review blockers recorded after `7b1c424` are resolved:
+
+| Blocker | Resolution | Regression coverage |
+| --- | --- | --- |
+| Delivery reservation ordering | Scheduler ownership precedes reservation and lasts through outcome commit. Elapsed host time accounts for compilation/waiting; cancellation and remaining lease time are rechecked before guest work. Failed outcome commits release their owned deliveries. | `crates/krit-runtime/tests/jobs.rs`: concurrent queue/schedule dispatch, cancelled waiters, SQLite contention, timestamp horizons, and outcome conflicts |
+| Replay lease lifecycle | HTTP/AI replay refuses open database transactions before approval or durable access. Typed failures, host traps, cancellation, approval denial, and completion failures abort owned replay leases; cleanup errors retain the original failure. | `crates/krit-runtime/tests/state.rs`: both operation kinds, transaction rollback, immediate retries, and stable provider keys |
+| Replay response bounds | Local/durable inbound responses and durable AI results obey current runtime/adapter limits, including body/header boundaries and host-generated rejection responses. | `crates/krit-runtime/tests/state.rs`: policy narrowing, restarted hosts, and inclusive bounds |
+| Lower-layer protocol maxima | Public state/job policies and service configuration validate shared count, byte, time, retention, and catch-up bounds. Durations are whole milliseconds; `open_with_jobs` validates the complete configuration before opening stores. The CLI reuses these APIs. | `crates/krit-runtime/tests/configuration.rs`: direct embedding, every maximum/one above, and rejection before file creation or schema migration |
+| Deployment entrypoint integration | Direct `run` rejects all deployment entrypoints. Human explain, LSP module/entrypoint facts, hover, completion, declaration ranges, and assistance redaction/permission review include queues and schedules. | CLI, LSP, and assist regression suites |
+| Strict configuration maps | Every map in host schemas 1 through 6 rejects conflicting and escaped-equivalent duplicate keys before service construction. | `crates/krit-cli/src/host_config.rs`: every map family, legacy defaults, and side-effect-free rejection |
+
+The 2026-09-05 completion gate passed workspace formatting, strict Clippy,
+629 unit/integration/conformance/command-line tests, documentation tests, and
+the release build. All nine checked-in example sources formatted and checked;
+the root package and all seven example packages built as validated Component
+artifacts with allowed exact Krit imports and no WASI. Repeated factorial
+builds produced identical 1,393-byte components and metadata, and a long-lived
+release host returned identical search results on a cache miss and subsequent
+hit.
+
+The release binary uses rustls/static-libcurl and bundled SQLite without
+dynamic libcurl or SQLite linkage. The one public HTTPS smoke test remains
+opt-in and was not part of this gate; no public-network success is claimed.
+
+This gate closes implementation and integration work, not product validation
+or production readiness. The next priority is realistic end-to-end agent
+applications, measured authoring/review effort, and the missing durable/data
+service performance baselines. General Wasm layouts, schema-directed JSON,
+modules/build caching, distributed coordination, and multi-tenant OS isolation
+remain outside this completed scope. New service breadth must be justified by
+application evidence rather than by the roadmap's phase count.
 
 ## Deferred platform work
 

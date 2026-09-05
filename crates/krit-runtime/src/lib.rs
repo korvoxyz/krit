@@ -147,6 +147,11 @@ pub struct ExecutionStats {
 pub struct Runtime {
     engine: Engine,
     limits: RuntimeLimits,
+    /// Serialises every Wasmtime epoch-driven execution on this runtime.
+    ///
+    /// A durable delivery must own this *before* it reserves work, so a lease
+    /// clock never starts while the dispatch is still queued behind another
+    /// execution.
     epoch_lock: Mutex<()>,
     active_deadline_workers: Arc<AtomicUsize>,
     active_dns_workers: Arc<AtomicUsize>,
@@ -230,7 +235,23 @@ enum RetrySafety {
     HostReadOnly,
 }
 
+/// Exclusive ownership of this runtime's execution scheduler.
+///
+/// Held across a durable reservation, its execution, and its outcome commit, so
+/// a reserved lease can never expire while the delivery waits its turn.
+pub(crate) struct SchedulerOwnership<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
 impl Runtime {
+    /// Takes exclusive scheduler ownership, blocking until it is available.
+    pub(crate) fn own_scheduler(&self) -> Result<SchedulerOwnership<'_>, RuntimeError> {
+        self.epoch_lock
+            .lock()
+            .map(|guard| SchedulerOwnership { _guard: guard })
+            .map_err(|_| RuntimeError::setup("runtime epoch scheduler lock is poisoned"))
+    }
+
     pub fn new(limits: RuntimeLimits) -> Result<Self, RuntimeError> {
         limits.validate()?;
         curl::init();
@@ -293,10 +314,7 @@ impl Runtime {
             ));
         }
 
-        let _epoch_guard = self
-            .epoch_lock
-            .lock()
-            .map_err(|_| RuntimeError::setup("runtime epoch scheduler lock is poisoned"))?;
+        let _epoch_guard = self.own_scheduler()?;
         if cancellation.is_cancelled() {
             return Err(RuntimeError::cancelled(
                 "embedding cancellation requested before component instantiation",
@@ -386,10 +404,7 @@ impl Runtime {
                 "embedding cancellation requested before guest execution",
             ));
         }
-        let _epoch_guard = self
-            .epoch_lock
-            .lock()
-            .map_err(|_| RuntimeError::setup("runtime epoch scheduler lock is poisoned"))?;
+        let _epoch_guard = self.own_scheduler()?;
         if cancellation.is_cancelled() {
             return Err(RuntimeError::cancelled(
                 "embedding cancellation requested before component instantiation",
@@ -405,7 +420,7 @@ impl Runtime {
             .wasm_stack_bytes()
             .checked_add(HOST_STACK_HEADROOM_BYTES)
             .ok_or_else(|| RuntimeError::setup("Wasm execution worker stack size overflowed"))?;
-        let idempotency = agent_host.idempotency_decision(metadata, &request)?;
+        let idempotency = agent_host.idempotency_decision(metadata, &request, self.limits)?;
         let policy::IdempotencyDecision::Execute(mut idempotency_token) = idempotency else {
             let (response, replayed) = match idempotency {
                 policy::IdempotencyDecision::Replay(response) => (response, true),
@@ -429,6 +444,7 @@ impl Runtime {
                     unreachable!("execute decision matched above")
                 }
             };
+            response.validate(self.limits)?;
             return Ok(WebhookExecutionResult {
                 response,
                 output: Vec::new(),
@@ -1640,6 +1656,7 @@ impl bindings::webhook::krit::runtime::state::Host for HostState {
         if let Some(error) = self.record_fallible_host_call()? {
             return Ok(Err(error));
         }
+        self.require_no_open_transaction("durable HTTP replay")?;
         self.require_grant("state.transaction", &store)?;
         self.require_grant("http.request", &origin)?;
         if !krit_capability::is_valid_resource_name(&operation) {
@@ -1696,31 +1713,28 @@ impl bindings::webhook::krit::runtime::state::Host for HostState {
             }
             krit_state::ReplayDecision::Execute(lease) => {
                 self.state.record_replay(false);
-                let response = match self.perform_http_inner(origin, request, None)? {
-                    Ok(response) => response,
-                    Err(error) => {
+                let attempt =
+                    (|host: &mut Self| -> wasmtime::Result<Result<HttpResponse, String>> {
+                        let response = match host.perform_http_inner(origin, request, None)? {
+                            Ok(response) => response,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let bytes = serde_json::to_vec(&response).map_err(|_| {
+                            wasmtime::Error::new(RuntimeError::durable_state(
+                                "could not encode durable HTTP replay result",
+                            ))
+                        })?;
+                        let now = wall_clock_millis()?;
                         binding
                             .store()
-                            .abort_replay(&lease)
+                            .complete_replay(&lease, &bytes, now, binding.replay_policy())
                             .map_err(state::map_state_error)?;
-                        return Ok(Err(error));
-                    }
-                };
-                let bytes = serde_json::to_vec(&response).map_err(|_| {
-                    wasmtime::Error::new(RuntimeError::durable_state(
-                        "could not encode durable HTTP replay result",
-                    ))
-                })?;
-                binding
-                    .store()
-                    .complete_replay(
-                        &lease,
-                        &bytes,
-                        wall_clock_millis()?,
-                        binding.replay_policy(),
-                    )
-                    .map_err(state::map_state_error)?;
-                response
+                        Ok(Ok(response))
+                    })(self);
+                match finish_replay_attempt(&binding, &lease, attempt)? {
+                    Ok(response) => response,
+                    Err(error) => return Ok(Err(error)),
+                }
             }
             krit_state::ReplayDecision::Conflict => {
                 return Err(wasmtime::Error::new(RuntimeError::replay(
@@ -1760,6 +1774,7 @@ impl bindings::webhook::krit::runtime::state::Host for HostState {
         if let Some(error) = self.record_fallible_host_call()? {
             return Ok(Err(error));
         }
+        self.require_no_open_transaction("durable AI replay")?;
         self.require_grant("state.transaction", &store)?;
         self.require_grant("ai.invoke", &adapter)?;
         if !krit_capability::is_valid_resource_name(&operation) {
@@ -1808,6 +1823,13 @@ impl bindings::webhook::krit::runtime::state::Host for HostState {
         match decision {
             krit_state::ReplayDecision::Replay(bytes) => {
                 self.state.record_replay(true);
+                if let Err(error) = validate_ai_response_size(
+                    bytes.len(),
+                    configured.max_response_bytes(),
+                    self.limits.ai_response_bytes(),
+                ) {
+                    return Ok(Err(error));
+                }
                 String::from_utf8(bytes).map(Ok).map_err(|_| {
                     wasmtime::Error::new(RuntimeError::durable_state(
                         "durable AI replay result is not UTF-8",
@@ -1822,26 +1844,19 @@ impl bindings::webhook::krit::runtime::state::Host for HostState {
                     &operation,
                     &input_digest,
                 );
-                let result = match self.perform_ai_inner(adapter, input, Some(&stable_key))? {
-                    Ok(result) => result,
-                    Err(error) => {
-                        binding
-                            .store()
-                            .abort_replay(&lease)
-                            .map_err(state::map_state_error)?;
-                        return Ok(Err(error));
-                    }
-                };
-                binding
-                    .store()
-                    .complete_replay(
-                        &lease,
-                        result.as_bytes(),
-                        wall_clock_millis()?,
-                        binding.replay_policy(),
-                    )
-                    .map_err(state::map_state_error)?;
-                Ok(Ok(result))
+                let attempt = (|host: &mut Self| -> wasmtime::Result<Result<String, String>> {
+                    let result = match host.perform_ai_inner(adapter, input, Some(&stable_key))? {
+                        Ok(result) => result,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    let now = wall_clock_millis()?;
+                    binding
+                        .store()
+                        .complete_replay(&lease, result.as_bytes(), now, binding.replay_policy())
+                        .map_err(state::map_state_error)?;
+                    Ok(Ok(result))
+                })(self);
+                finish_replay_attempt(&binding, &lease, attempt)
             }
             krit_state::ReplayDecision::Conflict => {
                 Err(wasmtime::Error::new(RuntimeError::replay(
@@ -2512,7 +2527,14 @@ impl HostState {
             Ok(response) => response,
             Err(error) => return Ok(Err(error)),
         };
-        Ok(adapter.parse_response(response))
+        Ok(adapter.parse_response(response).and_then(|output| {
+            validate_ai_response_size(
+                output.len(),
+                adapter.max_response_bytes(),
+                self.limits.ai_response_bytes(),
+            )?;
+            Ok(output)
+        }))
     }
 
     /// Runs one bounded search or vector call against a named connector.
@@ -2854,6 +2876,40 @@ impl HostState {
     }
 }
 
+// Both fallible results and host traps must release a reservation immediately;
+// recording a completed external effect remains independent of the guest outcome.
+fn finish_replay_attempt<T>(
+    binding: &state::StoreBinding,
+    lease: &krit_state::ReplayLease,
+    attempt: wasmtime::Result<Result<T, String>>,
+) -> wasmtime::Result<Result<T, String>> {
+    if !matches!(attempt, Ok(Ok(_)))
+        && let Err(cleanup) = binding.store().abort_replay(lease)
+    {
+        let error = match attempt {
+            Ok(Err(message)) => RuntimeError::replay(message),
+            Err(error) => map_wasmtime_error(error),
+            Ok(Ok(_)) => unreachable!("successful replay does not need cleanup"),
+        };
+        return Err(wasmtime::Error::new(
+            error.with_cleanup_failure(&state::map_state_error(cleanup)),
+        ));
+    }
+    attempt
+}
+
+fn validate_ai_response_size(
+    bytes: usize,
+    adapter_limit: usize,
+    runtime_limit: usize,
+) -> Result<(), String> {
+    if bytes > adapter_limit || bytes > runtime_limit {
+        Err("AI model output exceeded the configured size limit".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
 fn retry_eligible(request: &HttpRequest) -> bool {
     if request.method.eq_ignore_ascii_case("GET") || request.method.eq_ignore_ascii_case("HEAD") {
         return true;
@@ -3099,6 +3155,15 @@ impl Drop for DeadlineWorker {
 #[cfg(test)]
 mod phase4_policy_tests {
     use super::*;
+
+    #[test]
+    fn ai_output_bounds_are_inclusive_and_apply_independently() {
+        let bytes = "r\u{e9}sum\u{e9}".len();
+        assert!(validate_ai_response_size(bytes, bytes, bytes).is_ok());
+        assert!(validate_ai_response_size(bytes, bytes - 1, bytes).is_err());
+        assert!(validate_ai_response_size(bytes, bytes, bytes - 1).is_err());
+        assert!(validate_ai_response_size(0, 0, 0).is_ok());
+    }
 
     #[test]
     fn retry_after_accepts_one_decimal_value_and_caps_the_schedule() {

@@ -6,10 +6,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use krit::{Source, analyze, lower, parse_source};
@@ -17,9 +18,9 @@ use krit_package::Manifest;
 use krit_runtime::{
     AgentHost, AgentHostPolicy, BucketDefinition, BucketPolicy, CancellationHandle,
     DeliveryOutcome, DeliveryRequest, DenyAllApprovalPolicy, Durability, DurableState,
-    DurableStoreDefinition, DurableStoreLimits, GrantSet, HostInputs, NetworkPolicy,
-    QueueDefinition, QueuePolicy, RetentionPolicy, Runtime, ScheduleDefinition, SchedulePolicy,
-    SecretStore,
+    DurableStoreDefinition, DurableStoreLimits, GrantSet, HARD_MAX_LIMITS, HostInputs, HttpRequest,
+    NetworkPolicy, QueueDefinition, QueuePolicy, RetentionPolicy, Runtime, ScheduleDefinition,
+    SchedulePolicy, SecretStore,
 };
 use krit_state::{
     BucketPolicy as StoreBucketPolicy, CommitPlan, DurableStore, Mutation,
@@ -437,14 +438,15 @@ queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
             cancellation: &CancellationHandle::new(),
         })
         .expect("first attempt should dispatch");
-    assert!(matches!(
-        first.outcome,
-        DeliveryOutcome::Retried {
-            attempt: 1,
-            visible_at_millis: 3_000,
-            ..
-        }
-    ));
+    let DeliveryOutcome::Retried {
+        attempt: 1,
+        visible_at_millis,
+        ..
+    } = first.outcome
+    else {
+        panic!("first attempt must be retried");
+    };
+    assert!(visible_at_millis >= 3_000);
     assert_eq!(first.detail, "not yet");
     let store = open_store(&database);
     assert_eq!(
@@ -460,7 +462,7 @@ queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
             grants: &grants,
             agent_host: &host(durable(database.clone(), Resources::default())),
             resource: "render-jobs",
-            now_millis: 4_000,
+            now_millis: visible_at_millis,
             cancellation: &CancellationHandle::new(),
         })
         .expect("second attempt should dispatch");
@@ -1231,6 +1233,7 @@ queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
         },
         Err(error) => Err(error),
     }
+
 }
 "#,
         &["queue.consume", "queue.publish"],
@@ -1295,4 +1298,489 @@ queues = ["thumbnails"]
         open_store(&database).queue_stats("thumbnails").unwrap().0,
         0
     );
+}
+
+fn waiting_delivery_does_not_reserve(schedule: bool, cancel_waiter: bool) {
+    let directory = TestDirectory::new("scheduler-reservation");
+    if !schedule {
+        seed_job(&directory.database(), 1, "one");
+    }
+    let blocking_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let blocking_origin = format!("http://{}", blocking_listener.local_addr().unwrap());
+    let (entered_sender, entered_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let blocker_mock = thread::spawn(move || {
+        let (mut stream, _) = blocking_listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = [0; 4096];
+        assert!(stream.read(&mut bytes).unwrap() > 0);
+        entered_sender.send(()).unwrap();
+        let _ = release_receiver.recv_timeout(Duration::from_secs(5));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .unwrap();
+    });
+    let effect_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let effect_origin = format!("http://{}", effect_listener.local_addr().unwrap());
+    effect_listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let effects = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut calls = 0;
+        while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
+            match effect_listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut bytes = [0; 4096];
+                    assert!(stream.read(&mut bytes).unwrap() > 0);
+                    calls += 1;
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("effect mock failed: {error}"),
+            }
+        }
+        calls
+    });
+    let blocking_artifact = compile(
+        &format!(
+            r#"
+    webhook fn handle(request: HttpRequest) -> HttpResponse {{
+        match http_request("{blocking_origin}", request, None) {{
+            Ok(response) => response,
+            Err(error) => record {{ status: 502, headers: [], body: error }},
+        }}
+    }}
+    "#
+        ),
+        &["http.request"],
+    );
+    let blocking_grants =
+        GrantSet::from_manifest(&manifest(&format!("http = [\"{blocking_origin}\"]")));
+    let declaration = if schedule {
+        r#"schedule "hourly-sweep" fn handle(event: ScheduleEvent)"#
+    } else {
+        r#"queue "render-jobs" fn handle(job: QueueJob)"#
+    };
+    let effect = if schedule {
+        "schedule.trigger"
+    } else {
+        "queue.consume"
+    };
+    let artifact = compile(
+        &format!(
+            r#"
+    {declaration} -> Result<String, String> {{
+        match http_request("{effect_origin}", record {{
+            method: "GET", path: "/effect", query: "", headers: [], body: "",
+        }}, None) {{
+            Ok(response) => Ok(response.body),
+            Err(error) => Err(error),
+        }}
+    }}
+    "#
+        ),
+        &[effect, "http.request"],
+    );
+    let capabilities = if schedule {
+        "schedules = [\"hourly-sweep\"]"
+    } else {
+        "consumes = [\"render-jobs\"]"
+    };
+    let grants = GrantSet::from_manifest(&manifest(&format!(
+        "{capabilities}\nhttp = [\"{effect_origin}\"]"
+    )));
+    let agent_host = host(durable(
+        directory.database(),
+        Resources {
+            queues: !schedule,
+            schedules: schedule,
+            buckets: false,
+            max_attempts: 2,
+        },
+    ));
+    let blocking_host = host(DurableState::default());
+    let mut limits = HARD_MAX_LIMITS;
+    limits.narrow_deadline(Duration::from_secs(5)).unwrap();
+    limits.narrow_http_timeout(Duration::from_secs(4)).unwrap();
+    limits.narrow_read_timeout(Duration::from_secs(4)).unwrap();
+    let runtime = Runtime::new(limits).unwrap();
+    let competing_runtime = Runtime::new(limits).unwrap();
+    let cancellation = CancellationHandle::new();
+    let now = if schedule { 120_000 } else { 2_000 };
+    let resource = if schedule {
+        "hourly-sweep"
+    } else {
+        "render-jobs"
+    };
+    let dispatch = |runtime: &Runtime, instant, cancellation: &CancellationHandle| {
+        let delivery = DeliveryRequest {
+            bytes: &artifact.bytes,
+            metadata: &artifact.metadata,
+            grants: &grants,
+            agent_host: &agent_host,
+            resource,
+            now_millis: instant,
+            cancellation,
+        };
+        if schedule {
+            runtime
+                .dispatch_schedule(delivery)
+                .map(|(_, result)| result)
+        } else {
+            runtime.dispatch_job(delivery)
+        }
+    };
+    let (waiting, competing, blocked) = thread::scope(|scope| {
+        let blocker = scope.spawn(|| {
+            runtime.invoke_webhook_with_host(
+                &blocking_artifact.bytes,
+                &blocking_artifact.metadata,
+                &blocking_grants,
+                &blocking_host,
+                HttpRequest {
+                    method: "GET".to_owned(),
+                    path: "/block".to_owned(),
+                    query: String::new(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                },
+            )
+        });
+        entered_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let (starting, started) = mpsc::channel();
+        let (finished, result) = mpsc::channel();
+        let waiting_runtime = &runtime;
+        let waiting_cancellation = &cancellation;
+        let waiting_dispatch = &dispatch;
+        scope.spawn(move || {
+            starting.send(()).unwrap();
+            finished
+                .send(waiting_dispatch(waiting_runtime, now, waiting_cancellation))
+                .unwrap();
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Keep the execution scheduler occupied while the second dispatch waits.
+        let premature = result.recv_timeout(Duration::from_millis(100));
+        if cancel_waiter {
+            cancellation.cancel();
+        }
+        let competing = dispatch(&competing_runtime, now + 30_001, &CancellationHandle::new());
+        release_sender.send(()).unwrap();
+        let waiting = match premature {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                result.recv_timeout(Duration::from_secs(5)).unwrap()
+            }
+            Err(error) => panic!("waiting dispatch disconnected: {error}"),
+        };
+        (waiting, competing, blocker.join().unwrap())
+    });
+    stop.store(true, Ordering::Release);
+    blocker_mock.join().unwrap();
+    let effect_count = effects.join().unwrap();
+    assert_eq!(blocked.unwrap().response.body, "ok");
+    assert!(matches!(
+        competing.unwrap().outcome,
+        DeliveryOutcome::Completed { attempt: 1, .. }
+    ));
+    if cancel_waiter {
+        assert_eq!(
+            waiting
+                .expect_err("waiting cancellation must be rechecked")
+                .code(),
+            "K5106"
+        );
+    } else {
+        assert!(
+            waiting
+                .expect("waiting dispatcher should find no work")
+                .outcome
+                .is_idle()
+        );
+    }
+    assert_eq!(
+        effect_count, 1,
+        "a waiting dispatcher must not repeat the external effect"
+    );
+}
+
+#[test]
+fn concurrent_queue_dispatch_reserves_only_after_scheduler_ownership() {
+    waiting_delivery_does_not_reserve(false, false);
+}
+
+#[test]
+fn concurrent_schedule_dispatch_reserves_only_after_scheduler_ownership() {
+    waiting_delivery_does_not_reserve(true, false);
+}
+
+#[test]
+fn cancelled_queue_and_schedule_waiters_do_not_reserve_deliveries() {
+    for schedule in [false, true] {
+        waiting_delivery_does_not_reserve(schedule, true);
+    }
+}
+
+#[test]
+fn failed_outcome_commits_release_queue_and_schedule_leases() {
+    for schedule in [false, true] {
+        let directory = TestDirectory::new("outcome-conflict");
+        if !schedule {
+            seed_job(&directory.database(), 1, "one");
+        }
+        let agent_host = host(durable(
+            directory.database(),
+            Resources {
+                queues: !schedule,
+                schedules: schedule,
+                buckets: false,
+                max_attempts: 2,
+            },
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let database = directory.database();
+        let mock = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "delivery never reached the mock");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("mock failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut bytes = [0; 4096];
+            assert!(stream.read(&mut bytes).unwrap() > 0);
+            let store = open_store(&database);
+            store
+                .commit(
+                    store.revision().unwrap(),
+                    &[Mutation::Put {
+                        key: "concurrent".to_owned(),
+                        value: b"committed".to_vec(),
+                    }],
+                )
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let declaration = if schedule {
+            r#"schedule "hourly-sweep" fn handle(event: ScheduleEvent)"#
+        } else {
+            r#"queue "render-jobs" fn handle(job: QueueJob)"#
+        };
+        let effect = if schedule {
+            "schedule.trigger"
+        } else {
+            "queue.consume"
+        };
+        let artifact = compile(
+            &format!(
+                r#"
+{declaration} -> Result<String, String> {{
+    let staged = state_put("agent-work", "guest", "uncommitted");
+    match http_request("{origin}", record {{
+        method: "GET", path: "/effect", query: "", headers: [], body: "",
+    }}, None) {{
+        Ok(response) => Ok(response.body),
+        Err(error) => Err(error),
+    }}
+}}
+"#
+            ),
+            &[effect, "http.request", "state.transaction"],
+        );
+        let capability = if schedule {
+            "schedules = [\"hourly-sweep\"]"
+        } else {
+            "consumes = [\"render-jobs\"]"
+        };
+        let grants = GrantSet::from_manifest(&manifest(&format!(
+            "{capability}\nstate = [\"agent-work\"]\nhttp = [\"{origin}\"]"
+        )));
+        let runtime = Runtime::default();
+        let cancellation = CancellationHandle::new();
+        let request = DeliveryRequest {
+            bytes: &artifact.bytes,
+            metadata: &artifact.metadata,
+            grants: &grants,
+            agent_host: &agent_host,
+            resource: if schedule {
+                "hourly-sweep"
+            } else {
+                "render-jobs"
+            },
+            now_millis: wall_clock_millis(),
+            cancellation: &cancellation,
+        };
+        let error = if schedule {
+            runtime.dispatch_schedule(request).unwrap_err()
+        } else {
+            runtime.dispatch_job(request).unwrap_err()
+        };
+        mock.join().unwrap();
+        assert_eq!(error.code(), "K5202");
+        let store = open_store(&directory.database());
+        assert!(store.get("guest").unwrap().is_none());
+        let retry_at = wall_clock_millis() + 2_000;
+        let attempt = if schedule {
+            store
+                .reserve_schedule_fire("hourly-sweep", schedule_policy(), &[9; 16], retry_at)
+                .unwrap()
+                .expect("failed commit must release the fire before lease expiry")
+                .attempt
+        } else {
+            store
+                .reserve_job("render-jobs", queue_policy(2), &[9; 16], retry_at)
+                .unwrap()
+                .expect("failed commit must release the job before lease expiry")
+                .attempt
+        };
+        assert_eq!(attempt, 2);
+    }
+}
+
+fn contended_schedule_dispatch(
+    now_millis: i64,
+    cancel: bool,
+) -> (
+    TestDirectory,
+    Result<krit_runtime::DeliveryExecutionResult, krit_runtime::RuntimeError>,
+) {
+    let directory = TestDirectory::new("schedule-contention");
+    let state = DurableState::open(
+        BTreeMap::from([(
+            "agent-work".to_owned(),
+            DurableStoreDefinition {
+                path: directory.database(),
+                durability: Durability::Full,
+                limits: DurableStoreLimits {
+                    busy_timeout: Duration::from_secs(1),
+                    ..store_limits()
+                },
+                replay: retention(),
+            },
+        )]),
+        None,
+    )
+    .unwrap()
+    .with_jobs(
+        BTreeMap::new(),
+        BTreeMap::from([(
+            "hourly-sweep".to_owned(),
+            ScheduleDefinition {
+                store: "agent-work".to_owned(),
+                policy: schedule_policy(),
+            },
+        )]),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let agent_host = host(state);
+    let artifact = compile(
+        r#"
+schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
+    Ok(event.id)
+}
+"#,
+        &["schedule.trigger"],
+    );
+    let grants = GrantSet::from_manifest(&manifest("schedules = [\"hourly-sweep\"]"));
+    let runtime = Runtime::default();
+    let cancellation = CancellationHandle::new();
+    let writer = rusqlite::Connection::open(directory.database()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let result = thread::scope(|scope| {
+        let (starting, started) = mpsc::channel();
+        let runtime = &runtime;
+        let artifact = &artifact;
+        let grants = &grants;
+        let agent_host = &agent_host;
+        let cancellation = &cancellation;
+        let dispatch = scope.spawn(move || {
+            starting.send(()).unwrap();
+            runtime
+                .dispatch_schedule(DeliveryRequest {
+                    bytes: &artifact.bytes,
+                    metadata: &artifact.metadata,
+                    grants,
+                    agent_host,
+                    resource: "hourly-sweep",
+                    now_millis,
+                    cancellation,
+                })
+                .map(|(_, result)| result)
+        });
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread::sleep(Duration::from_millis(250));
+        if cancel {
+            cancellation.cancel();
+        }
+        writer.execute_batch("ROLLBACK").unwrap();
+        dispatch.join().unwrap()
+    });
+    (directory, result)
+}
+
+#[test]
+fn cancellation_during_schedule_materialization_consumes_no_attempt() {
+    let (directory, result) = contended_schedule_dispatch(120_000, true);
+    assert_eq!(
+        result.expect_err("cancelled dispatch must fail").code(),
+        "K5106"
+    );
+    let store = open_store(&directory.database());
+    let policy = schedule_policy();
+    store
+        .materialize_schedule("hourly-sweep", policy, 120_000)
+        .unwrap();
+    let delivery = store
+        .reserve_schedule_fire("hourly-sweep", policy, &[7; 16], 120_000)
+        .unwrap()
+        .expect("cancelled materialization must leave its fire available");
+    assert_eq!(delivery.attempt, 1);
+}
+
+#[test]
+fn elapsed_schedule_horizon_failure_never_advances_the_cursor() {
+    let now = i64::MAX - i64::try_from(schedule_policy().retention.as_millis()).unwrap() - 100;
+    let (directory, result) = contended_schedule_dispatch(now, false);
+    let store = open_store(&directory.database());
+    match result {
+        Ok(result) => assert!(matches!(result.outcome, DeliveryOutcome::Completed { .. })),
+        Err(error) => {
+            assert_eq!(error.code(), "K5202");
+            let ordinary = store
+                .materialize_schedule("hourly-sweep", schedule_policy(), 120_000)
+                .unwrap();
+            assert_eq!(
+                ordinary.materialized, 1,
+                "an invalid future instant must not publish a cursor that suppresses ordinary ticks"
+            );
+        }
+    }
 }

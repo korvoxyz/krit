@@ -85,6 +85,8 @@ Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
 - opaque `DatabaseTransaction` handles with explicit begin/commit/rollback,
   host-catalogued parameterized statements, and no guest SQL, path, DSN, or
   credential
+- bounded optional TTL caches and provider-neutral text/vector search with
+  explicit cache miss and outage handling
 - recursive function declarations
 - exhaustive empty/cons list matching
 - deterministic comment-preserving canonical source formatting
@@ -249,8 +251,8 @@ and buffered output released only on success. The exact default and hard
 limits plus the serialized epoch-scheduling and pre-deadline compilation
 limitations are documented in [the sandbox specification](spec/WASM-SANDBOX.md).
 `krit run` remains the full-language direct evaluator for pure/stdout source;
-it fails with `K5003` for webhook, configuration, secret, HTTP, AI, and
-structured-log host operations rather than fabricating values.
+it rejects webhook, queue, and schedule entrypoints and host-only operations
+with `K5003` rather than fabricating values.
 
 Invoke a webhook deterministically from an exact JSON fixture:
 
@@ -822,9 +824,9 @@ The specification is the semantic authority:
 - [Jobs and object storage](spec/JOBS-AND-STORAGE.md) — durable queues,
   host-owned scheduled triggers, and bounded object buckets
 - [Database access](spec/DATABASE.md) — catalogued parameterized transactions
+  against an operator-owned database
 - [Cache and search](spec/CACHE-AND-SEARCH.md) — bounded optional cache and
   provider-neutral connectors
-  against an operator-owned database
 - [Narrow product MVP](docs/mvp.md)
 - [Agent platform roadmap](docs/agent-roadmap.md)
 - [Rust technical design](docs/technical-design.md)
@@ -873,10 +875,16 @@ The accepted implementation path is:
     storage (complete for local single-host coordination)
 11. capability-scoped catalogued parameterized database transactions (complete
     for the local SQLite connector)
-12. cache and search services (Phase 7; next)
+12. cache and search services (complete for bounded optional local cache and
+    provider-neutral connectors)
 
 Performance claims follow [docs/performance.md](docs/performance.md), not
 implementation-language assumptions.
+
+The next priority is consolidation: complete applications, reviewable authoring,
+recovery under failure, and measured performance before more service breadth.
+Completed implementation phases do not make Krit production-ready or remove
+the documented backend, package-system, and OS-isolation limitations.
 
 ## License
 
