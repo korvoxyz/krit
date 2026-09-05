@@ -356,6 +356,9 @@ completed bounded agent roadmap.
 
 - Simplified the database import/effect consistency condition without changing
   behavior, fixing the minimum-toolchain Clippy failure in GitHub Actions
+- Removed platform-dependent port-order assumptions from reference-agent
+  approval expectations and made the backoff cancellation fixture use a
+  retry-eligible request
 - Reserve queue jobs and schedule fires only after acquiring the Runtime's
   execution scheduler, retain ownership through acknowledgement, and recheck
   cancellation after scheduler and schedule-materialization waits

@@ -254,6 +254,12 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
             SECRETS_INTERFACE
         ]
     );
+    let mut expected_approvals = [
+        ("ai.invoke", "reviewer"),
+        ("http.bearer", github_origin.as_str()),
+        ("http.bearer", messaging_origin.as_str()),
+    ];
+    expected_approvals.sort_unstable();
     assert_eq!(
         artifact
             .metadata
@@ -261,11 +267,7 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
             .iter()
             .map(|approval| (approval.operation.as_str(), approval.resource.as_str()))
             .collect::<Vec<_>>(),
-        [
-            ("ai.invoke", "reviewer"),
-            ("http.bearer", github_origin.as_str()),
-            ("http.bearer", messaging_origin.as_str()),
-        ]
+        expected_approvals
     );
 
     let manifest = manifest(&format!(
@@ -1169,6 +1171,8 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
     let cancellation = CancellationHandle::new();
     let runtime = Runtime::new(krit_runtime::HARD_MAX_LIMITS).expect("runtime");
     let grants = GrantSet::from_manifest(&manifest);
+    let mut retryable = request("");
+    retryable.method = "GET".to_owned();
     let result = thread::scope(|scope| {
         let worker = scope.spawn(|| {
             runtime.invoke_webhook_with_cancellation(
@@ -1177,7 +1181,7 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
                 &grants,
                 &host,
                 &cancellation,
-                request(""),
+                retryable,
             )
         });
         seen_receiver
