@@ -20,7 +20,7 @@ edition = "2024"
 rust-version = "1.94"
 authors = ["Akshay Bhardwaj"]
 license = "Apache-2.0"
-repository = "https://github.com/akshay-bhardwaj/Krit"
+repository = "https://github.com/korvoxyz/krit"
 
 [workspace.dependencies]
 krit = { path = "crates/krit" }

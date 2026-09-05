@@ -464,7 +464,7 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
         })
         .cloned()
         .collect::<Vec<_>>();
-    if database_imported != !declared_database.is_empty() {
+    if database_imported == declared_database.is_empty() {
         return Err(BuildError::artifact(
             "component database imports and declared database effects disagree",
         ));

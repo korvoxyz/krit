@@ -111,7 +111,75 @@ dependency resolution, build caching, broader autonomous editing, and
 production multi-tenant OS isolation are also future work. Krit is not
 production-ready.
 
+## Install a prebuilt release
+
+Download Krit from [GitHub Releases](https://github.com/korvoxyz/krit/releases/latest).
+The archives are self-contained: **no Rust, Python, or Node.js installation is
+required**. Each includes the CLI, runnable examples, `BUILD.json` with the source
+commit and binary digest, and dependency license notices.
+
+| Platform | Archive for release 0.2.0 |
+| --- | --- |
+| Linux x86-64, glibc 2.35+ | `krit-0.2.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64, glibc 2.35+ | `krit-0.2.0-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS 12+, Intel | `krit-0.2.0-x86_64-apple-darwin.tar.gz` |
+| macOS 12+, Apple Silicon | `krit-0.2.0-aarch64-apple-darwin.tar.gz` |
+| Windows x86-64 | `krit-0.2.0-x86_64-pc-windows-msvc.zip` |
+
+Download `SHA256SUMS` alongside your archive. On Linux, verify the downloaded
+archive with `sha256sum --check --ignore-missing SHA256SUMS`. On macOS, select
+its checksum entry, for example:
+
+```sh
+grep '  krit-0.2.0-aarch64-apple-darwin.tar.gz$' SHA256SUMS | shasum -a 256 -c -
+tar -xzf krit-0.2.0-aarch64-apple-darwin.tar.gz
+cd krit-0.2.0-aarch64-apple-darwin
+./krit --version
+./krit run examples/factorial.krit
+```
+
+On Windows, compare `Get-FileHash <archive> -Algorithm SHA256` with its entry
+in `SHA256SUMS`, extract the ZIP, and run `.\krit.exe --version`. Add the
+extracted directory to `PATH` if desired.
+
+The macOS and Windows downloads are not developer-signed or notarized. Use
+your OS's per-application approval flow only after checking the download's
+source and checksum; do not disable system-wide protections. Guided-assistance
+acceptance still fails closed on platforms without the audited atomic-exchange
+primitive, including Windows.
+
+### GitHub Packages
+
+Krit is also published to
+[GitHub's Container registry](https://github.com/korvoxyz/krit/pkgs/container/krit),
+with native Linux AMD64 and ARM64 images:
+
+```sh
+docker run --rm ghcr.io/korvoxyz/krit:0.2.0 --version
+docker run --rm ghcr.io/korvoxyz/krit:0.2.0 run examples/factorial.krit
+```
+
+The image runs as a non-root user. To use a local project on Linux or macOS,
+mount it explicitly and use your own user identity so generated files remain
+yours:
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" \
+  --volume "$PWD:/work" ghcr.io/korvoxyz/krit:0.2.0 check main.krit
+```
+
+The `0.2` tag tracks the 0.2 series; `latest` tracks the latest stable release.
+Pin a full version or image digest for reproducible use. GitHub Packages hosts
+the container; standalone native archives are GitHub Release assets.
+
+GitHub creates a new container package with private visibility even when its
+repository is public. A package administrator must make it **Public** once in
+**Package settings > Change visibility** to enable anonymous pulls. Subsequent
+versions retain that setting.
+
 ## Requirements
+
+These requirements apply only when building from source:
 
 - Rust 1.94 or newer
 - Cargo

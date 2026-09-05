@@ -7,8 +7,33 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-05
+
+First tagged Rust release, including the bootstrap begun on 2026-09-01 and the
+completed bounded agent roadmap.
+
 ### Added
 
+- Downloadable native CLI archives for Linux x86-64/ARM64, macOS Intel/Apple
+  Silicon, and Windows x86-64, with checksums, runnable examples, build identity,
+  and dependency license notices
+- Reusable quality-gated CI that exercises extracted native packages and retains
+  downloadable workflow artifacts
+- Tagged-release publication to GitHub Releases and GitHub Packages, including
+  non-root Linux AMD64/ARM64 containers and a multi-architecture GHCR index
+- Pinned Actions dependencies, narrow publishing permissions, tag/version
+  consistency checks, and explicit recovery for unpublished release drafts
+- Normative language charter, readable syntax, runtime semantics, and
+  diagnostic contract
+- Draft type/effect, capability, module, and package specifications
+- Rust technical design and reproducible performance methodology
+- Rust workspace with source mapping, lexer, parser, direct evaluator, CLI,
+  and strict manifest validation
+- Stable human and JSON Lines diagnostics
+- Checked signed 64-bit arithmetic
+- Immutable lexical closures, recursion, lists, and exhaustive list matching
+- Implementation-neutral conformance fixture format and cases
+- Rust-only formatting, linting, testing, release build, and CLI CI
 - Updated the provider-neutral generation prompt to version 0.2.15 for the
   optional cache and search capabilities
 - Bounded namespaced TTL cache with `cache_get`, `cache_put`, and `cache_delete`
@@ -329,6 +354,8 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 
 ### Fixed
 
+- Simplified the database import/effect consistency condition without changing
+  behavior, fixing the minimum-toolchain Clippy failure in GitHub Actions
 - Reserve queue jobs and schedule fires only after acquiring the Runtime's
   execution scheduler, retain ownership through acknowledgement, and recheck
   cancellation after scheduler and schedule-materialization waits
@@ -354,6 +381,9 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 
 ### Changed
 
+- Replaced the active Racket implementation with a Rust-only bootstrap
+- Replaced prototype S-expressions with Krit's edition-2026 readable syntax
+- Made specifications and conformance cases the semantic authority
 - Selected WebAssembly components instead of custom bytecode as the first
   deployment target
 - Defined LLM assistance as optional visible edits gated by deterministic
@@ -496,28 +526,6 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
   runs before any durable store or application database is created or opened
 - Rejection of any durable state store and application database that resolve to
   the same file by canonical path, or by device and inode on Unix
-
-## [0.2.0] - 2026-09-01
-
-### Added
-
-- Normative language charter, readable syntax, runtime semantics, and
-  diagnostic contract
-- Draft type/effect, capability, module, and package specifications
-- Rust technical design and reproducible performance methodology
-- Rust workspace with source mapping, lexer, parser, direct evaluator, CLI,
-  and strict manifest validation
-- Stable human and JSON Lines diagnostics
-- Checked signed 64-bit arithmetic
-- Immutable lexical closures, recursion, lists, and exhaustive list matching
-- Implementation-neutral conformance fixture format and cases
-- Rust-only formatting, linting, testing, release build, and CLI CI
-
-### Changed
-
-- Replaced the active Racket implementation with a Rust-only bootstrap
-- Replaced prototype S-expressions with Krit's edition-2026 readable syntax
-- Made specifications and conformance cases the semantic authority
 
 ### Removed
 

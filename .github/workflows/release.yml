@@ -1,0 +1,268 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  version:
+    name: Validate release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      series: ${{ steps.version.outputs.series }}
+      image: ${{ steps.version.outputs.image }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require a matching stable version tag
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_TYPE" == tag ]] || {
+            echo "::error::Run releases from a version tag, not a branch."
+            exit 1
+          }
+          version="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "krit-cli") | .version')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$GITHUB_REF_NAME" == "v$version" ]] || {
+            echo "::error::The tag must equal v plus the Cargo workspace version."
+            exit 1
+          }
+          existing="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .draft")"
+          [[ "$existing" != false ]] || {
+            echo "::error::This release is already published. Never move a published tag."
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "series=${version%.*}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: Release quality and native packages
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  containers:
+    name: Container ${{ matrix.arch }}
+    needs: [version, ci]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      IMAGE: ${{ needs.version.outputs.image }}
+    steps:
+      - name: Check out release packaging
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the native Linux package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: krit-${{ matrix.target }}
+          path: dist
+
+      - name: Verify and extract the container payload
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check -- *.sha256)
+          mkdir -p "$RUNNER_TEMP/krit-image/package"
+          tar -xzf "dist/krit-$VERSION-$TARGET.tar.gz" \
+            --strip-components=1 -C "$RUNNER_TEMP/krit-image/package"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build the container from the tested binary
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ runner.temp }}/krit-image
+          file: .github/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: krit:release-test
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            REVISION=${{ github.sha }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Exercise the non-root container without network access
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --network none krit:release-test --version)" = "Krit $VERSION"
+          test "$(docker run --rm --network none krit:release-test run examples/factorial.krit)" = "720"
+          test "$(docker run --rm --network none --entrypoint sh krit:release-test -ec 'krit build >/dev/null && krit sandbox')" = "720"
+
+      - name: Authenticate to GitHub Packages
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish the native container
+        id: publish
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ runner.temp }}/krit-image
+          file: .github/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}-${{ matrix.arch }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            REVISION=${{ github.sha }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Record the immutable container digest
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          printf '%s\n' "$DIGEST" > "digest-$ARCH.txt"
+
+      - name: Upload the container digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-digest-${{ matrix.arch }}
+          path: digest-${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Packages and release downloads
+    needs: [version, ci, containers]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.version.outputs.version }}
+      SERIES: ${{ needs.version.outputs.series }}
+      IMAGE: ${{ needs.version.outputs.image }}
+    steps:
+      - name: Download all native archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: krit-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download immutable container digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: container-digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Authenticate to GitHub Packages
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish the multi-architecture package
+        run: |
+          set -euo pipefail
+          amd64="$(<digests/digest-amd64.txt)"
+          arm64="$(<digests/digest-arm64.txt)"
+          [[ "$amd64" =~ ^sha256:[a-f0-9]{64}$ && "$arm64" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.description=Human-auditable, capability-scoped agent language" \
+            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --tag "$IMAGE:$VERSION" --tag "$IMAGE:$SERIES" --tag "$IMAGE:latest" \
+            "$IMAGE@$amd64" "$IMAGE@$arm64"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+
+      - name: Verify archives and collect checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum --check -- *.sha256
+          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 4
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 1
+          sha256sum -- *.tar.gz *.zip | LC_ALL=C sort -k2 > SHA256SUMS
+
+      - name: Publish release downloads
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          notes="Krit $VERSION is the Rust-based, capability-scoped agent language release.
+
+          Download the archive for your operating system and CPU, verify it with SHA256SUMS, and extract it. No Rust toolchain is required. Each archive includes the CLI, examples, build identity, and dependency license notices.
+
+          GitHub Packages: \`docker run --rm $IMAGE:$VERSION --version\` (Linux AMD64 and ARM64).
+
+          This is an early, pre-1.0 release, not a production-readiness claim. The macOS and Windows binaries are not developer-signed/notarized. See README.md for supported platforms, installation, and limitations."
+          existing="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .draft")"
+          if [[ "$existing" == true ]]; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber -- *.tar.gz *.zip SHA256SUMS
+          elif [[ -z "$existing" ]]; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --title "Krit $VERSION" --notes "$notes" \
+              -- *.tar.gz *.zip SHA256SUMS
+          else
+            echo "::error::Refusing to replace an already-published release."
+            exit 1
+          fi
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+      - name: Report package visibility
+        run: |
+          set -euo pipefail
+          owner_type="$(gh api "repos/$GITHUB_REPOSITORY" --jq .owner.type)"
+          if [[ "$owner_type" == Organization ]]; then
+            scope=orgs
+          else
+            scope=users
+          fi
+          package="${GITHUB_REPOSITORY##*/}"
+          endpoint="$scope/$GITHUB_REPOSITORY_OWNER/packages/container/${package,,}"
+          visibility="$(gh api "$endpoint" --jq .visibility)"
+          echo "### Krit $VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Package: $IMAGE:$VERSION ($visibility)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$visibility" != public ]]; then
+            echo "::warning::GitHub creates container packages privately. A package admin must select Package settings > Change visibility > Public once to enable anonymous downloads."
+            echo "- Required once: set the container package visibility to Public in GitHub Package settings." >> "$GITHUB_STEP_SUMMARY"
+          fi
