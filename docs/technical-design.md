@@ -89,9 +89,10 @@ but does not own language semantics.
 - Release binaries use link-time optimization and stripped symbols
 - Reproducible source archives include `Cargo.lock`
 
-The initial minimum supported version is Rust 1.94 because that toolchain is
-available in the development baseline. CI should also test current stable
-Rust. Raising the minimum requires a changelog entry.
+The minimum supported version started at Rust 1.94 and is now Rust 1.95, the
+version Wasmtime 48 LTS requires; `Cargo.toml` records it as the workspace
+`rust-version`. CI should also test current stable Rust. Raising the minimum
+requires a changelog entry.
 
 ## Source and syntax
 
@@ -259,10 +260,12 @@ bounded standard/custom metadata without source text or machine paths.
 The reference host uses Wasmtime with only the component-model, Cranelift,
 runtime, and std features. One Engine is reusable, while every invocation gets
 a fresh Store, StoreLimits, host state, component instance, fuel budget, epoch
-deadline, and output buffer. Validation derives the exact scalar or webhook
-surface from component shape before linking. A runtime binding can register
-extra typed definitions, but an artifact cannot name or call an interface it
-did not import. The linker never adds WASI.
+deadline, and output buffer. Instantiation draws on the invocation's fuel
+budget; `spec/WASM-SANDBOX.md` defines the cost model, including the
+host-dependent charge for copying literal data images. Validation derives the
+exact scalar or webhook surface from component shape before linking. A runtime
+binding can register extra typed definitions, but an artifact cannot name or
+call an interface it did not import. The linker never adds WASI.
 
 Validation, digest checking, authorization, input-size checks, and static
 component resource inspection precede Wasmtime compilation. Component
@@ -295,10 +298,11 @@ progress callback. Inbound response idempotency defaults to process-local bounde
 Phase 6 adds explicit opt-in durable storage. Both replay paths validate
 responses against the current invocation's body and header limits.
 
-Wasmtime 47 is a short-supported non-LTS line. `Cargo.toml` accepts security
-patches compatible with 47.0.4, and `Cargo.lock` records the exact tested
-patch. The project plans an audited move to Wasmtime 48 LTS before 47 support
-ends on 2026-09-20. Runtime-major and MSRV changes require explicit CI,
+The host follows Wasmtime long-term-support lines only. It runs Wasmtime 48
+LTS, released 2026-08-20 and supported upstream through 2028-08-20.
+`Cargo.toml` accepts security patches compatible with 48.0.5, and `Cargo.lock`
+records the exact tested patch. Wasmtime 48 requires Rust 1.95, which is the
+workspace MSRV. Runtime-major and MSRV changes require explicit CI,
 documentation, and changelog updates. Untrusted multi-tenant execution still
 adds a restricted OS process or container. `spec/WASM-SANDBOX.md` defines the
 exact limits and security contract.

@@ -394,7 +394,15 @@ impl Document {
         let resources = match context.builtin {
             Builtin::AiInvoke => &package.manifest.capabilities.ai,
             Builtin::ConfigString => &package.manifest.capabilities.config,
-            Builtin::Secret => &package.manifest.capabilities.secrets,
+            // A secret is granted by the legacy list or by its own
+            // `[secrets.<name>]` binding table.
+            Builtin::Secret => {
+                return self.build_resource_completions(
+                    &context,
+                    package,
+                    &package.manifest.secret_names(),
+                );
+            }
             Builtin::HttpRequest => &package.manifest.capabilities.http,
             Builtin::StateGet
             | Builtin::StatePut
@@ -2628,6 +2636,50 @@ state = ["agent-work"]
         )
         .expect("facts should serialize");
         assert_eq!(facts["durableState"]["operations"][0]["kind"], "state-get");
+    }
+
+    #[test]
+    fn secret_completion_offers_bound_and_legacy_secrets() {
+        let directory = TestDirectory::new();
+        fs::write(
+            directory.path.join("krit.pkg"),
+            r#"
+schema = 1
+
+[package]
+name = "example/agent"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+http = ["https://api.github.com"]
+secrets = ["legacy-token"]
+
+[secrets.github-token]
+origins = ["https://api.github.com"]
+"#,
+        )
+        .expect("manifest should be written");
+        fs::write(directory.path.join("main.krit"), "").expect("entry should exist");
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        state.open(uri.clone(), 1, "let token = secret(\"\");\n".to_owned());
+        let CompletionResponse::List(resources) = state
+            .completion(&uri, Position::new(0, 20))
+            .expect("secret completion should succeed")
+        else {
+            panic!("completion should return a bounded list")
+        };
+        assert_eq!(
+            resources
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["github-token", "legacy-token"]
+        );
     }
 
     #[test]

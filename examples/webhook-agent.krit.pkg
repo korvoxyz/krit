@@ -14,6 +14,14 @@ http = [
     "https://github.example.invalid",
     "https://message.example.invalid",
 ]
-secrets = ["ai-token", "github-token", "message-token"]
 ai = ["reviewer"]
 logs = true
+
+[secrets.ai-token]
+origins = ["https://ai.example.invalid"]
+
+[secrets.github-token]
+origins = ["https://github.example.invalid"]
+
+[secrets.message-token]
+origins = ["https://message.example.invalid"]

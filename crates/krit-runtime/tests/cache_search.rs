@@ -969,6 +969,15 @@ fn the_http_json_transport_sends_an_exact_bounded_request_and_hides_credentials(
         header_block.contains("authorization:"),
         "the credential must travel as a header: {request_text}"
     );
+    // A connector builds its own headers, so it always sends the host default.
+    assert_eq!(
+        header_block
+            .lines()
+            .filter(|line| line.starts_with("user-agent:"))
+            .collect::<Vec<_>>(),
+        [format!("user-agent: krit/{}", env!("CARGO_PKG_VERSION"))],
+        "{request_text}"
+    );
     let body = request_text
         .split("\r\n\r\n")
         .nth(1)
@@ -1239,6 +1248,87 @@ fn a_connector_secret_must_be_granted_by_the_manifest() {
         listener.accept().is_err(),
         "no credential may be transmitted for an ungranted secret"
     );
+}
+
+#[test]
+fn a_connector_secret_must_be_bound_to_the_connector_origin() {
+    let (listener, origin) = silent_listener();
+    let artifact = compile(SEARCH_SOURCE, &["search.query"]);
+    let host = connector_host(
+        &origin,
+        Some("search-token"),
+        vec![(krit_runtime::ApprovalOperation::HttpBearer, origin.clone())],
+    );
+    // The connector origin and credential are both granted, but the manifest
+    // binds the credential to a different origin. A connector is host
+    // configuration and cannot widen that binding.
+    let grants = GrantSet::from_manifest(&manifest(&format!(
+        "searchIndexes = [\"docs\"]\nhttp = [\"{origin}\", \"https://elsewhere.example\"]\n\n\
+         [secrets.search-token]\norigins = [\"https://elsewhere.example\"]\n"
+    )));
+
+    let error = Runtime::default()
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &grants,
+            &host,
+            request("needle"),
+        )
+        .expect_err("a connector credential bound elsewhere must be refused");
+
+    assert_eq!(error.code(), "K5006");
+    assert_eq!(
+        error.message(),
+        format!("secret `search-token` is not bound to origin `{origin}`")
+    );
+    assert!(
+        listener.accept().is_err(),
+        "no credential may be transmitted to an unbound origin"
+    );
+
+    // Bound to the connector's own origin, the same connector carries its
+    // credential there.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("mock should bind");
+    let origin = listener_origin(&listener);
+    let server = std::thread::spawn(move || {
+        use std::io::Write;
+
+        let (mut stream, _) = listener.accept().expect("connector should connect");
+        let request = read_request(&mut stream);
+        let body = "{\"results\":[]}";
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("response should write");
+        String::from_utf8_lossy(&request).to_lowercase()
+    });
+    let host = connector_host(
+        &origin,
+        Some("search-token"),
+        vec![(krit_runtime::ApprovalOperation::HttpBearer, origin.clone())],
+    );
+    let grants = GrantSet::from_manifest(&manifest(&format!(
+        "searchIndexes = [\"docs\"]\nhttp = [\"{origin}\"]\n\n\
+         [secrets.search-token]\norigins = [\"{origin}\"]\n"
+    )));
+    let result = Runtime::default()
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &grants,
+            &host,
+            request("needle"),
+        )
+        .expect("a bound connector credential must be accepted");
+    assert_eq!(result.response.status, 200);
+    let captured = server.join().expect("mock should finish");
+    assert!(captured.contains("authorization: bearer private-connector-token\r\n"));
 }
 
 #[test]

@@ -13,7 +13,7 @@ private vulnerability reporting.
 
 ## Setup
 
-Install Rust 1.94 or newer, then run:
+Install Rust 1.95 or newer, then run:
 
 ```sh
 cargo build --workspace --locked

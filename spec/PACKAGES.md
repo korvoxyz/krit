@@ -44,10 +44,16 @@ target = "wasm-component"
 stdout = true
 config = ["agent.model", "agent.timeout-ms"]
 http = ["https://api.github.com", "https://slack.com"]
-secrets = ["github-token", "slack-token"]
 ai = ["reviewer"]
 logs = true
 state = ["agent-work"]
+
+[secrets.github-token]
+origins = ["https://api.github.com"]
+
+[secrets.slack-token]
+origins = ["https://slack.com"]
+inject = "bearer"
 ```
 
 Package names contain a lowercase namespace and name separated by `/`.
@@ -65,6 +71,27 @@ immutable for a version.
 `wasm-component` is the implemented artifact target and the default when
 `target` is omitted for schema-1 compatibility. Unknown targets are errors.
 The target selects an artifact contract, not additional ambient capabilities.
+
+### Secrets
+
+Each top-level `[secrets.<name>]` table grants one secret and binds it to the
+origins its bearer injection may reach:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `origins` | yes | Non-empty list of unique canonical HTTP origins. Every origin must also appear in `[capabilities] http`. |
+| `inject` | no | How the host presents the secret. `"bearer"` (the default) is the only accepted value. |
+
+`<name>` uses the capability resource grammar (quote it in TOML when it
+contains `.`). An empty or duplicate `origins` entry, an origin that is not a
+granted `http` origin, an unknown `inject` value, or an unknown key is a
+manifest error (`K6001`).
+
+The legacy `[capabilities] secrets = ["name", ...]` list remains valid schema 1.
+It grants each secret unbound, so it may reach any granted origin. A name may
+appear in both forms, in which case its table binds it. The union of both forms
+is limited to 256 secrets. Runtime enforcement and permission reporting are
+defined in [CAPABILITIES.md](CAPABILITIES.md#secret-binding).
 
 ## Dependency sources
 
@@ -155,9 +182,12 @@ It excludes absolute project paths, wall time, and secret values.
 For schema-1 agent contracts, package build planning compares the analyzer's
 sorted literal-resource requirements with the manifest before backend
 emission. `config.read("agent.model")` requires an exact `config` entry and
-`secret.read("github-token")` requires an exact `secrets` entry. Missing
-resources are `K5001`. `http.request("https://api.example.com")` likewise
-requires one exact normalized `http` entry, and `ai.invoke("reviewer")`
+`secret.read("github-token")` requires an exact `secrets` entry or a
+`[secrets.github-token]` table. Missing resources are `K5001`. Build planning
+does not relate a secret to the origin it is sent to; the host enforces each
+binding at invocation time with `K5006`.
+`http.request("https://api.example.com")` likewise requires one exact
+normalized `http` entry, and `ai.invoke("reviewer")`
 requires one exact sorted `ai` entry. `observe.log` requires `logs = true`.
 `state.transaction("agent-work")` requires one exact `state` entry.
 `queue.publish("render-jobs")` requires one exact `queues` entry and
@@ -182,7 +212,8 @@ statement catalogs, and schemas are likewise strict host configuration.
 Matching resources permit the bounded webhook backend only; unsupported
 general composite layouts still fail closed. Host-config adapter origins,
 secrets, retry/rate keys, and approval resources must also be manifest-granted
-and cannot widen this plan.
+and cannot widen this plan; a host-configured adapter or connector secret that
+the manifest binds must also list that adapter's or connector's origin.
 
 Cache hits must be behaviorally identical to clean builds. A corrupt artifact
 is rejected by checksum rather than executed.

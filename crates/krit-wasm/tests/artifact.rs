@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{borrow::Cow, fs, path::Path};
 
 use krit::{Source, analyze, lower, parse_source};
 use krit_wasm::{
@@ -9,9 +9,11 @@ use krit_wasm::{
     validate_artifact, validate_component,
 };
 use wasm_encoder::{
-    Component, CustomSection, MemorySection, MemoryType, Module, ModuleSection, RawSection,
+    CodeSection, Component, CustomSection, DataCountSection, DataSection, ElementSection, Elements,
+    Function, FunctionSection, HeapType, Instruction, MemorySection, MemoryType, Module,
+    ModuleSection, RawSection, RefType, TableSection, TableType, TypeSection,
 };
-use wasmparser::{KnownCustom, Name, Parser, Payload};
+use wasmparser::{KnownCustom, Name, Parser, Payload, Validator, WasmFeatures};
 
 fn compile(
     name: &str,
@@ -367,6 +369,145 @@ fn restrictive_validation_rejects_forbidden_core_features() {
         .expect_err("shared memory must be rejected by the feature policy");
     assert_eq!(error.kind(), BuildErrorKind::InvalidArtifact);
     assert!(error.to_string().contains("policy 1 validation"));
+}
+
+#[test]
+fn restrictive_validation_rejects_operand_sized_bulk_operators() {
+    // Wasmtime charges these operators fuel per byte or element on top of
+    // their flat cost and checks the epoch deadline only once per operation.
+    // The feature policy admits none of them, so the guest code of every
+    // accepted artifact keeps the flat per-operator fuel model and loop-header
+    // epoch checks. (Instantiation charges are separate; krit-runtime's
+    // engine_contract_tests pin them.)
+    // The memory, table, and function scaffolding alone is policy-valid, so a
+    // rejection below is caused by the operator or the passive segment it
+    // needs.
+    Validator::new_with_features(WasmFeatures::COMPONENT_MODEL)
+        .validate_all(&bulk_operator_component(&[], false))
+        .expect("scaffolding must satisfy the feature policy");
+
+    let zero = Instruction::I32Const(0);
+    let null = Instruction::RefNull(HeapType::FUNC);
+    let cases = [
+        (
+            "memory.copy",
+            Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            },
+        ),
+        ("memory.fill", Instruction::MemoryFill(0)),
+        (
+            "memory.init",
+            Instruction::MemoryInit {
+                mem: 0,
+                data_index: 0,
+            },
+        ),
+        (
+            "table.copy",
+            Instruction::TableCopy {
+                src_table: 0,
+                dst_table: 0,
+            },
+        ),
+        (
+            "table.init",
+            Instruction::TableInit {
+                elem_index: 0,
+                table: 0,
+            },
+        ),
+        ("table.fill", Instruction::TableFill(0)),
+        ("table.grow", Instruction::TableGrow(0)),
+    ];
+
+    for (operator, instruction) in cases {
+        let body = match instruction {
+            Instruction::TableFill(_) => {
+                vec![zero.clone(), null.clone(), zero.clone(), instruction]
+            }
+            Instruction::TableGrow(_) => {
+                vec![null.clone(), zero.clone(), instruction, Instruction::Drop]
+            }
+            _ => vec![zero.clone(), zero.clone(), zero.clone(), instruction],
+        };
+        let segments = matches!(operator, "memory.init" | "table.init");
+        let component = bulk_operator_component(&body, segments);
+        // The same bytes validate once the proposals are enabled, so the
+        // rejection below comes from the feature policy alone.
+        Validator::new_with_features(
+            WasmFeatures::COMPONENT_MODEL
+                | WasmFeatures::BULK_MEMORY
+                | WasmFeatures::REFERENCE_TYPES,
+        )
+        .validate_all(&component)
+        .unwrap_or_else(|error| panic!("{operator} fixture must be otherwise valid: {error}"));
+
+        let error = validate_component(&component)
+            .expect_err("operand-sized bulk operators must be rejected by the feature policy");
+        assert_eq!(error.kind(), BuildErrorKind::InvalidArtifact, "{operator}");
+        assert!(
+            error.to_string().contains("policy 1 validation"),
+            "{operator}: {error}"
+        );
+    }
+}
+
+/// Wraps one `() -> ()` function with `body` in a component, beside a
+/// one-page memory and a one-element funcref table, plus the passive data and
+/// element segments `*.init` operators address when `segments` is set.
+fn bulk_operator_component(body: &[Instruction<'_>], segments: bool) -> Vec<u8> {
+    let mut types = TypeSection::new();
+    types.ty().function([], []);
+    let mut functions = FunctionSection::new();
+    functions.function(0);
+    let mut tables = TableSection::new();
+    tables.table(TableType {
+        element_type: RefType::FUNCREF,
+        table64: false,
+        minimum: 1,
+        maximum: Some(1),
+        shared: false,
+    });
+    let mut memories = MemorySection::new();
+    memories.memory(MemoryType {
+        minimum: 1,
+        maximum: Some(1),
+        memory64: false,
+        shared: false,
+        page_size_log2: None,
+    });
+    let mut function = Function::new([]);
+    for instruction in body {
+        function.instruction(instruction);
+    }
+    function.instruction(&Instruction::End);
+    let mut code = CodeSection::new();
+    code.function(&function);
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&functions)
+        .section(&tables)
+        .section(&memories);
+    if segments {
+        let mut elements = ElementSection::new();
+        elements.passive(Elements::Functions(Cow::Borrowed(&[0])));
+        module
+            .section(&elements)
+            .section(&DataCountSection { count: 1 });
+    }
+    module.section(&code);
+    if segments {
+        let mut data = DataSection::new();
+        data.passive([0]);
+        module.section(&data);
+    }
+    let mut component = Component::new();
+    component.section(&ModuleSection(&module));
+    component.finish()
 }
 
 #[test]

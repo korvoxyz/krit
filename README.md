@@ -184,7 +184,7 @@ versions retain that setting.
 
 These requirements apply only when building from source:
 
-- Rust 1.94 or newer
+- Rust 1.95 or newer
 - Cargo
 
 Install Rust through [rustup](https://rustup.rs/) if it is not already

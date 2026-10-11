@@ -197,14 +197,20 @@ struct HostStateConfig {
     artifact_identity: [u8; 32],
 }
 
+/// Guest-held secret resource.
+///
+/// It carries the secret's logical manifest name so every bearer injection can
+/// be checked against that name's origin binding; the bytes never leave the
+/// host.
 pub struct SecretHandle {
+    name: String,
     bytes: Arc<host::SecretBytes>,
 }
 
 struct RetryRequest<'a> {
     origin: &'a krit_capability::HttpOrigin,
     request: &'a HttpRequest,
-    bearer: Option<&'a host::SecretBytes>,
+    bearer: Option<&'a permissions::AuthorizedBearer>,
     rate_resource: policy::RateResource,
     /// Guest-visible name for a rate denial. It is not the bucket identity: a
     /// connector shares its origin's bucket but must never disclose that
@@ -323,7 +329,7 @@ impl Runtime {
         }
         let component = Component::new(&self.engine, bytes).map_err(|error| {
             RuntimeError::setup(format!(
-                "validated component could not be compiled by Wasmtime 47.x: {error}"
+                "validated component could not be compiled by Wasmtime 48.x: {error}"
             ))
         })?;
         let worker_stack_bytes = self
@@ -413,7 +419,7 @@ impl Runtime {
         }
         let component = Component::new(&self.engine, bytes).map_err(|error| {
             RuntimeError::setup(format!(
-                "validated webhook component could not be compiled by Wasmtime 47.x: {error}"
+                "validated webhook component could not be compiled by Wasmtime 48.x: {error}"
             ))
         })?;
         let worker_stack_bytes = self
@@ -899,12 +905,15 @@ impl Runtime {
                             adapter.origin
                         )));
                     }
-                    if let Some(secret) = &adapter.secret
-                        && !grants.grants("secret.read", Some(secret))
-                    {
-                        return Err(RuntimeError::authorization(format!(
-                            "AI adapter `{name}` secret `{secret}` is not granted by the manifest"
-                        )));
+                    if let Some(secret) = &adapter.secret {
+                        if !grants.grants("secret.read", Some(secret)) {
+                            return Err(RuntimeError::authorization(format!(
+                                "AI adapter `{name}` secret `{secret}` is not granted by the manifest"
+                            )));
+                        }
+                        if !grants.permits_bearer(secret, &adapter.origin) {
+                            return Err(RuntimeError::unbound_secret(secret, &adapter.origin));
+                        }
                     }
                 }
             }
@@ -1029,12 +1038,15 @@ impl Runtime {
                         config.origin
                     )));
                 }
-                if let Some(secret) = &config.secret
-                    && !grants.grants("secret.read", Some(secret))
-                {
-                    return Err(RuntimeError::authorization(format!(
-                        "search connector `{name}` secret `{secret}` is not granted by the manifest"
-                    )));
+                if let Some(secret) = &config.secret {
+                    if !grants.grants("secret.read", Some(secret)) {
+                        return Err(RuntimeError::authorization(format!(
+                            "search connector `{name}` secret `{secret}` is not granted by the manifest"
+                        )));
+                    }
+                    if !grants.permits_bearer(secret, &config.origin) {
+                        return Err(RuntimeError::unbound_secret(secret, &config.origin));
+                    }
                 }
             }
         }
@@ -1418,7 +1430,7 @@ impl bindings::webhook::krit::runtime::secrets::Host for HostState {
         };
         let handle = self
             .resources
-            .push(SecretHandle { bytes })
+            .push(SecretHandle { name, bytes })
             .map_err(|error| {
                 wasmtime::Error::new(RuntimeError::resource(format!(
                     "secret handle table is full: {error}"
@@ -2274,6 +2286,27 @@ impl HostState {
         }
     }
 
+    /// Pins a secret to one origin after checking its manifest binding.
+    ///
+    /// A refusal traps with `K5006`, like any other use of authority the
+    /// manifest does not grant, and happens before any request is sent.
+    fn authorize_bearer(
+        &self,
+        secret_name: &str,
+        origin: &krit_capability::HttpOrigin,
+        secret: Arc<host::SecretBytes>,
+    ) -> wasmtime::Result<permissions::AuthorizedBearer> {
+        let Some(grants) = self.grants.as_ref() else {
+            return Err(wasmtime::Error::new(RuntimeError::unbound_secret(
+                secret_name,
+                origin.as_str(),
+            )));
+        };
+        grants
+            .authorize_bearer(secret_name, origin, secret)
+            .map_err(wasmtime::Error::new)
+    }
+
     fn require_grant(&self, capability: &str, resource: &str) -> wasmtime::Result<()> {
         if self
             .grants
@@ -2344,6 +2377,19 @@ impl HostState {
                 "guest requested invalid HTTP origin `{origin}`: {error}"
             )))
         })?;
+        // The secret's origin binding is checked first, so a misdirected
+        // credential is refused before any limit, approval, DNS lookup, or
+        // connection is attempted.
+        let bearer = bearer
+            .as_ref()
+            .map(|handle| {
+                let secret = self.resources.get(handle).map_err(|error| {
+                    wasmtime::Error::msg(format!("invalid secret handle: {error}"))
+                })?;
+                let (name, bytes) = (secret.name.clone(), Arc::clone(&secret.bytes));
+                self.authorize_bearer(&name, &parsed, bytes)
+            })
+            .transpose()?;
         let next_http_calls = self
             .http_calls
             .checked_add(1)
@@ -2366,15 +2412,6 @@ impl HostState {
                 "approval denied for bearer HTTP origin `{origin}`"
             )));
         }
-        let bearer = bearer
-            .as_ref()
-            .map(|handle| {
-                self.resources
-                    .get(handle)
-                    .map(|secret| Arc::clone(&secret.bytes))
-            })
-            .transpose()
-            .map_err(|error| wasmtime::Error::msg(format!("invalid secret handle: {error}")))?;
         let retry = self
             .agent_host
             .policy()
@@ -2395,7 +2432,7 @@ impl HostState {
         Ok(self.send_with_retry(RetryRequest {
             origin: &parsed,
             request: &request,
-            bearer: bearer.as_deref(),
+            bearer: bearer.as_ref(),
             rate_resource: policy::RateResource::Http(origin.clone()),
             rate_label: origin.clone(),
             approval_label: origin,
@@ -2460,6 +2497,14 @@ impl HostState {
                 "approval denied for AI adapter `{adapter_name}`"
             )));
         }
+        let origin = krit_capability::HttpOrigin::parse_exact(adapter.origin()).map_err(|_| {
+            wasmtime::Error::new(RuntimeError::setup(
+                "validated AI adapter origin became invalid",
+            ))
+        })?;
+        // An adapter credential is host-configured, but it is still held to
+        // the manifest binding of its secret: configuration may narrow where a
+        // secret goes, never widen it.
         let bearer = match adapter.secret_name() {
             Some(secret_name) => {
                 let Some(secret) = self.agent_host.inputs().secrets().get(secret_name) else {
@@ -2467,7 +2512,7 @@ impl HostState {
                         "AI adapter `{adapter_name}` secret is not configured"
                     )));
                 };
-                Some(secret)
+                Some(self.authorize_bearer(secret_name, &origin, secret)?)
             }
             None => None,
         };
@@ -2488,11 +2533,6 @@ impl HostState {
         if let Err(error) = request.validate(self.limits) {
             return Ok(Err(error.message().to_owned()));
         }
-        let origin = krit_capability::HttpOrigin::parse_exact(adapter.origin()).map_err(|_| {
-            wasmtime::Error::new(RuntimeError::setup(
-                "validated AI adapter origin became invalid",
-            ))
-        })?;
         let retry = self
             .agent_host
             .policy()
@@ -2514,7 +2554,7 @@ impl HostState {
         let response = match self.send_with_retry(RetryRequest {
             origin: &origin,
             request: &request,
-            bearer: bearer.as_deref(),
+            bearer: bearer.as_ref(),
             rate_resource: policy::RateResource::Ai(adapter_name.clone()),
             rate_label: adapter_name.clone(),
             approval_label: adapter_name.clone(),
@@ -2635,6 +2675,11 @@ impl HostState {
         // embedding that builds a catalog directly cannot reach an origin or a
         // credential the manifest never granted.
         self.require_effect_resource("http.request", &config.origin)?;
+        let origin = krit_capability::HttpOrigin::parse_exact(&config.origin).map_err(|_| {
+            wasmtime::Error::new(RuntimeError::setup(
+                "validated search connector origin became invalid",
+            ))
+        })?;
         let bearer = match config.secret.as_deref() {
             Some(name) => {
                 self.require_effect_resource("secret.read", name)?;
@@ -2643,7 +2688,7 @@ impl HostState {
                         "search connector `{index}` secret is not configured"
                     )));
                 };
-                Some(secret)
+                Some(self.authorize_bearer(name, &origin, secret)?)
             }
             None => None,
         };
@@ -2658,11 +2703,6 @@ impl HostState {
         if let Err(error) = request.validate(self.limits) {
             return Ok(Err(error.message().to_owned()));
         }
-        let origin = krit_capability::HttpOrigin::parse_exact(&config.origin).map_err(|_| {
-            wasmtime::Error::new(RuntimeError::setup(
-                "validated search connector origin became invalid",
-            ))
-        })?;
         // Retry and rate selection match guest HTTP exactly: an exact-origin
         // override wins, otherwise the default applies. A connector is ordinary
         // HTTP traffic and must not get its own weaker or stronger policy.
@@ -2693,7 +2733,7 @@ impl HostState {
         let response = match self.send_with_retry(RetryRequest {
             origin: &origin,
             request: &request,
-            bearer: bearer.as_deref(),
+            bearer: bearer.as_ref(),
             // Charged against the origin, not the connector name, so every
             // connector and every direct request to one origin share a single
             // bucket. Charging per connector would multiply the configured cap
@@ -3227,5 +3267,312 @@ mod phase4_policy_tests {
                 Duration::from_millis(25)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod engine_contract_tests {
+    //! Pins the reference engine's fuel model for the operators policy
+    //! validation admits and for the instantiation work Krit artifacts
+    //! trigger, independent of the Krit compiler. A Wasmtime upgrade that
+    //! changes per-operator costs, adds a size-dependent charge to an admitted
+    //! operator, changes what instantiation charges on a platform, or remaps
+    //! fuel exhaustion fails here instead of silently shifting every
+    //! artifact's budget.
+
+    use super::*;
+    use std::borrow::Cow;
+    use wasm_encoder::{
+        BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, ExportKind,
+        ExportSection, Function, FunctionSection, ImportSection, Instruction, MemorySection,
+        MemoryType, Module as ModuleEncoder, RefType, TableSection, TableType, TypeSection,
+        ValType,
+    };
+    use wasmtime::{Instance, Module, Ref, Table};
+
+    /// Exports `sum(n) -> n + (n - 1) + ... + 1` as a counted loop and
+    /// `grow(pages) -> previous_pages` over a 0..4 page memory, using only
+    /// MVP operators.
+    fn accounting_module() -> Vec<u8> {
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I64], [ValType::I64]);
+        types.ty().function([ValType::I32], [ValType::I32]);
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        functions.function(1);
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 0,
+            maximum: Some(4),
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut exports = ExportSection::new();
+        exports.export("sum", ExportKind::Func, 0);
+        exports.export("grow", ExportKind::Func, 1);
+
+        // Flat costs: each function invocation costs one unit, `block`,
+        // `loop`, and `end` are free, and every other operator costs one unit.
+        // A full iteration therefore costs 12, and entry, the exit test, and
+        // the final `local.get` cost 5.
+        let mut sum = Function::new([(1, ValType::I64)]);
+        for instruction in [
+            Instruction::Block(BlockType::Empty),
+            Instruction::Loop(BlockType::Empty),
+            Instruction::LocalGet(0),
+            Instruction::I64Eqz,
+            Instruction::BrIf(1),
+            Instruction::LocalGet(1),
+            Instruction::LocalGet(0),
+            Instruction::I64Add,
+            Instruction::LocalSet(1),
+            Instruction::LocalGet(0),
+            Instruction::I64Const(1),
+            Instruction::I64Sub,
+            Instruction::LocalSet(0),
+            Instruction::Br(0),
+            Instruction::End,
+            Instruction::End,
+            Instruction::LocalGet(1),
+            Instruction::End,
+        ] {
+            sum.instruction(&instruction);
+        }
+        let mut grow = Function::new([]);
+        for instruction in [
+            Instruction::LocalGet(0),
+            Instruction::MemoryGrow(0),
+            Instruction::End,
+        ] {
+            grow.instruction(&instruction);
+        }
+        let mut code = CodeSection::new();
+        code.function(&sum);
+        code.function(&grow);
+
+        let mut module = ModuleEncoder::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&memories)
+            .section(&exports)
+            .section(&code);
+        module.finish()
+    }
+
+    fn fresh_store(runtime: &Runtime, fuel: u64) -> Store<()> {
+        let mut store = Store::new(&runtime.engine, ());
+        store.set_fuel(fuel).expect("fuel is enabled");
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_trap();
+        store
+    }
+
+    #[test]
+    fn admitted_operators_keep_the_flat_fuel_model() {
+        let runtime = Runtime::new(RuntimeLimits::default()).expect("default engine");
+        let module = Module::new(&runtime.engine, accounting_module()).expect("valid module");
+        let budget = runtime.limits.fuel();
+
+        for (n, expected_sum) in [(0_i64, 0_i64), (1, 1), (10, 55), (1_000, 500_500)] {
+            let mut store = fresh_store(&runtime, budget);
+            let instance = Instance::new(&mut store, &module, &[]).expect("instantiates");
+            let sum = instance
+                .get_typed_func::<i64, i64>(&mut store, "sum")
+                .expect("sum export");
+            assert_eq!(sum.call(&mut store, n).expect("sum runs"), expected_sum);
+            let consumed = budget - store.get_fuel().expect("fuel is enabled");
+            assert_eq!(consumed, 12 * n.unsigned_abs() + 5, "sum({n})");
+        }
+
+        // Krit's guest allocator grows memory, so `memory.grow` must stay a
+        // flat charge no matter how many pages it requests.
+        for (pages, previous) in [(0, 0), (1, 0), (4, 0), (5, -1)] {
+            let mut store = fresh_store(&runtime, budget);
+            let instance = Instance::new(&mut store, &module, &[]).expect("instantiates");
+            let grow = instance
+                .get_typed_func::<i32, i32>(&mut store, "grow")
+                .expect("grow export");
+            assert_eq!(grow.call(&mut store, pages).expect("grow runs"), previous);
+            let consumed = budget - store.get_fuel().expect("fuel is enabled");
+            assert_eq!(consumed, 3, "grow({pages})");
+        }
+
+        let mut store = fresh_store(&runtime, 1_000);
+        let instance = Instance::new(&mut store, &module, &[]).expect("instantiates");
+        let sum = instance
+            .get_typed_func::<i64, i64>(&mut store, "sum")
+            .expect("sum export");
+        let error = map_wasmtime_error(
+            sum.call(&mut store, 1_000_000)
+                .expect_err("budget must run out"),
+        );
+        assert_eq!(error.kind(), RuntimeErrorKind::FuelExhausted);
+        assert_eq!(error.code(), "K5101");
+    }
+
+    /// Linear-memory offset of the test data segment, matching the static
+    /// base above which krit-wasm places literals, so the image starts inside
+    /// the first page.
+    const DATA_OFFSET: u64 = 1_024;
+
+    /// Wasmtime merges a module's active data segments into one image padded
+    /// to the compilation target's page alignment (Cranelift's
+    /// `page_size_align_log2`), whatever page size the host later uses.
+    const DATA_IMAGE_ALIGN: u64 = if cfg!(all(target_arch = "aarch64", target_vendor = "apple")) {
+        16 << 10
+    } else if cfg!(target_arch = "aarch64") {
+        64 << 10
+    } else {
+        4 << 10
+    };
+
+    /// Whether Wasmtime can map a data image copy-on-write for an in-memory
+    /// compiled module. Only Linux can, through `memfd`; every other host
+    /// copies the image during instantiation.
+    const MAPS_DATA_IMAGES: bool = cfg!(target_os = "linux");
+
+    /// A fixed four-page memory with one active segment of `bytes` nonzero
+    /// bytes at `DATA_OFFSET`. A zero-byte segment is still emitted.
+    fn data_segment_module(bytes: u64) -> Vec<u8> {
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 4,
+            maximum: Some(4),
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut data = DataSection::new();
+        data.active(
+            0,
+            &ConstExpr::i32_const(i32::try_from(DATA_OFFSET).expect("offset fits in i32")),
+            std::iter::repeat_n(0x2a, usize::try_from(bytes).expect("segment fits in usize")),
+        );
+
+        let mut module = ModuleEncoder::new();
+        module.section(&memories).section(&data);
+        module.finish()
+    }
+
+    /// One no-op function written into elements 1..=3 of a four-element
+    /// funcref table by an active segment. With `imported_table` the table is
+    /// the module's only import, the shape of a wit-component fixup module;
+    /// otherwise the module defines it, like Krit's core module.
+    fn element_segment_module(imported_table: bool) -> Vec<u8> {
+        let table = TableType {
+            element_type: RefType::FUNCREF,
+            table64: false,
+            minimum: 4,
+            maximum: Some(4),
+            shared: false,
+        };
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        let mut imports = ImportSection::new();
+        let mut tables = TableSection::new();
+        if imported_table {
+            imports.import("host", "table", table);
+        } else {
+            tables.table(table);
+        }
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        let mut elements = ElementSection::new();
+        elements.active(
+            None,
+            &ConstExpr::i32_const(1),
+            Elements::Functions(Cow::Borrowed(&[0, 0, 0])),
+        );
+        let mut noop = Function::new([]);
+        noop.instruction(&Instruction::End);
+        let mut code = CodeSection::new();
+        code.function(&noop);
+
+        let mut module = ModuleEncoder::new();
+        module.section(&types);
+        if imported_table {
+            module.section(&imports);
+        }
+        module.section(&functions);
+        if !imported_table {
+            module.section(&tables);
+        }
+        module.section(&elements).section(&code);
+        module.finish()
+    }
+
+    #[test]
+    fn instantiation_charges_data_images_the_host_cannot_map() {
+        let runtime = Runtime::new(RuntimeLimits::default()).expect("default engine");
+        let budget = runtime.limits.fuel();
+
+        // (segment bytes, pages in the padded image)
+        let cases = [
+            (0, 0),
+            (1, 1),
+            (DATA_IMAGE_ALIGN - DATA_OFFSET, 1),
+            (DATA_IMAGE_ALIGN - DATA_OFFSET + 1, 2),
+        ];
+        for (bytes, pages) in cases {
+            let module =
+                Module::new(&runtime.engine, data_segment_module(bytes)).expect("valid module");
+            let mut store = fresh_store(&runtime, budget);
+            Instance::new(&mut store, &module, &[]).expect("instantiates");
+            let consumed = budget - store.get_fuel().expect("fuel is enabled");
+            // A mapped image needs no startup function at all. Otherwise the
+            // startup function costs one unit to enter and copies the padded
+            // image like `memory.init`, one unit per byte.
+            let expected = if pages == 0 || MAPS_DATA_IMAGES {
+                0
+            } else {
+                1 + pages * DATA_IMAGE_ALIGN
+            };
+            assert_eq!(consumed, expected, "{bytes}-byte data segment");
+        }
+
+        // The copy draws on the invocation's budget, so a budget smaller than
+        // the image fails instantiation with the ordinary fuel diagnostic.
+        let module = Module::new(&runtime.engine, data_segment_module(1)).expect("valid module");
+        let mut store = fresh_store(&runtime, DATA_IMAGE_ALIGN);
+        let instantiated = Instance::new(&mut store, &module, &[]);
+        if MAPS_DATA_IMAGES {
+            instantiated.expect("a mapped image costs no fuel");
+            assert_eq!(store.get_fuel().expect("fuel is enabled"), DATA_IMAGE_ALIGN);
+        } else {
+            let error = map_wasmtime_error(instantiated.expect_err("budget must run out"));
+            assert_eq!(error.kind(), RuntimeErrorKind::FuelExhausted);
+            assert_eq!(error.code(), "K5101");
+        }
+    }
+
+    #[test]
+    fn instantiation_charges_element_segments_on_imported_tables() {
+        let runtime = Runtime::new(RuntimeLimits::default()).expect("default engine");
+        let budget = runtime.limits.fuel();
+
+        // A defined table is precomputed and initialized lazily, outside fuel.
+        let module =
+            Module::new(&runtime.engine, element_segment_module(false)).expect("valid module");
+        let mut store = fresh_store(&runtime, budget);
+        Instance::new(&mut store, &module, &[]).expect("instantiates");
+        assert_eq!(budget - store.get_fuel().expect("fuel is enabled"), 0);
+
+        // An imported table is written by the startup function, which draws
+        // one unit on entry. Wasmtime buffers the offset-expression and
+        // per-element charges when they total at most 128 units, as here, and
+        // returns without flushing them, so only the entry unit is drawn.
+        let module =
+            Module::new(&runtime.engine, element_segment_module(true)).expect("valid module");
+        let mut store = fresh_store(&runtime, budget);
+        let table = Table::new(
+            &mut store,
+            wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 4, Some(4)),
+            Ref::Func(None),
+        )
+        .expect("host table");
+        Instance::new(&mut store, &module, &[table.into()]).expect("instantiates");
+        assert_eq!(budget - store.get_fuel().expect("fuel is enabled"), 1);
     }
 }

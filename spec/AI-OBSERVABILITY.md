@@ -89,10 +89,22 @@ http = [
   "https://ai.example",
   "https://message.example",
 ]
-secrets = ["github-token", "ai-token", "message-token"]
 ai = ["reviewer"]
 logs = true
+
+[secrets.ai-token]
+origins = ["https://ai.example"]
+
+[secrets.github-token]
+origins = ["https://api.github.example"]
+
+[secrets.message-token]
+origins = ["https://message.example"]
 ```
+
+Each `[secrets.<name>]` table binds its secret to the origins that may receive
+it; the legacy flat `secrets` list grants unbound secrets. See
+`CAPABILITIES.md`.
 
 `ai` is a sorted-unique set of canonical adapter names. `logs` is a boolean.
 The manifest requests authority but cannot configure adapters, approve an
@@ -185,8 +197,9 @@ hosts to strict schema 2 with an exact `http.bearer` approval:
 Every object denies unknown fields. Maps are bounded and their keys must be
 manifest-granted exact origins or adapter names. An adapter name must be
 manifest-granted and artifact-required before use. Its exact origin and
-optional secret must also be manifest-granted. Host configuration cannot add
-a grant.
+optional secret must also be manifest-granted, and a bound secret must list the
+adapter origin; otherwise loading fails with `K5006`. Host configuration cannot
+add a grant or widen a binding.
 
 Configuration, secret, adapter, approval, retry, and rate collections are each
 bounded to at most 256 entries, in addition to the selected host-config byte
@@ -205,8 +218,10 @@ provider-neutral Rust adapter interface and uses this deterministic mapping:
 {"model":"configured-model","input":"raw source input"}
 ```
 
-It sends `POST` with `content-type: application/json` and optional host-side
-bearer authentication. A successful provider response is the strict object:
+It sends `POST` with `content-type: application/json`, the host default
+`User-Agent` (`WEBHOOK-CONTRACTS.md`, "Outbound User-Agent"), and optional
+host-side bearer authentication. A successful provider response is the strict
+object:
 
 ```json
 {"output":"raw UTF-8 model text"}
@@ -220,8 +235,11 @@ keys, or stats.
 
 Adapter input, response, and timeout values must be nonzero and no greater
 than both the selected runtime limits and the hard maxima. Paths are safe
-origin-form absolute paths without query or fragment. Model identifiers are
-bounded printable identifiers and are not artifact facts.
+origin-form absolute paths without query or fragment, held to the request path
+rule in `WEBHOOK-CONTRACTS.md` ("Request paths and queries"); an adapter path
+that breaks it is refused with `K7003` when the host configuration is
+validated. Model identifiers are bounded printable identifiers and are not
+artifact facts.
 
 ## Structured logging and publication
 

@@ -271,11 +271,21 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
         expected_approvals
     );
 
+    // Every credential is bound to the one origin that should receive it, as
+    // in the shipped webhook-agent example.
     let manifest = manifest(&format!(
         "http = [\"{github_origin}\", \"{ai_origin}\", \"{messaging_origin}\"]\n\
-         secrets = [\"ai-token\", \"github-token\", \"message-token\"]\n\
          ai = [\"reviewer\"]\n\
-         logs = true"
+         logs = true\n\
+         \n\
+         [secrets.ai-token]\n\
+         origins = [\"{ai_origin}\"]\n\
+         \n\
+         [secrets.github-token]\n\
+         origins = [\"{github_origin}\"]\n\
+         \n\
+         [secrets.message-token]\n\
+         origins = [\"{messaging_origin}\"]"
     ));
     let inputs = HostInputs::new(
         BTreeMap::new(),
@@ -1280,6 +1290,138 @@ fn ai_test_host(origin: String, max_response_bytes: usize, timeout: Duration) ->
 }
 
 #[test]
+fn ai_adapter_paths_refuse_traversal_forms_at_setup() {
+    let policy_with_path = |path: &str| {
+        let mut policy = AgentHostPolicy::default();
+        policy.ai_adapters.insert(
+            "reviewer".to_owned(),
+            AiAdapterConfig::HttpJson(HttpJsonAdapterConfig {
+                origin: "https://ai.example.com".to_owned(),
+                path: path.to_owned(),
+                model: "test".to_owned(),
+                secret: None,
+                max_input_bytes: 1024,
+                max_response_bytes: 1024,
+                timeout: Duration::from_millis(500),
+            }),
+        );
+        policy
+    };
+
+    // An adapter path obeys the same rule as every request path, so a bad one
+    // is refused when the host is configured, not on its first request.
+    for path in [
+        "/v1/../admin",
+        "/v1/./invoke",
+        "/v1/..;/admin",
+        "/v1/%2e%2e/admin",
+        "/v1%2Finvoke",
+        "/v1%5cinvoke",
+        "/v1/%252e%252e/admin",
+        "/v1/%c0%ae%c0%ae/admin",
+        "/v1/..%3F/admin",
+        "/v1/..%0a/admin",
+        "/v1/invoke%",
+        "/v1/chat completions",
+    ] {
+        let error = krit_runtime::validate_policy(&policy_with_path(path))
+            .expect_err("a traversal form must be refused at setup");
+        assert_eq!(error.code(), "K7003", "`{path}`");
+        assert_eq!(
+            error.message(),
+            "AI adapter `reviewer` has an invalid relative path"
+        );
+    }
+    for path in ["/v1/invoke", "/v1.1/chat%20completions", "/.well-known/ai"] {
+        krit_runtime::validate_policy(&policy_with_path(path))
+            .unwrap_or_else(|error| panic!("`{path}` must be accepted: {error}"));
+    }
+}
+
+#[test]
+fn ai_adapter_secrets_cannot_widen_a_manifest_binding() {
+    let artifact = compile(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match ai_invoke("reviewer", request.body) {
+        Ok(output) => record { status: 200, headers: [], body: output },
+        Err(error) => record { status: 503, headers: [], body: error },
+    }
+}
+"#,
+        &["ai.invoke"],
+    );
+    let ai = TcpListener::bind("127.0.0.1:0").expect("AI listener should bind");
+    let ai_origin = listener_origin(&ai);
+    let github_origin = "https://github.example.invalid";
+    let host = |secret: &str| {
+        let inputs = HostInputs::new(
+            BTreeMap::new(),
+            SecretStore::new(BTreeMap::from([(
+                secret.to_owned(),
+                b"ai-private".to_vec(),
+            )]))
+            .expect("secrets should be valid"),
+        )
+        .expect("inputs should be valid")
+        .with_network_policy(NetworkPolicy::loopback_for_tests().with_plaintext_bearer_for_tests());
+        let mut policy = AgentHostPolicy::default();
+        policy.ai_adapters.insert(
+            "reviewer".to_owned(),
+            AiAdapterConfig::HttpJson(HttpJsonAdapterConfig {
+                origin: ai_origin.clone(),
+                path: "/invoke".to_owned(),
+                model: "test".to_owned(),
+                secret: Some(secret.to_owned()),
+                max_input_bytes: 1024,
+                max_response_bytes: 1024,
+                timeout: Duration::from_millis(500),
+            }),
+        );
+        AgentHost::new(
+            inputs,
+            policy,
+            Arc::new(
+                ExplicitApprovalPolicy::new([(ApprovalOperation::AiInvoke, "reviewer".to_owned())])
+                    .expect("approval"),
+            ),
+        )
+        .expect("host")
+    };
+
+    // The adapter would carry a credential the manifest binds only to another
+    // origin. The host configuration cannot widen that binding, so setup
+    // refuses before the guest runs or any connection is opened.
+    let manifest = manifest(&format!(
+        "http = [\"{ai_origin}\", \"{github_origin}\"]\n\
+         ai = [\"reviewer\"]\n\
+         \n\
+         [secrets.github-token]\n\
+         origins = [\"{github_origin}\"]"
+    ));
+    let error = Runtime::default()
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &GrantSet::from_manifest(&manifest),
+            &host("github-token"),
+            request("prompt"),
+        )
+        .expect_err("an adapter must not widen a secret binding");
+    assert_eq!(error.code(), "K5006");
+    assert_eq!(
+        error.message(),
+        format!("secret `github-token` is not bound to origin `{ai_origin}`")
+    );
+    ai.set_nonblocking(true)
+        .expect("listener should become nonblocking");
+    assert!(matches!(
+        ai.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+}
+
+#[test]
 fn ai_errors_are_bounded_redacted_and_model_text_is_never_executed() {
     let artifact = compile(
         r#"
@@ -1666,4 +1808,64 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
     assert!(!format!("{error:?}").contains("private prompt"));
     assert!(!format!("{error:?}").contains("not-json"));
     mock.join().expect("mock");
+}
+
+#[test]
+fn ai_adapter_requests_carry_the_host_user_agent() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock should bind");
+    let origin = listener_origin(&listener);
+    let mock = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("mock should accept");
+        let captured = read_request(&mut stream);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"output\":\"ok\"}",
+            )
+            .expect("mock response");
+        String::from_utf8(captured).expect("request should be UTF-8")
+    });
+    let artifact = compile(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match ai_invoke("reviewer", request.body) {
+        Ok(output) => record { status: 200, headers: [], body: output },
+        Err(error) => record { status: 503, headers: [], body: error },
+    }
+}
+"#,
+        &["ai.invoke"],
+    );
+    let manifest = manifest(&format!("http = [\"{origin}\"]\nai = [\"reviewer\"]"));
+    let host = ai_test_host(origin, 1024, Duration::from_millis(500));
+
+    let result = Runtime::default()
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &GrantSet::from_manifest(&manifest),
+            &host,
+            request("summarize"),
+        )
+        .expect("AI invocation should succeed");
+
+    assert_eq!(result.response.status, 200);
+    assert_eq!(result.response.body, "ok");
+    let captured = mock.join().expect("mock should finish");
+    // Guest code never builds adapter headers, so the provider always sees the
+    // host default, exactly once.
+    let user_agents = captured
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_agents,
+        [format!("User-Agent: krit/{}", env!("CARGO_PKG_VERSION"))],
+        "{captured}"
+    );
 }

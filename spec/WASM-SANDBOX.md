@@ -568,9 +568,9 @@ needs a second explicit host-only switch.
 The neutral AI interface selects a named host adapter. Phase 4 includes only
 `http-json`, which constructs and parses one strict provider mapping behind a
 provider-neutral Rust trait. Adapter origin and optional secret must already
-be manifest-granted. Prompts, provider bodies, model output, and credentials
-are absent from metadata, permission output, default logs, cache keys, and
-stats.
+be manifest-granted, and a bound secret must list the adapter origin. Prompts,
+provider bodies, model output, and credentials are absent from metadata,
+permission output, default logs, cache keys, and stats.
 
 Transport retries occur inside one host operation and never re-enter guest
 code. Only connection/timeouts and 429/502/503/504 are retryable, and only for
@@ -609,14 +609,16 @@ execution deadline starts; this limitation is explicit and compilation is
 still bounded by component and metadata input limits.
 
 Under the [upstream release
-policy](https://docs.wasmtime.dev/stability-release.html), Wasmtime 47 is a
-non-LTS monthly release with a two-month support window (through 2026-09-20
-for version 47). The dependency requirement is compatible `47.0.4`, while
-`Cargo.lock` pins the exact tested patch. Security patches within 47 may be
-adopted with `cargo update` plus the complete host test suite. Krit plans an
-audited move to the Wasmtime 48 LTS line before 47 leaves support. A runtime
-major or Rust MSRV increase is never implicit: it requires CI validation,
-documentation, and a changelog entry.
+policy](https://docs.wasmtime.dev/stability-release.html), a Wasmtime release
+whose major version is a multiple of 12 is a long-term-support (LTS) release
+supported for 24 months; other monthly releases are supported for two months.
+Krit follows LTS lines only. The host runs Wasmtime 48 LTS, released
+2026-08-20 and supported through 2028-08-20. The dependency requirement is
+compatible `48.0.5`, while `Cargo.lock` pins the exact tested patch. Security
+patches within 48 may be adopted with `cargo update` plus the complete host
+test suite. Wasmtime 48 requires Rust 1.95, which is the workspace MSRV. A
+runtime major or Rust MSRV increase is never implicit: it requires CI
+validation, documentation, and a changelog entry.
 
 URL parsing is pinned to `url` 2.5.8, HTTP types to `http` 1.5.0, the blocking
 HTTP/TLS client to `curl` 0.4.50, secret clearing to `zeroize` 1.9.0, and CLI
@@ -747,6 +749,36 @@ recursion from reaching the caller thread's native guard page before Wasmtime
 converts the configured Wasm stack limit into `K5103`. The runtime joins this
 thread before returning, including after traps and deadline interruption.
 
+Fuel uses Wasmtime's default cost model. The runtime sets the budget before it
+instantiates the component, so instantiation and the call draw on one budget.
+Each function invocation costs one unit, and each executed operator costs one
+unit except `nop`, `drop`, `block`, `loop`, `else`, `end`, `return`, and
+`unreachable`, which are free. `memory.grow` costs one unit however many pages
+it requests. Wasmtime charges bulk memory, table, and GC array operators per
+byte or element and checks the epoch deadline only once per such operation;
+the feature policy rejects all of them in guest code.
+
+Instantiation also consumes fuel, and part of that cost depends on the host.
+A core module runs a startup function when it has initialization Wasmtime can
+neither precompute nor map, such as the active element segment with which a
+generated canonical adapter module fills an imported table. Entering that
+function costs one unit, and Wasmtime may add small charges for the constant
+expressions and elements it evaluates. Active data segments dominate. Every
+Krit core module with linear memory places its literal data in one active
+segment at a constant offset. Wasmtime merges such segments into one image
+padded to the compilation target's page alignment: 4 KiB on x86-64, 16 KiB on
+Apple aarch64, and 64 KiB on other aarch64 targets. Where Wasmtime maps that
+image copy-on-write, which today means Linux through `memfd`, initializing it
+costs nothing. On every other host, including macOS and Windows, the startup
+function copies the image like `memory.init` at one unit per byte of the
+padded image. `fuel_consumed` for those artifacts is therefore host-dependent:
+on an Apple aarch64 host a one-page image costs 16,384 units beyond the
+startup unit, which a Linux host never pays. A narrowed fuel budget must be
+sized for the most expensive host that will run the artifact, and running out
+during instantiation is `K5101` like any other fuel exhaustion. Host tests pin
+the operator costs and these instantiation charges with per-platform
+expectations, so a runtime upgrade that changes either fails before release.
+
 Exhaustion produces a stable resource diagnostic distinct from capability
 denial and application failure. A memory or table growth that the limits
 refuse traps the guest and is reported as `K5103`, including when the
@@ -866,7 +898,10 @@ An outbound grant binds:
 - hostname
 - port
 - exact normalized origin (no path, query, fragment, or userinfo)
-- per-call validated origin-form path, query, method, and headers
+- per-call validated origin-form path, query, method, and headers; the path
+  obeys the request path rule in `WEBHOOK-CONTRACTS.md` ("Request paths and
+  queries"), and libcurl never resolves its dot segments or decodes its escapes
+  (`CURLOPT_PATH_AS_IS`)
 - fixed no-redirect policy
 - response-size limit
 - timeout and request quota
@@ -880,8 +915,10 @@ manifest.
 
 Applications refer to secrets by manifest-approved logical name. The host
 acquires bounded owner-only files into a zeroizing store and returns only a
-WIT resource handle. Hosts that cannot enforce owner-only files refuse secrets
-(see [Platform support](#platform-support)). The HTTP host borrows that resource and injects bearer
+WIT resource handle that carries the secret's logical name. Hosts that cannot
+enforce owner-only files refuse secrets (see [Platform support](#platform-support)).
+The HTTP host borrows that resource, checks the name's manifest origin binding
+(`K5006` on a mismatch, before any network I/O), and injects bearer
 authentication without returning bytes to the component.
 
 Secret data is excluded from:

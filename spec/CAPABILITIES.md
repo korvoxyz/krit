@@ -55,7 +55,6 @@ Grants are narrow data:
 stdout = true
 config = ["agent.model", "agent.timeout-ms"]
 http = ["https://api.github.com", "https://slack.com"]
-secrets = ["github-token", "slack-token"]
 ai = ["reviewer"]
 logs = true
 state = ["agent-work"]
@@ -66,13 +65,21 @@ buckets = ["render-output"]
 readOnlyBuckets = ["reference"]
 databases = ["catalog"]
 readOnlyDatabases = ["reference-data"]
+
+[secrets.github-token]
+origins = ["https://api.github.com"]
+
+[secrets.slack-token]
+origins = ["https://slack.com"]
+inject = "bearer"
 ```
 
 The schema-1 manifest implements requests for `stdout`, `config`, `http`,
-`secrets`, `ai`, structured `logs`, durable `state`, durable queue publish
-(`queues`) and consume (`consumes`), scheduled triggers (`schedules`), and
-object buckets (`buckets` for read and write, `readOnlyBuckets` for read only;
-the two lists are disjoint). The language emits literal-resource facts for
+`secrets` (and the `[secrets.<name>]` binding tables below), `ai`, structured
+`logs`, durable `state`, durable queue publish (`queues`) and consume
+(`consumes`), scheduled triggers (`schedules`), and object buckets
+(`buckets` for read and write, `readOnlyBuckets` for read only; the two lists
+are disjoint). The language emits literal-resource facts for
 `config.read`, `secret.read`, `http.request`, `ai.invoke`, `state.transaction`,
 `queue.publish`, `object.read`, and `object.write`; `queue.consume` and
 `schedule.trigger` come from the `queue` and `schedule` entrypoint
@@ -104,6 +111,46 @@ pattern. DNS rebinding and redirects cannot expand the original grant.
 
 Secret grants expose opaque handles where possible. Secrets must not appear in
 debug output, diagnostics, cache keys, lockfiles, or telemetry.
+
+## Secret binding
+
+A secret grant is also a statement of where the secret may go. A
+`[secrets.<name>]` table grants the secret and binds it to `origins`, the exact
+HTTP origins its bearer injection may reach:
+
+```toml
+[secrets.github-token]
+origins = ["https://api.github.com"]
+inject = "bearer"
+```
+
+`origins` is a non-empty list of unique canonical origins, and every one must
+also be granted under `[capabilities] http`; a binding narrows where a secret
+may go and never adds network authority. `inject` defaults to `"bearer"`,
+which is the only accepted value; any other value, and any unknown field, is a
+manifest error.
+
+The legacy `[capabilities] secrets = [...]` list still parses. It grants each
+named secret *unbound*: an unbound secret may be injected into any granted
+origin, exactly as in Krit 0.2. A name present in both forms is bound by its
+table. New manifests should declare every secret as a table.
+
+The `Secret` resource carries its logical name, and every bearer injection is
+checked against that name's binding before any DNS lookup, connection, or
+request byte; for guest `http_request` the check also precedes the call limit
+and approval. A secret sent to an origin its binding does not list is refused
+with `K5006`, whose message names the secret and the origin and never the
+secret's bytes. Like any other use of authority the manifest does not grant,
+the refusal traps the invocation; it is not a guest-visible `Err`. Source
+checking and package builds do not yet prove which secret reaches which
+origin, so a misdirected pairing builds and is refused at run time.
+
+Host configuration can only narrow a binding, never widen it. Credentials the
+host itself injects, an AI adapter's `secret` and a search connector's
+`secret`, are held to the same rule: a bound secret configured for an origin
+outside its binding is refused with `K5006` when the host configuration is
+loaded, when the runtime validates the host, and again at dispatch. An unbound
+legacy secret may serve any adapter or connector whose origin is granted.
 
 ## Bounded host operations
 
@@ -148,6 +195,20 @@ each granted only by its exact spelling. Source analysis (`K3008`), manifest
 validation (`K6001`), artifact metadata validation, and host configuration
 apply the same grammar to each kind of name.
 
+An HTTP grant names an origin, never a path. The host holds every request path
+to the rule in [WEBHOOK-CONTRACTS.md](WEBHOOK-CONTRACTS.md) ("Request paths and
+queries"). That rule refuses dot segments, including those behind `;` path
+parameters or a decoded `?` or `#` and those padded with escaped spaces, and
+escapes that decode, once or repeatedly, into `.`, `/`, `\`, or an ASCII control
+byte. It also refuses overlong UTF-8 escapes, including those only a lenient
+decoder reads as overlong, and malformed escapes. A guest
+`http_request` or `replay_http` that breaks the rule traps with `K4001` before
+any connection. The host never resolves or decodes an accepted path, and
+libcurl only respells it (uppercase escape hex, non-ASCII bytes
+percent-encoded) without changing what it decodes to. A path built from
+untrusted text therefore cannot use the standard server-side normalizations
+listed there to reach outside the prefix the program addressed.
+
 Phase 6 adds exact `state.transaction("store")` requirements for bounded
 state, checkpoint, and replay operations. Replay also retains the exact
 external HTTP-origin or AI-adapter requirement. Store/checkpoint/replay names
@@ -178,18 +239,27 @@ origins without treating approval as a grant. A denied report is printed
 completely and exits 4. Deployment and approval policy evaluation remain
 `not-evaluated` in this inspection command.
 
-The request-only `krit permissions --json` output remains:
+The request-only `krit permissions --json` output is:
 
 ```json
-{"schema":1,"package":"akshay/agent","requested":[{"capability":"http.request","resource":"https://api.github.com"},{"capability":"secret.read","resource":"github-token"}],"grantStatus":"not-evaluated"}
+{"schema":1,"package":"akshay/agent","requested":[{"capability":"http.request","resource":"https://api.github.com"},{"capability":"secret.read","resource":"github-token"}],"secretBindings":[{"secret":"github-token","inject":"bearer","binding":"bound","origins":["https://api.github.com"]}],"grantStatus":"not-evaluated"}
 ```
 
 Requests sort by capability and resource. Configuration keys, HTTP origins,
 and secret names are identifiers only; their values are never included.
 
+`secretBindings` lists every granted secret, sorted by name, and is omitted
+when no secret is granted. `binding` is `"bound"` for a `[secrets.<name>]`
+table, whose sorted `origins` are the only origins it may reach, or
+`"unbound"` for a legacy list entry, whose `origins` is empty and whose reach
+is every granted origin. The human report adds a `Secret bindings:` section
+with one `NAME (bearer): ORIGIN, ...` line per secret and labels an unbound
+secret `UNBOUND (any granted origin)`.
+
 Artifact-aware JSON uses schema 1 and includes `world`, `required`,
 `effective`, `denied`, `imports`, `approvalRequired`, `approvalStatus`,
-`denialReasons`, `localGrantStatus`, and `deploymentGrantStatus`.
+`denialReasons`, `localGrantStatus`, and `deploymentGrantStatus`, plus the
+same `secretBindings` when any secret is granted.
 
 ## Development mode
 

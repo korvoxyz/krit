@@ -140,16 +140,16 @@ Two transports ship:
   text and, when configured, a credential, so plaintext transport is refused.
   Only an explicit loopback test policy relaxes this, exactly as it does for a
   bearer credential. The connector path must be a safe origin-form absolute
-  path under the same rule every other host-owned path obeys: no authority
-  form, no scheme, no backslash, no query or fragment delimiter, no control
-  byte, and ASCII only.
+  path under the request path rule every other host-owned path obeys
+  (`WEBHOOK-CONTRACTS.md`, "Request paths and queries"), and ASCII only.
 - `local` - a deterministic in-process document set, for reference examples and
   tests. It performs no I/O.
 
 Request bodies are exactly `{"query": ..., "limit": ...}` or
 `{"vector": [...], "limit": ...}`. A credential, when configured, travels as a
 bearer header and **never** appears in a body, a cache key, an artifact,
-metadata, a log, a statistic, or an error.
+metadata, a log, a statistic, or an error. Every `http-json` request carries
+the host default `User-Agent` (`WEBHOOK-CONTRACTS.md`, "Outbound User-Agent").
 
 ### Results are untrusted input
 
@@ -194,9 +194,10 @@ clamped to the invocation deadline.
 
 A connector's authority is complete and is checked twice. At setup, the
 connector name, its exact `http.request` origin, and its `secret.read`
-credential must all be granted by the manifest, and its transport is
-re-validated against the host's network policy. At dispatch the origin and the
-credential are rechecked against the current grant set, so an embedding that
+credential must all be granted by the manifest, a bound credential must list
+the connector origin (`K5006` otherwise), and its transport is re-validated
+against the host's network policy. At dispatch the origin, the credential, and
+its binding are rechecked against the current grant set, so an embedding that
 builds a catalog directly through the public API cannot reach authority the
 package never requested.
 

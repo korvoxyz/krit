@@ -16,11 +16,19 @@ use zeroize::Zeroize;
 
 use crate::{
     CancellationHandle, HttpHeader, HttpRequest, HttpResponse, NetworkPolicy, RuntimeLimits,
-    host::SecretBytes,
+    permissions::AuthorizedBearer,
 };
 
 const MIN_CURL_TIMEOUT: Duration = Duration::from_millis(1);
 const MAX_DNS_WORKERS: usize = 16;
+
+/// The `User-Agent` sent on every outbound request that does not name one.
+///
+/// libcurl sends no `User-Agent` of its own, and many origins refuse or
+/// throttle a request without one. The value is fixed at build time, so it
+/// identifies the host release and nothing about the invocation, the guest, or
+/// the machine (WEBHOOK-CONTRACTS.md, "Outbound User-Agent").
+const DEFAULT_USER_AGENT: &str = concat!("krit/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NetworkFailureKind {
@@ -124,7 +132,7 @@ fn sanitize_transfer_error(error: &curl::Error) -> NetworkFailure {
 pub(crate) fn send(
     origin: &HttpOrigin,
     request: &HttpRequest,
-    bearer: Option<&SecretBytes>,
+    bearer: Option<&AuthorizedBearer>,
     context: SendContext<'_>,
 ) -> Result<HttpResponse, NetworkFailure> {
     let SendContext {
@@ -134,6 +142,20 @@ pub(crate) fn send(
         cancellation,
         active_dns_workers,
     } = context;
+    // The binding was checked for one exact origin when the credential was
+    // authorized. Refusing any other origin here, before DNS or a connection,
+    // keeps a secret from being redirected even if a caller pairs it wrongly.
+    // The message is fixed: an adapter's or connector's endpoint and secret
+    // name are never disclosed to guest code.
+    if let Some(bearer) = bearer
+        && bearer.origin() != origin.as_str()
+    {
+        return Err(
+            "outbound HTTP bearer credential is not bound to this origin"
+                .to_owned()
+                .into(),
+        );
+    }
     if cancellation.is_cancelled() {
         return Err(NetworkFailure::new(
             NetworkFailureKind::Cancelled,
@@ -188,6 +210,13 @@ pub(crate) fn send(
     let mut easy = Easy::new();
     easy.url(&target)
         .map_err(|_| "invalid outbound HTTP URL".to_owned())?;
+    // The host validated the path exactly as written, so libcurl must not
+    // resolve it: by default curl removes dot segments itself, and the request
+    // on the wire would no longer address the resource the host checked. curl
+    // still respells the path without changing what it decodes to (uppercase
+    // escape hex, non-ASCII bytes percent-encoded); see WEBHOOK-CONTRACTS.md.
+    easy.path_as_is(true)
+        .map_err(|_| "could not send the outbound HTTP path as validated".to_owned())?;
     easy.proxy("")
         .map_err(|_| "could not disable outbound proxy inheritance".to_owned())?;
     easy.follow_location(false)
@@ -239,15 +268,25 @@ pub(crate) fn send(
     let mut headers = List::new();
     let mut has_content_type = false;
     let mut has_expect = false;
+    let mut has_user_agent = false;
     for header in &request.headers {
         has_content_type |= header.name.eq_ignore_ascii_case("content-type");
         has_expect |= header.name.eq_ignore_ascii_case("expect");
+        has_user_agent |= header.name.eq_ignore_ascii_case("user-agent");
         headers
             .append(&format!("{}: {}", header.name, header.value))
             .map_err(|_| "could not encode outbound HTTP header".to_owned())?;
     }
-    if let Some(secret) = bearer {
-        let bytes = secret.expose_for_bearer();
+    // A request's own `User-Agent`, in any letter case, is passed through
+    // unchanged and the default is not added. An empty one therefore sends no
+    // `User-Agent` at all, because libcurl never sends a blank header value.
+    if !has_user_agent {
+        headers
+            .append(&format!("User-Agent: {DEFAULT_USER_AGENT}"))
+            .map_err(|_| "could not encode default User-Agent header".to_owned())?;
+    }
+    if let Some(bearer) = bearer {
+        let bytes = bearer.secret().expose_for_bearer();
         let header = HeaderValue::from_bytes(bytes)
             .map_err(|_| "secret is not a valid bearer credential".to_owned())?;
         header
@@ -619,6 +658,77 @@ mod tests {
         assert!(error.message.contains("deadline expired"));
     }
 
+    #[test]
+    fn an_authorized_bearer_is_never_injected_into_another_origin() {
+        let grants = crate::GrantSet::from_manifest(
+            &krit_package::Manifest::parse(
+                r#"
+schema = 1
+
+[package]
+name = "test/network"
+version = "1.0.0"
+edition = "2026"
+entry = "src/main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+http = ["https://192.0.2.1", "https://192.0.2.2"]
+secrets = ["token"]
+"#,
+            )
+            .expect("manifest should parse"),
+        );
+        let store = crate::SecretStore::new(std::collections::BTreeMap::from([(
+            "token".to_owned(),
+            b"fixture-private".to_vec(),
+        )]))
+        .expect("secret store should be valid");
+        let authorized =
+            HttpOrigin::parse_exact("https://192.0.2.1").expect("origin should be canonical");
+        let other =
+            HttpOrigin::parse_exact("https://192.0.2.2").expect("origin should be canonical");
+        let bearer = grants
+            .authorize_bearer(
+                "token",
+                &authorized,
+                store.get("token").expect("secret should exist"),
+            )
+            .unwrap_or_else(|error| panic!("an unbound secret is authorized: {error}"));
+        let request = HttpRequest {
+            method: "GET".to_owned(),
+            path: "/".to_owned(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        let workers = Arc::new(AtomicUsize::new(0));
+
+        // Without the origin check this would fail later, on the
+        // documentation-range address; refusing first proves the credential is
+        // rejected before any address is even considered.
+        let error = send(
+            &other,
+            &request,
+            Some(&bearer),
+            SendContext {
+                policy: NetworkPolicy::default(),
+                limits: RuntimeLimits::default(),
+                remaining: Duration::from_secs(5),
+                cancellation: &CancellationHandle::new(),
+                active_dns_workers: &workers,
+            },
+        )
+        .expect_err("a credential must never reach a second origin");
+
+        assert_eq!(error.kind, NetworkFailureKind::Fatal);
+        assert_eq!(
+            error.message,
+            "outbound HTTP bearer credential is not bound to this origin"
+        );
+        assert_eq!(workers.load(Ordering::SeqCst), 0);
+    }
+
     /// Every message a transfer failure may present to guest code.
     const ENDPOINT_NEUTRAL_MESSAGES: [&str; 8] = [
         "outbound HTTP request timed out",
@@ -810,6 +920,187 @@ mod tests {
         assert_eq!(response.status, 200);
         assert!(response.body.is_empty());
         mock.join().expect("mock should finish");
+    }
+
+    /// Sends one bodyless `request` to a loopback mock and returns the request
+    /// head (request line and header lines) the mock received.
+    fn request_head_on_the_wire(request: &HttpRequest) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock should bind");
+        let address = listener.local_addr().expect("mock address should exist");
+        let mock = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("mock should accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("mock read timeout should configure");
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).expect("mock should read request");
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .expect("mock should write response");
+            String::from_utf8(bytes).expect("request should be UTF-8")
+        });
+        let origin = HttpOrigin::parse_exact(&format!("http://{address}"))
+            .expect("loopback origin should be canonical");
+
+        let response = send(
+            &origin,
+            request,
+            None,
+            SendContext {
+                policy: NetworkPolicy::loopback_for_tests(),
+                limits: RuntimeLimits::default(),
+                remaining: Duration::from_secs(5),
+                cancellation: &CancellationHandle::new(),
+                active_dns_workers: &Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .expect("loopback request should complete");
+        assert_eq!(response.status, 204);
+        mock.join().expect("mock should finish")
+    }
+
+    fn get_request(path: &str, query: &str, headers: Vec<HttpHeader>) -> HttpRequest {
+        HttpRequest {
+            method: "GET".to_owned(),
+            path: path.to_owned(),
+            query: query.to_owned(),
+            headers,
+            body: String::new(),
+        }
+    }
+
+    /// Sends one GET for `path` and `query` to a loopback mock and returns the
+    /// request line the mock received.
+    fn request_line_on_the_wire(path: &str, query: &str) -> String {
+        request_head_on_the_wire(&get_request(path, query, Vec::new()))
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Every `User-Agent` header line in a request head, matched in any case.
+    fn user_agent_lines(head: &str) -> Vec<&str> {
+        head.lines()
+            .filter(|line| {
+                line.split_once(':')
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_default_user_agent_names_this_host_release() {
+        assert_eq!(
+            DEFAULT_USER_AGENT,
+            format!("krit/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(HeaderValue::from_str(DEFAULT_USER_AGENT).is_ok());
+    }
+
+    #[test]
+    fn a_request_without_a_user_agent_carries_the_host_default() {
+        let head = request_head_on_the_wire(&get_request(
+            "/",
+            "",
+            vec![HttpHeader {
+                name: "accept".to_owned(),
+                value: "application/json".to_owned(),
+            }],
+        ));
+        assert_eq!(
+            user_agent_lines(&head),
+            [format!("User-Agent: krit/{}", env!("CARGO_PKG_VERSION"))],
+            "{head}"
+        );
+    }
+
+    #[test]
+    fn a_request_user_agent_is_sent_unchanged_and_suppresses_the_default() {
+        for name in ["User-Agent", "user-agent", "USER-AGENT"] {
+            let head = request_head_on_the_wire(&get_request(
+                "/",
+                "",
+                vec![HttpHeader {
+                    name: name.to_owned(),
+                    value: "probe/2.0 (+https://example.test/bot)".to_owned(),
+                }],
+            ));
+            assert_eq!(
+                user_agent_lines(&head),
+                [format!("{name}: probe/2.0 (+https://example.test/bot)")],
+                "{head}"
+            );
+            assert!(!head.contains("krit/"), "{head}");
+        }
+    }
+
+    #[test]
+    fn an_empty_request_user_agent_sends_none_at_all() {
+        // The request's own header still wins over the default, and libcurl
+        // never sends a blank header value, so the request opts out entirely.
+        let head = request_head_on_the_wire(&get_request(
+            "/",
+            "",
+            vec![HttpHeader {
+                name: "user-agent".to_owned(),
+                value: String::new(),
+            }],
+        ));
+        assert!(user_agent_lines(&head).is_empty(), "{head}");
+    }
+
+    #[test]
+    fn libcurl_never_resolves_or_decodes_the_request_path() {
+        // `send` is reached only after validation, which already refuses dot
+        // segments. Calling it directly with one proves libcurl itself never
+        // resolves a path: a dot segment curl removed would have changed the
+        // target after the host checked it.
+        assert_eq!(
+            request_line_on_the_wire("/a/./b/../c", ""),
+            "GET /a/./b/../c HTTP/1.1"
+        );
+        assert_eq!(
+            request_line_on_the_wire("/a;v=1/..;/b", ""),
+            "GET /a;v=1/..;/b HTTP/1.1"
+        );
+        // Escapes are never decoded, and ASCII punctuation passes unchanged.
+        assert_eq!(
+            request_line_on_the_wire("/files/a%20b/100%25/%7E", ""),
+            "GET /files/a%20b/100%25/%7E HTTP/1.1"
+        );
+        assert_eq!(
+            request_line_on_the_wire("/a\"b<c>{d}|e^f`g", ""),
+            "GET /a\"b<c>{d}|e^f`g HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn libcurl_respells_the_path_but_sends_the_query_byte_for_byte() {
+        // The documented exception to "sent as validated" (WEBHOOK-CONTRACTS.md,
+        // "What reaches the wire"): curl writes escape hex in uppercase and
+        // percent-encodes raw non-ASCII path bytes as UTF-8. Neither changes
+        // what the path decodes to, so the traversal decision is unaffected, but
+        // a program that signs its path must sign this spelling.
+        assert_eq!(
+            request_line_on_the_wire("/%41%7e%c3%a9/A%2d", ""),
+            "GET /%41%7E%C3%A9/A%2D HTTP/1.1"
+        );
+        assert_eq!(
+            request_line_on_the_wire("/caf\u{e9}", ""),
+            "GET /caf%C3%A9 HTTP/1.1"
+        );
+        assert_eq!(
+            request_line_on_the_wire("/search", "q=%7e%c3%a9&next=%2f%2e&r=caf\u{e9}"),
+            "GET /search?q=%7e%c3%a9&next=%2f%2e&r=caf\u{e9} HTTP/1.1"
+        );
     }
 
     #[test]

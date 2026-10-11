@@ -88,7 +88,7 @@ Initial required codes:
 | `K3008` | Host capability resource is not a direct valid string literal |
 | `K3009` | Opaque secret is used by a revealing or structural operation |
 | `K3010` | Opaque database transaction handle is used outside a database operation |
-| `K4001` | Generic guest trap or wrong runtime value kind |
+| `K4001` | Generic guest trap, wrong runtime value kind, or HTTP request/response the host refuses (including a request path that breaks the rule in `WEBHOOK-CONTRACTS.md`, "Request paths and queries") |
 | `K4002` | Calling a non-function |
 | `K4003` | Function argument count mismatch |
 | `K4004` | Division or remainder by zero |
@@ -100,6 +100,7 @@ Initial required codes:
 | `K5001` | Required capability not granted |
 | `K5002` | Artifact import/world does not match the authorized host interface |
 | `K5003` | Required host contract is unavailable in direct source execution |
+| `K5006` | Secret would be injected into an origin its manifest binding does not list |
 | `K5101` | Wasm fuel budget exhausted |
 | `K5102` | Wasm wall-clock deadline exceeded |
 | `K5103` | Wasm memory, table, instance, stack, or host resource limit exceeded |
@@ -161,7 +162,7 @@ file's first position.
 | `1` | Source, compile, runtime, test, or conformance failure |
 | `2` | Invalid CLI usage |
 | `3` | Package resolution, lockfile, registry, or build-plan failure |
-| `4` | Capability, unavailable-host, or import authorization denial (`K5001`, `K5002`, or `K5003`); artifact-aware permission reports are still printed |
+| `4` | Capability, unavailable-host, import, or secret-binding authorization denial (`K5001`, `K5002`, `K5003`, or `K5006`); artifact-aware permission reports are still printed |
 | `101` | Internal compiler error |
 
 An internal compiler error is always a Krit bug. It must include a stable crash

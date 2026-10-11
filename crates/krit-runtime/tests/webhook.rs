@@ -708,3 +708,503 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
     assert_eq!(error.code(), "K5104");
     mock.join().expect("first HTTP mock should finish");
 }
+
+/// Builds a webhook that acquires `secret` and presents it to `origin`.
+fn bearer_webhook(secret: &str, origin: &str) -> BuiltComponent {
+    compile(
+        &format!(
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    match secret("{secret}") {{
+        Ok(token) => match http_request("{origin}", request, Some(token)) {{
+            Ok(response) => response,
+            Err(error) => record {{ status: 598, headers: [], body: error }},
+        }},
+        Err(error) => record {{ status: 500, headers: [], body: error }},
+    }}
+}}
+"#
+        ),
+        &["http.request", "secret.read"],
+    )
+}
+
+/// A host holding both reference secrets that approves bearer use at every
+/// given origin, so only the manifest binding can refuse a request.
+fn bearer_host(origins: &[&str]) -> AgentHost {
+    let inputs = HostInputs::new(
+        BTreeMap::new(),
+        SecretStore::new(BTreeMap::from([
+            ("github-token".to_owned(), b"github-private".to_vec()),
+            ("message-token".to_owned(), b"message-private".to_vec()),
+        ]))
+        .expect("secret store should be valid"),
+    )
+    .expect("inputs should be valid")
+    .with_network_policy(NetworkPolicy::loopback_for_tests().with_plaintext_bearer_for_tests());
+    AgentHost::new(
+        inputs,
+        AgentHostPolicy::default(),
+        Arc::new(
+            ExplicitApprovalPolicy::new(
+                origins
+                    .iter()
+                    .map(|origin| (ApprovalOperation::HttpBearer, (*origin).to_owned())),
+            )
+            .expect("approvals should be valid"),
+        ),
+    )
+    .expect("agent host should be valid")
+}
+
+/// The webhook-agent manifest shape with each secret bound to its own origin.
+fn bound_manifest(github_origin: &str, message_origin: &str) -> Manifest {
+    manifest(&format!(
+        "http = [\"{github_origin}\", \"{message_origin}\"]\n\
+         \n\
+         [secrets.github-token]\n\
+         origins = [\"{github_origin}\"]\n\
+         \n\
+         [secrets.message-token]\n\
+         origins = [\"{message_origin}\"]\n\
+         inject = \"bearer\""
+    ))
+}
+
+/// Accepts one request on `listener`, answers 202, and returns the raw bytes.
+fn accept_one(listener: TcpListener) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("origin should accept one request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout should configure");
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).expect("request should read");
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 9\r\nConnection: close\r\n\r\ndelivered",
+            )
+            .expect("response should write");
+        String::from_utf8(bytes).expect("request should be UTF-8")
+    })
+}
+
+fn listener_origin(listener: &TcpListener) -> String {
+    format!(
+        "http://127.0.0.1:{}",
+        listener.local_addr().expect("listener address").port()
+    )
+}
+
+/// Proves that nothing connected to `listener`: a refused request must not
+/// even open a connection, let alone send a credential.
+fn assert_never_contacted(listener: &TcpListener) {
+    listener
+        .set_nonblocking(true)
+        .expect("listener should become nonblocking");
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) => panic!("unexpected accept failure: {error}"),
+        Ok(_) => panic!("a refused bearer request reached the network"),
+    }
+}
+
+#[test]
+fn a_swapped_secret_is_refused_with_k5006_before_any_bytes_leave() {
+    // The swapped-token probe: the reference agent's GitHub credential sent to
+    // its messaging origin. Both origins and both secrets are granted and both
+    // bearer uses are approved; only the binding forbids the pairing.
+    let github = TcpListener::bind("127.0.0.1:0").expect("GitHub listener should bind");
+    let message = TcpListener::bind("127.0.0.1:0").expect("message listener should bind");
+    let github_origin = listener_origin(&github);
+    let message_origin = listener_origin(&message);
+    let artifact = bearer_webhook("github-token", &message_origin);
+    let bound = bound_manifest(&github_origin, &message_origin);
+    let host = bearer_host(&[&github_origin, &message_origin]);
+
+    let error = Runtime::default()
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &GrantSet::from_manifest(&bound),
+            &host,
+            request("summary"),
+        )
+        .expect_err("a secret sent to an unbound origin must be refused");
+    assert_eq!(error.code(), "K5006");
+    assert_eq!(error.kind(), krit_runtime::RuntimeErrorKind::Authorization);
+    assert_eq!(
+        error.message(),
+        format!("secret `github-token` is not bound to origin `{message_origin}`")
+    );
+    assert!(!error.message().contains("github-private"));
+    assert_never_contacted(&message);
+    assert_never_contacted(&github);
+
+    // A name in both forms is bound by its table, so the legacy list entry
+    // does not reopen the swapped pairing.
+    let both = manifest(&format!(
+        "http = [\"{github_origin}\", \"{message_origin}\"]\n\
+         secrets = [\"github-token\", \"message-token\"]\n\
+         \n\
+         [secrets.github-token]\n\
+         origins = [\"{github_origin}\"]"
+    ));
+    let error = Runtime::default()
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &GrantSet::from_manifest(&both),
+            &host,
+            request("summary"),
+        )
+        .expect_err("the table binding must win over the legacy list");
+    assert_eq!(error.code(), "K5006");
+    assert_never_contacted(&message);
+}
+
+#[test]
+fn bound_secrets_reach_their_origin_and_legacy_secrets_stay_unbound() {
+    let github = TcpListener::bind("127.0.0.1:0").expect("GitHub listener should bind");
+    let message = TcpListener::bind("127.0.0.1:0").expect("message listener should bind");
+    let github_origin = listener_origin(&github);
+    let message_origin = listener_origin(&message);
+    let host = bearer_host(&[&github_origin, &message_origin]);
+
+    // A correctly bound pairing is delivered with its own credential.
+    let bound = bound_manifest(&github_origin, &message_origin);
+    let correct = bearer_webhook("message-token", &message_origin);
+    let server = accept_one(message);
+    let result = Runtime::default()
+        .invoke_webhook_with_host(
+            &correct.bytes,
+            &correct.metadata,
+            &GrantSet::from_manifest(&bound),
+            &host,
+            request(""),
+        )
+        .expect("a bound secret must reach its own origin");
+    assert_eq!(result.response.status, 202);
+    assert_eq!(result.response.body, "delivered");
+    let captured = server.join().expect("message origin should finish");
+    let lowercase = captured.to_ascii_lowercase();
+    assert!(lowercase.contains("authorization: bearer message-private\r\n"));
+    assert!(!captured.contains("github-private"));
+
+    // The legacy flat list keeps 0.2 behavior: an unbound secret may reach any
+    // granted origin, including the one the probe targets.
+    let message = TcpListener::bind("127.0.0.1:0").expect("message listener should bind");
+    let message_origin = listener_origin(&message);
+    let legacy = manifest(&format!(
+        "http = [\"{github_origin}\", \"{message_origin}\"]\n\
+         secrets = [\"github-token\", \"message-token\"]"
+    ));
+    let swapped = bearer_webhook("github-token", &message_origin);
+    let host = bearer_host(&[&github_origin, &message_origin]);
+    let server = accept_one(message);
+    let result = Runtime::default()
+        .invoke_webhook_with_host(
+            &swapped.bytes,
+            &swapped.metadata,
+            &GrantSet::from_manifest(&legacy),
+            &host,
+            request(""),
+        )
+        .expect("an unbound legacy secret still reaches any granted origin");
+    assert_eq!(result.response.status, 202);
+    let captured = server.join().expect("message origin should finish");
+    assert!(
+        captured
+            .to_ascii_lowercase()
+            .contains("authorization: bearer github-private\r\n")
+    );
+    drop(github);
+
+    // The artifact-aware report shows the difference a reviewer must see.
+    let runtime = Runtime::default();
+    let report = runtime
+        .permissions(
+            &swapped.bytes,
+            &swapped.metadata,
+            &GrantSet::from_manifest(&legacy),
+        )
+        .expect("legacy permissions should evaluate")
+        .render_human();
+    assert!(report.contains("  github-token (bearer): UNBOUND (any granted origin)\n"));
+    let report = runtime
+        .permissions(
+            &swapped.bytes,
+            &swapped.metadata,
+            &GrantSet::from_manifest(&bound_manifest(&github_origin, &message_origin)),
+        )
+        .expect("bound permissions should evaluate");
+    assert!(
+        report
+            .render_human()
+            .contains(&format!("  github-token (bearer): {github_origin}\n"))
+    );
+    assert!(report.render_json().contains(&format!(
+        "\"secretBindings\":[{{\"secret\":\"github-token\",\"inject\":\"bearer\",\"binding\":\"bound\",\"origins\":[\"{github_origin}\"]}}"
+    )));
+}
+
+/// One spelling of every traversal form the host refuses in a request path:
+/// dot segments (bare, behind `;` path parameters or a decoded `?` or `#`, and
+/// padded with escaped spaces), percent-encoded `.`, `/`, `\`, and control
+/// bytes in either case, double-encoded and overlong UTF-8 escapes (including
+/// those only a lenient decoder reads), and a malformed escape.
+const TRAVERSAL_PATHS: [&str; 26] = [
+    "/api/../admin",
+    "/api/./admin",
+    "/api/..;/admin",
+    "/api/.;/admin",
+    "/api/..;x=1/admin",
+    "/api/..%3B/admin",
+    "/api/..%3F/admin",
+    "/api/.%3f/admin",
+    "/api/..%23/admin",
+    "/api/..%20/admin",
+    "/api/%2e%2e/admin",
+    "/api/.%2E/admin",
+    "/api%2fadmin",
+    "/api%2Fadmin",
+    "/api%5c..%5cadmin",
+    "/api%5C..%5Cadmin",
+    "/api/..%00/admin",
+    "/api/..%0a/admin",
+    "/api/..%09/admin",
+    "/api/%252e%252e/admin",
+    "/api%252fadmin",
+    "/api/%c0%ae%c0%ae/admin",
+    "/api/%e0%80%ae",
+    "/api/..%c1%dc..%c1%dcadmin",
+    "/api/%c0n%c0n/admin",
+    "/api/50%",
+];
+
+const TRAVERSAL_MESSAGE: &str = "HTTP request path must not contain a dot segment, a percent-encoded `.`, `/`, `\\`, or control byte, a double-encoded or overlong UTF-8 escape, or a malformed percent escape";
+
+#[test]
+fn inbound_paths_refuse_traversal_forms_before_guest_execution() {
+    let echo = compile(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.path }
+}
+"#,
+        &[],
+    );
+    let grants = GrantSet::from_manifest(&manifest(""));
+    let inputs =
+        HostInputs::new(BTreeMap::new(), SecretStore::default()).expect("inputs should be valid");
+    let with_path = |path: &str| HttpRequest {
+        path: path.to_owned(),
+        ..request("")
+    };
+
+    for path in TRAVERSAL_PATHS {
+        let error = Runtime::default()
+            .invoke_webhook(
+                &echo.bytes,
+                &echo.metadata,
+                &grants,
+                &inputs,
+                with_path(path),
+            )
+            .expect_err("a traversal form must fail before guest execution");
+        assert_eq!(error.code(), "K4001", "`{path}`");
+        assert_eq!(error.message(), TRAVERSAL_MESSAGE, "`{path}`");
+    }
+
+    // Ordinary dots and every other escape still reach the guest unchanged.
+    for path in [
+        "/.well-known/hook",
+        "/hooks/v1.2/a%20b",
+        "/hooks/100%25",
+        "/hooks/files;v=2",
+        "/hooks/C%23",
+        "/hooks/caf%E9",
+    ] {
+        let result = Runtime::default()
+            .invoke_webhook(
+                &echo.bytes,
+                &echo.metadata,
+                &grants,
+                &inputs,
+                with_path(path),
+            )
+            .unwrap_or_else(|error| panic!("`{path}` must be accepted: {error}"));
+        assert_eq!(result.response.body, path);
+    }
+}
+
+/// A webhook that forwards its inbound body as the outbound request path: the
+/// injection shape that string building opens up.
+fn path_forwarding_artifact(origin: &str) -> BuiltComponent {
+    compile(
+        &format!(
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    let outbound: HttpRequest = record {{
+        method: "GET",
+        path: request.body,
+        query: "",
+        headers: [],
+        body: "",
+    }};
+    match http_request("{origin}", outbound, None) {{
+        Ok(response) => response,
+        Err(error) => record {{ status: 598, headers: [], body: error }},
+    }}
+}}
+"#
+        ),
+        &["http.request"],
+    )
+}
+
+#[test]
+fn outbound_paths_refuse_traversal_forms_before_any_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("origin listener should bind");
+    let origin = listener_origin(&listener);
+    let artifact = path_forwarding_artifact(&origin);
+    let grants = GrantSet::from_manifest(&manifest(&format!("http = [\"{origin}\"]")));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default())
+        .expect("inputs should be valid")
+        .with_network_policy(NetworkPolicy::loopback_for_tests());
+
+    for path in TRAVERSAL_PATHS {
+        let error = Runtime::default()
+            .invoke_webhook(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &inputs,
+                request(path),
+            )
+            .expect_err("a traversal form must trap the invocation");
+        assert_eq!(error.code(), "K4001", "`{path}`");
+        assert_eq!(error.message(), TRAVERSAL_MESSAGE, "`{path}`");
+    }
+    assert_never_contacted(&listener);
+
+    // An ordinary path reaches the origin unresolved and undecoded. libcurl only
+    // respells it: escape hex is sent in uppercase.
+    listener
+        .set_nonblocking(false)
+        .expect("listener should become blocking");
+    let server = accept_one(listener);
+    let result = Runtime::default()
+        .invoke_webhook(
+            &artifact.bytes,
+            &artifact.metadata,
+            &grants,
+            &inputs,
+            request("/api/files;v=2/v1.2/a%20b/%7euser"),
+        )
+        .expect("an ordinary path must be sent");
+    assert_eq!(result.response.status, 202);
+    let captured = server.join().expect("origin should finish");
+    assert!(
+        captured.starts_with("GET /api/files;v=2/v1.2/a%20b/%7Euser HTTP/1.1\r\n"),
+        "{captured}"
+    );
+}
+
+/// Every `User-Agent` header line in a captured request head, in any case.
+fn user_agent_lines(captured: &str) -> Vec<&str> {
+    captured
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        })
+        .collect()
+}
+
+/// A webhook that forwards its inbound headers onto a bodyless outbound GET.
+fn header_forwarding_artifact(origin: &str) -> BuiltComponent {
+    compile(
+        &format!(
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    let outbound: HttpRequest = record {{
+        method: "GET",
+        path: "/agent",
+        query: "",
+        headers: request.headers,
+        body: "",
+    }};
+    match http_request("{origin}", outbound, None) {{
+        Ok(response) => response,
+        Err(error) => record {{ status: 598, headers: [], body: error }},
+    }}
+}}
+"#
+        ),
+        &["http.request"],
+    )
+}
+
+#[test]
+fn guest_http_requests_carry_the_host_user_agent_unless_they_name_one() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("origin listener should bind");
+    let origin = listener_origin(&listener);
+    let artifact = header_forwarding_artifact(&origin);
+    let grants = GrantSet::from_manifest(&manifest(&format!("http = [\"{origin}\"]")));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default())
+        .expect("inputs should be valid")
+        .with_network_policy(NetworkPolicy::loopback_for_tests());
+    let invoke = |headers: Vec<HttpHeader>| {
+        let mut inbound = request("");
+        inbound.headers = headers;
+        let result = Runtime::default()
+            .invoke_webhook(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &inputs,
+                inbound,
+            )
+            .expect("the outbound request should be sent");
+        assert_eq!(result.response.status, 202);
+    };
+
+    // A request that names no User-Agent is sent with the host default.
+    let server = accept_one(listener.try_clone().expect("listener should clone"));
+    invoke(vec![HttpHeader {
+        name: "accept".to_owned(),
+        value: "application/json".to_owned(),
+    }]);
+    let captured = server.join().expect("origin should finish");
+    assert_eq!(
+        user_agent_lines(&captured),
+        [format!("User-Agent: krit/{}", env!("CARGO_PKG_VERSION"))],
+        "{captured}"
+    );
+
+    // A guest-supplied User-Agent is sent unchanged, and the default is not
+    // added beside it.
+    let server = accept_one(listener);
+    invoke(vec![HttpHeader {
+        name: "user-agent".to_owned(),
+        value: "probe/2.0 (+https://example.test/bot)".to_owned(),
+    }]);
+    let captured = server.join().expect("origin should finish");
+    assert_eq!(
+        user_agent_lines(&captured),
+        ["user-agent: probe/2.0 (+https://example.test/bot)"],
+        "{captured}"
+    );
+    assert!(!captured.contains("krit/"), "{captured}");
+}

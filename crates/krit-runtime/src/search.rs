@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn a_connector_path_must_be_a_safe_origin_form_path() {
-        for path in ["/query", "/v1/search", "/"] {
+        for path in ["/query", "/v1/search", "/", "/v1.2/search%20all"] {
             assert!(
                 connector("https://search.example", path).validate().is_ok(),
                 "path `{path}` should be accepted"
@@ -722,6 +722,17 @@ mod tests {
             "/query\u{7f}",               // control byte
             "/query\u{00e9}",             // non-ASCII
             "/\u{0}",                     // NUL
+            "/v1/../admin",               // dot segment
+            "/v1/%2e%2e/admin",           // encoded dot segment
+            "/v1%2Fsearch",               // encoded slash
+            "/v1%5csearch",               // encoded backslash
+            "/v1/search%",                // malformed escape
+            "/v1/..;/admin",              // dot segment behind a path parameter
+            "/v1/%252e%252e/admin",       // double-encoded dot segment
+            "/v1/%c0%ae%c0%ae/admin",     // overlong UTF-8 dot segment
+            "/v1/..%3F/admin",            // dot segment behind a decoded `?`
+            "/v1/..%0a/admin",            // escaped control byte
+            "/v1/search all",             // raw space
         ] {
             assert!(
                 connector("https://search.example", path)

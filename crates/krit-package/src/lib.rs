@@ -22,7 +22,69 @@ pub struct Manifest {
     pub dependencies: BTreeMap<String, toml::Value>,
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// `[secrets.<name>]` tables. Each one grants the secret and binds it to
+    /// the exact HTTP origins it may be injected into.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretBinding>,
 }
+
+/// One `[secrets.<name>]` table.
+///
+/// The table both grants the secret and restricts it to `origins`, each of
+/// which must also be a granted `http` origin. A secret named only by the
+/// legacy `[capabilities] secrets` list stays unbound and may reach any granted
+/// origin; a name present in both forms is bound by its table.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SecretBinding {
+    pub origins: Vec<String>,
+    #[serde(default)]
+    pub inject: SecretInjection,
+}
+
+/// How the host presents a secret to an origin.
+///
+/// Bearer injection is the only supported form; any other spelling is a
+/// manifest error rather than a silently ignored request.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretInjection {
+    #[default]
+    Bearer,
+}
+
+impl SecretInjection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+        }
+    }
+}
+
+/// Whether a granted secret is restricted to a declared set of origins.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretBindingStatus {
+    /// Declared by a `[secrets.<name>]` table; only its origins may receive it.
+    Bound,
+    /// Declared only by the legacy list; any granted origin may receive it.
+    Unbound,
+}
+
+/// The reviewable binding of one granted secret.
+///
+/// `origins` is sorted and is empty for an unbound secret, whose reach is
+/// every granted `http` origin.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct SecretBindingFact {
+    pub secret: String,
+    pub inject: SecretInjection,
+    pub binding: SecretBindingStatus,
+    pub origins: Vec<String>,
+}
+
+/// Human label for a legacy secret that any granted origin may receive.
+pub const UNBOUND_SECRET_LABEL: &str = "UNBOUND (any granted origin)";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +144,8 @@ pub struct PermissionPlan {
     pub schema: u32,
     pub package: String,
     pub requested: Vec<PermissionRequest>,
+    #[serde(rename = "secretBindings", skip_serializing_if = "Vec::is_empty")]
+    pub secret_bindings: Vec<SecretBindingFact>,
     #[serde(rename = "grantStatus")]
     pub grant_status: &'static str,
 }
@@ -196,6 +260,7 @@ impl Manifest {
         for name in &self.capabilities.secrets {
             validate_resource_name("secret name", name)?;
         }
+        self.validate_secret_bindings()?;
         validate_sorted_unique_names("AI adapter", &self.capabilities.ai)?;
         validate_capability_count("AI adapter", &self.capabilities.ai)?;
         for name in &self.capabilities.ai {
@@ -258,6 +323,95 @@ impl Manifest {
         Ok(())
     }
 
+    /// Validates every `[secrets.<name>]` table.
+    ///
+    /// A binding names at least one origin, each origin is canonical, unique,
+    /// and already granted under `[capabilities] http`, and only bearer
+    /// injection is accepted. A binding can therefore narrow where a secret
+    /// goes but never adds network authority of its own.
+    fn validate_secret_bindings(&self) -> Result<(), ManifestError> {
+        validate_capability_count("secret name", &self.secret_names())?;
+        for (name, binding) in &self.secrets {
+            validate_resource_name("secret name", name)?;
+            if binding.origins.is_empty() {
+                return Err(ManifestError::new(format!(
+                    "secret `{name}` must bind at least one origin"
+                )));
+            }
+            let mut seen = Vec::with_capacity(binding.origins.len());
+            for origin in &binding.origins {
+                validate_http_origin(origin)?;
+                if seen.contains(&origin) {
+                    return Err(ManifestError::new(format!(
+                        "secret `{name}` binds origin `{origin}` more than once"
+                    )));
+                }
+                seen.push(origin);
+                if !self.capabilities.http.contains(origin) {
+                    return Err(ManifestError::new(format!(
+                        "secret `{name}` is bound to origin `{origin}`, which is not a granted `http` origin"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every granted secret name, sorted and unique: the legacy
+    /// `[capabilities] secrets` list together with every `[secrets.<name>]`
+    /// table.
+    pub fn secret_names(&self) -> Vec<String> {
+        let mut names = self
+            .capabilities
+            .secrets
+            .iter()
+            .chain(self.secrets.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The binding of every granted secret, sorted by secret name.
+    pub fn secret_bindings(&self) -> Vec<SecretBindingFact> {
+        self.secret_names()
+            .into_iter()
+            .map(|secret| match self.secrets.get(&secret) {
+                Some(binding) => {
+                    let mut origins = binding.origins.clone();
+                    origins.sort();
+                    SecretBindingFact {
+                        secret,
+                        inject: binding.inject,
+                        binding: SecretBindingStatus::Bound,
+                        origins,
+                    }
+                }
+                None => SecretBindingFact {
+                    secret,
+                    inject: SecretInjection::Bearer,
+                    binding: SecretBindingStatus::Unbound,
+                    origins: Vec::new(),
+                },
+            })
+            .collect()
+    }
+
+    /// Whether the host may inject `secret` as the bearer credential of a
+    /// request to `origin`.
+    ///
+    /// Both must be granted, and a secret bound by a `[secrets.<name>]` table
+    /// may reach only the origins that table lists.
+    pub fn permits_bearer(&self, secret: &str, origin: &str) -> bool {
+        self.grants_permission("secret.read", Some(secret))
+            && self.grants_permission("http.request", Some(origin))
+            && self
+                .secrets
+                .get(secret)
+                .is_none_or(|binding| binding.origins.iter().any(|bound| bound == origin))
+    }
+
     pub fn resolve_entry(&self, manifest_path: &Path) -> Result<PathBuf, ManifestError> {
         let root = manifest_path
             .parent()
@@ -306,12 +460,14 @@ impl Manifest {
                 resource: Some(resource),
             }
         }));
-        requested.extend(self.capabilities.secrets.iter().cloned().map(|resource| {
-            PermissionRequest {
-                capability: "secret.read",
-                resource: Some(resource),
-            }
-        }));
+        requested.extend(
+            self.secret_names()
+                .into_iter()
+                .map(|resource| PermissionRequest {
+                    capability: "secret.read",
+                    resource: Some(resource),
+                }),
+        );
         requested.extend(
             self.capabilities
                 .ai
@@ -387,6 +543,7 @@ impl Manifest {
             schema: 1,
             package: self.package.name.clone(),
             requested,
+            secret_bindings: self.secret_bindings(),
             grant_status: "not-evaluated",
         }
     }
@@ -411,6 +568,7 @@ impl Manifest {
                     .secrets
                     .iter()
                     .any(|granted| granted == resource)
+                    || self.secrets.contains_key(resource)
             }),
             "ai.invoke" => resource.is_some_and(|resource| {
                 self.capabilities
@@ -519,12 +677,34 @@ impl PermissionPlan {
                 output.push('\n');
             }
         }
+        render_secret_bindings(&mut output, &self.secret_bindings);
         output.push_str("Deployment grants: not evaluated\n");
         output
     }
 
     pub fn render_json(&self) -> String {
         serde_json::to_string(self).expect("permission plan serialization cannot fail")
+    }
+}
+
+/// Appends the human `Secret bindings:` section shared by every permission
+/// report. Nothing is written when no secret is granted.
+pub fn render_secret_bindings(output: &mut String, bindings: &[SecretBindingFact]) {
+    if bindings.is_empty() {
+        return;
+    }
+    output.push_str("Secret bindings:\n");
+    for binding in bindings {
+        output.push_str("  ");
+        output.push_str(&binding.secret);
+        output.push_str(" (");
+        output.push_str(binding.inject.as_str());
+        output.push_str("): ");
+        match binding.binding {
+            SecretBindingStatus::Bound => output.push_str(&binding.origins.join(", ")),
+            SecretBindingStatus::Unbound => output.push_str(UNBOUND_SECRET_LABEL),
+        }
+        output.push('\n');
     }
 }
 
@@ -766,7 +946,7 @@ mod tests {
         let manifest = Manifest::parse(VALID).expect("manifest should be valid");
         assert_eq!(
             manifest.permission_plan().render_json(),
-            "{\"schema\":1,\"package\":\"akshay/krit\",\"requested\":[{\"capability\":\"config.read\",\"resource\":\"agent.model\"},{\"capability\":\"config.read\",\"resource\":\"agent.timeout-ms\"},{\"capability\":\"http.request\",\"resource\":\"https://api.github.com\"},{\"capability\":\"http.request\",\"resource\":\"https://slack.com:8443\"},{\"capability\":\"io.stdout\"},{\"capability\":\"secret.read\",\"resource\":\"github-token\"},{\"capability\":\"secret.read\",\"resource\":\"slack-token\"}],\"grantStatus\":\"not-evaluated\"}"
+            "{\"schema\":1,\"package\":\"akshay/krit\",\"requested\":[{\"capability\":\"config.read\",\"resource\":\"agent.model\"},{\"capability\":\"config.read\",\"resource\":\"agent.timeout-ms\"},{\"capability\":\"http.request\",\"resource\":\"https://api.github.com\"},{\"capability\":\"http.request\",\"resource\":\"https://slack.com:8443\"},{\"capability\":\"io.stdout\"},{\"capability\":\"secret.read\",\"resource\":\"github-token\"},{\"capability\":\"secret.read\",\"resource\":\"slack-token\"}],\"secretBindings\":[{\"secret\":\"github-token\",\"inject\":\"bearer\",\"binding\":\"unbound\",\"origins\":[]},{\"secret\":\"slack-token\",\"inject\":\"bearer\",\"binding\":\"unbound\",\"origins\":[]}],\"grantStatus\":\"not-evaluated\"}"
         );
     }
 
@@ -886,5 +1066,176 @@ mod tests {
         ))
         .expect_err("unsorted state stores should fail");
         assert!(error.to_string().contains("sorted and unique"));
+    }
+
+    const BOUND: &str = r#"
+        schema = 1
+
+        [package]
+        name = "akshay/krit"
+        version = "0.2.0"
+        edition = "2026"
+        entry = "examples/factorial.krit"
+        license = "Apache-2.0"
+
+        [capabilities]
+        http = ["https://api.github.com", "https://slack.com:8443"]
+        secrets = ["github-token", "legacy-token"]
+
+        [secrets.github-token]
+        origins = ["https://api.github.com"]
+
+        [secrets.slack-token]
+        origins = ["https://slack.com:8443", "https://api.github.com"]
+        inject = "bearer"
+    "#;
+
+    #[test]
+    fn secret_tables_grant_and_bind_while_the_legacy_list_stays_unbound() {
+        let manifest = Manifest::parse(BOUND).expect("bound manifest should be valid");
+        assert_eq!(
+            manifest.secret_names(),
+            ["github-token", "legacy-token", "slack-token"]
+        );
+        for name in ["github-token", "legacy-token", "slack-token"] {
+            assert!(manifest.grants_permission("secret.read", Some(name)));
+        }
+        assert!(!manifest.grants_permission("secret.read", Some("missing-token")));
+
+        // A name in both forms is bound by its table.
+        assert!(manifest.permits_bearer("github-token", "https://api.github.com"));
+        assert!(!manifest.permits_bearer("github-token", "https://slack.com:8443"));
+        assert!(manifest.permits_bearer("slack-token", "https://slack.com:8443"));
+        assert!(manifest.permits_bearer("slack-token", "https://api.github.com"));
+        // A legacy secret reaches any granted origin, and nothing else.
+        assert!(manifest.permits_bearer("legacy-token", "https://api.github.com"));
+        assert!(manifest.permits_bearer("legacy-token", "https://slack.com:8443"));
+        assert!(!manifest.permits_bearer("legacy-token", "https://other.example"));
+        assert!(!manifest.permits_bearer("missing-token", "https://api.github.com"));
+
+        // A dotted resource name is a quoted TOML key.
+        let dotted =
+            Manifest::parse(&BOUND.replace("[secrets.slack-token]", "[secrets.\"slack.token\"]"))
+                .expect("a quoted dotted secret name should be valid");
+        assert!(dotted.permits_bearer("slack.token", "https://slack.com:8443"));
+
+        assert_eq!(
+            manifest.secret_bindings(),
+            [
+                SecretBindingFact {
+                    secret: "github-token".to_owned(),
+                    inject: SecretInjection::Bearer,
+                    binding: SecretBindingStatus::Bound,
+                    origins: vec!["https://api.github.com".to_owned()],
+                },
+                SecretBindingFact {
+                    secret: "legacy-token".to_owned(),
+                    inject: SecretInjection::Bearer,
+                    binding: SecretBindingStatus::Unbound,
+                    origins: Vec::new(),
+                },
+                SecretBindingFact {
+                    secret: "slack-token".to_owned(),
+                    inject: SecretInjection::Bearer,
+                    binding: SecretBindingStatus::Bound,
+                    origins: vec![
+                        "https://api.github.com".to_owned(),
+                        "https://slack.com:8443".to_owned(),
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn permission_plans_report_every_secret_binding() {
+        let plan = Manifest::parse(BOUND)
+            .expect("bound manifest should be valid")
+            .permission_plan();
+        assert_eq!(
+            plan.render_json(),
+            "{\"schema\":1,\"package\":\"akshay/krit\",\"requested\":[{\"capability\":\"http.request\",\"resource\":\"https://api.github.com\"},{\"capability\":\"http.request\",\"resource\":\"https://slack.com:8443\"},{\"capability\":\"secret.read\",\"resource\":\"github-token\"},{\"capability\":\"secret.read\",\"resource\":\"legacy-token\"},{\"capability\":\"secret.read\",\"resource\":\"slack-token\"}],\"secretBindings\":[{\"secret\":\"github-token\",\"inject\":\"bearer\",\"binding\":\"bound\",\"origins\":[\"https://api.github.com\"]},{\"secret\":\"legacy-token\",\"inject\":\"bearer\",\"binding\":\"unbound\",\"origins\":[]},{\"secret\":\"slack-token\",\"inject\":\"bearer\",\"binding\":\"bound\",\"origins\":[\"https://api.github.com\",\"https://slack.com:8443\"]}],\"grantStatus\":\"not-evaluated\"}"
+        );
+        assert_eq!(
+            plan.render_human(),
+            "Requested capabilities for akshay/krit:\n  \
+             http.request: https://api.github.com\n  \
+             http.request: https://slack.com:8443\n  \
+             secret.read: github-token\n  \
+             secret.read: legacy-token\n  \
+             secret.read: slack-token\n\
+             Secret bindings:\n  \
+             github-token (bearer): https://api.github.com\n  \
+             legacy-token (bearer): UNBOUND (any granted origin)\n  \
+             slack-token (bearer): https://api.github.com, https://slack.com:8443\n\
+             Deployment grants: not evaluated\n"
+        );
+
+        // A plan without secrets keeps its exact pre-binding shape.
+        let plain =
+            Manifest::parse(&VALID.replace("secrets = [\"github-token\", \"slack-token\"]", ""))
+                .expect("secret-free manifest should be valid")
+                .permission_plan();
+        assert!(!plain.render_json().contains("secretBindings"));
+        assert!(!plain.render_human().contains("Secret bindings"));
+    }
+
+    #[test]
+    fn secret_bindings_fail_closed() {
+        for (from, to, expected) in [
+            (
+                "origins = [\"https://api.github.com\"]",
+                "origins = [\"https://other.example\"]",
+                "not a granted `http` origin",
+            ),
+            (
+                "origins = [\"https://api.github.com\"]",
+                "origins = []",
+                "must bind at least one origin",
+            ),
+            (
+                "origins = [\"https://api.github.com\"]",
+                "origins = [\"https://api.github.com\", \"https://api.github.com\"]",
+                "more than once",
+            ),
+            (
+                "origins = [\"https://api.github.com\"]",
+                "origins = [\"https://api.github.com/\"]",
+                "invalid HTTP origin",
+            ),
+            (
+                "inject = \"bearer\"",
+                "inject = \"basic\"",
+                "unknown variant",
+            ),
+            (
+                "inject = \"bearer\"",
+                "inject = \"Bearer\"",
+                "unknown variant",
+            ),
+            (
+                "inject = \"bearer\"",
+                "header = \"x-api-key\"",
+                "unknown field",
+            ),
+            (
+                "[secrets.github-token]",
+                "[secrets.GitHub-Token]",
+                "must use 1-64 lowercase",
+            ),
+            (
+                "[secrets.github-token]\n        origins = [\"https://api.github.com\"]",
+                "[secrets.github-token]",
+                "missing field `origins`",
+            ),
+        ] {
+            assert!(BOUND.contains(from), "fixture must contain `{from}`");
+            let error = Manifest::parse(&BOUND.replacen(from, to, 1))
+                .expect_err("invalid secret binding must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "`{to}` produced `{error}`"
+            );
+        }
     }
 }
