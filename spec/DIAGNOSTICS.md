@@ -27,8 +27,20 @@ LSP `DiagnosticSeverity.Warning` and errors with `DiagnosticSeverity.Error`,
 and `krit/compilerFacts` diagnostics carry the same `severity` strings as the
 JSON Lines format.
 
-The schema reserves `info` for informational diagnostics; no command emits it
-yet.
+The language server bounds the warnings it publishes for one document, so that
+a document within its size limit always fits in a protocol frame. It keeps the
+first 100 warnings in the order above, and stops before the first warning that
+would take their combined message text past 64 KiB. When it leaves warnings
+out, it publishes one `K8003` notice after the warnings it kept: the notice
+sits at the span of the first warning left out, has LSP
+`DiagnosticSeverity.Information`, and states how many warnings were left out.
+The error that rejects the document, if any, is always published, last.
+`krit/compilerFacts` returns the same list, with severity `info` for the
+notice. The commands above do not bound warnings.
+
+The schema reserves `info` for informational diagnostics. Only the language
+server's `K8003` notice uses it; commands never report an `info` diagnostic on
+standard error.
 
 ## Human format
 
@@ -92,7 +104,7 @@ fields and must reject an unknown schema number.
 | `K9000`-`K9999` | Lints: warnings by default |
 
 A code's severity is part of its contract within an edition. Codes outside the
-lint range are errors unless the table below marks them as warnings. Lints
+lint range are errors unless the table below gives them another severity. Lints
 report readability, safety, and authority hazards in programs that are
 otherwise valid; they are warnings by default, so adding a lint never rejects
 a program that checked before.
@@ -161,6 +173,7 @@ Initial required codes:
 | `K7004` | Artifact metadata, byte size, or content digest mismatch |
 | `K8001` | Source is not canonically formatted in formatter check mode |
 | `K8002` | Language-server input or open-document state exceeds a bounded limit |
+| `K8003` | Info: the language server left a document's remaining warnings out of its published diagnostics at the bounded limit |
 | `K8101` | Authoring assistance is disabled or provider configuration is invalid |
 | `K8102` | Authoring context, range, path, ignore, redaction, or privacy validation failed |
 | `K8103` | Authoring provider transport or strict response decoding failed |

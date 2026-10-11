@@ -36,6 +36,17 @@ const MAX_COMPILER_FACT_DYNAMIC_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_FIELD_REPAIR_WORK_BYTES: usize = 1024 * 1024;
 const MAX_FIELD_REPAIR_ATTEMPTS: usize = 16;
+/// The most analysis warnings one document publishes. A document can hold a
+/// warning for every few bytes of source (each read of `_` is one), so without
+/// this bound a document well under `MAX_DOCUMENT_BYTES` could need a
+/// `publishDiagnostics` notification above the protocol frame limit.
+const MAX_PUBLISHED_WARNINGS: usize = 100;
+/// The most warning message bytes one document publishes, so that warnings
+/// whose messages quote source stay bounded too.
+const MAX_PUBLISHED_WARNING_MESSAGE_BYTES: usize = 64 * 1024;
+/// The code of the notice that stands in for the warnings a document leaves
+/// out of its published diagnostics.
+const OMITTED_WARNINGS_CODE: &str = "K8003";
 
 pub(crate) struct ServerState {
     workspace_roots: Vec<PathBuf>,
@@ -197,15 +208,66 @@ struct Document {
     source: Source,
     lines: LineIndex,
     analysis: Option<Analysis>,
-    /// Analysis warnings in source order, followed by the parse or analysis
-    /// error that rejected the document, if any.
-    compiler_diagnostics: Vec<CompilerDiagnostic>,
+    /// The analysis warnings the document publishes: a source-order prefix
+    /// bounded by `MAX_PUBLISHED_WARNINGS` and
+    /// `MAX_PUBLISHED_WARNING_MESSAGE_BYTES`.
+    warnings: Vec<CompilerDiagnostic>,
+    /// The analysis warnings left out of `warnings`, if any.
+    omitted_warnings: Option<OmittedWarnings>,
+    /// The parse or analysis error that rejected the document, if any. It is
+    /// always published, after the warnings and any omission notice.
+    error: Option<CompilerDiagnostic>,
     formatted: Result<String, CompilerDiagnostic>,
     declarations: Vec<DeclarationFact>,
     syntax_kinds: BTreeMap<Span, &'static str>,
     durable_operations: Vec<krit::DurableOperationFact>,
     package: Option<PackageContext>,
     oversized: bool,
+}
+
+/// The analysis warnings a document leaves out of its published diagnostics.
+/// One informational notice stands in for all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OmittedWarnings {
+    count: usize,
+    /// The span of the first warning left out, where the notice is reported.
+    span: Span,
+}
+
+impl OmittedWarnings {
+    fn message(self) -> String {
+        if self.count == 1 {
+            "1 more warning is not shown; `krit check` reports every warning".to_owned()
+        } else {
+            format!(
+                "{} more warnings are not shown; `krit check` reports every warning",
+                self.count
+            )
+        }
+    }
+}
+
+/// Splits source-ordered analysis warnings into the prefix a document
+/// publishes, at most `MAX_PUBLISHED_WARNINGS` warnings and
+/// `MAX_PUBLISHED_WARNING_MESSAGE_BYTES` of message text, and the rest.
+fn bound_warnings(
+    mut warnings: Vec<CompilerDiagnostic>,
+) -> (Vec<CompilerDiagnostic>, Option<OmittedWarnings>) {
+    let mut message_bytes = 0_usize;
+    let mut kept = 0;
+    for warning in warnings.iter().take(MAX_PUBLISHED_WARNINGS) {
+        message_bytes = message_bytes.saturating_add(warning.message().len());
+        if message_bytes > MAX_PUBLISHED_WARNING_MESSAGE_BYTES {
+            break;
+        }
+        kept += 1;
+    }
+    let omitted = warnings.get(kept).map(|first| OmittedWarnings {
+        count: warnings.len() - kept,
+        span: first.span(),
+    });
+    warnings.truncate(kept);
+    (warnings, omitted)
 }
 
 impl Document {
@@ -223,7 +285,9 @@ impl Document {
                 lines: LineIndex::new(source.text()),
                 source,
                 analysis: None,
-                compiler_diagnostics: Vec::new(),
+                warnings: Vec::new(),
+                omitted_warnings: None,
+                error: None,
                 formatted: Err(CompilerDiagnostic::new(
                     "K8002",
                     format!(
@@ -243,20 +307,17 @@ impl Document {
         let source = Source::new(document_name(&uri), text);
         let lines = LineIndex::new(source.text());
         let formatted = krit::format_source(&source);
-        let (program, analysis, compiler_diagnostics) = match krit::parse_source(&source) {
+        let (program, analysis, all_warnings, error) = match krit::parse_source(&source) {
             Ok(program) => {
                 let report = krit::analyze_with_warnings(&program);
-                let mut diagnostics = report.warnings;
                 match report.result {
-                    Ok(analysis) => (Some(program), Some(analysis), diagnostics),
-                    Err(diagnostic) => {
-                        diagnostics.push(diagnostic);
-                        (Some(program), None, diagnostics)
-                    }
+                    Ok(analysis) => (Some(program), Some(analysis), report.warnings, None),
+                    Err(diagnostic) => (Some(program), None, report.warnings, Some(diagnostic)),
                 }
             }
-            Err(diagnostic) => (None, None, vec![diagnostic]),
+            Err(diagnostic) => (None, None, Vec::new(), Some(diagnostic)),
         };
+        let (warnings, omitted_warnings) = bound_warnings(all_warnings);
         let (declarations, syntax_kinds) = match (&program, &analysis) {
             (Some(program), Some(analysis)) => {
                 DeclarationCollector::collect(source.text(), program, analysis, source.text().len())
@@ -274,7 +335,9 @@ impl Document {
             source,
             lines,
             analysis,
-            compiler_diagnostics,
+            warnings,
+            omitted_warnings,
+            error,
             formatted,
             declarations,
             syntax_kinds,
@@ -284,6 +347,8 @@ impl Document {
         }
     }
 
+    /// Publishes the bounded warnings in source order, then the notice for
+    /// any warnings left out, then the rejecting error, if any.
     fn publish_diagnostics(&self) -> PublishDiagnosticsParams {
         let diagnostics = if self.oversized {
             vec![Diagnostic {
@@ -298,10 +363,27 @@ impl Document {
                 ..Diagnostic::default()
             }]
         } else {
-            self.compiler_diagnostics
+            let mut diagnostics = self
+                .warnings
                 .iter()
                 .map(|diagnostic| self.lsp_diagnostic(diagnostic))
-                .collect()
+                .collect::<Vec<_>>();
+            if let Some(omitted) = self.omitted_warnings {
+                diagnostics.push(Diagnostic {
+                    range: self.lines.range(self.source.text(), omitted.span),
+                    severity: Some(DiagnosticSeverity::INFORMATION),
+                    code: Some(NumberOrString::String(OMITTED_WARNINGS_CODE.to_owned())),
+                    source: Some("krit-lsp".to_owned()),
+                    message: omitted.message(),
+                    ..Diagnostic::default()
+                });
+            }
+            diagnostics.extend(
+                self.error
+                    .iter()
+                    .map(|diagnostic| self.lsp_diagnostic(diagnostic)),
+            );
+            diagnostics
         };
         PublishDiagnosticsParams::new(self.uri.clone(), diagnostics, Some(self.version))
     }
@@ -725,16 +807,27 @@ impl Document {
                 range: Range::new(Position::new(0, 0), Position::new(0, 0)),
             }]
         } else {
-            self.compiler_diagnostics
-                .iter()
-                .map(|diagnostic| CompilerDiagnosticFact {
-                    severity: diagnostic.severity().as_str(),
-                    code: diagnostic.code().to_owned(),
-                    message: diagnostic.message().to_owned(),
-                    span: diagnostic.span().into(),
-                    range: self.lines.range(self.source.text(), diagnostic.span()),
-                })
-                .collect()
+            // The same bounded list, in the same order, that the document
+            // publishes.
+            let compiler_fact = |diagnostic: &CompilerDiagnostic| CompilerDiagnosticFact {
+                severity: diagnostic.severity().as_str(),
+                code: diagnostic.code().to_owned(),
+                message: diagnostic.message().to_owned(),
+                span: diagnostic.span().into(),
+                range: self.lines.range(self.source.text(), diagnostic.span()),
+            };
+            let mut diagnostics = self.warnings.iter().map(compiler_fact).collect::<Vec<_>>();
+            if let Some(omitted) = self.omitted_warnings {
+                diagnostics.push(CompilerDiagnosticFact {
+                    severity: "info",
+                    code: OMITTED_WARNINGS_CODE.to_owned(),
+                    message: omitted.message(),
+                    span: omitted.span.into(),
+                    range: self.lines.range(self.source.text(), omitted.span),
+                });
+            }
+            diagnostics.extend(self.error.iter().map(compiler_fact));
+            diagnostics
         };
 
         let analysis = self.analysis.as_ref();
@@ -2630,6 +2723,177 @@ mod tests {
         assert_eq!(facts["valid"], false);
         assert_eq!(facts["diagnostics"][0]["severity"], "warning");
         assert_eq!(facts["diagnostics"][1]["severity"], "error");
+    }
+
+    /// A valid program that binds `_` on its first line and reads it once on
+    /// each of the next `reads` lines.
+    fn discard_reads_program(reads: usize) -> String {
+        let mut source = String::from("let _ = 1;\n");
+        source.push_str(&"_;\n".repeat(reads));
+        source
+    }
+
+    #[test]
+    fn bounds_published_warnings_and_reports_the_rest_in_one_notice() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+
+        // About 300 KB of source: every one of its warnings, published, would
+        // take a notification past the 16 MiB protocol frame limit.
+        let reads = 100_001;
+        let source = discard_reads_program(reads);
+        assert!(source.len() < MAX_DOCUMENT_BYTES);
+        let valid = state.open(uri.clone(), 1, source.clone());
+        assert_eq!(valid.diagnostics.len(), MAX_PUBLISHED_WARNINGS + 1);
+        for (index, warning) in valid.diagnostics[..MAX_PUBLISHED_WARNINGS]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(
+                warning.code,
+                Some(NumberOrString::String("K2003".to_owned()))
+            );
+            assert_eq!(warning.range.start, Position::new(index as u32 + 1, 0));
+        }
+        let notice = &valid.diagnostics[MAX_PUBLISHED_WARNINGS];
+        assert_eq!(notice.severity, Some(DiagnosticSeverity::INFORMATION));
+        assert_eq!(
+            notice.code,
+            Some(NumberOrString::String("K8003".to_owned()))
+        );
+        assert_eq!(notice.source.as_deref(), Some("krit-lsp"));
+        assert_eq!(
+            notice.message,
+            "99901 more warnings are not shown; `krit check` reports every warning"
+        );
+        // The notice sits on the first warning left out.
+        assert_eq!(
+            notice.range.start,
+            Position::new(MAX_PUBLISHED_WARNINGS as u32 + 1, 0)
+        );
+        let published = serde_json::to_vec(&valid).expect("diagnostics should serialize");
+        assert!(published.len() < 64 * 1024);
+        assert!(
+            state
+                .hover(&uri, Position::new(0, 4))
+                .expect("hover should succeed")
+                .is_some()
+        );
+
+        // The rejecting error is always published, after the notice, and
+        // compiler facts carry the same bounded list.
+        let invalid = state
+            .change(&uri, 2, format!("{source}missing;\n"))
+            .expect("change should succeed");
+        assert_eq!(invalid.diagnostics.len(), MAX_PUBLISHED_WARNINGS + 2);
+        assert_eq!(invalid.diagnostics[MAX_PUBLISHED_WARNINGS], *notice);
+        let error = &invalid.diagnostics[MAX_PUBLISHED_WARNINGS + 1];
+        assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(error.code, Some(NumberOrString::String("K2001".to_owned())));
+        assert_eq!(error.range.start, Position::new(reads as u32 + 1, 0));
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        assert_eq!(facts["valid"], false);
+        let diagnostics = facts["diagnostics"]
+            .as_array()
+            .expect("diagnostics should be an array");
+        assert_eq!(diagnostics.len(), MAX_PUBLISHED_WARNINGS + 2);
+        assert!(
+            diagnostics[..MAX_PUBLISHED_WARNINGS]
+                .iter()
+                .all(|diagnostic| diagnostic["severity"] == "warning")
+        );
+        let notice = &diagnostics[MAX_PUBLISHED_WARNINGS];
+        assert_eq!(notice["severity"], "info");
+        assert_eq!(notice["code"], "K8003");
+        assert_eq!(
+            notice["message"],
+            "99901 more warnings are not shown; `krit check` reports every warning"
+        );
+        // `let _ = 1;\n` and 100 lines of `_;\n` precede the first omitted read.
+        assert_eq!(
+            notice["span"],
+            serde_json::json!({"start": 311, "end": 312})
+        );
+        assert_eq!(diagnostics[MAX_PUBLISHED_WARNINGS + 1]["severity"], "error");
+        assert_eq!(diagnostics[MAX_PUBLISHED_WARNINGS + 1]["code"], "K2001");
+
+        // At the bound nothing is left out and no notice is published.
+        let bounded = state
+            .change(&uri, 3, discard_reads_program(MAX_PUBLISHED_WARNINGS))
+            .expect("change should succeed");
+        assert_eq!(bounded.diagnostics.len(), MAX_PUBLISHED_WARNINGS);
+        assert!(
+            bounded
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::WARNING))
+        );
+    }
+
+    #[test]
+    fn bounds_published_warnings_by_count_and_message_bytes() {
+        let warning = |index: usize, message: String| {
+            CompilerDiagnostic::warning("K2003", message, Span::new(index, index + 1))
+        };
+        let short = |count: usize| {
+            (0..count)
+                .map(|index| warning(index, "short".to_owned()))
+                .collect::<Vec<_>>()
+        };
+
+        let (kept, omitted) = bound_warnings(Vec::new());
+        assert!(kept.is_empty());
+        assert_eq!(omitted, None);
+
+        let (kept, omitted) = bound_warnings(short(MAX_PUBLISHED_WARNINGS));
+        assert_eq!(kept.len(), MAX_PUBLISHED_WARNINGS);
+        assert_eq!(omitted, None);
+
+        let (kept, omitted) = bound_warnings(short(MAX_PUBLISHED_WARNINGS + 1));
+        assert_eq!(kept.len(), MAX_PUBLISHED_WARNINGS);
+        let omitted = omitted.expect("one warning should be left out");
+        assert_eq!(
+            omitted,
+            OmittedWarnings {
+                count: 1,
+                span: Span::new(MAX_PUBLISHED_WARNINGS, MAX_PUBLISHED_WARNINGS + 1),
+            }
+        );
+        assert_eq!(
+            omitted.message(),
+            "1 more warning is not shown; `krit check` reports every warning"
+        );
+
+        // Messages that exactly fill the byte budget are kept. The first
+        // warning past it is left out with every later one, however short, so
+        // the published warnings stay a source-order prefix.
+        let half = MAX_PUBLISHED_WARNING_MESSAGE_BYTES / 2;
+        let (kept, omitted) = bound_warnings(vec![
+            warning(0, "a".repeat(half)),
+            warning(1, "b".repeat(half)),
+            warning(2, "c".to_owned()),
+            warning(3, "d".to_owned()),
+        ]);
+        assert_eq!(
+            kept.iter()
+                .map(|warning| warning.span().start)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            omitted,
+            Some(OmittedWarnings {
+                count: 2,
+                span: Span::new(2, 3),
+            })
+        );
     }
 
     #[test]

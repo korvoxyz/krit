@@ -146,7 +146,8 @@ returns schema 1 with:
 
 - language and authoring-protocol versions
 - stable diagnostics, each with its `error` or `warning` severity, byte span,
-  and UTF-16 range
+  and UTF-16 range, bounded like published diagnostics (with an `info`
+  `K8003` notice for warnings left out)
 - module effects, literal-resource requirements, and entrypoints
 - symbols with inferred/declared types, reference status, and visibility
 - expression syntax kinds, inferred types, effects, requirements, and
@@ -157,9 +158,12 @@ returns schema 1 with:
 
 The server limits each protocol frame to 16 MiB, each open document to 1 MiB,
 the open set to 128 documents, and the applicable manifest read to 256 KiB.
-Completion, document symbols, recursive type rendering, and compiler-fact
-responses are separately bounded. Package facts are attached only when the
-nearest `krit.pkg` passes the normal canonical entry-containment validation.
+Each document publishes at most its first 100 warnings, and at most 64 KiB of
+warning message text; one `K8003` notice reports how many more were left out
+(see `DIAGNOSTICS.md`). Completion, document symbols, recursive type
+rendering, and compiler-fact responses are separately bounded. Package facts
+are attached only when the nearest `krit.pkg` passes the normal canonical
+entry-containment validation.
 The server reads only local source supplied by the editor and that validated
 manifest. It does not invoke the evaluator, lower/build components, install
 packages, open sockets, perform network requests, read host
