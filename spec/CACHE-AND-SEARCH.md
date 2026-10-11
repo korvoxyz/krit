@@ -148,7 +148,8 @@ Two transports ship:
 Request bodies are exactly `{"query": ..., "limit": ...}` or
 `{"vector": [...], "limit": ...}`. A credential, when configured, travels as a
 bearer header and **never** appears in a body, a cache key, an artifact,
-metadata, a log, a statistic, or an error.
+metadata, a log, a statistic, or an error. Every `http-json` request carries
+the host default `User-Agent` (`WEBHOOK-CONTRACTS.md`, "Outbound User-Agent").
 
 ### Results are untrusted input
 

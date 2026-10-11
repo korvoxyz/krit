@@ -1806,3 +1806,63 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
     assert!(!format!("{error:?}").contains("not-json"));
     mock.join().expect("mock");
 }
+
+#[test]
+fn ai_adapter_requests_carry_the_host_user_agent() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock should bind");
+    let origin = listener_origin(&listener);
+    let mock = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("mock should accept");
+        let captured = read_request(&mut stream);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"output\":\"ok\"}",
+            )
+            .expect("mock response");
+        String::from_utf8(captured).expect("request should be UTF-8")
+    });
+    let artifact = compile(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match ai_invoke("reviewer", request.body) {
+        Ok(output) => record { status: 200, headers: [], body: output },
+        Err(error) => record { status: 503, headers: [], body: error },
+    }
+}
+"#,
+        &["ai.invoke"],
+    );
+    let manifest = manifest(&format!("http = [\"{origin}\"]\nai = [\"reviewer\"]"));
+    let host = ai_test_host(origin, 1024, Duration::from_millis(500));
+
+    let result = Runtime::default()
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &GrantSet::from_manifest(&manifest),
+            &host,
+            request("summarize"),
+        )
+        .expect("AI invocation should succeed");
+
+    assert_eq!(result.response.status, 200);
+    assert_eq!(result.response.body, "ok");
+    let captured = mock.join().expect("mock should finish");
+    // Guest code never builds adapter headers, so the provider always sees the
+    // host default, exactly once.
+    let user_agents = captured
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_agents,
+        [format!("User-Agent: krit/{}", env!("CARGO_PKG_VERSION"))],
+        "{captured}"
+    );
+}

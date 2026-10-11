@@ -22,6 +22,14 @@ use crate::{
 const MIN_CURL_TIMEOUT: Duration = Duration::from_millis(1);
 const MAX_DNS_WORKERS: usize = 16;
 
+/// The `User-Agent` sent on every outbound request that does not name one.
+///
+/// libcurl sends no `User-Agent` of its own, and many origins refuse or
+/// throttle a request without one. The value is fixed at build time, so it
+/// identifies the host release and nothing about the invocation, the guest, or
+/// the machine (WEBHOOK-CONTRACTS.md, "Outbound User-Agent").
+const DEFAULT_USER_AGENT: &str = concat!("krit/", env!("CARGO_PKG_VERSION"));
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NetworkFailureKind {
     Cancelled,
@@ -260,12 +268,22 @@ pub(crate) fn send(
     let mut headers = List::new();
     let mut has_content_type = false;
     let mut has_expect = false;
+    let mut has_user_agent = false;
     for header in &request.headers {
         has_content_type |= header.name.eq_ignore_ascii_case("content-type");
         has_expect |= header.name.eq_ignore_ascii_case("expect");
+        has_user_agent |= header.name.eq_ignore_ascii_case("user-agent");
         headers
             .append(&format!("{}: {}", header.name, header.value))
             .map_err(|_| "could not encode outbound HTTP header".to_owned())?;
+    }
+    // A request's own `User-Agent`, in any letter case, is passed through
+    // unchanged and the default is not added. An empty one therefore sends no
+    // `User-Agent` at all, because libcurl never sends a blank header value.
+    if !has_user_agent {
+        headers
+            .append(&format!("User-Agent: {DEFAULT_USER_AGENT}"))
+            .map_err(|_| "could not encode default User-Agent header".to_owned())?;
     }
     if let Some(bearer) = bearer {
         let bytes = bearer.secret().expose_for_bearer();
@@ -904,9 +922,9 @@ secrets = ["token"]
         mock.join().expect("mock should finish");
     }
 
-    /// Sends one GET for `path` and `query` to a loopback mock and returns the
-    /// request line the mock received.
-    fn request_line_on_the_wire(path: &str, query: &str) -> String {
+    /// Sends one bodyless `request` to a loopback mock and returns the request
+    /// head (request line and header lines) the mock received.
+    fn request_head_on_the_wire(request: &HttpRequest) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock should bind");
         let address = listener.local_addr().expect("mock address should exist");
         let mock = thread::spawn(move || {
@@ -916,7 +934,7 @@ secrets = ["token"]
                 .expect("mock read timeout should configure");
             let mut bytes = Vec::new();
             let mut chunk = [0u8; 1024];
-            while !bytes.windows(2).any(|window| window == b"\r\n") {
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
                 let count = stream.read(&mut chunk).expect("mock should read request");
                 if count == 0 {
                     break;
@@ -926,22 +944,14 @@ secrets = ["token"]
             stream
                 .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
                 .expect("mock should write response");
-            let text = String::from_utf8(bytes).expect("request should be UTF-8");
-            text.lines().next().unwrap_or_default().to_owned()
+            String::from_utf8(bytes).expect("request should be UTF-8")
         });
         let origin = HttpOrigin::parse_exact(&format!("http://{address}"))
             .expect("loopback origin should be canonical");
-        let request = HttpRequest {
-            method: "GET".to_owned(),
-            path: path.to_owned(),
-            query: query.to_owned(),
-            headers: Vec::new(),
-            body: String::new(),
-        };
 
         let response = send(
             &origin,
-            &request,
+            request,
             None,
             SendContext {
                 policy: NetworkPolicy::loopback_for_tests(),
@@ -954,6 +964,97 @@ secrets = ["token"]
         .expect("loopback request should complete");
         assert_eq!(response.status, 204);
         mock.join().expect("mock should finish")
+    }
+
+    fn get_request(path: &str, query: &str, headers: Vec<HttpHeader>) -> HttpRequest {
+        HttpRequest {
+            method: "GET".to_owned(),
+            path: path.to_owned(),
+            query: query.to_owned(),
+            headers,
+            body: String::new(),
+        }
+    }
+
+    /// Sends one GET for `path` and `query` to a loopback mock and returns the
+    /// request line the mock received.
+    fn request_line_on_the_wire(path: &str, query: &str) -> String {
+        request_head_on_the_wire(&get_request(path, query, Vec::new()))
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Every `User-Agent` header line in a request head, matched in any case.
+    fn user_agent_lines(head: &str) -> Vec<&str> {
+        head.lines()
+            .filter(|line| {
+                line.split_once(':')
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_default_user_agent_names_this_host_release() {
+        assert_eq!(
+            DEFAULT_USER_AGENT,
+            format!("krit/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(HeaderValue::from_str(DEFAULT_USER_AGENT).is_ok());
+    }
+
+    #[test]
+    fn a_request_without_a_user_agent_carries_the_host_default() {
+        let head = request_head_on_the_wire(&get_request(
+            "/",
+            "",
+            vec![HttpHeader {
+                name: "accept".to_owned(),
+                value: "application/json".to_owned(),
+            }],
+        ));
+        assert_eq!(
+            user_agent_lines(&head),
+            [format!("User-Agent: krit/{}", env!("CARGO_PKG_VERSION"))],
+            "{head}"
+        );
+    }
+
+    #[test]
+    fn a_request_user_agent_is_sent_unchanged_and_suppresses_the_default() {
+        for name in ["User-Agent", "user-agent", "USER-AGENT"] {
+            let head = request_head_on_the_wire(&get_request(
+                "/",
+                "",
+                vec![HttpHeader {
+                    name: name.to_owned(),
+                    value: "probe/2.0 (+https://example.test/bot)".to_owned(),
+                }],
+            ));
+            assert_eq!(
+                user_agent_lines(&head),
+                [format!("{name}: probe/2.0 (+https://example.test/bot)")],
+                "{head}"
+            );
+            assert!(!head.contains("krit/"), "{head}");
+        }
+    }
+
+    #[test]
+    fn an_empty_request_user_agent_sends_none_at_all() {
+        // The request's own header still wins over the default, and libcurl
+        // never sends a blank header value, so the request opts out entirely.
+        let head = request_head_on_the_wire(&get_request(
+            "/",
+            "",
+            vec![HttpHeader {
+                name: "user-agent".to_owned(),
+                value: String::new(),
+            }],
+        ));
+        assert!(user_agent_lines(&head).is_empty(), "{head}");
     }
 
     #[test]

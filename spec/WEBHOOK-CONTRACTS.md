@@ -117,6 +117,29 @@ sign this spelling, or use uppercase escapes and escape non-ASCII bytes itself.
 libcurl refuses a raw space anywhere in the request target, which is why the
 rule refuses one before approval rather than letting the transfer fail later.
 
+## Outbound User-Agent
+
+Every outbound request the host sends on a program's behalf identifies the
+host. This covers a guest `http_request`, durable `replay_http`, and the
+requests an AI adapter (`ai_invoke`, `replay_ai`) or a search connector builds.
+When the request's header list has no `User-Agent` header, with names compared
+without regard to letter case, the host appends `User-Agent: krit/<version>`.
+`<version>` is the release version of the `krit-runtime` host crate, so a 0.3.0
+host sends `krit/0.3.0`. The value is fixed when the host is built. It reveals
+nothing about the program, the invocation, or the machine, and every retry of
+one call sends the same value.
+
+A guest-supplied `User-Agent` is sent exactly as written, in its own letter
+case and position, and the host adds no default beside it. A guest `User-Agent`
+with an empty value sends no `User-Agent` at all, because libcurl never sends a
+header whose value is blank. This is how a program opts out. AI adapters and
+search connectors build their own headers and never name a `User-Agent`, so
+their requests always carry the default.
+
+Like the bearer `Authorization` header, the default is added at the transport.
+It does not count toward the request header limits, and it is not part of a
+durable replay's input digest.
+
 ## Request JSON Schema
 
 The exact schema-1 request document is:

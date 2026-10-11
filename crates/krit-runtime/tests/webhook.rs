@@ -1106,3 +1106,94 @@ fn outbound_paths_refuse_traversal_forms_before_any_connection() {
         "{captured}"
     );
 }
+
+/// Every `User-Agent` header line in a captured request head, in any case.
+fn user_agent_lines(captured: &str) -> Vec<&str> {
+    captured
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        })
+        .collect()
+}
+
+/// A webhook that forwards its inbound headers onto a bodyless outbound GET.
+fn header_forwarding_artifact(origin: &str) -> BuiltComponent {
+    compile(
+        &format!(
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    let outbound: HttpRequest = record {{
+        method: "GET",
+        path: "/agent",
+        query: "",
+        headers: request.headers,
+        body: "",
+    }};
+    match http_request("{origin}", outbound, None) {{
+        Ok(response) => response,
+        Err(error) => record {{ status: 598, headers: [], body: error }},
+    }}
+}}
+"#
+        ),
+        &["http.request"],
+    )
+}
+
+#[test]
+fn guest_http_requests_carry_the_host_user_agent_unless_they_name_one() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("origin listener should bind");
+    let origin = listener_origin(&listener);
+    let artifact = header_forwarding_artifact(&origin);
+    let grants = GrantSet::from_manifest(&manifest(&format!("http = [\"{origin}\"]")));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default())
+        .expect("inputs should be valid")
+        .with_network_policy(NetworkPolicy::loopback_for_tests());
+    let invoke = |headers: Vec<HttpHeader>| {
+        let mut inbound = request("");
+        inbound.headers = headers;
+        let result = Runtime::default()
+            .invoke_webhook(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &inputs,
+                inbound,
+            )
+            .expect("the outbound request should be sent");
+        assert_eq!(result.response.status, 202);
+    };
+
+    // A request that names no User-Agent is sent with the host default.
+    let server = accept_one(listener.try_clone().expect("listener should clone"));
+    invoke(vec![HttpHeader {
+        name: "accept".to_owned(),
+        value: "application/json".to_owned(),
+    }]);
+    let captured = server.join().expect("origin should finish");
+    assert_eq!(
+        user_agent_lines(&captured),
+        [format!("User-Agent: krit/{}", env!("CARGO_PKG_VERSION"))],
+        "{captured}"
+    );
+
+    // A guest-supplied User-Agent is sent unchanged, and the default is not
+    // added beside it.
+    let server = accept_one(listener);
+    invoke(vec![HttpHeader {
+        name: "user-agent".to_owned(),
+        value: "probe/2.0 (+https://example.test/bot)".to_owned(),
+    }]);
+    let captured = server.join().expect("origin should finish");
+    assert_eq!(
+        user_agent_lines(&captured),
+        ["user-agent: probe/2.0 (+https://example.test/bot)"],
+        "{captured}"
+    );
+    assert!(!captured.contains("krit/"), "{captured}");
+}

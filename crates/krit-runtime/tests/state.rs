@@ -1873,3 +1873,84 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
         }
     }
 }
+
+/// Every `User-Agent` header line in a captured request head, in any case.
+fn user_agent_lines(captured: &str) -> Vec<&str> {
+    captured
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        })
+        .collect()
+}
+
+#[test]
+fn durable_replay_requests_carry_the_host_user_agent_unless_they_name_one() {
+    let default = format!("User-Agent: krit/{}", env!("CARGO_PKG_VERSION"));
+    let named = "User-Agent: probe/2.0 (+https://example.test/bot)";
+    for (kind, expected) in [
+        ("http", default.as_str()),
+        ("ai", default.as_str()),
+        ("named", named),
+    ] {
+        let directory = TestDirectory::new("replay-user-agent");
+        let body = if kind == "ai" {
+            r#"{"output":"ok"}"#
+        } else {
+            "ok"
+        };
+        let (origin, mock) = replay_mock(vec![ReplayReply::Body(body)]);
+        let artifact = if kind == "named" {
+            compile(
+                &format!(
+                    r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    let outbound: HttpRequest = record {{
+        method: "GET",
+        path: "/work",
+        query: "",
+        headers: [record {{ name: "User-Agent", value: "probe/2.0 (+https://example.test/bot)" }}],
+        body: "",
+    }};
+    match replay_http("agent-work", "operation", "{origin}", outbound) {{
+        Ok(value) => record {{ status: 200, headers: [], body: value.body }},
+        Err(error) => record {{ status: 502, headers: [], body: error }},
+    }}
+}}
+"#
+                ),
+                &["state.transaction"],
+            )
+        } else {
+            replay_artifact(&origin, kind == "ai")
+        };
+        let agent_host = replay_host(
+            &origin,
+            durable(directory.database(), false),
+            1024,
+            replay_approvals(),
+        );
+        let result = Runtime::default()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &replay_grants(&origin),
+                &agent_host,
+                request("input"),
+            )
+            .expect("the replayed operation should execute");
+        assert_eq!(result.response.body, "ok", "{kind}");
+        let requests = mock.join().expect("mock should finish");
+        assert_eq!(requests.len(), 1, "{kind}");
+        assert_eq!(
+            user_agent_lines(&requests[0]),
+            [expected],
+            "{kind}: {}",
+            requests[0]
+        );
+    }
+}

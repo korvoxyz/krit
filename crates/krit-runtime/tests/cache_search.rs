@@ -969,6 +969,15 @@ fn the_http_json_transport_sends_an_exact_bounded_request_and_hides_credentials(
         header_block.contains("authorization:"),
         "the credential must travel as a header: {request_text}"
     );
+    // A connector builds its own headers, so it always sends the host default.
+    assert_eq!(
+        header_block
+            .lines()
+            .filter(|line| line.starts_with("user-agent:"))
+            .collect::<Vec<_>>(),
+        [format!("user-agent: krit/{}", env!("CARGO_PKG_VERSION"))],
+        "{request_text}"
+    );
     let body = request_text
         .split("\r\n\r\n")
         .nth(1)

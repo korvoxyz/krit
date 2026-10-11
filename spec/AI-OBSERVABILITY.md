@@ -217,8 +217,10 @@ provider-neutral Rust adapter interface and uses this deterministic mapping:
 {"model":"configured-model","input":"raw source input"}
 ```
 
-It sends `POST` with `content-type: application/json` and optional host-side
-bearer authentication. A successful provider response is the strict object:
+It sends `POST` with `content-type: application/json`, the host default
+`User-Agent` (`WEBHOOK-CONTRACTS.md`, "Outbound User-Agent"), and optional
+host-side bearer authentication. A successful provider response is the strict
+object:
 
 ```json
 {"output":"raw UTF-8 model text"}
