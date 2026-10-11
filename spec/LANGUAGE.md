@@ -510,8 +510,11 @@ db_rollback(transaction) // Result<Unit, String>
 ```
 
 Config and secret operations require exactly one direct string-literal
-resource argument. `http_request` requires a direct normalized exact-origin
-literal, an `HttpRequest`, and directly `None` or `Some(secret)`. Indirect host
+resource argument in canonical-name form (see `CAPABILITIES.md`); a
+configuration key may additionally contain `_`, as in `"agent.timeout_ms"`,
+while a secret name may not. A malformed name is `K3008`. `http_request`
+requires a direct normalized exact-origin literal, an `HttpRequest`, and
+directly `None` or `Some(secret)`. Indirect host
 operation use and computed resources are rejected because capability
 requirements would not be statically knowable. A configuration read has
 effect `config.read` and

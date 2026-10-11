@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use krit_capability::is_valid_resource_name;
+use krit_capability::{is_valid_config_key, is_valid_resource_name};
 use zeroize::Zeroize;
 
 use crate::RuntimeError;
@@ -85,7 +85,7 @@ impl HostInputs {
                 "host configuration exceeds the {MAX_HOST_INPUT_ENTRIES}-entry limit"
             )));
         }
-        if let Some(name) = config.keys().find(|name| !is_valid_resource_name(name)) {
+        if let Some(name) = config.keys().find(|name| !is_valid_config_key(name)) {
             return Err(RuntimeError::setup(format!(
                 "invalid host configuration key `{name}`"
             )));
@@ -234,9 +234,42 @@ impl fmt::Debug for HostInputs {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::{
+        collections::BTreeMap,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    };
 
-    use super::NetworkPolicy;
+    use super::{HostInputs, NetworkPolicy, SecretStore};
+    use crate::RuntimeErrorKind;
+
+    #[test]
+    fn host_configuration_keys_use_the_configuration_key_grammar() {
+        let config = BTreeMap::from([
+            ("agent.timeout_ms".to_owned(), "1500".to_owned()),
+            ("max_retries".to_owned(), "3".to_owned()),
+        ]);
+        let inputs = HostInputs::new(config, SecretStore::default())
+            .expect("underscored configuration keys should be accepted");
+        assert_eq!(inputs.config()["agent.timeout_ms"], "1500");
+
+        for key in ["_agent", "agent_", "agent__model", "Agent_Model"] {
+            let config = BTreeMap::from([(key.to_owned(), "value".to_owned())]);
+            let Err(error) = HostInputs::new(config, SecretStore::default()) else {
+                panic!("configuration key `{key}` should be rejected");
+            };
+            assert_eq!(error.kind(), RuntimeErrorKind::RuntimeSetup, "{key}");
+            assert!(error.message().contains("configuration key"), "{key}");
+        }
+
+        // Secret names keep the narrower resource-name grammar, and the
+        // rejection never echoes the secret bytes.
+        let secrets = BTreeMap::from([("github_token".to_owned(), b"s3cret-bytes".to_vec())]);
+        let Err(error) = SecretStore::new(secrets) else {
+            panic!("an underscored secret name should be rejected");
+        };
+        assert_eq!(error.kind(), RuntimeErrorKind::RuntimeSetup);
+        assert!(!error.message().contains("s3cret-bytes"));
+    }
 
     #[test]
     fn default_network_policy_allows_only_public_unicast_addresses() {

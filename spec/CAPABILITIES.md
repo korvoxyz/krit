@@ -135,6 +135,19 @@ secret bytes. `ai_invoke` emits `ai.invoke` plus one named adapter.
 canonical literals and their ordered fields contain only ordinary strings.
 No host value is read during checking or explanation.
 
+A canonical name uses the resource-name grammar: 1-64 lowercase ASCII
+letters, digits, `.`, or `-`, with no leading or trailing punctuation and no
+`..` or `--`. Secret names, AI adapters, log events, and every store,
+checkpoint, operation, queue, schedule, bucket, database, statement, cache
+namespace, and index name use it unchanged. Configuration keys alone extend it
+with `_`, which follows the same rules as `-`: it never leads, trails, or
+doubles. `agent.timeout_ms` and `max_retries` are therefore valid keys, while
+`_agent`, `agent_`, and `agent__model` are not, and `github_token` is not a
+valid secret name. `agent.timeout_ms` and `agent.timeout-ms` are distinct keys,
+each granted only by its exact spelling. Source analysis (`K3008`), manifest
+validation (`K6001`), artifact metadata validation, and host configuration
+apply the same grammar to each kind of name.
+
 Phase 6 adds exact `state.transaction("store")` requirements for bounded
 state, checkpoint, and replay operations. Replay also retains the exact
 external HTTP-origin or AI-adapter requirement. Store/checkpoint/replay names

@@ -54,6 +54,11 @@ Package names contain a lowercase namespace and name separated by `/`.
 Allowed characters are ASCII lowercase letters, digits, and `-`. Names are
 globally identified by `(registry, namespace, name)`, not name alone.
 
+Capability resource names use the canonical-name grammar defined in
+[CAPABILITIES.md](CAPABILITIES.md). Entries in `config` may also contain `_`
+(for example `agent.timeout_ms`); no other capability list accepts it. A
+malformed entry is `K6001`.
+
 Versions follow Semantic Versioning 2.0.0. Published package contents are
 immutable for a version.
 

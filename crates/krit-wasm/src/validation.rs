@@ -688,8 +688,8 @@ fn valid_requirements(requirements: &[ResourceRequirementMetadata], effects: &[S
                     .is_ok()
                     && matches!(requirement.capability.as_str(), AI_EFFECT | HTTP_EFFECT)))
                 && match requirement.capability.as_str() {
+                    CONFIG_EFFECT => krit_capability::is_valid_config_key(&requirement.resource),
                     AI_EFFECT
-                    | CONFIG_EFFECT
                     | SECRETS_EFFECT
                     | STATE_EFFECT
                     | QUEUE_PUBLISH_EFFECT

@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use krit_capability::{HttpOrigin, is_valid_resource_name};
+use krit_capability::{HttpOrigin, is_valid_config_key, is_valid_resource_name};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
@@ -184,7 +184,7 @@ impl Manifest {
         validate_unique_names("configuration key", &self.capabilities.config)?;
         validate_capability_count("configuration key", &self.capabilities.config)?;
         for name in &self.capabilities.config {
-            validate_resource_name("configuration key", name)?;
+            validate_config_key(name)?;
         }
         validate_unique_names("HTTP origin", &self.capabilities.http)?;
         validate_capability_count("HTTP origin", &self.capabilities.http)?;
@@ -614,6 +614,15 @@ fn validate_resource_name(kind: &str, name: &str) -> Result<(), ManifestError> {
     Ok(())
 }
 
+fn validate_config_key(name: &str) -> Result<(), ManifestError> {
+    if !is_valid_config_key(name) {
+        return Err(ManifestError::new(format!(
+            "configuration key `{name}` must use 1-64 lowercase letters, digits, `.`, `-`, or `_`, without leading/trailing punctuation or `..`/`--`/`__`"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_http_origin(origin: &str) -> Result<(), ManifestError> {
     HttpOrigin::parse_exact(origin)
         .map(|_| ())
@@ -776,6 +785,50 @@ mod tests {
             );
             let error = Manifest::parse(&manifest).expect_err("unsafe origin should fail");
             assert!(error.to_string().contains("HTTP origin"));
+        }
+    }
+
+    #[test]
+    fn configuration_keys_alone_accept_underscores() {
+        let manifest = Manifest::parse(&VALID.replace(
+            "config = [\"agent.model\", \"agent.timeout-ms\"]",
+            "config = [\"agent.model\", \"agent.timeout_ms\", \"max_retries\"]",
+        ))
+        .expect("underscored configuration keys should validate");
+        assert!(manifest.grants_permission("config.read", Some("agent.timeout_ms")));
+        assert!(manifest.grants_permission("config.read", Some("max_retries")));
+        assert!(!manifest.grants_permission("config.read", Some("agent.timeout-ms")));
+
+        for key in ["_agent", "agent_", "agent__model", "Agent_Model"] {
+            let error = Manifest::parse(&VALID.replace(
+                "config = [\"agent.model\", \"agent.timeout-ms\"]",
+                &format!("config = [\"{key}\"]"),
+            ))
+            .expect_err("a non-canonical configuration key should fail");
+            assert_eq!(error.code(), "K6001");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("configuration key `{key}` must use")),
+                "{error}"
+            );
+        }
+
+        // Every other resource identity keeps the narrower grammar.
+        for (field, value) in [
+            ("secrets", "[\"github_token\"]"),
+            ("ai", "[\"code_reviewer\"]"),
+            ("state", "[\"agent_work\"]"),
+            ("queues", "[\"render_jobs\"]"),
+            ("buckets", "[\"render_output\"]"),
+        ] {
+            let manifest = VALID.replace(
+                "secrets = [\"github-token\", \"slack-token\"]",
+                &format!("{field} = {value}"),
+            );
+            let error = Manifest::parse(&manifest).expect_err("underscored resource should fail");
+            assert_eq!(error.code(), "K6001");
+            assert!(error.to_string().contains("must use"), "{error}");
         }
     }
 

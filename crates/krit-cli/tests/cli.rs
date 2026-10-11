@@ -2530,6 +2530,93 @@ license = "Apache-2.0"
 }
 
 #[test]
+fn underscored_configuration_keys_flow_from_manifest_to_guest() {
+    let directory = TestDirectory::new("config-underscore");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match config_string("agent.timeout_ms") {
+        Ok(value) => record { status: 200, headers: [], body: value },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/config-underscore"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+config = ["agent.timeout_ms"]
+"#,
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let host = directory.file(
+        "host.json",
+        r#"{"schema":1,"config":{"agent.timeout_ms":"1500"},"secrets":{}}"#,
+    );
+    let request = directory.file(
+        "request.json",
+        r#"{"method":"GET","path":"/","query":"","headers":[],"body":""}"#,
+    );
+    let invoked = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--host-config")
+        .arg(&host)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should invoke");
+    assert!(
+        invoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&invoked.stderr)
+    );
+    assert_eq!(
+        invoked.stdout,
+        b"{\"status\":200,\"headers\":[],\"body\":\"1500\"}\n"
+    );
+
+    // The hyphenated spelling is a different key and is not granted.
+    fs::write(
+        &host,
+        r#"{"schema":1,"config":{"agent.timeout-ms":"1500"},"secrets":{}}"#,
+    )
+    .expect("host config should be replaced");
+    let denied = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--host-config")
+        .arg(&host)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should reject an ungranted key");
+    assert_eq!(denied.status.code(), Some(4));
+    assert!(denied.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("error[K5001]"));
+}
+
+#[test]
 fn invoke_keeps_response_json_on_stdout_and_publishes_logs_on_stderr() {
     let directory = TestDirectory::new("invoke-structured-logs");
     directory.file(

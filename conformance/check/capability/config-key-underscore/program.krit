@@ -1,0 +1,2 @@
+let timeout = config_string("agent.timeout_ms");
+let retries = config_string("max_retries");

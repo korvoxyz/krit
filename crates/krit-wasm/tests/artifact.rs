@@ -452,6 +452,45 @@ fn embedded_metadata_supports_realistic_capability_sets() {
 }
 
 #[test]
+fn underscored_configuration_keys_build_and_validate_within_the_key_grammar() {
+    let source = Source::new(
+        "src/main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match config_string("agent.timeout_ms") {
+        Ok(value) => record { status: 200, headers: [], body: value },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}
+"#,
+    );
+    let program = parse_source(&source).expect("webhook source should parse");
+    let analysis = analyze(&program).expect("webhook source should analyze");
+    let module = lower(&program, &analysis).expect("webhook source should lower");
+    let mut options = BuildOptions::new("2026", "test/webhook", "1.0.0", "src/main.krit");
+    options.grant_effect("config.read");
+    let artifact = build_component(&module, &options).expect("webhook should compile");
+    assert_eq!(artifact.metadata.requirements.len(), 1);
+    assert_eq!(artifact.metadata.requirements[0].capability, "config.read");
+    assert_eq!(
+        artifact.metadata.requirements[0].resource,
+        "agent.timeout_ms"
+    );
+    validate_artifact(&artifact.bytes, &artifact.metadata)
+        .expect("an underscored configuration key should validate");
+
+    // Metadata naming a key outside the configuration-key grammar still
+    // fails closed before the component is inspected.
+    for resource in ["agent__timeout", "_agent.timeout", "agent.timeout_"] {
+        let mut metadata = artifact.metadata.clone();
+        metadata.requirements[0].resource = resource.to_owned();
+        let error = validate_artifact(&artifact.bytes, &metadata)
+            .expect_err("a non-canonical configuration key should fail");
+        assert_eq!(error.kind(), BuildErrorKind::Metadata, "{resource}");
+    }
+}
+
+#[test]
 fn ai_only_and_log_only_webhooks_select_exact_least_authority_worlds() {
     for (source_text, effect, interface, world_fragment) in [
         (
