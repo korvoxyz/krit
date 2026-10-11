@@ -34,22 +34,22 @@ documentation, examples, and the release gate.
 
 | ID | Item | Req | Status | Acceptance check | Notes |
 |---|---|---|---|---|---|
-| F1 | Depth guards K1005 (all stages), evaluator K4010 | R1.1 | doing | 2k nesting / 100k recursion | no exit 134 |
-| F2 | `run` gated on analysis; move ill-typed run cases | R1.2 | doing | run refuses check failures | `main.rs:1176-1224` |
-| F3 | Warnings channel (severity in human/JSON/LSP) | R4.3 | doing | warning shown, exit 0 | prerequisite for K2003/K9013 |
-| F4 | Habit codes K1101–K1112, did-you-mean K2001, K3011 | R4.4 | doing | one case per code | hints in `notes` |
+| F1 | Depth guards K1005 (all stages), evaluator K4010 | R1.1 | done | 2k nesting / 100k recursion | no exit 134 |
+| F2 | `run` gated on analysis; move ill-typed run cases | R1.2 | done | run refuses check failures | `main.rs:1176-1224` |
+| F3 | Warnings channel (severity in human/JSON/LSP) | R4.3 | done | warning shown, exit 0 | prerequisite for K2003/K9013 |
+| F4 | Habit codes K1101–K1112, did-you-mean K2001, K3011 | R4.4 | done | one case per code | hints in `notes` |
 
 ## Wave 2 — flat code and stdlib (sequential)
 
 | ID | Item | Req | Status | Acceptance check | Depends |
 |---|---|---|---|---|---|
-| L1 | Postfix `?` with Core exit op, K3012/K3013, Wasm `return` | R3.1 | todo | order case; webhook helper builds | wave 1 |
-| L2 | let-else, K3014 | R3.2 | todo | webhook builds | L1 |
-| L3 | Nested built-in patterns, `_`, exhaustiveness, K2003 | R3.3 | todo | 3-arm nested match builds | F3 |
-| L4 | Named construction with punning and defaults, K3016 | R3.4 | todo | examples drop `record` | |
-| L5 | Entry lists, `()`, `///` (formatter + LSP hover) | R3.5 | todo | fmt idempotent | |
-| L6 | Interpolation `\(…)`, `"""` text blocks, K3015 | R3.6 | todo | prompt webhook builds | W2 |
-| L7 | Stdlib v0 (8 functions) + K9013 lint | R4.1, R4.2 | todo | evaluator/Wasm agreement | W2, F3 |
+| L1 | Postfix `?` with Core exit op, K3012/K3013, Wasm `return` | R3.1 | doing | order case; webhook helper builds | wave 1 |
+| L2 | let-else, K3014 | R3.2 | doing | webhook builds | L1 |
+| L3 | Nested built-in patterns, `_`, exhaustiveness, K2003 | R3.3 | doing | 3-arm nested match builds | F3 |
+| L4 | Named construction with punning and defaults, K3016 | R3.4 | doing | examples drop `record` | |
+| L5 | Entry lists, `()`, `///` (formatter + LSP hover) | R3.5 | doing | fmt idempotent | |
+| L6 | Interpolation `\(…)`, `"""` text blocks, K3015 | R3.6 | doing | prompt webhook builds | W2 |
+| L7 | Stdlib v0 (8 functions; `url_path_segment` returns Result) + K9013 lint | R4.1, R4.2 | doing | evaluator/Wasm agreement | W2, F3 |
 | L8 | Formatter polish: `+` chains, digit separators, 100 cols | R3.7 | todo | idempotence suite | L1–L7 |
 
 ## Wave 3 — docs, examples, release
@@ -79,3 +79,10 @@ documentation, examples, and the release gate.
 - 2026-10-12 — Runtime track merged (Wasmtime 48.0.5 LTS + Rust 1.95,
   secret→origin binding K5006, path hardening incl. query-cut/control-byte/
   overlong forms, default User-Agent): clippy clean, 741 tests pass.
+- 2026-10-12 — Frontend track merged (F1 depth guards incl. type-height
+  bounds, F2 run gating, F3 warnings channel + K2003 + assist gate fix, F4
+  habit codes K1101–K1112, did-you-mean, K3011). An independent reviewer
+  approved the merge; six semantic merge conflicts were fixed. **Wave 1
+  complete: all 15 items approved and merged.**
+- 2026-10-12 — Wave 2 started: control track (L1–L3) and data track
+  (L4–L7) in parallel worktrees.
