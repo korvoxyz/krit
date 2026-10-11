@@ -36,14 +36,29 @@ pub const MAX_NESTING_DEPTH: usize = 256;
 /// which represent each `else if` continuation as one more nested block.
 pub const MAX_STRUCTURAL_DEPTH: usize = 4096;
 
-/// Maximum recursion of analysis and Core lowering over a syntax tree.
+/// Maximum recursion of analysis and Core lowering over a syntax tree:
+/// 4,610 levels.
 ///
-/// Both count one level per expression and one per block, so a block used as
-/// an expression, or a function literal's body, counts twice where the
-/// structural depth counts it once. That adds at most one level per syntactic
-/// level, so every tree the parser accepts stays within this bound and only a
-/// hand-built tree that bypassed the parser can exceed it.
-pub(crate) const MAX_TREE_DEPTH: usize = MAX_STRUCTURAL_DEPTH + MAX_NESTING_DEPTH;
+/// Both count one level per expression and one per block, which differs from
+/// the structural depth in four ways:
+///
+/// - a top-level statement's expression has structural depth 0 but is the
+///   first level of analysis (+1);
+/// - lowering places the top-level statements inside the module
+///   initialization block, one more level (+1, lowering only);
+/// - a block reached from an expression (a block expression, a function
+///   literal's body, or an `if` consequent) counts two levels for the one
+///   syntactic level it opens (+1 per such block);
+/// - an `else` block is a block expression below its `if`, so it counts three
+///   levels for the one syntactic level it opens (+2 per `else` block).
+///
+/// Every other construct counts at most as much as the structural depth, and
+/// parentheses count nothing. Each syntactic level therefore adds at most two
+/// levels, so analysis reaches at most `MAX_STRUCTURAL_DEPTH +
+/// 2 * MAX_NESTING_DEPTH + 1` levels and lowering one more. Every tree the
+/// parser accepts stays within this bound, and only a hand-built tree that
+/// bypassed the parser can exceed it.
+pub(crate) const MAX_TREE_DEPTH: usize = MAX_STRUCTURAL_DEPTH + 2 * MAX_NESTING_DEPTH + 2;
 
 /// Maximum nesting of Core IR blocks inside one function body.
 ///
@@ -95,11 +110,15 @@ pub const EVALUATOR_STACK_BYTES: usize = 1024 * 1024 * 1024;
 /// (lexing, parsing, analysis, Core lowering and verification, formatting,
 /// and WebAssembly compilation): 256 MiB.
 ///
-/// Measured on aarch64 macOS, the deepest program the parser accepts (an
-/// `else if` chain at [`MAX_STRUCTURAL_DEPTH`]) needs about 4 MiB to check or
-/// build in optimized builds and 57 MiB in unoptimized builds, dominated by
-/// Core verification; [`MAX_NESTING_DEPTH`] levels of any construct need under
-/// 2 MiB and about 8 MiB respectively.
+/// Measured on aarch64 macOS, the deepest syntax trees the parser accepts
+/// ([`MAX_NESTING_DEPTH`] nested `else` blocks or block expressions, each
+/// called until the innermost point reaches [`MAX_STRUCTURAL_DEPTH`], which
+/// analysis and lowering recurse through about 4,600 levels deep) need
+/// about 11 MiB to check, explain, or build in optimized builds and 81 MiB in
+/// unoptimized builds; an `else if` chain at [`MAX_STRUCTURAL_DEPTH`] needs
+/// about 4 MiB and 57 MiB, dominated by Core verification; and
+/// [`MAX_NESTING_DEPTH`] levels of any one construct need under 2 MiB and
+/// about 9 MiB respectively.
 pub const COMPILER_STACK_BYTES: usize = 256 * 1024 * 1024;
 
 /// Runs `work` to completion on a new thread named `name` with `stack_bytes`
@@ -156,4 +175,64 @@ pub(crate) fn tree_depth_error(span: Span) -> Diagnostic {
         ),
         span,
     )
+}
+
+/// Generators for the deepest programs the parser accepts, shared by the tests
+/// of every stage that recurses over syntax trees.
+#[cfg(test)]
+pub(crate) mod deepest {
+    use super::{MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH};
+
+    /// How each nested level of a [`source`] program holds the next.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Level {
+        /// `if false { g } else { let h = <next>; g }`: an `else` block, the
+        /// construct that adds the most levels of analysis and lowering
+        /// recursion per syntactic level.
+        Else,
+        /// `{ let h = <next>; g }`: a block expression.
+        Block,
+    }
+
+    /// Returns a well-typed program that prints `0`, whose innermost point
+    /// has nesting level [`MAX_NESTING_DEPTH`] and structural depth
+    /// [`MAX_STRUCTURAL_DEPTH`] plus `extra_links`.
+    ///
+    /// It nests [`MAX_NESTING_DEPTH`] levels of `level`, and each level is
+    /// called as many times as the nesting limit allows (level `j`, counted
+    /// from 1, may open `257 - j` levels of call links) until the structural
+    /// depth is reached. Every call applies `g`, a curried function of 200
+    /// parameters, so every level is a function and the outermost one, called
+    /// 200 times, is `0`.
+    pub(crate) fn source(level: Level, extra_links: usize) -> String {
+        const ARITY: usize = 200;
+        let mut text = String::from("fn g(x0) { ");
+        for parameter in 1..ARITY {
+            text.push_str(&format!("fn(x{parameter}) {{ "));
+        }
+        text.push('0');
+        text.push_str(&" }".repeat(ARITY));
+        text.push('\n');
+
+        let mut remaining = MAX_STRUCTURAL_DEPTH - MAX_NESTING_DEPTH + extra_links;
+        let links = (1..=MAX_NESTING_DEPTH)
+            .map(|nesting| {
+                let count = ARITY.min(MAX_NESTING_DEPTH + 1 - nesting).min(remaining);
+                remaining -= count;
+                count
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, 0, "the links should fit under the nesting limit");
+
+        let mut expression = String::from("0");
+        for count in links.into_iter().rev() {
+            let level = match level {
+                Level::Else => format!("if false {{ g }} else {{ let h = {expression}; g }}"),
+                Level::Block => format!("{{ let h = {expression}; g }}"),
+            };
+            expression = format!("{level}{}", "(1)".repeat(count));
+        }
+        text.push_str(&format!("let value = {expression};\nprintln(value);\n"));
+        text
+    }
 }

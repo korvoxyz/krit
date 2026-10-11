@@ -3689,7 +3689,11 @@ const fn variant_family_name(family: VariantFamily) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Source, analyze, parse_source};
+    use crate::{
+        Source, analyze,
+        limits::deepest::{self, Level},
+        parse_source,
+    };
 
     use super::*;
 
@@ -4023,6 +4027,25 @@ mod tests {
             block = alternative;
         }
         assert_eq!(links, 1_000);
+    }
+
+    #[test]
+    fn lowers_and_verifies_the_deepest_trees_the_parser_accepts() {
+        // Lowering recurses one level deeper than analysis, inside the module
+        // initialization block, so 256 nested `else` blocks at the structural
+        // limit need exactly `MAX_TREE_DEPTH` levels.
+        for level in [Level::Else, Level::Block] {
+            let text = deepest::source(level, 0);
+            let module =
+                crate::run_on_thread("core-test", crate::COMPILER_STACK_BYTES, move || {
+                    lowered(&text)
+                })
+                .expect("core test thread should start");
+            assert!(
+                module.deepest_block().0 <= MAX_CORE_BLOCK_DEPTH,
+                "{level:?}"
+            );
+        }
     }
 
     #[test]

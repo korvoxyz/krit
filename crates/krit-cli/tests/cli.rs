@@ -2414,6 +2414,84 @@ fn long_else_if_chains_check_run_format_build_and_execute() {
     assert_eq!(sandbox.stdout, b"2997\n");
 }
 
+/// The deepest syntax tree the parser accepts: 256 nested `else` blocks (or
+/// block expressions), each called as often as the nesting limit allows until
+/// the innermost point reaches the structural limit. Analysis and Core
+/// lowering recurse through more levels for it than for any other tree.
+/// Every call applies `g`, a curried function of 200 parameters, so the
+/// program prints `0`.
+fn deepest_tree_source(else_blocks: bool) -> String {
+    const ARITY: usize = 200;
+    let mut text = String::from("fn g(x0) { ");
+    for parameter in 1..ARITY {
+        text.push_str(&format!("fn(x{parameter}) {{ "));
+    }
+    text.push('0');
+    text.push_str(&" }".repeat(ARITY));
+    text.push('\n');
+    let mut remaining = krit::MAX_STRUCTURAL_DEPTH - krit::MAX_NESTING_DEPTH;
+    let links = (1..=krit::MAX_NESTING_DEPTH)
+        .map(|nesting| {
+            let count = ARITY
+                .min(krit::MAX_NESTING_DEPTH + 1 - nesting)
+                .min(remaining);
+            remaining -= count;
+            count
+        })
+        .collect::<Vec<_>>();
+    let mut expression = String::from("0");
+    for count in links.into_iter().rev() {
+        let level = if else_blocks {
+            format!("if false {{ g }} else {{ let h = {expression}; g }}")
+        } else {
+            format!("{{ let h = {expression}; g }}")
+        };
+        expression = format!("{level}{}", "(1)".repeat(count));
+    }
+    text.push_str(&format!("let value = {expression};\nprintln(value);\n"));
+    text
+}
+
+#[test]
+fn deepest_accepted_trees_pass_every_command() {
+    for else_blocks in [true, false] {
+        let directory = TestDirectory::new("deepest-tree");
+        directory.file("main.krit", &deepest_tree_source(else_blocks));
+        directory.file("krit.pkg", &package_manifest(true));
+        // Formatting rewrites the file, so checking it again shows the
+        // formatted program stays within the limits too.
+        for (command, stdout) in [
+            (vec!["check", "main.krit"], None),
+            (vec!["explain", "--json", "main.krit"], None),
+            (vec!["run", "main.krit"], Some(&b"0\n"[..])),
+            (vec!["build"], None),
+            (vec!["sandbox"], Some(&b"0\n"[..])),
+            (vec!["fmt", "main.krit"], None),
+            (vec!["check", "main.krit"], None),
+        ] {
+            let output = krit_in(&directory)
+                .args(&command)
+                .output()
+                .expect("Krit should start");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "else blocks {else_blocks} {command:?}: {stderr}"
+            );
+            assert!(
+                stderr.is_empty(),
+                "else blocks {else_blocks} {command:?}: {stderr}"
+            );
+            if let Some(stdout) = stdout {
+                assert_eq!(
+                    output.stdout, stdout,
+                    "else blocks {else_blocks} {command:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn unifying_solved_types_reports_limits_without_aborting() {
     // Unifying `shallow` with `deep` deepens `top` to 260 levels; unifying

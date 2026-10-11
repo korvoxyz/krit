@@ -3942,7 +3942,11 @@ fn type_variable_name(id: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Source, parse_source};
+    use crate::{
+        Source,
+        limits::deepest::{self, Level},
+        parse_source,
+    };
 
     use super::*;
 
@@ -4428,18 +4432,22 @@ mod tests {
 
     #[test]
     fn analyzes_every_tree_the_parser_accepts() {
-        // A block used as a callee counts twice in analysis recursion but
-        // once in the structural depth: 127 levels of `{ ... }` each followed
-        // by 31 calls is 4,064 structural levels and 4,191 levels of analysis
-        // recursion. Analysis reaches the undefined innermost name instead of
-        // reporting the tree as too deep.
-        let mut expression = String::from("g");
-        for _ in 0..127 {
-            expression = format!("{{ {expression} }}{}", "(1)".repeat(31));
+        // A block expression counts two levels of analysis recursion for its
+        // one syntactic level and an `else` block three, so 256 nested `else`
+        // blocks at the structural limit need `MAX_TREE_DEPTH - 1` levels.
+        for level in [Level::Else, Level::Block] {
+            check_on_compiler_stack(deepest::source(level, 0)).unwrap_or_else(|error| {
+                panic!("{level:?}: the deepest accepted tree should analyze: {error:?}")
+            });
+            let error = check_on_compiler_stack(deepest::source(level, 1))
+                .expect_err("one more link should exceed the structural limit");
+            assert_eq!(error.code(), "K1005", "{level:?}");
+            assert!(
+                error.message().contains("4096"),
+                "{level:?}: {}",
+                error.message()
+            );
         }
-        let error = check_on_compiler_stack(format!("let value = {expression};\n"))
-            .expect_err("the innermost name is undefined");
-        assert_eq!(error.code(), "K2001");
     }
 
     #[test]

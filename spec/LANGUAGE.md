@@ -224,7 +224,10 @@ within a fixed depth.
 Exceeding any of these limits is error `K1005` at the construct, operator, or
 inference step that crosses it. Parsing, static checking, Core lowering and
 verification, formatting, and component generation all enforce the same
-bounds, so no accepted program can exhaust the compiler's native stack.
+bounds, so no accepted program can exhaust the compiler's native stack. The
+later stages also count their own recursion, to reject syntax trees built
+without the parser; every tree within the limits above stays inside those
+internal bounds, so a source program only ever sees the limits stated here.
 
 ## 5. Program and block values
 
