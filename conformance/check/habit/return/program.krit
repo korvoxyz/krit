@@ -1,0 +1,7 @@
+fn absolute(value: Int) -> Int {
+    if value < 0 {
+        return 0 - value;
+    } else {
+        value
+    }
+}

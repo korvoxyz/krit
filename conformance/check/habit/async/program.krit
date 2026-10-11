@@ -1,0 +1,7 @@
+fn fetch() -> String {
+    "body"
+}
+
+fn handle() -> String {
+    await fetch()
+}

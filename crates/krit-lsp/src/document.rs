@@ -247,16 +247,28 @@ impl OmittedWarnings {
     }
 }
 
+/// The text a published diagnostic carries: the compiler message, then each
+/// note on its own line as `help: <note>`, as the human format prints them.
+fn published_message(diagnostic: &CompilerDiagnostic) -> String {
+    let mut message = diagnostic.message().to_owned();
+    for note in diagnostic.notes() {
+        message.push_str("\nhelp: ");
+        message.push_str(note);
+    }
+    message
+}
+
 /// Splits source-ordered analysis warnings into the prefix a document
 /// publishes, at most `MAX_PUBLISHED_WARNINGS` warnings and
-/// `MAX_PUBLISHED_WARNING_MESSAGE_BYTES` of message text, and the rest.
+/// `MAX_PUBLISHED_WARNING_MESSAGE_BYTES` of published message text (notes
+/// included), and the rest.
 fn bound_warnings(
     mut warnings: Vec<CompilerDiagnostic>,
 ) -> (Vec<CompilerDiagnostic>, Option<OmittedWarnings>) {
     let mut message_bytes = 0_usize;
     let mut kept = 0;
     for warning in warnings.iter().take(MAX_PUBLISHED_WARNINGS) {
-        message_bytes = message_bytes.saturating_add(warning.message().len());
+        message_bytes = message_bytes.saturating_add(published_message(warning).len());
         if message_bytes > MAX_PUBLISHED_WARNING_MESSAGE_BYTES {
             break;
         }
@@ -397,7 +409,7 @@ impl Document {
             }),
             code: Some(NumberOrString::String(diagnostic.code().to_owned())),
             source: Some("krit".to_owned()),
-            message: diagnostic.message().to_owned(),
+            message: published_message(diagnostic),
             ..Diagnostic::default()
         }
     }
@@ -803,6 +815,7 @@ impl Document {
                     "document exceeds the {} byte language-server limit",
                     MAX_DOCUMENT_BYTES
                 ),
+                notes: Vec::new(),
                 span: ByteSpan { start: 0, end: 0 },
                 range: Range::new(Position::new(0, 0), Position::new(0, 0)),
             }]
@@ -813,6 +826,7 @@ impl Document {
                 severity: diagnostic.severity().as_str(),
                 code: diagnostic.code().to_owned(),
                 message: diagnostic.message().to_owned(),
+                notes: diagnostic.notes().to_vec(),
                 span: diagnostic.span().into(),
                 range: self.lines.range(self.source.text(), diagnostic.span()),
             };
@@ -822,6 +836,7 @@ impl Document {
                     severity: "info",
                     code: OMITTED_WARNINGS_CODE.to_owned(),
                     message: omitted.message(),
+                    notes: Vec::new(),
                     span: omitted.span.into(),
                     range: self.lines.range(self.source.text(), omitted.span),
                 });
@@ -2411,6 +2426,8 @@ struct CompilerDiagnosticFact {
     severity: &'static str,
     code: String,
     message: String,
+    /// One-line repair hints, as in the JSON Lines `notes` field.
+    notes: Vec<String>,
     span: ByteSpan,
     range: Range,
 }
@@ -2654,6 +2671,51 @@ mod tests {
         assert_eq!(diagnostic.range.start, Position::new(0, 30));
         assert_eq!(diagnostic.range.end, Position::new(0, 37));
         assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn publishes_fix_hints_as_help_lines_and_compiler_fact_notes() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let diagnostics = state.open(
+            uri.clone(),
+            1,
+            "let total = 1;\nprintln(totl);\n".to_owned(),
+        );
+
+        assert_eq!(diagnostics.diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.diagnostics[0].message,
+            "undefined name `totl`\nhelp: did you mean `total`?"
+        );
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        assert_eq!(facts["diagnostics"][0]["code"], "K2001");
+        assert_eq!(facts["diagnostics"][0]["message"], "undefined name `totl`");
+        assert_eq!(
+            facts["diagnostics"][0]["notes"],
+            serde_json::json!(["did you mean `total`?"])
+        );
+
+        let changed = state
+            .change(&uri, 2, "fn f(x) {\n    return x;\n}\n".to_owned())
+            .expect("change should succeed");
+        let diagnostic = &changed.diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("K1101".to_owned()))
+        );
+        assert!(
+            diagnostic
+                .message
+                .starts_with("`return` is not Krit syntax\nhelp: a block's value")
+        );
+        assert_eq!(diagnostic.range.start, Position::new(1, 4));
     }
 
     #[test]

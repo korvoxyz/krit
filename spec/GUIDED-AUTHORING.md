@@ -140,14 +140,17 @@ The language server exposes versioned structured facts:
 
 The implemented protocol is synchronous LSP over stdio. It uses full-document
 synchronization and UTF-16 positions, publishes compiler errors and warnings
-with their LSP severities, and supports standard hover, completion, document
-symbols, formatting, and code actions. `krit/compilerFacts` accepts a standard `textDocument` identifier and
-returns schema 1 with:
+with their LSP severities and their notes as `help:` lines, and supports
+standard hover, completion, document symbols, formatting, and code actions.
+`krit/compilerFacts` accepts a standard `textDocument` identifier and returns
+schema 1 with:
 
 - language and authoring-protocol versions
 - stable diagnostics, each with its `error` or `warning` severity, byte span,
-  and UTF-16 range, bounded like published diagnostics (with an `info`
-  `K8003` notice for warnings left out)
+  UTF-16 range, and `notes` (one-line fix hints, such as a did-you-mean
+  suggestion or the Krit spelling of a construct from another language),
+  bounded like published diagnostics (with an `info` `K8003` notice for
+  warnings left out)
 - module effects, literal-resource requirements, and entrypoints
 - symbols with inferred/declared types, reference status, and visibility
 - expression syntax kinds, inferred types, effects, requirements, and

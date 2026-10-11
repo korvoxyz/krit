@@ -1,0 +1,3 @@
+let name = "krit";
+
+println(name.len());

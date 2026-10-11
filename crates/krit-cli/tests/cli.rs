@@ -1628,6 +1628,43 @@ fn assert_discard_read_json_warning(stderr: &[u8]) {
 }
 
 #[test]
+fn check_and_run_print_fix_hints_as_help_lines_and_json_notes() {
+    let directory = TestDirectory::new("habit-hints");
+    directory.file("main.krit", "fn f(x) {\n    return x;\n}\n");
+    directory.file("typo.krit", "let total = 1;\nprintln(totl);\n");
+
+    for command in ["check", "run"] {
+        let human = krit_in(&directory)
+            .args([command, "main.krit"])
+            .output()
+            .expect("Krit should start");
+        assert_eq!(human.status.code(), Some(1), "{command}");
+        assert!(human.stdout.is_empty(), "{command}");
+        assert_eq!(
+            String::from_utf8_lossy(&human.stderr),
+            "main.krit:2:5: error[K1101]: `return` is not Krit syntax\n\
+             help: a block's value is its final expression, written without `return` or `;`; \
+             for early exit, `?` and let-else arrive in Krit 0.3\n",
+            "{command}"
+        );
+
+        let json = krit_in(&directory)
+            .args([command, "--diagnostic-format", "json", "typo.krit"])
+            .output()
+            .expect("Krit should start");
+        assert_eq!(json.status.code(), Some(1), "{command}");
+        let diagnostics = parse_json_lines(&json.stderr);
+        assert_eq!(diagnostics.len(), 1, "{command}");
+        assert_eq!(diagnostics[0]["code"], "K2001");
+        assert_eq!(diagnostics[0]["message"], "undefined name `totl`");
+        assert_eq!(
+            diagnostics[0]["notes"],
+            serde_json::json!(["did you mean `total`?"])
+        );
+    }
+}
+
+#[test]
 fn check_run_and_explain_print_warnings_without_changing_the_exit_status() {
     let directory = TestDirectory::new("discard-warning");
     directory.file("main.krit", DISCARD_READ_SOURCE);
@@ -1806,6 +1843,33 @@ fn diagnostic_codes(diagnostics: &[serde_json::Value], severity: &str) -> Vec<St
         .collect()
 }
 
+/// Habit codes (`K1101`-`K1112`) and method calls (`K3011`) carry a one-line
+/// fix in their JSON `notes`; every note is a one-line string.
+fn assert_fix_hints(diagnostics: &[serde_json::Value], case: &Path) {
+    for diagnostic in diagnostics {
+        let code = diagnostic["code"]
+            .as_str()
+            .expect("code should be a string");
+        let notes = diagnostic["notes"]
+            .as_array()
+            .expect("notes should be an array");
+        let habit = code
+            .strip_prefix("K11")
+            .and_then(|number| number.parse::<u8>().ok())
+            .is_some_and(|number| (1..=12).contains(&number));
+        if habit || code == "K3011" {
+            assert!(!notes.is_empty(), "{}: {code} has no fix", case.display());
+        }
+        assert!(
+            notes.iter().all(|note| note
+                .as_str()
+                .is_some_and(|note| !note.is_empty() && !note.contains('\n'))),
+            "{}: every note is a one-line string",
+            case.display()
+        );
+    }
+}
+
 #[test]
 fn run_refuses_every_check_failure_with_checks_diagnostic_and_status() {
     for case in conformance_cases("check") {
@@ -1844,6 +1908,7 @@ fn run_refuses_every_check_failure_with_checks_diagnostic_and_status() {
                     "{}: every diagnostic is an error or a warning",
                     case.display()
                 );
+                assert_fix_hints(&diagnostics, &case);
             }
             let run = krit()
                 .args(["run", "--diagnostic-format", format])

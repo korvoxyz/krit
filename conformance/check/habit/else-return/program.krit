@@ -1,0 +1,6 @@
+fn first(items: List<Int>) -> Int {
+    match items {
+        [] => 0,
+        [head, .._] => if head > 0 { head } else { return 0; },
+    }
+}

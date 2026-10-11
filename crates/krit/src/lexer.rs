@@ -62,6 +62,7 @@ impl<'a> Lexer<'a> {
                 ',' => self.push(TokenKind::Comma, start),
                 ':' => self.push(TokenKind::Colon, start),
                 ';' => self.push(TokenKind::Semicolon, start),
+                '?' => self.push(TokenKind::Question, start),
                 '+' => self.push(TokenKind::Plus, start),
                 '-' if self.consume('>') => self.push(TokenKind::ThinArrow, start),
                 '-' => self.push(TokenKind::Minus, start),
@@ -389,6 +390,16 @@ mod tests {
                 .iter()
                 .any(|token| token.kind == TokenKind::ThinArrow)
         );
+    }
+
+    #[test]
+    fn lexes_the_question_mark_as_a_token() {
+        let source = Source::new("test.krit", "ready ? 1 : 2");
+        let tokens = lex(&source).expect("`?` should lex");
+
+        assert_eq!(tokens[1].kind, TokenKind::Question);
+        assert_eq!(tokens[1].span, Span::new(6, 7));
+        assert_eq!(tokens[3].kind, TokenKind::Colon);
     }
 
     #[test]

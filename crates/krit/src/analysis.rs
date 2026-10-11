@@ -14,6 +14,7 @@ use crate::{
         Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral,
         VariantFamily, VariantName,
     },
+    habits::{MethodReceiver, method_hint, undefined_name_note},
     limits::{MAX_NESTING_DEPTH, MAX_TREE_DEPTH, tree_depth_error},
 };
 
@@ -884,6 +885,9 @@ struct Analyzer {
     type_depth_error: Option<Diagnostic>,
     /// Warnings found so far, in analysis order. They never stop analysis.
     warnings: Vec<Diagnostic>,
+    /// The span of the field access `call` is about to analyze as its callee,
+    /// so a failed access reports the method call it is part of (`K3011`).
+    method_callee: Option<Span>,
 }
 
 #[derive(Clone)]
@@ -914,6 +918,7 @@ impl Analyzer {
             type_dependents: Vec::new(),
             type_depth_error: None,
             warnings: Vec::new(),
+            method_callee: None,
         }
     }
 
@@ -1371,8 +1376,18 @@ impl Analyzer {
                 })
             }
             ExpressionKind::FieldAccess { value, field } => {
-                let value = self.expression(value)?;
-                let ty = self.require_field(value.ty, field, expression.span)?;
+                let called = self.method_callee.take() == Some(expression.span);
+                let receiver = value;
+                let value = self.expression(receiver)?;
+                let receiver_type = called.then(|| value.ty.clone());
+                let ty = self
+                    .require_field(value.ty, field, expression.span)
+                    .map_err(|error| match receiver_type {
+                        Some(receiver_type) if error.code() == "K3004" => {
+                            self.method_call_error(&receiver_type, receiver, field, expression.span)
+                        }
+                        _ => error,
+                    })?;
                 Ok(ExpressionInfo {
                     ty,
                     effects: value.effects,
@@ -1776,6 +1791,9 @@ impl Analyzer {
         } else {
             Vec::new()
         };
+        if matches!(callee.kind, ExpressionKind::FieldAccess { .. }) {
+            self.method_callee = Some(callee.span);
+        }
         let callee_info = self.expression(callee)?;
         let mut effects = callee_info.effects;
         let mut argument_types = Vec::with_capacity(arguments.len());
@@ -1811,11 +1829,22 @@ impl Analyzer {
                 (parameters, return_type, effect)
             }
             other => {
-                return Err(Diagnostic::new(
+                let diagnostic = Diagnostic::new(
                     "K3002",
                     format!("cannot call value of type `{}`", self.render_type(&other)),
                     callee.span,
-                ));
+                );
+                // `None()`: the reserved name always means the built-in.
+                return Err(
+                    if matches!(&callee.kind, ExpressionKind::Variable(name) if name == "None") {
+                        diagnostic.with_note(
+                            "`None` is a value, not a function: write `None` without \
+                             parentheses, or `Some(value)` for a present value",
+                        )
+                    } else {
+                        diagnostic
+                    },
+                );
             }
         };
 
@@ -3084,8 +3113,69 @@ impl Analyzer {
                 return Ok((binding.ty.clone(), ResolvedName::Symbol(binding.id)));
             }
         }
-        self.builtin(name, span)
-            .ok_or_else(|| Diagnostic::new("K2001", format!("undefined name `{name}`"), span))
+        if let Some(builtin) = self.builtin(name, span) {
+            return Ok(builtin);
+        }
+        let diagnostic = Diagnostic::new("K2001", format!("undefined name `{name}`"), span);
+        // Suggestions come from the names visible here: bindings in scope,
+        // built-ins, and the Boolean literals (`True` -> `true`).
+        let candidates = self
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.keys().map(String::as_str))
+            .chain(Builtin::ALL.iter().map(|builtin| builtin.as_str()))
+            .chain(["true", "false"]);
+        Err(match undefined_name_note(name, candidates) {
+            Some(note) => diagnostic.with_note(note),
+            None => diagnostic,
+        })
+    }
+
+    /// The error for calling `.method()` on `receiver`, a value of
+    /// `receiver_type` that has no field of that name (`K3011`).
+    ///
+    /// Krit values have no methods; `value.name(...)` is valid only as a call
+    /// of a function stored in a record field. The note names the standard
+    /// library function that does the job when one exists or is planned.
+    fn method_call_error(
+        &self,
+        receiver_type: &InferType,
+        receiver: &Expression,
+        method: &str,
+        span: Span,
+    ) -> Diagnostic {
+        let head = self.resolve_head(receiver_type);
+        let rendered = self.render_type(&head);
+        let (kind, message) = match head {
+            InferType::Record { .. }
+            | InferType::HttpHeader
+            | InferType::HttpRequest
+            | InferType::HttpResponse
+            | InferType::LogField
+            | InferType::QueueJob
+            | InferType::ScheduleEvent => (
+                MethodReceiver::Other,
+                format!(
+                    "cannot call `.{method}()`: `{rendered}` has no field `{method}`, and Krit \
+                     values have no methods"
+                ),
+            ),
+            head => (
+                match head {
+                    InferType::String => MethodReceiver::String,
+                    InferType::Int => MethodReceiver::Int,
+                    InferType::List(_) => MethodReceiver::List,
+                    InferType::Option(_) | InferType::Result(..) => MethodReceiver::Variant,
+                    _ => MethodReceiver::Other,
+                },
+                format!(
+                    "cannot call `.{method}()` on a value of type `{rendered}`: Krit values have \
+                     no methods"
+                ),
+            ),
+        };
+        let value = receiver_path(receiver).unwrap_or_else(|| "value".to_owned());
+        Diagnostic::new("K3011", message, span).with_note(method_hint(kind, method, &value))
     }
 
     fn builtin(&mut self, name: &str, span: Span) -> Option<(InferType, ResolvedName)> {
@@ -3745,6 +3835,30 @@ impl<'a> TypeNormalizer<'a> {
     }
 }
 
+/// The source spelling of a method call's receiver when it is a name or a
+/// short field path (`s`, `request.body`), for use in a fix; `None` for any
+/// other expression.
+fn receiver_path(receiver: &Expression) -> Option<String> {
+    const MAX_FIELDS: usize = 4;
+    let mut fields = Vec::new();
+    let mut current = receiver;
+    loop {
+        match &current.kind {
+            ExpressionKind::Variable(name) => {
+                fields.push(name.as_str());
+                break;
+            }
+            ExpressionKind::FieldAccess { value, field } if fields.len() < MAX_FIELDS => {
+                fields.push(field);
+                current = value;
+            }
+            _ => return None,
+        }
+    }
+    fields.reverse();
+    Some(fields.join("."))
+}
+
 fn contract_record(nominal: &InferType) -> InferType {
     let fields = match nominal {
         InferType::HttpHeader => BTreeMap::from([
@@ -3944,6 +4058,7 @@ fn type_variable_name(id: u32) -> String {
 mod tests {
     use crate::{
         Source,
+        habits::Habit,
         limits::deepest::{self, Level},
         parse_source,
     };
@@ -4868,5 +4983,151 @@ mod tests {
             Some(expected.as_str())
         );
         assert!(large.render_bounded(16 * 1024).is_none());
+    }
+
+    fn error_notes(text: &str) -> (&'static str, String, Vec<String>) {
+        let error = check(text).expect_err("program should not check");
+        (
+            error.code(),
+            error.message().to_owned(),
+            error.notes().to_vec(),
+        )
+    }
+
+    #[test]
+    fn suggests_the_closest_visible_name_for_an_undefined_name() {
+        let (code, message, notes) = error_notes("let total = 1;\nprintln(totl);");
+        assert_eq!(code, "K2001");
+        assert_eq!(message, "undefined name `totl`");
+        assert_eq!(notes, ["did you mean `total`?"]);
+
+        // Built-ins, inner scopes, and the Boolean literals are candidates;
+        // a binding that has gone out of scope is not.
+        let (_, _, notes) = error_notes("pritnln(1);");
+        assert_eq!(notes, ["did you mean `println`?"]);
+        let (_, _, notes) = error_notes("fn f(count) { let counter = count; conuter }");
+        assert_eq!(notes, ["did you mean `counter`?"]);
+        let (_, _, notes) = error_notes("fn f() { let inner = 1; inner }\nprintln(innr);");
+        assert!(notes.is_empty(), "{notes:?}");
+        let (_, _, notes) = error_notes("let flag = True;");
+        assert_eq!(notes, ["did you mean `true`?"]);
+        let (_, _, notes) = error_notes("let value = some(1);");
+        assert_eq!(notes, ["did you mean `Some`?"]);
+
+        // Ties go to the fewest edits, then the bytewise smallest name.
+        let (_, _, notes) = error_notes("let tokb = 1;\nlet toka = 2;\ntok;");
+        assert_eq!(notes, ["did you mean `toka`?"]);
+        let (_, _, notes) = error_notes("let missing_value = 1;\nlet value = missing;");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn explains_null_and_foreign_keywords_used_as_names() {
+        for name in ["null", "nil", "undefined"] {
+            let (code, _, notes) = error_notes(&format!("let value = {name};"));
+            assert_eq!(code, "K2001");
+            assert_eq!(
+                notes,
+                [format!(
+                    "Krit has no `{name}`; write `None` for an absent `Option` value"
+                )]
+            );
+        }
+        for (text, habit) in [
+            ("fn f() { return; }", Habit::Return),
+            ("fn f() { return -1 }", Habit::Return),
+            ("fn f(g) { await(g) }", Habit::Async),
+            ("let json = require(\"json\");", Habit::Import),
+        ] {
+            let (code, _, notes) = error_notes(text);
+            assert_eq!(code, "K2001", "{text}");
+            assert_eq!(notes, [habit.hint()], "{text}");
+        }
+
+        let (code, _, notes) = error_notes("let value = None();");
+        assert_eq!(code, "K3002");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("`None` is a value, not a function"));
+        let (code, _, notes) = error_notes("let value = 1;\nvalue();");
+        assert_eq!(code, "K3002");
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn reports_method_calls_with_a_standard_library_hint() {
+        for (text, message, note) in [
+            (
+                "let name = \"krit\";\nname.len();",
+                "cannot call `.len()` on a value of type `String`: Krit values have no methods",
+                "call `string_byte_len(name)` instead",
+            ),
+            (
+                "fn f(path: String) { path.startsWith(\"/\") }",
+                "cannot call `.startsWith()` on a value of type `String`: Krit values have no \
+                 methods",
+                "call `string_starts_with(path, prefix)` instead",
+            ),
+            (
+                "let count = 1;\ncount.toString();",
+                "cannot call `.toString()` on a value of type `Int`: Krit values have no methods",
+                "call `int_to_string(count)` instead",
+            ),
+            (
+                "let items = [1];\nitems.len();",
+                "cannot call `.len()` on a value of type `List<Int>`: Krit values have no methods",
+                "match the list with `[]` and `[head, ..tail]` patterns instead",
+            ),
+            (
+                "let found = Some(1);\nfound.unwrap();",
+                "cannot call `.unwrap()` on a value of type `Option<Int>`: Krit values have no \
+                 methods",
+                "handle both outcomes with `match` instead",
+            ),
+            (
+                "let item = record { body: \"x\" };\nitem.body.len();",
+                "cannot call `.len()` on a value of type `String`: Krit values have no methods",
+                "call `string_byte_len(item.body)` instead",
+            ),
+            (
+                "let item = record { a: 1 };\nitem.send(1);",
+                "cannot call `.send()`: `Record { a: Int }` has no field `send`, and Krit values \
+                 have no methods",
+                "pass the value to a function instead, as in `f(item)`",
+            ),
+            (
+                "webhook fn handle(request: HttpRequest) -> HttpResponse {\n\
+                 request.json()\n}",
+                "cannot call `.json()`: `HttpRequest` has no field `json`, and Krit values have \
+                 no methods",
+                "pass the value to a function instead, as in `f(request)`",
+            ),
+        ] {
+            let (code, actual, notes) = error_notes(text);
+            assert_eq!(code, "K3011", "{text}");
+            assert_eq!(actual, message, "{text}");
+            assert_eq!(notes.len(), 1, "{text}");
+            assert!(notes[0].starts_with(note), "{text}: {}", notes[0]);
+        }
+    }
+
+    #[test]
+    fn field_access_and_calls_of_function_fields_keep_their_meaning() {
+        // A call of a function stored in a record field is not a method call.
+        check("let item = record { run: fn() { 1 } };\nitem.run();")
+            .expect("a function field should be callable");
+        check("fn f(item) { item.run() }").expect("an open record may hold a function field");
+
+        // A plain field access is still K3004, and so is a failing access in
+        // the receiver of a method call.
+        let (code, _, notes) = error_notes("let name = \"krit\";\nname.len;");
+        assert_eq!(code, "K3004");
+        assert!(notes.is_empty());
+        let (code, message, _) = error_notes("let item = record { a: 1 };\nitem.b.c();");
+        assert_eq!(code, "K3004");
+        assert_eq!(message, "record type has no field `b`");
+
+        // A field that exists but does not hold a function is a call error.
+        let (code, _, _) = error_notes("let item = record { a: 1 };\nitem.a();");
+        assert_eq!(code, "K3002");
     }
 }

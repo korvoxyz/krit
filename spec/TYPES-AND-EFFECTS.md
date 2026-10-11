@@ -241,6 +241,14 @@ traces remain draft. The intended complete error should state:
 The compiler must not emit a cascade of speculative errors after a binding's
 type becomes unknown.
 
+A call whose callee is a field access, `value.name(...)`, calls the function
+stored in that record field. When `value`'s type has no field `name`, because
+it is not a record type or is a closed record type without that field, the
+error is a method call (`K3011`) rather than a field-access error (`K3004`),
+and its note names the standard-library function to use instead where there
+is one (`DIAGNOSTICS.md`, Fix hints). An undefined name (`K2001`) carries a
+did-you-mean note chosen from the names visible at the reference.
+
 ## Open decisions
 
 - Generic exported functions

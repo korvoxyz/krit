@@ -1,0 +1,7 @@
+fn parse(text: String) -> Int {
+    if text == "" {
+        throw "empty input";
+    } else {
+        1
+    }
+}

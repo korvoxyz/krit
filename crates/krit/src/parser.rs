@@ -7,6 +7,7 @@ use crate::{
         RecordField, RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind,
         UnaryOperator, ValueLiteral, VariantArm, VariantFamily, VariantName,
     },
+    habits::Habit,
     limits::{MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, nesting_error, structural_error},
     token::{Token, TokenKind},
 };
@@ -93,7 +94,13 @@ impl Parser {
         {
             self.function_declaration()
         } else {
+            if let Some(habit) = self.statement_habit() {
+                return Err(habit);
+            }
             let expression = self.expression()?;
+            if let Some(assignment) = self.assignment_after(&expression) {
+                return Err(assignment);
+            }
             let semicolon = self.expect(TokenKind::Semicolon)?;
             let span = expression.span.join(semicolon.span);
             Ok(Statement {
@@ -113,6 +120,9 @@ impl Parser {
         };
         self.expect(TokenKind::Equal)?;
         let value = self.expression()?;
+        if let Some(assignment) = self.assignment_after(&value) {
+            return Err(assignment);
+        }
         let end = self.expect(TokenKind::Semicolon)?.span;
         Ok(Statement {
             kind: StatementKind::Let {
@@ -321,7 +331,13 @@ impl Parser {
                 continue;
             }
 
+            if let Some(habit) = self.statement_habit() {
+                return Err(habit);
+            }
             let expression = self.expression()?;
+            if let Some(assignment) = self.assignment_after(&expression) {
+                return Err(assignment);
+            }
             if self.consume(&TokenKind::Semicolon) {
                 let end = self.previous().span;
                 statements.push(Statement {
@@ -501,6 +517,15 @@ impl Parser {
                     },
                     span,
                 };
+            } else if self.check(&TokenKind::LeftBracket)
+                && self.previous().span.end == self.current().span.start
+            {
+                return Err(Habit::Indexing.diagnostic(
+                    "indexing with `[...]` is not Krit syntax",
+                    expression.span.join(self.current().span),
+                ));
+            } else if self.check(&TokenKind::Question) {
+                return Err(self.question_mark());
             } else {
                 break;
             }
@@ -534,18 +559,19 @@ impl Parser {
                 kind: ExpressionKind::Literal(ValueLiteral::Boolean(false)),
                 span: token.span,
             }),
-            TokenKind::Identifier(name) => Ok(Expression {
-                kind: ExpressionKind::Variable(name),
-                span: token.span,
-            }),
-            TokenKind::LeftParen => {
-                let expression = self.nested(token.span, Self::expression)?;
-                let end = self.expect(TokenKind::RightParen)?.span;
+            TokenKind::Identifier(name) => {
+                if self.check(&TokenKind::FatArrow) {
+                    return Err(arrow_function(token.span.join(self.current().span)));
+                }
+                if let Some(habit) = self.word_habit(&name, token.span) {
+                    return Err(habit);
+                }
                 Ok(Expression {
-                    span: token.span.join(end),
-                    ..expression
+                    kind: ExpressionKind::Variable(name),
+                    span: token.span,
                 })
             }
+            TokenKind::LeftParen => self.parenthesized(token.span),
             TokenKind::LeftBracket => self.list(token.span),
             TokenKind::Record => self.record(token.span),
             TokenKind::LeftBrace => {
@@ -559,12 +585,228 @@ impl Parser {
             TokenKind::If => self.if_expression(token.span),
             TokenKind::Match => self.match_expression(token.span),
             TokenKind::Fn => self.function_expression(token.span),
-            _ => Err(Diagnostic::new(
-                "K1001",
-                format!("unexpected {}", token.kind.description()),
-                token.span,
-            )),
+            _ => Err(self.mutation_operator(&token).unwrap_or_else(|| {
+                Diagnostic::new(
+                    "K1001",
+                    format!("unexpected {}", token.kind.description()),
+                    token.span,
+                )
+            })),
         }
+    }
+
+    /// Parses `( expression )` after its `(` at `open`, and reports an arrow
+    /// function's parameter list followed by `=>` (`K1109`): `(x) => e`,
+    /// `(x, y) => e`, `() => e`.
+    fn parenthesized(&mut self, open: Span) -> Result<Expression, Diagnostic> {
+        let open_index = self.cursor - 1;
+        let expression = match self.nested(open, Self::expression) {
+            Ok(expression) => expression,
+            // `()` and parameters such as `(...rest)` are not expressions.
+            Err(error) if !is_settled(&error) => {
+                return Err(self.arrow_after_group(open_index).unwrap_or(error));
+            }
+            Err(error) => return Err(error),
+        };
+        if !self.check(&TokenKind::RightParen) {
+            // `(x, y)` or `(x: Int)`.
+            return Err(self
+                .arrow_after_group(open_index)
+                .unwrap_or_else(|| self.expected(TokenKind::RightParen.description())));
+        }
+        let end = self.advance().span;
+        if self.check(&TokenKind::FatArrow) {
+            return Err(arrow_function(open.join(self.current().span)));
+        }
+        Ok(Expression {
+            span: open.join(end),
+            ..expression
+        })
+    }
+
+    /// Reports a habit word used as another language's keyword: `word` at
+    /// `span`, just consumed in expression position, followed by an operand
+    /// (`return value`, `for item in items`, `const limit = 3`,
+    /// `class Point`) or by a parenthesized group and `=>`
+    /// (`async (x) => e`).
+    ///
+    /// An identifier expression is never followed by either, so a habit word
+    /// used as an ordinary name is never reported.
+    fn word_habit(&self, word: &str, span: Span) -> Option<Diagnostic> {
+        let habit = Habit::of_word(word)?;
+        let next = self.current();
+        let foreign = follows_as_operand(span, next)
+            || (next.kind == TokenKind::LeftParen && self.arrow_after_group(self.cursor).is_some());
+        foreign.then(|| habit.word_diagnostic(word, span))
+    }
+
+    /// Reports a statement that starts with a habit word followed by `{`,
+    /// `:`, or a parenthesized group and `{`: `try {`, `loop {`, `default:`,
+    /// `while (ready) {`, `for (let i = 0; i < n; i++) {`.
+    ///
+    /// No expression statement continues that way, so a habit word used as an
+    /// ordinary name is never reported. Habit words followed by an operand are
+    /// reported when the expression is parsed ([`Self::word_habit`]).
+    fn statement_habit(&self) -> Option<Diagnostic> {
+        let word = self.current();
+        let TokenKind::Identifier(name) = &word.kind else {
+            return None;
+        };
+        let habit = Habit::of_word(name)?;
+        let foreign = match &self.tokens.get(self.cursor + 1)?.kind {
+            TokenKind::LeftBrace | TokenKind::Colon => true,
+            TokenKind::LeftParen => self
+                .matching_paren(self.cursor + 1, |kind| {
+                    matches!(kind, TokenKind::LeftBrace | TokenKind::RightBrace)
+                })
+                .is_some_and(|close| {
+                    self.tokens
+                        .get(close + 1)
+                        .is_some_and(|token| token.kind == TokenKind::LeftBrace)
+                }),
+            _ => false,
+        };
+        foreign.then(|| habit.word_diagnostic(name, word.span))
+    }
+
+    /// Reports `target = value` (`K1103`): an expression statement, a block's
+    /// final expression, or a `let` value followed by `=`.
+    fn assignment_after(&self, target: &Expression) -> Option<Diagnostic> {
+        self.check(&TokenKind::Equal).then(|| {
+            Habit::Mutation.diagnostic(
+                "assignment is not Krit syntax",
+                target.span.join(self.current().span),
+            )
+        })
+    }
+
+    /// Reports the compound assignment, increment, or decrement operator that
+    /// ends at `unexpected`, the token `primary` just consumed and could not
+    /// start an operand with: `x += 1`, `x++`, `x--` (`K1103`).
+    ///
+    /// Each lexes as an operator touching `=` or a second operator, which
+    /// leaves an operand missing where the second token stands.
+    fn mutation_operator(&self, unexpected: &Token) -> Option<Diagnostic> {
+        // Consuming the end of the file leaves the cursor on it.
+        let index = if unexpected.kind == TokenKind::Eof {
+            self.cursor
+        } else {
+            self.cursor - 1
+        };
+        let before = &self.tokens[index.checked_sub(1)?];
+        let (first, second, operator) = match (&before.kind, &unexpected.kind) {
+            (TokenKind::Plus, TokenKind::Equal) => (before, unexpected, "+="),
+            (TokenKind::Minus, TokenKind::Equal) => (before, unexpected, "-="),
+            (TokenKind::Star, TokenKind::Equal) => (before, unexpected, "*="),
+            (TokenKind::Slash, TokenKind::Equal) => (before, unexpected, "/="),
+            (TokenKind::Percent, TokenKind::Equal) => (before, unexpected, "%="),
+            (TokenKind::Plus, TokenKind::Plus) => (before, unexpected, "++"),
+            // `x--` parses as `x - -` with the negated operand missing.
+            (TokenKind::Minus, _) => {
+                let first = &self.tokens[index.checked_sub(2)?];
+                if first.kind != TokenKind::Minus {
+                    return None;
+                }
+                (first, before, "--")
+            }
+            _ => return None,
+        };
+        (first.span.end == second.span.start).then(|| {
+            Habit::Mutation.diagnostic(
+                format!("`{operator}` is not Krit syntax"),
+                first.span.join(second.span),
+            )
+        })
+    }
+
+    /// Diagnoses a `?` that follows an expression.
+    ///
+    /// `c ? a : b`, a `?` followed by an expression and then `:`, is another
+    /// language's conditional operator (`K1110`). Any other `?` there is a
+    /// postfix operator that Krit does not have yet.
+    fn question_mark(&mut self) -> Diagnostic {
+        let question = self.advance().span;
+        self.ternary_after(question).unwrap_or_else(|| {
+            Diagnostic::new("K1001", "unexpected `?`", question).with_note(
+                "postfix `?` arrives in Krit 0.3; until then, handle the `Result` or \
+                 `Option` with `match`",
+            )
+        })
+    }
+
+    /// Returns `K1110` when the tokens after the `?` at `question` are an
+    /// expression followed by `:`.
+    ///
+    /// The first branch is parsed speculatively, one nesting level deeper, and
+    /// the parser is restored either way, so the check never consumes input.
+    /// A conditional operator inside the first branch is reported in place of
+    /// the outer one. The parser never backtracks over a `?`, so each `?` is
+    /// examined once and the speculation adds at most one parse of the tokens
+    /// after it.
+    fn ternary_after(&mut self, question: Span) -> Option<Diagnostic> {
+        if !starts_expression(&self.current().kind) {
+            return None;
+        }
+        let saved = (self.cursor, self.depth, self.chain_depth, self.peak);
+        let branch = self.nested(question, Self::expression);
+        let colon = self.check(&TokenKind::Colon).then(|| self.current().span);
+        (self.cursor, self.depth, self.chain_depth, self.peak) = saved;
+        match branch {
+            Ok(_) => colon.map(|colon| {
+                Habit::Ternary.diagnostic(
+                    "the conditional operator `? :` is not Krit syntax",
+                    question.join(colon),
+                )
+            }),
+            Err(error) if error.code() == Habit::Ternary.code() => Some(error),
+            Err(_) => None,
+        }
+    }
+
+    /// Reports `else { return value }` or `else return value` (`K1112`): an
+    /// early exit written as another language's guard clause.
+    fn else_return(&self, else_span: Span) -> Option<Diagnostic> {
+        let word = self.cursor + usize::from(self.check(&TokenKind::LeftBrace));
+        let (word, next) = (self.tokens.get(word)?, self.tokens.get(word + 1)?);
+        let is_return = matches!(&word.kind, TokenKind::Identifier(name) if name == "return");
+        (is_return && follows_as_operand(word.span, next)).then(|| {
+            Habit::ElseReturn.diagnostic(
+                "`return` in an `else` block is not Krit syntax",
+                else_span.join(word.span),
+            )
+        })
+    }
+
+    /// Reports `K1109` when the parenthesized group opening at token `open` is
+    /// followed by `=>`, as an arrow function's parameter list is.
+    fn arrow_after_group(&self, open: usize) -> Option<Diagnostic> {
+        let close = self.matching_paren(open, |kind| *kind == TokenKind::Semicolon)?;
+        let arrow = self.tokens.get(close + 1)?;
+        (arrow.kind == TokenKind::FatArrow)
+            .then(|| arrow_function(self.tokens[open].span.join(arrow.span)))
+    }
+
+    /// The index of the `)` that closes the `(` at token `open`, looking no
+    /// further than the end of the file or the first token for which `stop`
+    /// holds.
+    fn matching_paren(&self, open: usize, stop: impl Fn(&TokenKind) -> bool) -> Option<usize> {
+        let mut depth = 0_usize;
+        for (index, token) in self.tokens.iter().enumerate().skip(open) {
+            match &token.kind {
+                TokenKind::LeftParen => depth += 1,
+                TokenKind::RightParen => {
+                    // A `)` before any `(` closes nothing.
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                TokenKind::Eof => return None,
+                kind if stop(kind) => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     fn list(&mut self, start: Span) -> Result<Expression, Diagnostic> {
@@ -643,7 +885,10 @@ impl Parser {
         let alternative = loop {
             let condition = self.nested(link_start, Self::expression)?;
             let consequent = self.block()?;
-            self.expect(TokenKind::Else)?;
+            let else_span = self.expect(TokenKind::Else)?.span;
+            if let Some(habit) = self.else_return(else_span) {
+                return Err(habit);
+            }
             links.push((link_start, condition, consequent));
             if self.check(&TokenKind::If) {
                 link_start = self.advance().span;
@@ -974,6 +1219,11 @@ impl Parser {
 
     fn binding_name(&mut self) -> Result<(String, Span), Diagnostic> {
         let (name, span) = self.identifier()?;
+        // `let mut x`, `fn f(mut x)`, and `Some(mut x)`; a binding named
+        // `mut` is never followed by another name.
+        if name == "mut" && matches!(self.current().kind, TokenKind::Identifier(_)) {
+            return Err(Habit::Mutation.word_diagnostic(&name, span));
+        }
         if matches!(
             name.as_str(),
             "print"
@@ -1099,6 +1349,54 @@ impl Parser {
         }
         token
     }
+}
+
+/// An arrow function at `span` (`K1109`).
+fn arrow_function(span: Span) -> Diagnostic {
+    Habit::ArrowFunction.diagnostic("arrow functions are not Krit syntax", span)
+}
+
+/// Whether `error` already explains the construct it reports, so an
+/// enclosing construct must pass it on rather than reinterpret it: a nesting
+/// limit, or a construct from another language.
+fn is_settled(error: &Diagnostic) -> bool {
+    error.code() == "K1005" || error.code().starts_with("K11")
+}
+
+/// Whether `next` starts an operand right after the word ending at `word`,
+/// which no expression is ever followed by: `return value`, `throw "boom"`,
+/// `await fetch()`, `return [a, b]`. A `[` touching the word is indexing
+/// (`K1108`) instead.
+fn follows_as_operand(word: Span, next: &Token) -> bool {
+    starts_operand_only(&next.kind)
+        || (next.kind == TokenKind::LeftBracket && next.span.start > word.end)
+}
+
+/// Whether a token of `kind` can start an operand but never continue an
+/// expression.
+fn starts_operand_only(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Identifier(_)
+            | TokenKind::Integer(_)
+            | TokenKind::String(_)
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::Record
+            | TokenKind::If
+            | TokenKind::Match
+            | TokenKind::Fn
+            | TokenKind::Bang
+    )
+}
+
+/// Whether a token of `kind` can start an expression.
+fn starts_expression(kind: &TokenKind) -> bool {
+    starts_operand_only(kind)
+        || matches!(
+            kind,
+            TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace | TokenKind::Minus
+        )
 }
 
 fn binary(left: Expression, operator: BinaryOperator, right: Expression) -> Expression {
@@ -1464,6 +1762,199 @@ mod tests {
         );
         let error = parse_on_compiler_stack(calls).expect_err("4,000 calls should fail");
         assert_eq!(error.code(), "K1005");
+    }
+
+    /// Parses `text` and returns the error's code, the source text its span
+    /// covers, and its notes.
+    fn habit(text: &str) -> (&'static str, String, Vec<String>) {
+        let error = parse_text(text).expect_err("foreign construct should not parse");
+        let span = error.span();
+        (
+            error.code(),
+            text[span.start..span.end].to_owned(),
+            error.notes().to_vec(),
+        )
+    }
+
+    #[test]
+    fn reports_each_foreign_construct_with_its_code_span_and_hint() {
+        for (text, code, spanned) in [
+            ("fn f(x) { return x; }", "K1101", "return"),
+            ("fn f(x) { return x }", "K1101", "return"),
+            (
+                "fn f(x) { if x { return 1; } else { 2 } }",
+                "K1101",
+                "return",
+            ),
+            (
+                "match Some(1) { Some(v) => return v, None => 0 };",
+                "K1101",
+                "return",
+            ),
+            ("fn f() { return [1]; }", "K1101", "return"),
+            ("fn f(xs) { for x in xs { x; } }", "K1102", "for"),
+            (
+                "fn f(n) { for (let i = 0; i < n; i++) { i; } }",
+                "K1102",
+                "for",
+            ),
+            ("fn f(x) { while x > 0 { x; } }", "K1102", "while"),
+            ("fn f(x) { while (x > 0) { x; } }", "K1102", "while"),
+            ("fn f() { loop { 1; } }", "K1102", "loop"),
+            ("fn f() { do { 1; } }", "K1102", "do"),
+            ("let x = 1;\nx = 2;", "K1103", "x ="),
+            ("fn f(r) { r.count = 2; r }", "K1103", "r.count ="),
+            ("fn f() { let x = 1; x = 2 }", "K1103", "x ="),
+            ("let a = 1;\nlet b = a = 2;", "K1103", "a ="),
+            ("let mut x = 1;", "K1103", "mut"),
+            ("fn f(mut x) { x }", "K1103", "mut"),
+            (
+                "match Some(1) { Some(mut x) => x, None => 0 };",
+                "K1103",
+                "mut",
+            ),
+            ("var x = 1;", "K1103", "var"),
+            ("const LIMIT = 3;", "K1103", "const"),
+            ("fn f(x) { x += 1; x }", "K1103", "+="),
+            ("fn f(x) { x -= 1; x }", "K1103", "-="),
+            ("fn f(x) { x *= 2; x }", "K1103", "*="),
+            ("fn f(x) { x /= 2; x }", "K1103", "/="),
+            ("fn f(x) { x %= 2; x }", "K1103", "%="),
+            ("fn f(x) { x++; x }", "K1103", "++"),
+            ("fn f(x) { x--; x }", "K1103", "--"),
+            ("fn f(x) { x-- }", "K1103", "--"),
+            ("struct Point { x: Int }", "K1104", "struct"),
+            ("class Point {}", "K1104", "class"),
+            ("impl Point {}", "K1104", "impl"),
+            ("trait Shape {}", "K1104", "trait"),
+            ("interface Shape {}", "K1104", "interface"),
+            ("import json;", "K1105", "import"),
+            ("import { encode } from \"json\";", "K1105", "import"),
+            ("use std::io;", "K1105", "use"),
+            ("let json = require \"json\";", "K1105", "require"),
+            ("from json import encode", "K1105", "from"),
+            ("async fn f() { 1 }", "K1106", "async"),
+            ("let f = async (x) => x;", "K1106", "async"),
+            ("fn f(g) { await g() }", "K1106", "await"),
+            ("fn f() { try { 1 } catch e { 2 } }", "K1107", "try"),
+            ("fn f() { try: 1 }", "K1107", "try"),
+            ("fn f() { throw \"boom\"; }", "K1107", "throw"),
+            ("fn f() { raise \"boom\" }", "K1107", "raise"),
+            ("let xs = [1];\nxs[0];", "K1108", "xs["),
+            ("fn f(g) { g()[0] }", "K1108", "g()["),
+            ("[1, 2][0];", "K1108", "[1, 2]["),
+            ("let f = x => x + 1;", "K1109", "x =>"),
+            ("let f = (x) => x + 1;", "K1109", "(x) =>"),
+            ("let f = (x, y) => x + y;", "K1109", "(x, y) =>"),
+            ("let f = (x: Int) => x;", "K1109", "(x: Int) =>"),
+            ("let f = () => 1;", "K1109", "() =>"),
+            ("let f = (...rest) => 1;", "K1109", "(...rest) =>"),
+            ("let f = ((x, y) => x);", "K1109", "(x, y) =>"),
+            ("let y = true ? 1 : 2;", "K1110", "? 1 :"),
+            (
+                "let x = 1;\nlet y = x > 0 ? f(x, 1) : 2;",
+                "K1110",
+                "? f(x, 1) :",
+            ),
+            ("let y = a ? b ? c : d : e;", "K1110", "? c :"),
+            ("let y = a ? -1 : 1;", "K1110", "? -1 :"),
+            ("fn f(x) { switch x { case 1: 2 } }", "K1111", "switch"),
+            ("fn f(x) { switch (x) { case 1: 2 } }", "K1111", "switch"),
+            ("fn f(x) { case 1: 2 }", "K1111", "case"),
+            ("fn f() { default: 1 }", "K1111", "default"),
+            (
+                "fn f(x) { if x { 1 } else { return 0; } }",
+                "K1112",
+                "else { return",
+            ),
+            (
+                "fn f(x) { if x { 1 } else return 0; }",
+                "K1112",
+                "else return",
+            ),
+        ] {
+            let (actual, actual_span, notes) = habit(text);
+            assert_eq!(actual, code, "{text}");
+            assert_eq!(actual_span, spanned, "{text}");
+            assert_eq!(notes.len(), 1, "{text}");
+        }
+    }
+
+    #[test]
+    fn habit_words_stay_ordinary_names_outside_foreign_constructs() {
+        for text in [
+            "let for = 1;\nfor;",
+            "let while = [1];\nmatch while { [] => 0, [x, .._] => x };",
+            "let return = 1;\nreturn - 1;",
+            "let return = 1;\nlet x = return;",
+            "fn use(x) { x }\nuse(1);",
+            "let async = fn(x) { x };\nasync(1);",
+            "let try = fn(x) { x };\ntry(1);",
+            "let r = record { from: 1, case: 2, default: 3 };\nr.from + r.case;",
+            "let loop = true;\nif loop { 1 } else { 2 };",
+            "let default = Some(1);\nmatch default { Some(x) => x, None => 0 };",
+            "let mut = 1;\nfn f(mut) { mut }",
+            "let xs = [1];\n[xs, [1]];",
+            "let class = 1;\n[class];",
+            "fn f(x) { if x { 1 } else { return } }",
+            "fn f(x) { if x { 1 } else { return; } }",
+            "let await = record { value: 1 };\nawait.value;",
+            "let x = 1;\nlet y = -x - -x;",
+            "let x = 1;\nlet y = x - -x;",
+        ] {
+            parse_text(text).unwrap_or_else(|error| panic!("{text:?} should parse: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn a_question_mark_outside_the_ternary_shape_is_an_unexpected_token() {
+        for (text, spanned) in [
+            ("fn f(x) { x? }", "?"),
+            ("fn f(x) { x?.y }", "?"),
+            ("fn f(x) { x ?? 1 }", "?"),
+            ("fn f(x) { x ? 1 }", "?"),
+            ("let y = ?;", "?"),
+        ] {
+            let error = parse_text(text).expect_err("`?` should not parse yet");
+            assert_eq!(error.code(), "K1001", "{text}");
+            assert_eq!(
+                &text[error.span().start..error.span().end],
+                spanned,
+                "{text}"
+            );
+        }
+        // The ternary check leaves the parser where it was: the first `?`
+        // here is not a ternary, so the second one is never examined.
+        let error = parse_text("let y = a ? (b ? c : d);").expect_err("should not parse");
+        assert_eq!(error.code(), "K1110");
+        let error = parse_text("let y = a ?;").expect_err("should not parse");
+        assert_eq!(error.code(), "K1001");
+        assert_eq!(error.notes().len(), 1);
+    }
+
+    #[test]
+    fn spaced_operators_and_brackets_keep_their_generic_errors() {
+        for (text, code) in [
+            ("fn f(x) { x + = 1; x }", "K1001"),
+            ("let xs = [1];\nlet y = xs [0];", "K1002"),
+            ("fn f(x) { x - - }", "K1001"),
+        ] {
+            let error = parse_text(text).expect_err("should not parse");
+            assert_eq!(error.code(), code, "{text}");
+            assert!(error.notes().is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn ternary_speculation_is_bounded_by_the_nesting_limit() {
+        // Each `?` examines its first branch one level deeper, so a long run of
+        // unterminated conditionals stops at the nesting limit.
+        let text = format!("let y = {}1;\n", "a ? ".repeat(2_000));
+        let error = parse_on_compiler_stack(text).expect_err("should not parse");
+        assert_eq!(error.code(), "K1001");
+        let text = format!("let y = {}1{};\n", "a ? ".repeat(200), " : b".repeat(200));
+        let error = parse_on_compiler_stack(text).expect_err("should not parse");
+        assert_eq!(error.code(), "K1110");
     }
 
     #[test]

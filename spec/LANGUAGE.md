@@ -59,6 +59,10 @@ comment     = "//", non-line-break* ;
 Integer separators cannot be leading, trailing, or repeated. Integers are
 signed through unary `-`; the sign is not part of the token.
 
+`?` is a token of its own. Edition 2026 gives it no meaning, so it appears in
+no valid program; the parser uses it only to recognize another language's
+conditional operator (section 4.2).
+
 Strings support these escapes:
 
 ```text
@@ -163,7 +167,10 @@ record-type-field
                 = identifier, ":", type ;
 ```
 
-Assignments and mutable bindings do not exist in edition 2026.
+Assignments and mutable bindings do not exist in edition 2026. Neither do
+`return`, loops, classes, modules, `async`, exceptions, indexing, arrow
+functions, the conditional operator, or `switch`; section 4.2 specifies how
+the parser reports them.
 
 A `webhook` declaration is valid only as a direct program item. A source
 module contains zero or one webhook. Nested or duplicate webhook declarations
@@ -228,6 +235,76 @@ bounds, so no accepted program can exhaust the compiler's native stack. The
 later stages also count their own recursion, to reject syntax trees built
 without the parser; every tree within the limits above stays inside those
 internal bounds, so a source program only ever sees the limits stated here.
+
+## 4.2 Constructs from other languages
+
+Constructs that other languages have and Krit does not are reported with
+their own codes (`K1101`-`K1112`), each with a one-line fix in the
+diagnostic's notes (`DIAGNOSTICS.md`), instead of a generic syntax error.
+Their words are not keywords: each remains an ordinary identifier, and
+`let for = 1;`, `use(value)`, and `record { from: a, default: b }` are valid.
+The parser reports a construct only where its tokens cannot be part of any
+valid program.
+
+A **habit word** is one of these identifiers:
+
+| Code | Construct | Words |
+|---|---|---|
+| `K1101` | `return` | `return` |
+| `K1102` | loops | `for` `while` `loop` `do` |
+| `K1103` | mutable bindings | `mut` `var` `const` |
+| `K1104` | type declarations | `struct` `class` `impl` `trait` `interface` |
+| `K1105` | imports | `import` `use` `require` `from` |
+| `K1106` | async functions | `async` `await` |
+| `K1107` | exceptions | `try` `catch` `throw` `raise` `except` `finally` |
+| `K1111` | `switch` | `switch` `case` `default` |
+
+A habit word reports its construct's code when:
+
+- it is an operand followed by a token that can only start an operand, which
+  never follows a complete expression: an identifier, integer, string,
+  `true`, `false`, `record`, `if`, `match`, `fn`, `!`, or a `[` with
+  whitespace between it and the word (`return value`, `for item in items`,
+  `const limit = 3`, `class Point`, `async fn`, `throw "empty"`,
+  `return [a, b]`);
+- it is an operand followed by a parenthesized group and then `=>`
+  (`async (x) => e`);
+- it starts a statement and is followed by `{`, by `:`, or by a parenthesized
+  group and then `{` (`try {`, `loop {`, `default:`,
+  `while (ready) {`, `for (let i = 0; i < n; i++) {`); or
+- it is `mut`, written where a binding name is expected and followed by
+  another name (`let mut x`, `fn f(mut x)`, `Some(mut x)`), which reports
+  `K1103`.
+
+These constructs are reported wherever they occur:
+
+- `K1103`: an expression statement, a block's final expression, or a `let`
+  value followed by `=` (`count = count + 1;`, `record.field = value;`); and
+  `+=`, `-=`, `*=`, `/=`, `%=`, `++`, or `--` written as two touching tokens
+  where an operand is missing (`x += 1`, `x++`, `x--`).
+- `K1108`: a `[` touching the end of an operand in a postfix chain
+  (`items[0]`, `load()[0]`, `[a, b][0]`). With whitespace before the `[`
+  (`items [0]`), the program is still invalid but is not reported as
+  indexing.
+- `K1109`: an identifier or a parenthesized group followed by `=>`
+  (`x => e`, `(x, y) => e`, `(x: Int) => e`, `() => e`). No expression is
+  ever followed by `=>`; only match patterns are.
+- `K1110`: a `?` after an operand, followed by an expression and then `:`
+  (`ready ? 1 : 2`). The parser examines the tokens after the `?` without
+  consuming them. A `?` in any other position is an unexpected token
+  (`K1001`).
+- `K1112`: `else` followed by `return` and a token that can only start an
+  operand, as above, either as the first tokens of its block or directly
+  (`else { return 0; }`, `else return 0;`).
+
+To find the end of a parenthesized group, the parser matches parentheses and
+looks no further than the first `;` when it expects `=>` after the group, or
+the first `{` or `}` when it expects `{`.
+
+Where a habit word could still be an ordinary name (`return;`,
+`return -1;`, `await(job)`), the program parses, and if the name is not bound
+checking reports `K2001` with the construct's fix. Parsing stops at the first
+error, so the first construct reached in source order is the one reported.
 
 ## 5. Program and block values
 
@@ -438,6 +515,12 @@ println(response.status);
 The `record` prefix distinguishes a record literal from a block. Fields
 evaluate from left to right. Accessing a field requires a record containing
 that field.
+
+Values have no methods. `value.name(arguments)` reads field `name` of the
+record `value` and calls the function stored there. When `value` has no such
+field, because it is not a record or is a record without that field, checking
+reports the method call (`K3011`) with the standard-library function to use
+instead when there is one, such as `string_byte_len(s)` for `s.len()`.
 
 List literal:
 

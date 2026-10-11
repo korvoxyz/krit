@@ -6,6 +6,7 @@ mod diagnostic;
 mod durable;
 mod evaluator;
 mod formatter;
+mod habits;
 mod lexer;
 mod limits;
 mod parser;

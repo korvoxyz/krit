@@ -1,0 +1,19 @@
+// Habit words are ordinary names wherever no other language's construct
+// could be meant.
+let for = 1;
+let from = 2;
+let default = for + from;
+
+fn use(value) {
+    value
+}
+
+let result = if default > 2 {
+    use(default)
+} else {
+    for
+};
+let await = record { value: result };
+
+println(await.value);
+println(use(from));

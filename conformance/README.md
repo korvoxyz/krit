@@ -46,7 +46,9 @@ krit check --diagnostic-format json program.krit
 
 It compares status, error codes, and warning codes as the runtime harness does,
 and requires that checking never execute program effects or emit program
-output. Because `krit run` checks
+output. An error with a habit code (`K1101`-`K1112`) or `K3011` must carry at
+least one note, and every note must be one line (`spec/DIAGNOSTICS.md`, Fix
+hints); the wording of notes is not compared. Because `krit run` checks
 first, the harness also requires that `krit run` refuse every failing check
 case with the same diagnostics and status and no program output.
 
@@ -87,7 +89,10 @@ network service, or nondeterministic value.
 | `check/syntax/missing-semicolon` | missing required syntax |
 | `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
 | `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, and an unbound `_` is undefined |
-| `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings |
+| `check/name/did-you-mean`, `check/name/null` | undefined names (`K2001`) that carry a did-you-mean or `None` note |
+| `check/habit/*` | one case per construct from another language (`K1101`-`K1112`): `return`, loops, assignment, `struct`, `import`, `await`, `throw`, indexing, arrow functions, the conditional operator, `switch`, and `else { return ... }` |
+| `check/valid/habit-words-as-names` | habit words stay ordinary identifiers outside foreign constructs |
+| `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings and a method call on a string (`K3011`) |
 | `check/match/*` | unique, exhaustive, single-family Option and Result arms (`K1003`) |
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |

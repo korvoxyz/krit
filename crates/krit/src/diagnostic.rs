@@ -34,6 +34,9 @@ pub struct Diagnostic {
     code: &'static str,
     message: String,
     span: Span,
+    /// One-line repair hints, in order. The human format prints each on its
+    /// own line as `help: <note>`; JSON Lines carries them as `notes`.
+    notes: Vec<String>,
 }
 
 impl Diagnostic {
@@ -44,6 +47,7 @@ impl Diagnostic {
             code,
             message: message.into(),
             span,
+            notes: Vec::new(),
         }
     }
 
@@ -54,7 +58,23 @@ impl Diagnostic {
             code,
             message: message.into(),
             span,
+            notes: Vec::new(),
         }
+    }
+
+    /// Appends a one-line repair hint.
+    ///
+    /// A note must not contain a line break: the human format gives each note
+    /// exactly one line.
+    #[must_use]
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        let note = note.into();
+        debug_assert!(
+            !note.contains(['\n', '\r']),
+            "a diagnostic note is one line"
+        );
+        self.notes.push(note);
+        self
     }
 
     pub const fn severity(&self) -> Severity {
@@ -73,9 +93,14 @@ impl Diagnostic {
         self.span
     }
 
+    /// The diagnostic's one-line repair hints, in order.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
     pub fn render_human(&self, source: &Source) -> String {
         let position = source.position(self.span.start);
-        format!(
+        let mut output = format!(
             "{}:{}:{}: {}[{}]: {}",
             source.name(),
             position.line,
@@ -83,7 +108,11 @@ impl Diagnostic {
             self.severity,
             self.code,
             self.message
-        )
+        );
+        for note in &self.notes {
+            write!(output, "\nhelp: {note}").expect("writing to a String cannot fail");
+        }
+        output
     }
 
     pub fn render_json(&self, source: &Source) -> String {
@@ -96,7 +125,7 @@ impl Diagnostic {
              \"message\":\"{}\",\"file\":\"{}\",\
              \"span\":{{\"start\":{{\"line\":{},\"column\":{},\"byte\":{}}},\
              \"end\":{{\"line\":{},\"column\":{},\"byte\":{}}}}},\
-             \"labels\":[],\"notes\":[]}}",
+             \"labels\":[],\"notes\":[",
             self.severity,
             self.code,
             escape_json(&self.message),
@@ -109,6 +138,13 @@ impl Diagnostic {
             end.byte
         )
         .expect("writing to a String cannot fail");
+        for (index, note) in self.notes.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            write!(output, "\"{}\"", escape_json(note)).expect("writing to a String cannot fail");
+        }
+        output.push_str("]}");
         output
     }
 }
@@ -183,5 +219,31 @@ mod tests {
              \"end\":{\"line\":2,\"column\":2,\"byte\":12}},\
              \"labels\":[],\"notes\":[]}"
         );
+    }
+
+    #[test]
+    fn renders_notes_as_help_lines_and_json_strings() {
+        let source = Source::new("sample.krit", "return x;");
+        let diagnostic = Diagnostic::new("K1101", "`return` is not Krit syntax", Span::new(0, 6))
+            .with_note("a block's value is its final \"expression\"")
+            .with_note("second hint");
+
+        assert_eq!(
+            diagnostic.notes(),
+            [
+                "a block's value is its final \"expression\"".to_owned(),
+                "second hint".to_owned()
+            ]
+        );
+        assert_eq!(
+            diagnostic.render_human(&source),
+            "sample.krit:1:1: error[K1101]: `return` is not Krit syntax\n\
+             help: a block's value is its final \"expression\"\n\
+             help: second hint"
+        );
+        assert!(diagnostic.render_json(&source).ends_with(
+            "\"labels\":[],\"notes\":[\"a block's value is its final \\\"expression\\\"\",\
+             \"second hint\"]}"
+        ));
     }
 }

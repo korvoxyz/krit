@@ -25,12 +25,16 @@ analysis also rejects the program, the warnings found before the error are
 reported first and the error last. The language server publishes warnings with
 LSP `DiagnosticSeverity.Warning` and errors with `DiagnosticSeverity.Error`,
 and `krit/compilerFacts` diagnostics carry the same `severity` strings as the
-JSON Lines format.
+JSON Lines format. A published LSP diagnostic's message is the diagnostic's
+message followed by each of its notes on its own line as `help: <note>`, as in
+the human format; `krit/compilerFacts` diagnostics carry the message and a
+`notes` array exactly as the JSON Lines format does.
 
 The language server bounds the warnings it publishes for one document, so that
 a document within its size limit always fits in a protocol frame. It keeps the
 first 100 warnings in the order above, and stops before the first warning that
-would take their combined message text past 64 KiB. When it leaves warnings
+would take their combined published message text, notes included, past
+64 KiB. When it leaves warnings
 out, it publishes one `K8003` notice after the warnings it kept: the notice
 sits at the span of the first warning left out, has LSP
 `DiagnosticSeverity.Information`, and states how many warnings were left out.
@@ -47,14 +51,16 @@ standard error.
 The default format is:
 
 ```text
-path/to/file.krit:4:11: error[K2001]: undefined name `total`
+path/to/file.krit:4:11: error[K2001]: undefined name `totl`
+help: did you mean `total`?
 path/to/file.krit:7:9: warning[K2003]: `_` is a discard; reading it will be an error in edition 2027
 ```
 
 The severity word comes first, followed by the code in brackets; warnings use
-the same location style as errors. An implementation may add source excerpts
-and suggestions after this first line. It must not expose a host-language stack trace unless explicitly
-requested with a developer option.
+the same location style as errors. Each of the diagnostic's notes follows on
+its own line, in order, as `help: <note>`. An implementation may add source
+excerpts after these lines. It must not expose a host-language stack trace
+unless explicitly requested with a developer option.
 
 Paths should be relative to the package root. Standalone files use the path
 provided by the user. Command-line expressions use `<command-line>` and the
@@ -80,7 +86,7 @@ Required top-level fields:
 | `file` | string | Package-relative or synthetic source name |
 | `span` | object or null | Primary source range |
 | `labels` | array | Additional labeled source ranges |
-| `notes` | array of strings | Context that has no precise source range |
+| `notes` | array of strings | One-line repair hints, in order, that have no precise source range (see [Fix hints](#fix-hints)) |
 
 Line and column values are one-based. Byte offsets are zero-based UTF-8 byte
 offsets. End positions are exclusive.
@@ -118,12 +124,24 @@ Initial required codes:
 | `K0001` | Invalid source character or token |
 | `K0002` | Unterminated string |
 | `K0003` | Invalid string escape |
-| `K1001` | Unexpected token |
+| `K1001` | Unexpected token, including a `?` that is not a conditional operator (`K1110`) |
 | `K1002` | Expected token not found |
 | `K1003` | Invalid match pattern |
 | `K1004` | Webhook declaration is nested or otherwise misplaced |
 | `K1005` | Nesting depth limit exceeded: syntax nests more than 256 levels, nesting plus the `else if` continuations, operators, and call or field-access links above a point exceeds 4,096, or an inferred type would nest more than 256 levels |
-| `K2001` | Undefined name |
+| `K1101` | `return`: a block's value is its final expression |
+| `K1102` | `for`, `while`, `loop`, or `do` loop |
+| `K1103` | Assignment, compound assignment (`+=`, `-=`, `*=`, `/=`, `%=`), `++` or `--`, `mut`, `var`, or `const` |
+| `K1104` | `struct`, `class`, `impl`, `trait`, or `interface` declaration |
+| `K1105` | `import`, `use`, `require`, or `from`: modules are not available |
+| `K1106` | `async` or `await` |
+| `K1107` | `try`, `catch`, `throw`, `raise`, `except`, or `finally` |
+| `K1108` | Indexing `a[i]` |
+| `K1109` | Arrow function `(x) => e` or `x => e` |
+| `K1110` | Conditional operator `c ? a : b` |
+| `K1111` | `switch`, `case`, or `default` |
+| `K1112` | `return` opening an `else` block: an early exit |
+| `K2001` | Undefined name; a note suggests the closest visible name, `None` for a spelling of null, or the fix for a construct from another language |
 | `K2002` | Duplicate binding or parameter; the discard name `_` is exempt |
 | `K2003` | Warning: the discard name `_` is read as a value; this becomes an error in edition 2027 |
 | `K3001` | Static type mismatch or invalid typed operator |
@@ -136,6 +154,7 @@ Initial required codes:
 | `K3008` | Host capability resource is not a direct valid string literal |
 | `K3009` | Opaque secret is used by a revealing or structural operation |
 | `K3010` | Opaque database transaction handle is used outside a database operation |
+| `K3011` | Method call `value.name(...)` on a value that has no field `name`: Krit values have no methods |
 | `K4001` | Generic guest trap or wrong runtime value kind |
 | `K4002` | Calling a non-function |
 | `K4003` | Function argument count mismatch |
@@ -183,6 +202,96 @@ Initial required codes:
 | `K8105` | Proposed source failed canonical formatting or compiler checking |
 | `K8106` | Required authority expansion lacks exact review approval or a manifest grant |
 | `K8107` | Proposal or accepted-source atomic I/O failed |
+
+## Fix hints
+
+A diagnostic's notes are one-line repair hints. Their wording is prose and
+may improve, but which diagnostics carry one is part of each code's contract:
+
+- `K1101`-`K1112` and `K3011` always carry exactly one note with the fix.
+- `K2001` carries one note when one of the rules below applies.
+- `K3002` for a call of `None` carries one note: `None` is a value, written
+  without parentheses.
+- `K1001` for a `?` after an operand carries one note: postfix `?` is not
+  available yet.
+
+### Constructs from other languages
+
+Models and people write constructs from other languages out of habit. Krit
+reports each with its own syntax code, under the rules of `LANGUAGE.md`
+section 4.2, instead of a generic `K1001` or `K1002`:
+
+| Code | Example | Fix in the note |
+|---|---|---|
+| `K1101` | `return total;` | a block's value is its final expression; for early exit, `?` and let-else arrive in Krit 0.3 |
+| `K1102` | `for item in items { ... }` | write a recursive function over `[]` and `[head, ..tail]`; list functions arrive in Krit 0.4 |
+| `K1103` | `count = count + 1;`, `x += 1`, `let mut x` | values are immutable; bind each new value with `let` under a new name |
+| `K1104` | `struct Point { x: Int }` | use a `record { field: value }` value and plain functions |
+| `K1105` | `import json;` | modules are not available yet; built-in functions need no import |
+| `K1106` | `await fetch()` | host calls finish before they return; call them directly |
+| `K1107` | `throw "empty";`, `try { ... }` | return `Ok(value)` or `Err(error)` and handle the `Result` with `match` |
+| `K1108` | `items[0]` | match the list with `[]` and `[head, ..tail]`; `list_get` arrives in Krit 0.4 |
+| `K1109` | `(x) => x + 1` | write `fn(x) { x + 1 }` |
+| `K1110` | `ready ? 1 : 2` | `if` is an expression: `if ready { 1 } else { 2 }` |
+| `K1111` | `switch code { case 200: ... }` | use `match`, or an `if ... else if ... else` chain |
+| `K1112` | `else { return 0; }` | exit early with let-else (arriving in Krit 0.3) |
+
+```text
+main.krit:2:5: error[K1101]: `return` is not Krit syntax
+help: a block's value is its final expression, written without `return` or `;`; for early exit, `?` and let-else arrive in Krit 0.3
+```
+
+### Undefined names
+
+`K2001` carries the first of these notes that applies:
+
+1. For `null`, `NULL`, `Null`, `nil`, `Nil`, `NIL`, `undefined`, or
+   `nullptr`: write `None` for an absent `Option` value.
+2. For `return`, `await`, `throw`, `raise`, `require`, or `import`, which
+   parse as names where they could still be one (`return;`, `return -1;`,
+   `require("json")`): the fix of the construct the word comes from.
+3. `did you mean `name`?`, naming the closest visible name: a binding in
+   scope at the reference, a built-in name, `true`, or `false`. A name
+   qualifies when it is at most two edits from the undefined name (inserting,
+   deleting, or substituting one character, or swapping two adjacent ones) and
+   fewer edits than the undefined name has characters. Fewer edits win, then
+   the bytewise smallest name, so the suggestion never depends on declaration
+   order.
+
+```text
+main.krit:2:9: error[K2001]: undefined name `null`
+help: Krit has no `null`; write `None` for an absent `Option` value
+```
+
+### Method calls
+
+Krit values have no methods. `value.name(arguments)` calls the function
+stored in field `name` of the record `value`; when `value` has no field
+`name`, because it is not a record or is a record without that field,
+checking reports `K3011` instead of the field-access error `K3004`. A field
+access that is not called still reports `K3004`. The note names the
+standard-library function that does the job when there is one:
+
+| Receiver | Methods | Note names |
+|---|---|---|
+| `String` | `len`, `length`, `size`, `count`, `byte_len` | `string_byte_len(s)` (counts UTF-8 bytes) |
+| `String` | `is_empty`, `isEmpty`, `empty` | `string_is_empty(s)` |
+| `String` | `contains`, `includes` | `string_contains(s, part)` |
+| `String` | `starts_with`, `startsWith`, `startswith`, `hasPrefix` | `string_starts_with(s, prefix)` |
+| `String` | `ends_with`, `endsWith`, `endswith`, `hasSuffix` | `string_ends_with(s, suffix)` |
+| `String` | any other | the five string functions |
+| `Int` | `to_string`, `toString`, `string`, `str` | `int_to_string(n)` |
+| `List` | any | list patterns; list functions arrive in Krit 0.4 |
+| `Option`, `Result` | any | `match` |
+| other | any | passing the value to a function |
+
+The note spells the receiver as written when it is a name or a short field
+path (`string_byte_len(request.body)`), and as `value` otherwise.
+
+```text
+main.krit:2:9: error[K3011]: cannot call `.len()` on a value of type `String`: Krit values have no methods
+help: call `string_byte_len(name)` instead; it counts UTF-8 bytes (standard library, arriving in Krit 0.3)
+```
 
 ## Exit statuses
 

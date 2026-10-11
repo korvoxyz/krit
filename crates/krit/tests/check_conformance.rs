@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use krit::{Severity, Source, analyze, analyze_with_warnings, parse_source};
+use krit::{Diagnostic, Severity, Source, analyze, analyze_with_warnings, parse_source};
 
 #[test]
 fn static_check_conformance_cases() {
@@ -106,15 +106,18 @@ fn run_case(case: &Path, root: &Path) {
         .iter()
         .map(|warning| warning.code().to_owned())
         .collect::<Vec<_>>();
-    let (actual_status, actual_codes) = match result {
-        Ok(_) => (0, Vec::new()),
-        Err(diagnostic) => (1, vec![diagnostic.code().to_owned()]),
-    };
     let case_name = case
         .strip_prefix(root)
         .unwrap_or(case)
         .display()
         .to_string();
+    if let Err(diagnostic) = &result {
+        assert_fix_hint(diagnostic, &case_name);
+    }
+    let (actual_status, actual_codes) = match result {
+        Ok(_) => (0, Vec::new()),
+        Err(diagnostic) => (1, vec![diagnostic.code().to_owned()]),
+    };
 
     assert_eq!(
         actual_status, expected_status,
@@ -133,6 +136,30 @@ fn run_case(case: &Path, root: &Path) {
             .iter()
             .all(|warning| warning.severity() == Severity::Warning),
         "analysis returned a non-warning beside its result in {case_name}"
+    );
+}
+
+/// Habit codes (`K1101`-`K1112`) and method calls (`K3011`) always carry a
+/// one-line fix in their notes (`spec/DIAGNOSTICS.md`); its wording may vary.
+fn assert_fix_hint(diagnostic: &Diagnostic, case_name: &str) {
+    let code = diagnostic.code();
+    let requires_hint = code == "K3011"
+        || code
+            .strip_prefix("K11")
+            .and_then(|number| number.parse::<u8>().ok())
+            .is_some_and(|number| (1..=12).contains(&number));
+    if requires_hint {
+        assert!(
+            !diagnostic.notes().is_empty(),
+            "{code} in {case_name} has no fix hint"
+        );
+    }
+    assert!(
+        diagnostic
+            .notes()
+            .iter()
+            .all(|note| !note.is_empty() && !note.contains(['\n', '\r'])),
+        "every note in {case_name} is one line"
     );
 }
 

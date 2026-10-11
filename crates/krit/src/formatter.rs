@@ -857,6 +857,7 @@ fn canonical_token_text(token: &Token) -> String {
         TokenKind::Comma => ",".to_owned(),
         TokenKind::Colon => ":".to_owned(),
         TokenKind::Semicolon => ";".to_owned(),
+        TokenKind::Question => "?".to_owned(),
         TokenKind::Dot => ".".to_owned(),
         TokenKind::Equal => "=".to_owned(),
         TokenKind::EqualEqual => "==".to_owned(),
@@ -1143,7 +1144,7 @@ mod tests {
             "fn add(a:Int,b:Int)->Int{a+b}\r\nlet values=[1,2,3,];\r\nprintln(add(values[0],2));";
         let error = format_source(&Source::new("test.krit", source))
             .expect_err("unsupported indexing should remain a syntax error");
-        assert_eq!(error.code(), "K1002");
+        assert_eq!(error.code(), "K1108");
 
         let source = "fn add(a:Int,b:Int)->Int{a+b}\r\nlet values=[1,2,3,];\r\nprintln(add(1,2));";
         let formatted = format(source);

@@ -1,0 +1,5 @@
+fn describe(code: Int) -> String {
+    switch code {
+        case 200: "ok"
+    }
+}
