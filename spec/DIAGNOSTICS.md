@@ -134,6 +134,24 @@ Initial required codes:
 | `K8106` | Required authority expansion lacks exact review approval or a manifest grant |
 | `K8107` | Proposal or accepted-source atomic I/O failed |
 
+## Build-target diagnostics
+
+`K7001` and `K7002` are reported by `krit build` and by `krit check` when it
+runs a target check (`--target component|module`, or by default for files
+that declare a webhook, queue, or schedule entrypoint). Both commands run the
+same backend pipeline and report the same set. Unlike front-end diagnostics,
+which stop at the first error, a failing target check reports every residual
+type and unsupported construct in the code that the selected entrypoint can
+reach. Each diagnostic caused by a source construct carries the span of the
+originating operation (or of the enclosing parameter, block, or
+declaration) and is never reported at a placeholder `1:1` position. They
+are emitted in source order (span start, span end, then code) with at most
+one diagnostic per code and source position. `K7002` messages name the layout policy of the program kind:
+"WebAssembly policy 1" for module programs and "the bounded webhook ABI
+(WebAssembly policy 2)" for entrypoint programs. Diagnostics about a file
+whose text is unavailable, such as an invalid manifest (`K6001`), use the
+file's first position.
+
 ## Exit statuses
 
 | Status | Meaning |

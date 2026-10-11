@@ -241,7 +241,8 @@ sockets, and databases are never imported.
 Krit source
     -> resolve + type/effect check
     -> typed Core IR
-    -> policy-1 layout/support check
+    -> dead-function elimination from the selected entrypoint
+    -> exhaustive residual-type and layout/support check (policy 1 or 2)
     -> wasm-encoder core module
     -> restricted core validation
     -> embed parsed WIT component types
@@ -255,7 +256,8 @@ Krit source
 `krit build` performs this complete pipeline in memory before writing. The
 component and adjacent JSON are staged beside their destinations and replaced
 with rollback on failure. The digest is `blake3:<hex>` and is stored beside,
-not inside, the hashed bytes.
+not inside, the hashed bytes. `krit check --target` runs the same pipeline
+with the output discarded (see [Target checks](#target-checks)).
 
 ## Implemented backend support
 
@@ -301,8 +303,63 @@ values, and any operation without a correct lowering. It never substitutes a
 trapping placeholder or direct-evaluator fallback.
 
 Policy 2 does not generalize these layouts to arbitrary records/lists,
-capturing closures, JSON, or dynamic string operators. Those shapes continue
-to fail closed rather than receiving fake values.
+capturing closures, JSON, composite equality, or string operators. Those
+shapes continue to fail closed rather than receiving fake values.
+
+Before any layout is chosen, dead-function elimination keeps only the
+functions reachable from module initialization and the selected entrypoint.
+A function is reachable when a reachable function uses its closure value as
+an operand (call, argument, field, list element, branch result, and so on)
+or captures a binding bound to it; binding or discarding a closure is not a
+use. An unreferenced top-level helper is therefore neither checked nor
+lowered, so an unused generic helper no longer fails the module with
+`K7001`. Eliminated functions keep their Core identifiers and table slots
+and are emitted as trapping stubs that no live code references.
+
+The support check then reports every finding rather than the first: each
+residual type (`K7001`) and each unsupported construct (`K7002`) in a live
+function, at the originating Core operation's source span, falling back to
+the enclosing block, parameter, or function declaration. A type that still
+contains an inference variable is reported only as `K7001`. Diagnostics are
+sorted by span start, span end, and code; one code is reported at most once
+per source position (the narrowest span wins when nested constructs start
+together). Code generation runs only after the support check passes and is
+a backstop: any error it raises is attached to the Core operation or
+function being lowered, so no source construct is reported without a
+location. Only internal failures that no source construct causes (a Core
+verification error, or `K7003`/`K7004` artifact failures) can be spanless.
+
+`K7002` messages name the layout policy of the program kind: module programs
+use "WebAssembly policy 1", and webhook, queue, and schedule entrypoint
+programs use "the bounded webhook ABI (WebAssembly policy 2)". This layout
+policy is distinct from the metadata validation `policyVersion`, which
+records whether the artifact imports host surfaces introduced after artifact
+policy 1.
+
+## Target checks
+
+`krit check [--target component|module|none] FILE` adds a target check after
+successful analysis and Core lowering. A target check runs the complete
+`krit build` pipeline above (dead-function elimination, support checking,
+code generation, componentization, metadata attachment, and validation)
+with the output discarded, so it reports exactly the `K7001`/`K7002` set,
+codes and spans, that `krit build` reports for the same source. It reads no
+manifest: package grants (`K5001`) remain a `build` check.
+
+- `component` checks the artifact `krit build` would emit: the selected
+  webhook, queue, or schedule world, or the module-program world.
+- `module` checks the file as a module program; a webhook, queue, or
+  schedule entrypoint is reported as `K7002` at its declaration because
+  entrypoint programs build only as components.
+- `none` skips the target check.
+
+Without `--target`, a file that declares a webhook, queue, or schedule
+entrypoint is checked as `component`, because a component is the only way
+such a file can run. Other files default to `none`; `krit run` executes them
+directly. Every target diagnostic is printed in the selected
+`--diagnostic-format`, in the sorted order above, and the command exits `1`
+without printing its success line. The language server does not run target
+checks in 0.3.
 
 ## Artifact policy
 
@@ -561,14 +618,18 @@ denial and application failure.
 ## CLI execution and inspection
 
 ```text
-krit build [--manifest PATH] [--output PATH]
+krit check [--diagnostic-format human|json] [--target component|module|none] FILE
+krit build [--manifest PATH] [--output PATH] [--diagnostic-format human|json]
 krit sandbox [--manifest PATH] [--artifact PATH]
 krit invoke [--manifest PATH] [--artifact PATH] [--host-config PATH] --request FILE
 krit serve [--manifest PATH] [--artifact PATH] [--host-config PATH] [--bind IP:PORT] [--once]
 krit permissions --artifact PATH [--json] [MANIFEST]
 ```
 
-`sandbox` defaults to `krit.pkg` and
+`build` prints every manifest, source, authority, and target diagnostic in
+the selected format (human by default, JSON Lines with
+`--diagnostic-format json`); on a target failure it prints all backend
+diagnostics in span order. `sandbox` defaults to `krit.pkg` and
 `target/krit/<package-name>.wasm`, with metadata at `<artifact>.json`. It never
 builds, interprets source, or searches for a fallback artifact. Missing files
 are K7003 errors. Artifact-aware `permissions` validates the component and

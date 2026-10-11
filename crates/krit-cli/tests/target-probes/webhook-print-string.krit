@@ -1,0 +1,5 @@
+// Standard output only carries Int, Bool, and Unit values.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    println(request.path);
+    record { status: 200, headers: [], body: request.path }
+}

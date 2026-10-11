@@ -1,0 +1,16 @@
+// Unused helpers, including a generic one, are eliminated before layout checks.
+fn identity(value) {
+    value
+}
+
+fn wrap(value) {
+    identity(record { inner: value })
+}
+
+fn status() -> Int {
+    200
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: status(), headers: [], body: request.path }
+}

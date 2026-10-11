@@ -20,7 +20,10 @@ use krit_runtime::{
     CancellationHandle, DeliveryOutcome, GrantSet, HttpHeader, HttpRequest, LogEvent, LogField,
     LogLevel, Runtime, RuntimeError, RuntimeErrorKind, RuntimeLimits,
 };
-use krit_wasm::{ArtifactMetadata, BuildErrorKind, BuildOptions, build_component};
+use krit_wasm::{
+    ArtifactMetadata, BuildError, BuildErrorKind, BuildOptions, CheckTarget,
+    build_component_diagnostics, check_target,
+};
 use serde::Serialize;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -31,6 +34,17 @@ enum DiagnosticFormat {
     Human,
     Json,
 }
+
+/// Artifact target selected by `krit check --target`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetSelection {
+    Component,
+    Module,
+    None,
+}
+
+/// The only language edition, used for target checks that have no manifest.
+const TARGET_CHECK_EDITION: &str = "2026";
 
 fn main() -> ExitCode {
     ExitCode::from(run(env::args().skip(1).collect()))
@@ -75,8 +89,12 @@ fn run(arguments: Vec<String>) -> u8 {
 }
 
 fn build_command(arguments: &[String]) -> u8 {
-    let (manifest_path, requested_output) = match parse_build_options(arguments) {
-        Ok(options) => options,
+    let BuildArguments {
+        manifest: manifest_path,
+        output: requested_output,
+        format,
+    } = match parse_build_options(arguments) {
+        Ok(arguments) => arguments,
         Err(message) => {
             eprintln!("krit: {message}");
             return 2;
@@ -85,20 +103,14 @@ fn build_command(arguments: &[String]) -> u8 {
     let manifest = match Manifest::load(&manifest_path) {
         Ok(manifest) => manifest,
         Err(error) => {
-            eprintln!(
-                "{}:1:1: error[K6001]: {error}",
-                manifest_path.to_string_lossy()
-            );
+            report_unlocated(&manifest_path.to_string_lossy(), "K6001", error, format);
             return 3;
         }
     };
     let entry_path = match manifest.resolve_entry(&manifest_path) {
         Ok(path) => path,
         Err(error) => {
-            eprintln!(
-                "{}:1:1: error[K6001]: {error}",
-                manifest_path.to_string_lossy()
-            );
+            report_unlocated(&manifest_path.to_string_lossy(), "K6001", error, format);
             return 3;
         }
     };
@@ -106,18 +118,23 @@ fn build_command(arguments: &[String]) -> u8 {
     let text = match fs::read_to_string(&entry_path) {
         Ok(text) => text,
         Err(error) => {
-            eprintln!("{entry_name}:1:1: error[K7003]: could not read package entry: {error}");
+            report_unlocated(
+                &entry_name,
+                "K7003",
+                format!("could not read package entry: {error}"),
+                format,
+            );
             return 1;
         }
     };
     let source = Source::new(entry_name.clone(), text);
     let program = match parse_source(&source) {
         Ok(program) => program,
-        Err(diagnostic) => return report(&diagnostic, &source, DiagnosticFormat::Human),
+        Err(diagnostic) => return report(&diagnostic, &source, format),
     };
     let analysis = match analyze(&program) {
         Ok(analysis) => analysis,
-        Err(diagnostic) => return report(&diagnostic, &source, DiagnosticFormat::Human),
+        Err(diagnostic) => return report(&diagnostic, &source, format),
     };
     let module = match lower(&program, &analysis) {
         Ok(module) => module,
@@ -133,7 +150,7 @@ fn build_command(arguments: &[String]) -> u8 {
             ),
             span,
         );
-        eprintln!("{}", diagnostic.render_human(&source));
+        report(&diagnostic, &source, format);
         return 4;
     }
 
@@ -204,13 +221,14 @@ fn build_command(arguments: &[String]) -> u8 {
     {
         options.grant_effect("database.read");
     }
-    let artifact = match build_component(&module, &options) {
+    let artifact = match build_component_diagnostics(&module, &options) {
         Ok(artifact) => artifact,
-        Err(error) => {
-            let span = error.span().unwrap_or_else(|| Span::new(0, 0));
-            let diagnostic = Diagnostic::new(error.code(), error.message(), span);
-            eprintln!("{}", diagnostic.render_human(&source));
-            return if error.kind() == BuildErrorKind::Capability {
+        Err(errors) => {
+            report_build_errors(&errors, &source, format);
+            return if errors
+                .iter()
+                .any(|error| error.kind() == BuildErrorKind::Capability)
+            {
                 4
             } else {
                 1
@@ -227,7 +245,7 @@ fn build_command(arguments: &[String]) -> u8 {
     };
     metadata.push(b'\n');
     if let Err(error) = replace_build_outputs(&output, &artifact.bytes, &metadata_path, &metadata) {
-        eprintln!("{}:1:1: error[K7003]: {error}", output.to_string_lossy());
+        report_unlocated(&output.to_string_lossy(), "K7003", error, format);
         return 1;
     }
     println!("built {}", output.display());
@@ -235,12 +253,34 @@ fn build_command(arguments: &[String]) -> u8 {
     0
 }
 
-fn parse_build_options(arguments: &[String]) -> Result<(PathBuf, Option<PathBuf>), String> {
+struct BuildArguments {
+    manifest: PathBuf,
+    output: Option<PathBuf>,
+    format: DiagnosticFormat,
+}
+
+fn parse_build_options(arguments: &[String]) -> Result<BuildArguments, String> {
     let mut manifest = PathBuf::from("krit.pkg");
     let mut output = None;
+    let mut format = DiagnosticFormat::Human;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
+            "--diagnostic-format" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "`--diagnostic-format` requires `human` or `json`".to_owned())?;
+                format = parse_diagnostic_format(value)?;
+                index += 2;
+            }
+            argument if argument.starts_with("--diagnostic-format=") => {
+                let value = argument
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default();
+                format = parse_diagnostic_format(value)?;
+                index += 1;
+            }
             "--manifest" => {
                 let value = arguments
                     .get(index + 1)
@@ -285,7 +325,11 @@ fn parse_build_options(arguments: &[String]) -> Result<(PathBuf, Option<PathBuf>
             }
         }
     }
-    Ok((manifest, output))
+    Ok(BuildArguments {
+        manifest,
+        output,
+        format,
+    })
 }
 
 fn default_build_output(manifest_path: &Path, manifest: &Manifest) -> PathBuf {
@@ -1132,7 +1176,11 @@ enum SourceAction {
 }
 
 fn source_command(arguments: &[String], action: SourceAction) -> u8 {
-    let (format, positional) = match parse_source_options(arguments) {
+    let SourceOptions {
+        format,
+        target,
+        positional,
+    } = match parse_source_options(arguments, action) {
         Ok(options) => options,
         Err(message) => {
             eprintln!("krit: {message}");
@@ -1163,8 +1211,18 @@ fn source_command(arguments: &[String], action: SourceAction) -> u8 {
             Ok(analysis) => analysis,
             Err(diagnostic) => return report(&diagnostic, &source, format),
         };
-        if let Err(error) = lower(&program, &analysis) {
-            return internal_error("KICE0001", "lowering Core IR", &error);
+        let module = match lower(&program, &analysis) {
+            Ok(module) => module,
+            Err(error) => return internal_error("KICE0001", "lowering Core IR", &error),
+        };
+        if let Some(target) = resolve_check_target(target, &module) {
+            let options =
+                BuildOptions::new(TARGET_CHECK_EDITION, "krit/check", "0.0.0", "main.krit");
+            let errors = check_target(&module, &options, target);
+            if !errors.is_empty() {
+                report_build_errors(&errors, &source, format);
+                return 1;
+            }
         }
         println!("checked {}", path.display());
         0
@@ -1256,13 +1314,68 @@ fn manifest_grants_requirement(
     )
 }
 
-fn parse_source_options(arguments: &[String]) -> Result<(DiagnosticFormat, Vec<String>), String> {
+/// Chooses the artifact target a check verifies.
+///
+/// An explicit `--target` wins. Otherwise a file that declares a webhook,
+/// queue, or schedule entrypoint is checked as a component, because a
+/// component is the only way such a file can run; other files default to no
+/// target check, since `krit run` executes them directly.
+fn resolve_check_target(
+    requested: Option<TargetSelection>,
+    module: &CoreModule,
+) -> Option<CheckTarget> {
+    let selection = requested.unwrap_or_else(|| {
+        if module
+            .entrypoints()
+            .iter()
+            .any(|entrypoint| entrypoint.kind.is_exported())
+        {
+            TargetSelection::Component
+        } else {
+            TargetSelection::None
+        }
+    });
+    match selection {
+        TargetSelection::Component => Some(CheckTarget::Component),
+        TargetSelection::Module => Some(CheckTarget::Module),
+        TargetSelection::None => None,
+    }
+}
+
+struct SourceOptions {
+    format: DiagnosticFormat,
+    target: Option<TargetSelection>,
+    positional: Vec<String>,
+}
+
+fn parse_source_options(
+    arguments: &[String],
+    action: SourceAction,
+) -> Result<SourceOptions, String> {
     let mut format = DiagnosticFormat::Human;
+    let mut target = None;
     let mut positional = Vec::new();
     let mut index = 0;
 
     while index < arguments.len() {
         match arguments[index].as_str() {
+            "--target" if matches!(action, SourceAction::Check) => {
+                let Some(value) = arguments.get(index + 1) else {
+                    return Err("`--target` requires `component`, `module`, or `none`".to_owned());
+                };
+                target = Some(parse_target_selection(value)?);
+                index += 2;
+            }
+            argument
+                if matches!(action, SourceAction::Check) && argument.starts_with("--target=") =>
+            {
+                let value = argument
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default();
+                target = Some(parse_target_selection(value)?);
+                index += 1;
+            }
             "--diagnostic-format" => {
                 let Some(value) = arguments.get(index + 1) else {
                     return Err("`--diagnostic-format` requires `human` or `json`".to_owned());
@@ -1292,7 +1405,22 @@ fn parse_source_options(arguments: &[String]) -> Result<(DiagnosticFormat, Vec<S
         }
     }
 
-    Ok((format, positional))
+    Ok(SourceOptions {
+        format,
+        target,
+        positional,
+    })
+}
+
+fn parse_target_selection(value: &str) -> Result<TargetSelection, String> {
+    match value {
+        "component" => Ok(TargetSelection::Component),
+        "module" => Ok(TargetSelection::Module),
+        "none" => Ok(TargetSelection::None),
+        _ => Err(format!(
+            "unknown check target `{value}`; expected `component`, `module`, or `none`"
+        )),
+    }
 }
 
 fn parse_diagnostic_format(value: &str) -> Result<DiagnosticFormat, String> {
@@ -1311,6 +1439,37 @@ fn report(diagnostic: &Diagnostic, source: &Source, format: DiagnosticFormat) ->
         DiagnosticFormat::Json => eprintln!("{}", diagnostic.render_json(source)),
     }
     1
+}
+
+/// Reports target diagnostics in the order the backend sorted them.
+///
+/// Every source-caused backend diagnostic carries a span; only internal
+/// artifact failures fall back to the start of the file.
+fn report_build_errors(errors: &[BuildError], source: &Source, format: DiagnosticFormat) {
+    for error in errors {
+        let span = error.span().unwrap_or_else(|| Span::new(0, 0));
+        report(
+            &Diagnostic::new(error.code(), error.message(), span),
+            source,
+            format,
+        );
+    }
+}
+
+/// Reports a diagnostic about a file whose text is unavailable (a manifest,
+/// an unreadable entry, or an output path) at its first position.
+fn report_unlocated(
+    file: &str,
+    code: &'static str,
+    message: impl std::fmt::Display,
+    format: DiagnosticFormat,
+) {
+    let source = Source::new(file.to_owned(), String::new());
+    report(
+        &Diagnostic::new(code, message.to_string(), Span::new(0, 0)),
+        &source,
+        format,
+    );
 }
 
 fn package_command(arguments: &[String]) -> u8 {
@@ -2531,8 +2690,8 @@ USAGE:
     krit assist review --manifest PATH --proposal PATH.json [--json]
     krit assist accept --manifest PATH --proposal PATH.json --reviewed [--approve-permission CAPABILITY[=RESOURCE]] [--json]
     krit run [--diagnostic-format human|json] FILE
-    krit check [--diagnostic-format human|json] FILE
-    krit build [--manifest PATH] [--output PATH]
+    krit check [--diagnostic-format human|json] [--target component|module|none] FILE
+    krit build [--manifest PATH] [--output PATH] [--diagnostic-format human|json]
     krit explain [--json] FILE
     krit fmt [--check] FILE...
     krit lsp
@@ -2559,16 +2718,80 @@ mod tests {
             "--diagnostic-format=json".to_owned(),
             "sample.krit".to_owned(),
         ];
-        let (format, positional) = parse_source_options(&arguments).expect("options should parse");
-        assert!(matches!(format, DiagnosticFormat::Json));
-        assert_eq!(positional, ["sample.krit"]);
+        let options =
+            parse_source_options(&arguments, SourceAction::Run).expect("options should parse");
+        assert!(matches!(options.format, DiagnosticFormat::Json));
+        assert_eq!(options.target, None);
+        assert_eq!(options.positional, ["sample.krit"]);
     }
 
     #[test]
     fn rejects_unknown_options() {
-        let error =
-            parse_source_options(&["--quiet".to_owned()]).expect_err("unknown option should fail");
+        let Err(error) = parse_source_options(&["--quiet".to_owned()], SourceAction::Check) else {
+            panic!("unknown option should fail");
+        };
         assert!(error.contains("unknown option"));
+    }
+
+    #[test]
+    fn parses_check_targets_only_for_check() {
+        for (arguments, expected) in [
+            (
+                ["--target", "component"].as_slice(),
+                TargetSelection::Component,
+            ),
+            (["--target=module"].as_slice(), TargetSelection::Module),
+            (["--target", "none"].as_slice(), TargetSelection::None),
+        ] {
+            let mut arguments = arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>();
+            arguments.push("sample.krit".to_owned());
+            let options =
+                parse_source_options(&arguments, SourceAction::Check).expect("target should parse");
+            assert_eq!(options.target, Some(expected));
+            assert_eq!(options.positional, ["sample.krit"]);
+        }
+
+        let Err(error) = parse_source_options(
+            &["--target=native".to_owned(), "sample.krit".to_owned()],
+            SourceAction::Check,
+        ) else {
+            panic!("unknown target should fail");
+        };
+        assert!(error.contains("unknown check target `native`"));
+        let Err(error) = parse_source_options(&["--target".to_owned()], SourceAction::Check) else {
+            panic!("missing target should fail");
+        };
+        assert!(error.contains("requires"));
+        let Err(error) = parse_source_options(
+            &["--target=component".to_owned(), "sample.krit".to_owned()],
+            SourceAction::Run,
+        ) else {
+            panic!("run should not accept a target");
+        };
+        assert!(error.contains("unknown option `--target=component`"));
+    }
+
+    #[test]
+    fn parses_build_diagnostic_format() {
+        let arguments = parse_build_options(&[
+            "--manifest".to_owned(),
+            "pkg/krit.pkg".to_owned(),
+            "--diagnostic-format=json".to_owned(),
+        ])
+        .expect("build options should parse");
+        assert_eq!(arguments.manifest, PathBuf::from("pkg/krit.pkg"));
+        assert_eq!(arguments.output, None);
+        assert!(matches!(arguments.format, DiagnosticFormat::Json));
+
+        let arguments = parse_build_options(&[]).expect("defaults should parse");
+        assert!(matches!(arguments.format, DiagnosticFormat::Human));
+        assert!(
+            parse_build_options(&["--diagnostic-format".to_owned(), "yaml".to_owned()])
+                .is_err_and(|error| error.contains("unknown diagnostic format"))
+        );
     }
 
     #[test]

@@ -1,0 +1,16 @@
+fn first(items: List<Int>) -> Int {
+    match items {
+        [] => 0,
+        [head, ..tail] => head,
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let count = first([1, 2]);
+    let encoded = json_encode(count);
+    let prefix = request.path;
+    let render = fn(status) {
+        record { status: status, headers: [], body: prefix }
+    };
+    render(200)
+}

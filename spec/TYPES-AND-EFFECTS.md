@@ -159,7 +159,12 @@ artifact stage must specialize or monomorphize those boundaries, or emit a
 stable source diagnostic, before layout selection and code emission.
 
 `krit check` preserves its existing success line while lowering and verifying
-typed Core IR. `krit explain FILE` renders module-init effects, top-level binding types,
+typed Core IR. For files that declare a webhook, queue, or schedule
+entrypoint, or when `--target component|module` is given, it then runs the
+WebAssembly target check described in `WASM-SANDBOX.md`, which reports every
+`K7001` residual type and `K7002` unsupported construct that `krit build`
+would, after eliminating functions the selected entrypoint cannot reach.
+`krit explain FILE` renders module-init effects, top-level binding types,
 stable Core facts, and a compact webhook contract when present.
 `krit explain --json FILE` keeps schema 1 compatibility and adds a versioned
 entrypoint-contract fact containing source name, kind, normalized signature,

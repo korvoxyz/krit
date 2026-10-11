@@ -32,7 +32,13 @@ krit check --diagnostic-format json program.krit
 ```
 
 It compares status and diagnostic codes and requires that checking never
-execute program effects or emit program output.
+execute program effects or emit program output. Files that declare a
+webhook, queue, or schedule entrypoint are checked against the component
+target by default, so `K7001`/`K7002` build-target diagnostics are part of
+their expected output, in source order. `conformance/check/target` pins the
+current bounded backend: as the backend grows, these cases move from failure
+to success. A front-end-only harness treats a case whose expected codes are
+all `K7xxx` as passing analysis.
 
 `conformance/format` contains formatter input/output pairs. Each
 `input.krit` must parse, and formatting must exactly equal
@@ -78,6 +84,7 @@ network service, or nondeterministic value.
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time; unused helpers are eliminated first |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |

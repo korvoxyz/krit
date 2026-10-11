@@ -1,0 +1,11 @@
+// A module program in policy 1: strings, records, options, and residuals.
+fn ignore(value) {
+    0
+}
+
+let greeting = "hello";
+let point = record { x: 1, y: 2 };
+let maybe: Option<Int> = Some(1);
+
+println(ignore(None));
+println(point.x);

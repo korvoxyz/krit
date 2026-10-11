@@ -238,7 +238,8 @@ krit publish
 All mutating package commands support `--dry-run`. Resolution and build plans
 have stable JSON output for agent use.
 
-The bootstrap implements `krit build [--manifest PATH] [--output PATH]`,
+The bootstrap implements
+`krit build [--manifest PATH] [--output PATH] [--diagnostic-format human|json]`,
 `krit sandbox [--manifest PATH] [--artifact PATH]`, and
 `krit permissions --artifact PATH [--json] [MANIFEST]` for one local package.
 The default build/sandbox artifact is

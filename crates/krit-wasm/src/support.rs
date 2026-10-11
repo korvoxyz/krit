@@ -1,12 +1,17 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use krit::{
     BinaryOperator, Builtin, CoreBlock, CoreFunction, CoreModule, CoreOperation, OperationKind,
     Span, Type, UnaryOperator, ValueLiteral,
 };
 
-use crate::BuildError;
-use crate::{ApprovalRequirementMetadata, ResourceRequirementMetadata, wit::ProgramKind};
+use crate::{
+    ApprovalRequirementMetadata, BuildError, ResourceRequirementMetadata, error::normalize,
+    wit::ProgramKind,
+};
 
 pub const SUPPORTED_BACKEND_SEMANTICS: &str = "\
 Krit Wasm policy 1 supports Int (i64), Bool (i32), zero-width Unit, \
@@ -16,7 +21,8 @@ and print/println of Int, Bool, or Unit. Webhook policy 2 additionally supports 
 String values, the closed HttpHeader/HttpRequest/HttpResponse records, header lists, \
 LogField records and field lists, Result/Option matching, exact config/secret/http/AI \
 host calls, structured logging, unescaped JSON string decoding, and static \
-non-capturing helper references. Other composites, general JSON, data captures, \
+non-capturing helper references. Helpers unreachable from the selected entrypoint \
+are eliminated before layout checks. Other composites, general JSON, data captures, \
 residual types, and list matching fail closed.";
 
 pub(crate) struct CheckedModule {
@@ -26,6 +32,178 @@ pub(crate) struct CheckedModule {
     pub requirements: Vec<ResourceRequirementMetadata>,
     pub approvals: Vec<ApprovalRequirementMetadata>,
     pub minimum_literal_operands: BTreeSet<krit::ValueId>,
+    pub live: LiveFunctions,
+}
+
+/// Core functions that survive dead-function elimination.
+///
+/// Module initialization and the selected entrypoint are roots. A function is
+/// live when a live function uses its closure value as an operand (a call,
+/// argument, field, list element, branch result, ...) or captures a binding
+/// that names it. Binding or discarding a closure is not a use, so an
+/// unreferenced top-level helper is dead. Dead functions keep their Core
+/// identifiers and table slots but are neither checked nor lowered: the
+/// emitters replace each one with a trapping stub that nothing references.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LiveFunctions {
+    functions: BTreeSet<krit::FunctionId>,
+}
+
+impl LiveFunctions {
+    fn compute(module: &CoreModule, entrypoint: krit::FunctionId) -> Self {
+        let mut closures = BTreeMap::new();
+        for function in module.functions() {
+            collect_closure_values(&function.body, &mut closures);
+        }
+        let mut bound = BTreeMap::new();
+        for function in module.functions() {
+            if let Some(recursive) = &function.recursive {
+                bound.insert(recursive.binding, function.id);
+            }
+            collect_bound_functions(&function.body, &closures, &mut bound);
+        }
+
+        let mut functions = BTreeSet::new();
+        let mut pending = vec![module.entrypoint(), entrypoint];
+        while let Some(id) = pending.pop() {
+            if !functions.insert(id) {
+                continue;
+            }
+            let Some(function) = module.functions().get(id.as_u32() as usize) else {
+                continue;
+            };
+            pending.extend(
+                function
+                    .captures
+                    .iter()
+                    .filter_map(|capture| bound.get(&capture.binding).copied()),
+            );
+            collect_used_functions(&function.body, &closures, &mut pending);
+        }
+        Self { functions }
+    }
+
+    pub(crate) fn contains(&self, function: krit::FunctionId) -> bool {
+        self.functions.contains(&function)
+    }
+
+    /// Whether `operation` creates a closure over an eliminated function.
+    pub(crate) fn is_dead_closure(&self, operation: &CoreOperation) -> bool {
+        matches!(
+            operation.kind,
+            OperationKind::Closure { function, .. } if !self.contains(function)
+        )
+    }
+
+    /// Live functions in Core order.
+    pub(crate) fn functions<'a>(
+        &'a self,
+        module: &'a CoreModule,
+    ) -> impl Iterator<Item = &'a CoreFunction> + 'a {
+        module
+            .functions()
+            .iter()
+            .filter(|function| self.contains(function.id))
+    }
+}
+
+fn collect_closure_values(
+    block: &CoreBlock,
+    closures: &mut BTreeMap<krit::ValueId, krit::FunctionId>,
+) {
+    for operation in &block.operations {
+        if let OperationKind::Closure { function, .. } = operation.kind {
+            closures.insert(operation.result, function);
+        }
+        for_each_nested_block(operation, |nested| collect_closure_values(nested, closures));
+    }
+}
+
+fn collect_bound_functions(
+    block: &CoreBlock,
+    closures: &BTreeMap<krit::ValueId, krit::FunctionId>,
+    bound: &mut BTreeMap<krit::BindingId, krit::FunctionId>,
+) {
+    for operation in &block.operations {
+        if let OperationKind::Bind { binding, value } = operation.kind
+            && let Some(function) = closures.get(&value)
+        {
+            bound.insert(binding, *function);
+        }
+        for_each_nested_block(operation, |nested| {
+            collect_bound_functions(nested, closures, bound);
+        });
+    }
+}
+
+fn collect_used_functions(
+    block: &CoreBlock,
+    closures: &BTreeMap<krit::ValueId, krit::FunctionId>,
+    used: &mut Vec<krit::FunctionId>,
+) {
+    let mut mark = |value: &krit::ValueId| {
+        if let Some(function) = closures.get(value) {
+            used.push(*function);
+        }
+    };
+    for operation in &block.operations {
+        match &operation.kind {
+            OperationKind::Literal(_)
+            | OperationKind::Unit
+            | OperationKind::Builtin(_)
+            | OperationKind::Closure { .. }
+            | OperationKind::Bind { .. }
+            | OperationKind::Discard { .. }
+            | OperationKind::Block { .. } => {}
+            OperationKind::Variant { payload, .. } => payload.iter().for_each(&mut mark),
+            OperationKind::List(values) => values.iter().for_each(&mut mark),
+            OperationKind::Record(fields) => fields.iter().for_each(|field| mark(&field.value)),
+            OperationKind::Field { value, .. } => mark(value),
+            OperationKind::Call { callee, arguments } => {
+                mark(callee);
+                arguments.iter().for_each(&mut mark);
+            }
+            OperationKind::If { condition, .. } => mark(condition),
+            OperationKind::MatchList { subject, .. }
+            | OperationKind::MatchVariant { subject, .. } => mark(subject),
+            OperationKind::Unary { operand, .. } => mark(operand),
+            OperationKind::Binary { left, right, .. } => {
+                mark(left);
+                mark(right);
+            }
+        }
+    }
+    mark(&block.result);
+    for operation in &block.operations {
+        for_each_nested_block(operation, |nested| {
+            collect_used_functions(nested, closures, used);
+        });
+    }
+}
+
+/// Calls `visit` for every block nested directly inside `operation`.
+fn for_each_nested_block(operation: &CoreOperation, mut visit: impl FnMut(&CoreBlock)) {
+    match &operation.kind {
+        OperationKind::Block { block } => visit(block),
+        OperationKind::If {
+            consequent,
+            alternative,
+            ..
+        } => {
+            visit(consequent);
+            visit(alternative);
+        }
+        OperationKind::MatchList { empty, cons, .. } => {
+            visit(empty);
+            visit(cons);
+        }
+        OperationKind::MatchVariant { arms, .. } => {
+            for arm in arms {
+                visit(&arm.block);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,21 +219,24 @@ enum RestrictedUse {
     Other,
 }
 
-pub(crate) fn check_module(module: &CoreModule) -> Result<CheckedModule, BuildError> {
-    module
-        .verify()
-        .map_err(|error| BuildError::invalid_core(format!("Core verification failed: {error}")))?;
+/// Checks that every live Core construct has a lowering for the selected
+/// artifact policy.
+///
+/// The checker never stops at the first problem: it returns every finding,
+/// each at the originating Core operation's source span (falling back to the
+/// enclosing block or function), sorted by span with one report per code and
+/// span. Emission only runs after this check passes.
+pub(crate) fn check_module(module: &CoreModule) -> Result<CheckedModule, Vec<BuildError>> {
+    module.verify().map_err(|error| {
+        vec![BuildError::invalid_core(format!(
+            "Core verification failed: {error}"
+        ))]
+    })?;
 
     let exported = module
         .entrypoints()
         .iter()
         .find(|entrypoint| entrypoint.kind.is_exported());
-    if exported.is_some() && !module.entrypoint_function().signature.effects.is_empty() {
-        return Err(BuildError::unsupported(
-            "entrypoint components cannot contain effectful module-initialization statements",
-            module.entrypoint_function().source,
-        ));
-    }
     let (kind, entrypoint) = match exported {
         Some(entrypoint) => (
             match entrypoint.kind {
@@ -63,35 +244,48 @@ pub(crate) fn check_module(module: &CoreModule) -> Result<CheckedModule, BuildEr
                 krit::EntrypointKind::QueueConsumer => ProgramKind::Job,
                 krit::EntrypointKind::ScheduleHandler => ProgramKind::Schedule,
                 _ => {
-                    return Err(BuildError::invalid_core(
+                    return Err(vec![BuildError::invalid_core(
                         "module initialization is not an exported entrypoint",
-                    ));
+                    )]);
                 }
             },
             entrypoint.function,
         ),
         None => (ProgramKind::Module, module.entrypoint()),
     };
+    let webhook = kind != ProgramKind::Module;
 
-    if module.has_residual_types() {
-        return Err(BuildError::residual(
-            "WebAssembly layout requires specialization of residual parametric types",
-            first_residual_span(module),
+    let mut findings = Vec::new();
+    if webhook && !module.entrypoint_function().signature.effects.is_empty() {
+        findings.push(BuildError::unsupported(
+            "entrypoint components cannot contain effectful module-initialization statements",
+            first_effect_span(module),
         ));
     }
 
-    let minimum_literal_operands = minimum_literal_operands(module);
-    let static_functions = static_function_bindings(module);
-    for function in module.functions() {
-        check_function(
-            function,
-            &minimum_literal_operands,
-            kind != ProgramKind::Module,
-            &static_functions,
-        )?;
+    let live = LiveFunctions::compute(module, entrypoint);
+    for function in live.functions(module) {
+        collect_residual_function(function, &live, &mut findings);
     }
-    if kind != ProgramKind::Module {
-        check_restricted_uses(module)?;
+
+    let minimum_literal_operands = minimum_literal_operands(module, &live);
+    let static_functions = static_function_bindings(module);
+    let mut checker = SupportChecker {
+        minimum_literal_operands: &minimum_literal_operands,
+        webhook,
+        static_functions: &static_functions,
+        live: &live,
+        findings: &mut findings,
+    };
+    for function in live.functions(module) {
+        checker.check_function(function);
+    }
+    if webhook {
+        check_restricted_uses(module, &live, &mut findings);
+    }
+    if !findings.is_empty() {
+        normalize(&mut findings);
+        return Err(findings);
     }
 
     let selected = &module.functions()[entrypoint.as_u32() as usize];
@@ -114,7 +308,7 @@ pub(crate) fn check_module(module: &CoreModule) -> Result<CheckedModule, BuildEr
         .collect::<Vec<_>>();
     requirements.sort();
     requirements.dedup();
-    let approvals = approval_requirements(module, &requirements);
+    let approvals = approval_requirements(module, &live, &requirements);
     Ok(CheckedModule {
         kind,
         entrypoint,
@@ -122,11 +316,12 @@ pub(crate) fn check_module(module: &CoreModule) -> Result<CheckedModule, BuildEr
         requirements,
         approvals,
         minimum_literal_operands,
+        live,
     })
 }
-
 fn approval_requirements(
     module: &CoreModule,
+    live: &LiveFunctions,
     requirements: &[ResourceRequirementMetadata],
 ) -> Vec<ApprovalRequirementMetadata> {
     let mut approvals = requirements
@@ -140,7 +335,7 @@ fn approval_requirements(
     let mut builtins = BTreeMap::new();
     let mut strings = BTreeMap::new();
     let mut bearer_options = BTreeSet::new();
-    for function in module.functions() {
+    for function in live.functions(module) {
         collect_approval_values(
             &function.body,
             &mut builtins,
@@ -148,7 +343,7 @@ fn approval_requirements(
             &mut bearer_options,
         );
     }
-    for function in module.functions() {
+    for function in live.functions(module) {
         collect_bearer_approvals(
             &function.body,
             &builtins,
@@ -274,208 +469,355 @@ pub(crate) fn first_effect_span(module: &CoreModule) -> Option<Span> {
     first_effect_block_span(&module.entrypoint_function().body)
 }
 
-fn check_function(
-    function: &CoreFunction,
-    minimum_literal_operands: &BTreeSet<krit::ValueId>,
-    webhook: bool,
-    static_functions: &BTreeMap<krit::BindingId, krit::FunctionId>,
-) -> Result<(), BuildError> {
-    if function
-        .captures
-        .iter()
-        .any(|capture| !static_functions.contains_key(&capture.binding))
-    {
-        return Err(BuildError::unsupported(
-            "data captures are not supported by the bounded webhook ABI",
-            function.source,
-        ));
-    }
-    for ty in function
-        .signature
-        .parameters
-        .iter()
-        .chain(std::iter::once(&function.signature.result))
-    {
-        check_type(ty, function.source, webhook)?;
-    }
-    for parameter in &function.parameters {
-        check_type(&parameter.ty, parameter.source.or(function.source), webhook)?;
-    }
-    if let Some(recursive) = &function.recursive {
-        check_type(&recursive.ty, function.source, webhook)?;
-    }
-    check_block(
-        &function.body,
-        minimum_literal_operands,
-        webhook,
-        static_functions,
-    )
+/// Locates the first use of `effect` in the selected entrypoint: the
+/// innermost operation that performs it, else the entrypoint declaration
+/// (whose export implies effects such as `queue.consume`).
+pub(crate) fn effect_span(
+    module: &CoreModule,
+    entrypoint: krit::FunctionId,
+    effect: &str,
+) -> Option<Span> {
+    module
+        .functions()
+        .get(entrypoint.as_u32() as usize)
+        .and_then(|function| find_effect_span(&function.body, effect).or(function.source))
+        .or_else(|| first_effect_span(module))
 }
 
-fn check_block(
-    block: &CoreBlock,
-    minimum_literal_operands: &BTreeSet<krit::ValueId>,
-    webhook: bool,
-    static_functions: &BTreeMap<krit::BindingId, krit::FunctionId>,
-) -> Result<(), BuildError> {
-    if !webhook && !block.parameters.is_empty() {
-        return Err(BuildError::unsupported(
-            "match block parameters are not supported by WebAssembly policy 1",
-            block.source,
-        ));
-    }
-    for parameter in &block.parameters {
-        check_type(&parameter.ty, block.source, webhook)?;
-    }
-    check_type(&block.ty, block.source, webhook)?;
-    for operation in &block.operations {
-        check_operation(
-            operation,
-            minimum_literal_operands,
-            webhook,
-            static_functions,
-        )?;
-    }
-    Ok(())
+fn find_effect_span(block: &CoreBlock, effect: &str) -> Option<Span> {
+    let operation = block.operations.iter().find(|operation| {
+        operation
+            .effects
+            .iter()
+            .any(|candidate| candidate.as_str() == effect)
+    })?;
+    let mut nested = None;
+    for_each_nested_block(operation, |inner| {
+        if nested.is_none() {
+            nested = find_effect_span(inner, effect);
+        }
+    });
+    nested.or(operation.source).or(block.source)
 }
 
-fn check_operation(
-    operation: &CoreOperation,
-    minimum_literal_operands: &BTreeSet<krit::ValueId>,
+/// Names the backend layout policy a program kind selects in diagnostics.
+///
+/// Module programs lower through the scalar policy-1 compiler; webhook, queue,
+/// and schedule entrypoints lower through the bounded policy-2 webhook ABI.
+const fn policy_name(webhook: bool) -> &'static str {
+    if webhook {
+        "the bounded webhook ABI (WebAssembly policy 2)"
+    } else {
+        "WebAssembly policy 1"
+    }
+}
+
+struct SupportChecker<'a> {
+    minimum_literal_operands: &'a BTreeSet<krit::ValueId>,
     webhook: bool,
-    static_functions: &BTreeMap<krit::BindingId, krit::FunctionId>,
-) -> Result<(), BuildError> {
-    check_type(&operation.ty, operation.source, webhook)?;
-    match &operation.kind {
-        OperationKind::Literal(ValueLiteral::Integer(value)) => {
-            if i64::try_from(*value).is_err()
-                && !minimum_literal_operands.contains(&operation.result)
-            {
-                return Err(BuildError::unsupported(
-                    "integer literal is outside the concrete i64 WebAssembly layout",
-                    operation.source,
-                ));
+    static_functions: &'a BTreeMap<krit::BindingId, krit::FunctionId>,
+    live: &'a LiveFunctions,
+    findings: &'a mut Vec<BuildError>,
+}
+
+impl SupportChecker<'_> {
+    fn report(&mut self, result: Result<(), BuildError>) {
+        if let Err(error) = result {
+            self.findings.push(error);
+        }
+    }
+
+    fn check_type(&mut self, ty: &Type, span: Option<Span>) {
+        let result = check_type(ty, span, self.webhook);
+        self.report(result);
+    }
+
+    fn check_function(&mut self, function: &CoreFunction) {
+        if function
+            .captures
+            .iter()
+            .any(|capture| !self.static_functions.contains_key(&capture.binding))
+        {
+            self.findings.push(BuildError::unsupported(
+                format!(
+                    "data captures are not supported by {}",
+                    policy_name(self.webhook)
+                ),
+                function.source,
+            ));
+        }
+        for (index, ty) in function.signature.parameters.iter().enumerate() {
+            self.check_type(ty, parameter_span(function, index));
+        }
+        for (index, parameter) in function.parameters.iter().enumerate() {
+            self.check_type(&parameter.ty, parameter_span(function, index));
+        }
+        // The recursive self binding and every closure over this function
+        // share this signature, so it is checked once, here.
+        self.check_type(&function.signature.result, function.source);
+        let types = function_value_types(function);
+        self.check_block(&function.body, &types, function.source);
+    }
+
+    fn check_block(
+        &mut self,
+        block: &CoreBlock,
+        types: &BTreeMap<krit::ValueId, Arc<Type>>,
+        fallback: Option<Span>,
+    ) {
+        let span = block.source.or(fallback);
+        if !self.webhook && !block.parameters.is_empty() {
+            self.findings.push(BuildError::unsupported(
+                "match block parameters are not supported by WebAssembly policy 1",
+                span,
+            ));
+        }
+        for parameter in &block.parameters {
+            self.check_type(&parameter.ty, span);
+        }
+        self.check_block_body(block, types, span);
+    }
+
+    /// Checks a block's result and operations but not its match binders.
+    ///
+    /// Arms of a match that is itself unsupported use this so that the
+    /// binders are not reported a second time.
+    fn check_block_body(
+        &mut self,
+        block: &CoreBlock,
+        types: &BTreeMap<krit::ValueId, Arc<Type>>,
+        span: Option<Span>,
+    ) {
+        self.check_type(&block.ty, span);
+        for operation in &block.operations {
+            if self.live.is_dead_closure(operation) {
+                continue;
             }
+            self.check_operation(operation, types, span);
         }
-        OperationKind::Literal(ValueLiteral::Boolean(_))
-        | OperationKind::Unit
-        | OperationKind::Bind { .. }
-        | OperationKind::Discard { .. } => {}
-        OperationKind::Literal(ValueLiteral::String(_)) if !webhook => {
-            return Err(unsupported_layout("String", operation.source));
+    }
+
+    fn check_operation(
+        &mut self,
+        operation: &CoreOperation,
+        types: &BTreeMap<krit::ValueId, Arc<Type>>,
+        fallback: Option<Span>,
+    ) {
+        let span = operation.source.or(fallback);
+        if contains_residual(&operation.ty)
+            && !matches!(
+                operation.kind,
+                OperationKind::Block { .. }
+                    | OperationKind::If { .. }
+                    | OperationKind::MatchList { .. }
+                    | OperationKind::MatchVariant { .. }
+            )
+        {
+            // The residual pass reports this operation as K7001; its layout
+            // cannot be judged until the type is specialized.
+            return;
         }
-        OperationKind::Literal(ValueLiteral::String(_)) => {}
-        OperationKind::Builtin(builtin) => {
-            check_builtin(*builtin, &operation.ty, operation.source, webhook)?
+        self.check_operation_kind(operation, types, span);
+        if !matches!(operation.kind, OperationKind::Closure { .. }) {
+            // A closure has its target's signature, checked with that function.
+            // The kind-specific explanation above wins when both apply.
+            self.check_type(&operation.ty, span);
         }
-        OperationKind::Closure { captures, .. } => {
-            if captures
-                .iter()
-                .any(|capture| !static_functions.contains_key(&capture.binding))
-            {
-                return Err(BuildError::unsupported(
-                    "data captures are not supported by the bounded webhook ABI",
-                    operation.source,
-                ));
-            }
-        }
-        OperationKind::Call { .. } => {}
-        OperationKind::Block { block } => {
-            check_block(block, minimum_literal_operands, webhook, static_functions)?
-        }
-        OperationKind::If {
-            consequent,
-            alternative,
-            ..
-        } => {
-            check_block(
-                consequent,
-                minimum_literal_operands,
-                webhook,
-                static_functions,
-            )?;
-            check_block(
-                alternative,
-                minimum_literal_operands,
-                webhook,
-                static_functions,
-            )?;
-        }
-        OperationKind::Unary { operator, .. } => match operator {
-            UnaryOperator::Not | UnaryOperator::Negate => {}
-        },
-        OperationKind::Binary { operator, .. } => match operator {
-            BinaryOperator::Add
-            | BinaryOperator::Subtract
-            | BinaryOperator::Multiply
-            | BinaryOperator::Divide
-            | BinaryOperator::Remainder
-            | BinaryOperator::Equal
-            | BinaryOperator::NotEqual
-            | BinaryOperator::Less
-            | BinaryOperator::LessEqual
-            | BinaryOperator::Greater
-            | BinaryOperator::GreaterEqual => {
-                if webhook
-                    && matches!(
-                        operator,
-                        BinaryOperator::Add | BinaryOperator::Equal | BinaryOperator::NotEqual
-                    )
-                    && operation.ty.as_ref() == &Type::String
+    }
+
+    fn check_operation_kind(
+        &mut self,
+        operation: &CoreOperation,
+        types: &BTreeMap<krit::ValueId, Arc<Type>>,
+        span: Option<Span>,
+    ) {
+        let webhook = self.webhook;
+        match &operation.kind {
+            OperationKind::Literal(ValueLiteral::Integer(value)) => {
+                if i64::try_from(*value).is_err()
+                    && !self.minimum_literal_operands.contains(&operation.result)
                 {
-                    return Err(BuildError::unsupported(
-                        "dynamic String operators are outside the bounded webhook ABI",
-                        operation.source,
+                    self.findings.push(BuildError::unsupported(
+                        "integer literal is outside the concrete i64 WebAssembly layout",
+                        span,
                     ));
                 }
             }
-            BinaryOperator::And | BinaryOperator::Or => {
-                return Err(BuildError::unsupported(
-                    "short-circuit operators must be lowered to Core conditionals",
-                    operation.source,
-                ));
+            OperationKind::Literal(ValueLiteral::Boolean(_))
+            | OperationKind::Unit
+            | OperationKind::Bind { .. }
+            | OperationKind::Discard { .. }
+            | OperationKind::Call { .. } => {}
+            OperationKind::Literal(ValueLiteral::String(_)) => {
+                if !webhook {
+                    self.findings
+                        .push(unsupported_layout("String", span, webhook));
+                }
             }
-        },
-        OperationKind::Variant { .. } if !webhook => {
-            return Err(BuildError::unsupported(
-                "Option and Result layouts are not supported by WebAssembly policy 1",
-                operation.source,
-            ));
-        }
-        OperationKind::Variant { .. } => {}
-        OperationKind::List(_)
-            if webhook
-                && (is_header_list(&operation.ty)
-                    || is_log_field_list(&operation.ty)
-                    || is_string_list(&operation.ty)) => {}
-        OperationKind::List(_) | OperationKind::MatchList { .. } => {
-            return Err(unsupported_layout("List", operation.source));
-        }
-        OperationKind::Record(_) | OperationKind::Field { .. }
-            if webhook && (is_http_contract_type(&operation.ty) || is_log_field(&operation.ty)) => {
-        }
-        OperationKind::Field { .. } if webhook && is_supported_webhook_type(&operation.ty) => {}
-        OperationKind::Record(_) | OperationKind::Field { .. } => {
-            return Err(unsupported_layout("Record", operation.source));
-        }
-        OperationKind::MatchVariant { .. } if !webhook => {
-            return Err(BuildError::unsupported(
-                "Option and Result matching is not supported by WebAssembly policy 1",
-                operation.source,
-            ));
-        }
-        OperationKind::MatchVariant { arms, .. } => {
-            for arm in arms {
-                check_block(
-                    &arm.block,
-                    minimum_literal_operands,
-                    webhook,
-                    static_functions,
-                )?;
+            OperationKind::Builtin(builtin) => {
+                let result = check_builtin(*builtin, &operation.ty, span, webhook);
+                self.report(result);
+            }
+            OperationKind::Closure { captures, .. } => {
+                if captures
+                    .iter()
+                    .any(|capture| !self.static_functions.contains_key(&capture.binding))
+                {
+                    self.findings.push(BuildError::unsupported(
+                        format!(
+                            "data captures are not supported by {}",
+                            policy_name(webhook)
+                        ),
+                        span,
+                    ));
+                }
+            }
+            OperationKind::Block { block } => self.check_block(block, types, span),
+            OperationKind::If {
+                consequent,
+                alternative,
+                ..
+            } => {
+                self.check_block(consequent, types, span);
+                self.check_block(alternative, types, span);
+            }
+            OperationKind::Unary { operator, .. } => match operator {
+                UnaryOperator::Not | UnaryOperator::Negate => {}
+            },
+            OperationKind::Binary { left, operator, .. } => {
+                if let Some(message) = unsupported_binary(*operator, types.get(left), webhook) {
+                    self.findings.push(BuildError::unsupported(message, span));
+                }
+            }
+            OperationKind::Variant { .. } => {
+                if !webhook {
+                    self.findings.push(BuildError::unsupported(
+                        "Option and Result layouts are not supported by WebAssembly policy 1",
+                        span,
+                    ));
+                }
+            }
+            OperationKind::List(_)
+                if webhook
+                    && (is_header_list(&operation.ty)
+                        || is_log_field_list(&operation.ty)
+                        || is_string_list(&operation.ty)) => {}
+            OperationKind::List(_) => {
+                self.findings
+                    .push(unsupported_layout("List", span, webhook));
+            }
+            OperationKind::MatchList { empty, cons, .. } => {
+                self.findings.push(BuildError::unsupported(
+                    format!("list matching is outside {}", policy_name(webhook)),
+                    span,
+                ));
+                self.check_block_body(empty, types, empty.source.or(span));
+                self.check_block_body(cons, types, cons.source.or(span));
+            }
+            OperationKind::Record(_) | OperationKind::Field { .. }
+                if webhook
+                    && (is_http_contract_type(&operation.ty) || is_log_field(&operation.ty)) => {}
+            OperationKind::Field { .. } if webhook && is_supported_webhook_type(&operation.ty) => {}
+            OperationKind::Record(_) | OperationKind::Field { .. } => {
+                self.findings
+                    .push(unsupported_layout("Record", span, webhook));
+            }
+            OperationKind::MatchVariant { arms, .. } if !webhook => {
+                self.findings.push(BuildError::unsupported(
+                    "Option and Result matching is not supported by WebAssembly policy 1",
+                    span,
+                ));
+                for arm in arms {
+                    self.check_block_body(&arm.block, types, arm.block.source.or(span));
+                }
+            }
+            OperationKind::MatchVariant { arms, .. } => {
+                for arm in arms {
+                    self.check_block(&arm.block, types, span);
+                }
             }
         }
     }
-    Ok(())
+}
+
+/// Explains why a binary operator has no lowering, or returns `None`.
+///
+/// Policy 1 only admits scalar operands, which the operand definitions
+/// already enforce, so only the policy-2 operand shapes need inspection here.
+fn unsupported_binary(
+    operator: BinaryOperator,
+    operand: Option<&Arc<Type>>,
+    webhook: bool,
+) -> Option<String> {
+    let operand = operand.map(Arc::as_ref);
+    match operator {
+        BinaryOperator::And | BinaryOperator::Or => {
+            Some("short-circuit operators must be lowered to Core conditionals".to_owned())
+        }
+        _ if !webhook => None,
+        _ if operand == Some(&Type::String) => Some(format!(
+            "String operator `{}` is outside {}",
+            operator_symbol(operator),
+            policy_name(webhook)
+        )),
+        BinaryOperator::Equal | BinaryOperator::NotEqual => match operand {
+            Some(Type::Int | Type::Bool | Type::Unit | Type::Function(_)) => None,
+            _ => Some(format!(
+                "composite equality is outside {}",
+                policy_name(webhook)
+            )),
+        },
+        _ if operand == Some(&Type::Int) => None,
+        _ => Some(format!(
+            "operator `{}` requires Int operands in {}",
+            operator_symbol(operator),
+            policy_name(webhook)
+        )),
+    }
+}
+
+const fn operator_symbol(operator: BinaryOperator) -> &'static str {
+    match operator {
+        BinaryOperator::Add => "+",
+        BinaryOperator::Subtract => "-",
+        BinaryOperator::Multiply => "*",
+        BinaryOperator::Divide => "/",
+        BinaryOperator::Remainder => "%",
+        BinaryOperator::Equal => "==",
+        BinaryOperator::NotEqual => "!=",
+        BinaryOperator::Less => "<",
+        BinaryOperator::LessEqual => "<=",
+        BinaryOperator::Greater => ">",
+        BinaryOperator::GreaterEqual => ">=",
+        BinaryOperator::And => "&&",
+        BinaryOperator::Or => "||",
+    }
+}
+
+/// Types of every value a function body can name, as emission sees them.
+fn function_value_types(function: &CoreFunction) -> BTreeMap<krit::ValueId, Arc<Type>> {
+    let mut types = BTreeMap::new();
+    for parameter in &function.parameters {
+        types.insert(parameter.value, Arc::clone(&parameter.ty));
+    }
+    for capture in &function.captures {
+        types.insert(capture.value, Arc::clone(&capture.ty));
+    }
+    if let Some(recursive) = &function.recursive {
+        types.insert(recursive.value, Arc::clone(&recursive.ty));
+    }
+    collect_block_value_types(&function.body, &mut types);
+    types
+}
+
+fn collect_block_value_types(block: &CoreBlock, types: &mut BTreeMap<krit::ValueId, Arc<Type>>) {
+    for parameter in &block.parameters {
+        types.insert(parameter.value, Arc::clone(&parameter.ty));
+    }
+    for operation in &block.operations {
+        types.insert(operation.result, Arc::clone(&operation.ty));
+        for_each_nested_block(operation, |nested| collect_block_value_types(nested, types));
+    }
 }
 
 fn check_builtin(
@@ -524,7 +866,7 @@ fn check_builtin(
             match function.parameters()[0].as_ref() {
                 Type::Int | Type::Bool | Type::Unit => Ok(()),
                 unsupported => Err(BuildError::unsupported(
-                    format!("cannot print `{unsupported}` in WebAssembly policy 1"),
+                    format!("cannot print `{unsupported}` in {}", policy_name(webhook)),
                     span,
                 )),
             }
@@ -853,7 +1195,14 @@ fn check_builtin(
     }
 }
 
+/// Checks that `ty` has a concrete layout in the selected policy.
+///
+/// Types that still contain inference variables are left to the residual
+/// pass, which reports them as `K7001` at the same locations.
 fn check_type(ty: &Type, span: Option<Span>, webhook: bool) -> Result<(), BuildError> {
+    if contains_residual(ty) {
+        return Ok(());
+    }
     let mut visited = BTreeSet::new();
     check_type_inner(ty, span, webhook, &mut visited)
 }
@@ -898,25 +1247,28 @@ fn check_type_inner(
         {
             Ok(())
         }
-        Type::String => Err(unsupported_layout("String", span)),
-        Type::HttpHeader => Err(unsupported_layout("HttpHeader", span)),
-        Type::HttpRequest => Err(unsupported_layout("HttpRequest", span)),
-        Type::HttpResponse => Err(unsupported_layout("HttpResponse", span)),
-        Type::LogField => Err(unsupported_layout("LogField", span)),
-        Type::QueueJob => Err(unsupported_layout("QueueJob", span)),
-        Type::ScheduleEvent => Err(unsupported_layout("ScheduleEvent", span)),
-        Type::DatabaseTransaction => Err(unsupported_layout("DatabaseTransaction", span)),
-        Type::Secret => Err(unsupported_layout("Secret", span)),
-        Type::List(_) => Err(unsupported_layout("List", span)),
-        Type::Record(_) => Err(unsupported_layout("Record", span)),
-        Type::Option(_) => Err(unsupported_layout("Option", span)),
-        Type::Result(_, _) => Err(unsupported_layout("Result", span)),
+        Type::String => Err(unsupported_layout("String", span, webhook)),
+        Type::HttpHeader => Err(unsupported_layout("HttpHeader", span, webhook)),
+        Type::HttpRequest => Err(unsupported_layout("HttpRequest", span, webhook)),
+        Type::HttpResponse => Err(unsupported_layout("HttpResponse", span, webhook)),
+        Type::LogField => Err(unsupported_layout("LogField", span, webhook)),
+        Type::QueueJob => Err(unsupported_layout("QueueJob", span, webhook)),
+        Type::ScheduleEvent => Err(unsupported_layout("ScheduleEvent", span, webhook)),
+        Type::DatabaseTransaction => Err(unsupported_layout("DatabaseTransaction", span, webhook)),
+        Type::Secret => Err(unsupported_layout("Secret", span, webhook)),
+        Type::List(_) => Err(unsupported_layout("List", span, webhook)),
+        Type::Record(_) => Err(unsupported_layout("Record", span, webhook)),
+        Type::Option(_) => Err(unsupported_layout("Option", span, webhook)),
+        Type::Result(_, _) => Err(unsupported_layout("Result", span, webhook)),
     }
 }
 
-fn unsupported_layout(layout: &str, span: Option<Span>) -> BuildError {
+fn unsupported_layout(layout: &str, span: Option<Span>, webhook: bool) -> BuildError {
     BuildError::unsupported(
-        format!("{layout} has no concrete guest layout in WebAssembly policy 1"),
+        format!(
+            "{layout} has no concrete guest layout in {}",
+            policy_name(webhook)
+        ),
         span,
     )
 }
@@ -955,15 +1307,24 @@ fn static_function_bindings(module: &CoreModule) -> BTreeMap<krit::BindingId, kr
     bindings
 }
 
-fn check_restricted_uses(module: &CoreModule) -> Result<(), BuildError> {
+fn check_restricted_uses(
+    module: &CoreModule,
+    live: &LiveFunctions,
+    findings: &mut Vec<BuildError>,
+) {
     let mut builtins = BTreeMap::new();
     let mut option_secrets = BTreeMap::new();
-    for function in module.functions() {
-        collect_restricted_values(&function.body, &mut builtins, &mut option_secrets);
+    for function in live.functions(module) {
+        collect_restricted_values(
+            &function.body,
+            function.source,
+            &mut builtins,
+            &mut option_secrets,
+        );
     }
     let mut uses = BTreeMap::<krit::ValueId, Vec<RestrictedUse>>::new();
-    for function in module.functions() {
-        collect_restricted_uses(&function.body, &builtins, &mut uses);
+    for function in live.functions(module) {
+        collect_restricted_uses(&function.body, live, &builtins, &mut uses);
     }
     for (value, (builtin, span)) in builtins {
         if matches!(builtin, Builtin::Print | Builtin::Println) {
@@ -975,7 +1336,7 @@ fn check_restricted_uses(module: &CoreModule) -> Result<(), BuildError> {
                 .iter()
                 .any(|value_use| *value_use != RestrictedUse::DirectCall)
         {
-            return Err(BuildError::unsupported(
+            findings.push(BuildError::unsupported(
                 format!(
                     "built-in `{}` must remain a direct call in the bounded webhook ABI",
                     builtin.as_str()
@@ -987,62 +1348,48 @@ fn check_restricted_uses(module: &CoreModule) -> Result<(), BuildError> {
     for (value, span) in option_secrets {
         let value_uses = uses.get(&value).map(Vec::as_slice).unwrap_or_default();
         if value_uses != [RestrictedUse::HttpBearer] {
-            return Err(BuildError::unsupported(
+            findings.push(BuildError::unsupported(
                 "Option<Secret> must be consumed directly by `http_request`",
                 span,
             ));
         }
     }
-    Ok(())
 }
 
 fn collect_restricted_values(
     block: &CoreBlock,
+    fallback: Option<Span>,
     builtins: &mut BTreeMap<krit::ValueId, (Builtin, Option<Span>)>,
     option_secrets: &mut BTreeMap<krit::ValueId, Option<Span>>,
 ) {
+    let block_span = block.source.or(fallback);
     for operation in &block.operations {
+        let span = operation.source.or(block_span);
         if let OperationKind::Builtin(builtin) = operation.kind {
-            builtins.insert(operation.result, (builtin, operation.source));
+            builtins.insert(operation.result, (builtin, span));
         }
         if matches!(
             operation.ty.as_ref(),
             Type::Option(element) if element.as_ref() == &Type::Secret
         ) {
-            option_secrets.insert(operation.result, operation.source);
+            option_secrets.insert(operation.result, span);
         }
-        match &operation.kind {
-            OperationKind::Block { block } => {
-                collect_restricted_values(block, builtins, option_secrets);
-            }
-            OperationKind::If {
-                consequent,
-                alternative,
-                ..
-            } => {
-                collect_restricted_values(consequent, builtins, option_secrets);
-                collect_restricted_values(alternative, builtins, option_secrets);
-            }
-            OperationKind::MatchList { empty, cons, .. } => {
-                collect_restricted_values(empty, builtins, option_secrets);
-                collect_restricted_values(cons, builtins, option_secrets);
-            }
-            OperationKind::MatchVariant { arms, .. } => {
-                for arm in arms {
-                    collect_restricted_values(&arm.block, builtins, option_secrets);
-                }
-            }
-            _ => {}
-        }
+        for_each_nested_block(operation, |nested| {
+            collect_restricted_values(nested, span, builtins, option_secrets);
+        });
     }
 }
 
 fn collect_restricted_uses(
     block: &CoreBlock,
+    live: &LiveFunctions,
     builtins: &BTreeMap<krit::ValueId, (Builtin, Option<Span>)>,
     uses: &mut BTreeMap<krit::ValueId, Vec<RestrictedUse>>,
 ) {
     for operation in &block.operations {
+        if live.is_dead_closure(operation) {
+            continue;
+        }
         match &operation.kind {
             OperationKind::Literal(_) | OperationKind::Unit | OperationKind::Builtin(_) => {}
             OperationKind::Call { callee, arguments } => {
@@ -1085,7 +1432,7 @@ fn collect_restricted_uses(
                 uses.entry(*value).or_default().push(RestrictedUse::Other);
             }
             OperationKind::Block { block } => {
-                collect_restricted_uses(block, builtins, uses);
+                collect_restricted_uses(block, live, builtins, uses);
             }
             OperationKind::Closure { captures, .. } => {
                 for capture in captures {
@@ -1102,8 +1449,8 @@ fn collect_restricted_uses(
                 uses.entry(*condition)
                     .or_default()
                     .push(RestrictedUse::Other);
-                collect_restricted_uses(consequent, builtins, uses);
-                collect_restricted_uses(alternative, builtins, uses);
+                collect_restricted_uses(consequent, live, builtins, uses);
+                collect_restricted_uses(alternative, live, builtins, uses);
             }
             OperationKind::MatchList {
                 subject,
@@ -1112,13 +1459,13 @@ fn collect_restricted_uses(
                 ..
             } => {
                 uses.entry(*subject).or_default().push(RestrictedUse::Other);
-                collect_restricted_uses(empty, builtins, uses);
-                collect_restricted_uses(cons, builtins, uses);
+                collect_restricted_uses(empty, live, builtins, uses);
+                collect_restricted_uses(cons, live, builtins, uses);
             }
             OperationKind::MatchVariant { subject, arms, .. } => {
                 uses.entry(*subject).or_default().push(RestrictedUse::Other);
                 for arm in arms {
-                    collect_restricted_uses(&arm.block, builtins, uses);
+                    collect_restricted_uses(&arm.block, live, builtins, uses);
                 }
             }
             OperationKind::Unary { operand, .. } => {
@@ -1284,53 +1631,65 @@ fn webhook_type_equivalent(left: &Type, right: &Type) -> bool {
         )
 }
 
-fn first_residual_span(module: &CoreModule) -> Option<Span> {
-    for function in module.functions() {
-        if function
-            .signature
-            .parameters
-            .iter()
-            .any(|ty| contains_residual(ty))
-            || contains_residual(&function.signature.result)
-        {
-            return function.source.or(function.body.source);
-        }
-        if let Some(span) = first_residual_block_span(&function.body) {
-            return Some(span);
-        }
+/// Reports every live location whose type still contains an inference
+/// variable, at the same spans the layout checks use.
+fn collect_residual_function(
+    function: &CoreFunction,
+    live: &LiveFunctions,
+    findings: &mut Vec<BuildError>,
+) {
+    for (index, ty) in function.signature.parameters.iter().enumerate() {
+        push_residual(ty, parameter_span(function, index), findings);
     }
-    None
+    for (index, parameter) in function.parameters.iter().enumerate() {
+        push_residual(&parameter.ty, parameter_span(function, index), findings);
+    }
+    push_residual(&function.signature.result, function.source, findings);
+    collect_residual_block(&function.body, live, function.source, findings);
 }
 
-fn first_residual_block_span(block: &CoreBlock) -> Option<Span> {
-    if contains_residual(&block.ty) {
-        return block.source;
+/// Span of a function's `index`th parameter, or of the function itself.
+fn parameter_span(function: &CoreFunction, index: usize) -> Option<Span> {
+    function
+        .parameters
+        .get(index)
+        .and_then(|parameter| parameter.source)
+        .or(function.source)
+}
+
+fn collect_residual_block(
+    block: &CoreBlock,
+    live: &LiveFunctions,
+    fallback: Option<Span>,
+    findings: &mut Vec<BuildError>,
+) {
+    let span = block.source.or(fallback);
+    for parameter in &block.parameters {
+        push_residual(&parameter.ty, span, findings);
     }
+    push_residual(&block.ty, span, findings);
     for operation in &block.operations {
-        if contains_residual(&operation.ty) {
-            return operation.source.or(block.source);
+        if live.is_dead_closure(operation) {
+            continue;
         }
-        let nested = match &operation.kind {
-            OperationKind::Block { block } => first_residual_block_span(block),
-            OperationKind::If {
-                consequent,
-                alternative,
-                ..
-            } => first_residual_block_span(consequent)
-                .or_else(|| first_residual_block_span(alternative)),
-            OperationKind::MatchList { empty, cons, .. } => {
-                first_residual_block_span(empty).or_else(|| first_residual_block_span(cons))
-            }
-            OperationKind::MatchVariant { arms, .. } => arms
-                .iter()
-                .find_map(|arm| first_residual_block_span(&arm.block)),
-            _ => None,
-        };
-        if nested.is_some() {
-            return nested;
+        let operation_span = operation.source.or(span);
+        // A closure has its target's signature, reported with that function.
+        if !matches!(operation.kind, OperationKind::Closure { .. }) {
+            push_residual(&operation.ty, operation_span, findings);
         }
+        for_each_nested_block(operation, |nested| {
+            collect_residual_block(nested, live, operation_span, findings);
+        });
     }
-    None
+}
+
+fn push_residual(ty: &Type, span: Option<Span>, findings: &mut Vec<BuildError>) {
+    if contains_residual(ty) {
+        findings.push(BuildError::residual(
+            format!("WebAssembly layout requires a concrete type, found parametric `{ty}`"),
+            span,
+        ));
+    }
 }
 
 fn first_effect_block_span(block: &CoreBlock) -> Option<Span> {
@@ -1390,10 +1749,10 @@ fn contains_residual(ty: &Type) -> bool {
     }
 }
 
-fn minimum_literal_operands(module: &CoreModule) -> BTreeSet<krit::ValueId> {
+fn minimum_literal_operands(module: &CoreModule, live: &LiveFunctions) -> BTreeSet<krit::ValueId> {
     let mut candidates = BTreeSet::new();
     let mut uses = BTreeMap::<_, Vec<_>>::new();
-    for function in module.functions() {
+    for function in live.functions(module) {
         collect_minimum_literals(&function.body, &mut candidates);
         collect_value_uses(&function.body, &mut uses);
     }
@@ -1527,9 +1886,64 @@ fn record_use(
 mod tests {
     use std::sync::Arc;
 
-    use krit::Type;
+    use krit::{CoreModule, Source, Type, analyze, lower, parse_source};
 
-    use super::is_supported_webhook_type;
+    use super::{LiveFunctions, is_supported_webhook_type};
+
+    fn lower_source(text: &str) -> CoreModule {
+        let source = Source::new("main.krit", text);
+        let program = parse_source(&source).expect("source should parse");
+        let analysis = analyze(&program).expect("source should analyze");
+        lower(&program, &analysis).expect("source should lower")
+    }
+
+    fn live_names(text: &str) -> Vec<String> {
+        let module = lower_source(text);
+        let entrypoint = module
+            .entrypoints()
+            .iter()
+            .find(|entrypoint| entrypoint.kind.is_exported())
+            .map_or_else(|| module.entrypoint(), |entrypoint| entrypoint.function);
+        let live = LiveFunctions::compute(&module, entrypoint);
+        live.functions(&module)
+            .map(|function| function.debug_name.clone().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn dead_function_elimination_follows_uses_and_captures() {
+        assert_eq!(
+            live_names(
+                "fn leaf() { 1 }\nfn unused() { leaf() }\nfn used() { 2 }\nprintln(used());\n"
+            ),
+            ["$module_init", "used"]
+        );
+        assert_eq!(
+            live_names(
+                "fn apply(function, value) { function(value) }\n\
+                 fn increment(value) { value + 1 }\n\
+                 println(apply(increment, 1));\n"
+            ),
+            ["$module_init", "apply", "increment"]
+        );
+        assert_eq!(
+            live_names(
+                "fn increment(value) { value + 1 }\nlet alias = increment;\nprintln(alias(1));\n"
+            ),
+            ["$module_init", "increment"]
+        );
+        assert_eq!(
+            live_names(
+                "fn countdown(value) { if value == 0 { 0 } else { countdown(value - 1) } }\n\
+                 fn helper() { 200 }\n\
+                 fn unused() { countdown(3) }\n\
+                 webhook fn handle(request: HttpRequest) -> HttpResponse {\n\
+                 record { status: helper(), headers: [], body: request.path }\n\
+                 }\n"
+            ),
+            ["$module_init", "helper", "handle"]
+        );
+    }
 
     #[test]
     fn option_string_results_still_require_a_string_error() {

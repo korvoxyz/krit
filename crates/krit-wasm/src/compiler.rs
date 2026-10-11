@@ -16,6 +16,7 @@ use wasm_encoder::{
 
 use crate::{
     BuildError,
+    support::LiveFunctions,
     wit::{Scalar, Signature, WitContract},
 };
 
@@ -100,6 +101,7 @@ pub(crate) fn encode_core(
     entrypoint: FunctionId,
     contract: &WitContract,
     minimum_literal_operands: &BTreeSet<ValueId>,
+    live: &LiveFunctions,
 ) -> Result<EncodedCore, BuildError> {
     if contract.requires_memory {
         return crate::agent_compiler::encode_webhook_core(
@@ -107,9 +109,10 @@ pub(crate) fn encode_core(
             entrypoint,
             contract,
             minimum_literal_operands,
+            live,
         );
     }
-    let builtin_flavors = collect_builtin_flavors(module)?;
+    let builtin_flavors = collect_builtin_flavors(module, live)?;
     let builtin_slots = builtin_flavors
         .iter()
         .copied()
@@ -131,7 +134,7 @@ pub(crate) fn encode_core(
             .map(|function| function.signature.clone()),
     );
     for function in module.functions() {
-        signatures.insert(function_signature(function)?);
+        signatures.insert(function_signature(function, live)?);
     }
     signatures.extend(
         builtin_flavors
@@ -172,7 +175,7 @@ pub(crate) fn encode_core(
 
     let mut functions = FunctionSection::new();
     for function in module.functions() {
-        functions.function(signature_indices[&function_signature(function)?]);
+        functions.function(signature_indices[&function_signature(function, live)?]);
     }
     for flavor in &builtin_flavors {
         functions.function(signature_indices[&flavor.signature()]);
@@ -219,10 +222,18 @@ pub(crate) fn encode_core(
         signature_indices: &signature_indices,
         builtin_slots: &builtin_slots,
         minimum_literal_operands,
+        live,
     };
     let mut code = CodeSection::new();
     for function in module.functions() {
-        code.function(&encode_function(function, &context)?);
+        if live.contains(function.id) {
+            code.function(
+                &encode_function(function, &context)
+                    .map_err(|error| error.or_span(function.source))?,
+            );
+        } else {
+            code.function(&eliminated_function());
+        }
     }
     for flavor in &builtin_flavors {
         code.function(&encode_builtin_wrapper(*flavor, contract)?);
@@ -250,6 +261,7 @@ struct EncodeContext<'a> {
     signature_indices: &'a BTreeMap<Signature, u32>,
     builtin_slots: &'a BTreeMap<BuiltinFlavor, u32>,
     minimum_literal_operands: &'a BTreeSet<ValueId>,
+    live: &'a LiveFunctions,
 }
 
 struct FunctionContext<'a> {
@@ -286,6 +298,7 @@ fn encode_function(
     }
     collect_block_locals(
         &core.body,
+        shared.live,
         next_parameter,
         &mut locals,
         &mut value_types,
@@ -320,6 +333,7 @@ fn encode_function(
 
 fn collect_block_locals(
     block: &CoreBlock,
+    live: &LiveFunctions,
     parameter_count: u32,
     locals: &mut BTreeMap<ValueId, u32>,
     value_types: &mut BTreeMap<ValueId, Arc<Type>>,
@@ -336,6 +350,9 @@ fn collect_block_locals(
         )?;
     }
     for operation in &block.operations {
+        if live.is_dead_closure(operation) {
+            continue;
+        }
         value_types.insert(operation.result, Arc::clone(&operation.ty));
         push_local(
             operation.result,
@@ -343,11 +360,17 @@ fn collect_block_locals(
             parameter_count,
             locals,
             declarations,
-        )?;
+        )
+        .map_err(|error| error.or_span(operation.source))?;
         match &operation.kind {
-            OperationKind::Block { block } => {
-                collect_block_locals(block, parameter_count, locals, value_types, declarations)?
-            }
+            OperationKind::Block { block } => collect_block_locals(
+                block,
+                live,
+                parameter_count,
+                locals,
+                value_types,
+                declarations,
+            )?,
             OperationKind::If {
                 consequent,
                 alternative,
@@ -355,6 +378,7 @@ fn collect_block_locals(
             } => {
                 collect_block_locals(
                     consequent,
+                    live,
                     parameter_count,
                     locals,
                     value_types,
@@ -362,6 +386,7 @@ fn collect_block_locals(
                 )?;
                 collect_block_locals(
                     alternative,
+                    live,
                     parameter_count,
                     locals,
                     value_types,
@@ -369,13 +394,28 @@ fn collect_block_locals(
                 )?;
             }
             OperationKind::MatchList { empty, cons, .. } => {
-                collect_block_locals(empty, parameter_count, locals, value_types, declarations)?;
-                collect_block_locals(cons, parameter_count, locals, value_types, declarations)?;
+                collect_block_locals(
+                    empty,
+                    live,
+                    parameter_count,
+                    locals,
+                    value_types,
+                    declarations,
+                )?;
+                collect_block_locals(
+                    cons,
+                    live,
+                    parameter_count,
+                    locals,
+                    value_types,
+                    declarations,
+                )?;
             }
             OperationKind::MatchVariant { arms, .. } => {
                 for arm in arms {
                     collect_block_locals(
                         &arm.block,
+                        live,
                         parameter_count,
                         locals,
                         value_types,
@@ -418,7 +458,11 @@ fn encode_block(
     block: &CoreBlock,
 ) -> Result<(), BuildError> {
     for operation in &block.operations {
-        encode_operation(function, context, operation)?;
+        if context.shared.live.is_dead_closure(operation) {
+            continue;
+        }
+        encode_operation(function, context, operation)
+            .map_err(|error| error.or_span(operation.source))?;
     }
     Ok(())
 }
@@ -771,9 +815,12 @@ fn store_value(
     Ok(())
 }
 
-fn collect_builtin_flavors(module: &CoreModule) -> Result<Vec<BuiltinFlavor>, BuildError> {
+fn collect_builtin_flavors(
+    module: &CoreModule,
+    live: &LiveFunctions,
+) -> Result<Vec<BuiltinFlavor>, BuildError> {
     let mut flavors = BTreeSet::new();
-    for function in module.functions() {
+    for function in live.functions(module) {
         collect_block_builtins(&function.body, &mut flavors)?;
     }
     Ok(flavors.into_iter().collect())
@@ -786,7 +833,10 @@ fn collect_block_builtins(
     for operation in &block.operations {
         match &operation.kind {
             OperationKind::Builtin(builtin) => {
-                flavors.insert(BuiltinFlavor::from_operation(*builtin, &operation.ty)?);
+                flavors.insert(
+                    BuiltinFlavor::from_operation(*builtin, &operation.ty)
+                        .map_err(|error| error.or_span(operation.source))?,
+                );
             }
             OperationKind::Block { block } => collect_block_builtins(block, flavors)?,
             OperationKind::If {
@@ -831,8 +881,29 @@ fn encode_builtin_wrapper(
     Ok(function)
 }
 
-fn function_signature(function: &CoreFunction) -> Result<Signature, BuildError> {
+/// Signature of a lowered function, or the empty stub signature of an
+/// eliminated one.
+fn function_signature(
+    function: &CoreFunction,
+    live: &LiveFunctions,
+) -> Result<Signature, BuildError> {
+    if !live.contains(function.id) {
+        return Ok(Signature {
+            params: Vec::new(),
+            results: Vec::new(),
+        });
+    }
     type_signature(&function.signature.parameters, &function.signature.result)
+        .map_err(|error| error.or_span(function.source))
+}
+
+/// Body of an eliminated function: it keeps its table slot but traps if
+/// ever reached, which no live code can do.
+pub(crate) fn eliminated_function() -> Function {
+    let mut function = Function::new(Vec::new());
+    function.instruction(&Instruction::Unreachable);
+    function.instruction(&Instruction::End);
+    function
 }
 
 fn type_signature(parameters: &[Arc<Type>], result: &Type) -> Result<Signature, BuildError> {

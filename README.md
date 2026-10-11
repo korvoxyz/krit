@@ -215,7 +215,19 @@ executing. A successful check also lowers and verifies typed Core IR:
 
 ```sh
 krit check examples/factorial.krit
+krit check --diagnostic-format json examples/webhook-agent.krit
+krit check --target component examples/lists.krit
 ```
+
+`--target component|module|none` also runs the complete WebAssembly build
+pipeline with the output discarded and reports every `K7001`/`K7002` that
+`krit build` would, each at its source span and in source order.
+`component` checks the artifact `krit build` emits; `module` checks the file
+as a module program; `none` skips the target check. A file that declares a
+webhook, queue, or schedule entrypoint is checked as `component` by default,
+because a component is the only way it can run, so a clean `krit check` of an
+entrypoint file means it builds. Other files default to `none`. Target checks
+read no manifest; `krit build` still enforces package grants (`K5001`).
 
 Inspect stable compiler facts and the resolved Core program:
 
@@ -283,7 +295,12 @@ Build the package's validated WebAssembly component:
 ```sh
 krit build
 krit build --manifest path/to/krit.pkg --output dist/program.wasm
+krit build --diagnostic-format json
 ```
+
+`--diagnostic-format human|json` selects the format of every build
+diagnostic, from manifest errors to backend failures; a failed backend check
+reports all of its findings at once.
 
 The default output is `target/krit/krit.wasm` for this repository, with
 metadata at `target/krit/krit.wasm.json`. Metadata schema 1 includes the exact
@@ -305,8 +322,10 @@ config, opaque secrets, outbound HTTP, neutral AI calls, ordered log fields,
 and unescaped JSON-string decoding used to validate the reference model
 output. Other composites, general JSON shapes, escaped JSON strings, data
 captures, and unresolved parametric layouts fail closed with stable
-`K7001`/`K7002` diagnostics or a bounded guest trap. `krit build` never falls
-back to direct interpretation. Run only an existing validated artifact:
+`K7001`/`K7002` diagnostics or a bounded guest trap; helpers the entrypoint
+never reaches are eliminated first, so an unused generic helper does not fail
+the build. `krit build` never falls back to direct interpretation. Run only an
+existing validated artifact:
 
 ```sh
 krit sandbox

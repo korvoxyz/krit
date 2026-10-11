@@ -1,0 +1,4 @@
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let empty = [];
+    record { status: 200, headers: [], body: request.path }
+}

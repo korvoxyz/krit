@@ -1,0 +1,14 @@
+fn identity(value) {
+    value
+}
+
+fn first(items: List<Int>) -> Int {
+    match items {
+        [] => 0,
+        [head, ..tail] => head,
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.path }
+}

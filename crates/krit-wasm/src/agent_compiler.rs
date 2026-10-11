@@ -18,7 +18,8 @@ use wasm_encoder::{
 
 use crate::{
     BuildError,
-    compiler::EncodedCore,
+    compiler::{EncodedCore, eliminated_function},
+    support::LiveFunctions,
     wit::{ProgramKind, Scalar, Signature, WitContract},
 };
 
@@ -99,10 +100,11 @@ pub(crate) fn encode_webhook_core(
     entrypoint: FunctionId,
     contract: &WitContract,
     minimum_literal_operands: &BTreeSet<ValueId>,
+    live: &LiveFunctions,
 ) -> Result<EncodedCore, BuildError> {
-    let literals = StaticMemory::collect(module)?;
+    let literals = StaticMemory::collect(module, live)?;
     let builtin_values = collect_builtin_values(module);
-    let stdout_flavors = collect_stdout_flavors(module)?;
+    let stdout_flavors = collect_stdout_flavors(module, live)?;
     let stdout_slots = stdout_flavors
         .iter()
         .copied()
@@ -125,7 +127,7 @@ pub(crate) fn encode_webhook_core(
             .map(|function| function.signature.clone()),
     );
     for function in module.functions() {
-        signatures.insert(function_signature(function)?);
+        signatures.insert(function_signature(function, live)?);
     }
     signatures.extend(stdout_flavors.iter().copied().map(StdoutFlavor::signature));
     signatures.insert(contract.entry_signature.clone());
@@ -174,7 +176,7 @@ pub(crate) fn encode_webhook_core(
 
     let mut functions = FunctionSection::new();
     for function in module.functions() {
-        functions.function(signature_indices[&function_signature(function)?]);
+        functions.function(signature_indices[&function_signature(function, live)?]);
     }
     for flavor in &stdout_flavors {
         functions.function(signature_indices[&flavor.signature()]);
@@ -252,10 +254,18 @@ pub(crate) fn encode_webhook_core(
             .iter()
             .any(|interface| interface == crate::HTTP_INTERFACE),
         realloc_index,
+        live,
     };
     let mut code = CodeSection::new();
     for function in module.functions() {
-        code.function(&encode_function(function, &shared)?);
+        if live.contains(function.id) {
+            code.function(
+                &encode_function(function, &shared)
+                    .map_err(|error| error.or_span(function.source))?,
+            );
+        } else {
+            code.function(&eliminated_function());
+        }
     }
     for flavor in &stdout_flavors {
         code.function(&encode_stdout_wrapper(*flavor, contract)?);
@@ -303,12 +313,12 @@ struct StaticMemory {
 }
 
 impl StaticMemory {
-    fn collect(module: &CoreModule) -> Result<Self, BuildError> {
+    fn collect(module: &CoreModule, live: &LiveFunctions) -> Result<Self, BuildError> {
         let mut builder = StaticMemoryBuilder {
             data: Vec::new(),
             offsets: BTreeMap::new(),
         };
-        for function in module.functions() {
+        for function in live.functions(module) {
             builder.collect_block(&function.body)?;
         }
         let end = STATIC_MEMORY_BASE
@@ -420,6 +430,7 @@ struct EncodeContext<'a> {
     import_indices: &'a BTreeMap<String, u32>,
     http_bearer: bool,
     realloc_index: u32,
+    live: &'a LiveFunctions,
 }
 
 struct FunctionContext<'a> {
@@ -469,6 +480,7 @@ fn encode_function(
     }
     collect_block_locals(
         &core.body,
+        shared.live,
         next_parameter,
         &mut locals,
         &mut value_types,
@@ -535,6 +547,7 @@ fn encode_function(
 
 fn collect_block_locals(
     block: &CoreBlock,
+    live: &LiveFunctions,
     parameter_count: u32,
     locals: &mut BTreeMap<ValueId, u32>,
     value_types: &mut BTreeMap<ValueId, Arc<Type>>,
@@ -551,6 +564,9 @@ fn collect_block_locals(
         )?;
     }
     for operation in &block.operations {
+        if live.is_dead_closure(operation) {
+            continue;
+        }
         value_types.insert(operation.result, Arc::clone(&operation.ty));
         push_local(
             operation.result,
@@ -558,10 +574,18 @@ fn collect_block_locals(
             parameter_count,
             locals,
             declarations,
-        )?;
+        )
+        .map_err(|error| error.or_span(operation.source))?;
         match &operation.kind {
             OperationKind::Block { block } => {
-                collect_block_locals(block, parameter_count, locals, value_types, declarations)?;
+                collect_block_locals(
+                    block,
+                    live,
+                    parameter_count,
+                    locals,
+                    value_types,
+                    declarations,
+                )?;
             }
             OperationKind::If {
                 consequent,
@@ -570,6 +594,7 @@ fn collect_block_locals(
             } => {
                 collect_block_locals(
                     consequent,
+                    live,
                     parameter_count,
                     locals,
                     value_types,
@@ -577,6 +602,7 @@ fn collect_block_locals(
                 )?;
                 collect_block_locals(
                     alternative,
+                    live,
                     parameter_count,
                     locals,
                     value_types,
@@ -584,13 +610,28 @@ fn collect_block_locals(
                 )?;
             }
             OperationKind::MatchList { empty, cons, .. } => {
-                collect_block_locals(empty, parameter_count, locals, value_types, declarations)?;
-                collect_block_locals(cons, parameter_count, locals, value_types, declarations)?;
+                collect_block_locals(
+                    empty,
+                    live,
+                    parameter_count,
+                    locals,
+                    value_types,
+                    declarations,
+                )?;
+                collect_block_locals(
+                    cons,
+                    live,
+                    parameter_count,
+                    locals,
+                    value_types,
+                    declarations,
+                )?;
             }
             OperationKind::MatchVariant { arms, .. } => {
                 for arm in arms {
                     collect_block_locals(
                         &arm.block,
+                        live,
                         parameter_count,
                         locals,
                         value_types,
@@ -633,7 +674,11 @@ fn encode_block(
     block: &CoreBlock,
 ) -> Result<(), BuildError> {
     for operation in &block.operations {
-        encode_operation(function, context, operation)?;
+        if context.shared.live.is_dead_closure(operation) {
+            continue;
+        }
+        encode_operation(function, context, operation)
+            .map_err(|error| error.or_span(operation.source))?;
     }
     Ok(())
 }
@@ -2177,9 +2222,12 @@ fn collect_block_builtins(block: &CoreBlock, values: &mut BTreeMap<ValueId, Buil
     }
 }
 
-fn collect_stdout_flavors(module: &CoreModule) -> Result<Vec<StdoutFlavor>, BuildError> {
+fn collect_stdout_flavors(
+    module: &CoreModule,
+    live: &LiveFunctions,
+) -> Result<Vec<StdoutFlavor>, BuildError> {
     let mut flavors = BTreeSet::new();
-    for function in module.functions() {
+    for function in live.functions(module) {
         collect_block_stdout_flavors(&function.body, &mut flavors)?;
     }
     Ok(flavors.into_iter().collect())
@@ -2193,7 +2241,10 @@ fn collect_block_stdout_flavors(
         if let OperationKind::Builtin(builtin @ (Builtin::Print | Builtin::Println)) =
             &operation.kind
         {
-            flavors.insert(StdoutFlavor::from_builtin(*builtin, &operation.ty)?);
+            flavors.insert(
+                StdoutFlavor::from_builtin(*builtin, &operation.ty)
+                    .map_err(|error| error.or_span(operation.source))?,
+            );
         }
         match &operation.kind {
             OperationKind::Block { block } => collect_block_stdout_flavors(block, flavors)?,
@@ -2254,8 +2305,20 @@ fn static_function_bindings(module: &CoreModule) -> BTreeMap<BindingId, Function
     bindings
 }
 
-fn function_signature(function: &CoreFunction) -> Result<Signature, BuildError> {
+/// Signature of a lowered function, or the empty stub signature of an
+/// eliminated one.
+fn function_signature(
+    function: &CoreFunction,
+    live: &LiveFunctions,
+) -> Result<Signature, BuildError> {
+    if !live.contains(function.id) {
+        return Ok(Signature {
+            params: Vec::new(),
+            results: Vec::new(),
+        });
+    }
     type_signature(&function.signature.parameters, &function.signature.result)
+        .map_err(|error| error.or_span(function.source))
 }
 
 fn type_signature(parameters: &[Arc<Type>], result: &Type) -> Result<Signature, BuildError> {

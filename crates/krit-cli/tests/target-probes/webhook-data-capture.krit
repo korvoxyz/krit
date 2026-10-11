@@ -1,0 +1,8 @@
+// Closures that capture data have no lowering in the bounded webhook ABI.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let prefix = request.path;
+    let render = fn(status) {
+        record { status: status, headers: [], body: prefix }
+    };
+    render(200)
+}

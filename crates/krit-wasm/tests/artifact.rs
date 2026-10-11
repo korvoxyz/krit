@@ -219,7 +219,7 @@ fn rejects_every_layout_and_semantic_family_outside_policy_one() {
     for (name, source, expected_kind) in [
         (
             "generic",
-            "fn identity(value) { value }\n",
+            "fn ignore(value) { 0 }\nprintln(ignore(None));\n",
             BuildErrorKind::ResidualType,
         ),
         (

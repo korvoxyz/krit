@@ -1,0 +1,10 @@
+// Equality over Result values is a composite comparison.
+queue "render-jobs" fn worker(job: QueueJob) -> Result<String, String> {
+    let current = object_get("render-output", job.id);
+    let previous = object_get("render-output", job.body);
+    if current == previous {
+        Ok(job.id)
+    } else {
+        Err(job.id)
+    }
+}
