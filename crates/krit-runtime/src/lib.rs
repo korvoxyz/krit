@@ -26,12 +26,13 @@ use std::{
 };
 
 use krit_wasm::{
-    ArtifactMetadata, ComponentInspection, PROGRAM_WORLD, PURE_PROGRAM_WORLD, WEBHOOK_INTERFACE,
-    validate_artifact,
+    ArtifactMetadata, ComponentInspection, JSON_DECODE_FUNCTION_NAME, PROGRAM_WORLD,
+    PURE_PROGRAM_WORLD, WEBHOOK_INTERFACE, validate_artifact,
 };
 use serde::Serialize;
 use wasmtime::{
-    Config, Engine, ProfilingStrategy, Store, StoreLimits, StoreLimitsBuilder, Strategy, Trap,
+    Config, Engine, FrameInfo, ProfilingStrategy, Store, StoreLimits, StoreLimitsBuilder, Strategy,
+    Trap, WasmBacktrace,
     component::{Component, HasSelf, Linker, Resource, ResourceTable},
 };
 
@@ -2974,6 +2975,17 @@ fn map_wasmtime_error(error: wasmtime::Error) -> RuntimeError {
                 RuntimeError::guest("K4004", "division or remainder by zero")
             }
             Trap::IntegerOverflow => RuntimeError::guest("K4005", "integer overflow"),
+            // The generated JSON string decoder traps only on input that is
+            // not one JSON string, which the direct evaluator reports as
+            // K4009. The message never repeats the (possibly secret) input.
+            Trap::UnreachableCodeReached
+                if innermost_frame_is(&error, JSON_DECODE_FUNCTION_NAME) =>
+            {
+                RuntimeError::guest(
+                    "K4009",
+                    "invalid JSON: json_decode into String requires exactly one JSON string",
+                )
+            }
             Trap::UnreachableCodeReached => {
                 RuntimeError::guest("K4001", "guest executed an unreachable instruction")
             }
@@ -2983,14 +2995,26 @@ fn map_wasmtime_error(error: wasmtime::Error) -> RuntimeError {
             _ => RuntimeError::guest("K4001", format!("guest trapped: {trap}")),
         };
     }
-    let message = error.to_string();
-    if message.starts_with("resource limit exceeded:")
-        || message.starts_with("forcing trap when growing ")
-    {
-        RuntimeError::resource(message)
-    } else {
-        RuntimeError::guest("K4001", format!("component execution failed: {message}"))
+    // A growth the store limiter denies arrives as a message, usually wrapped
+    // in a guest backtrace context (as when the guest's bounded allocator
+    // grows memory for a string), so the whole cause chain is inspected.
+    if let Some(limit) = error.chain().map(ToString::to_string).find(|message| {
+        message.starts_with("resource limit exceeded:")
+            || message.starts_with("forcing trap when growing ")
+    }) {
+        return RuntimeError::resource(limit);
     }
+    RuntimeError::guest("K4001", format!("component execution failed: {error}"))
+}
+
+/// Whether the innermost guest frame of a trap is the function named `name`
+/// in the artifact's name section.
+fn innermost_frame_is(error: &wasmtime::Error, name: &str) -> bool {
+    error
+        .downcast_ref::<WasmBacktrace>()
+        .and_then(|backtrace| backtrace.frames().first())
+        .and_then(FrameInfo::func_name)
+        == Some(name)
 }
 
 fn replay_safe_http(request: &HttpRequest, max_key_bytes: usize) -> bool {

@@ -1,0 +1,6 @@
+// Module initialization never runs in a component, so effects there fail.
+let model = config_string("agent.model");
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.path }
+}

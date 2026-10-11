@@ -1,0 +1,8 @@
+// Option<Int> has no bounded layout.
+schedule "hourly-sweep" fn tick(event: ScheduleEvent) -> Result<String, String> {
+    let attempt = Some(event.attempt);
+    match attempt {
+        Some(value) => Ok(event.id),
+        None => Err(event.schedule),
+    }
+}

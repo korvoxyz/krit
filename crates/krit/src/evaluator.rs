@@ -813,12 +813,23 @@ impl Evaluator<'_> {
             | BinaryOperator::LessEqual
             | BinaryOperator::Greater
             | BinaryOperator::GreaterEqual => {
-                let (left, right) = self.integer_pair(left_value, right_value, span)?;
+                // Strings order byte-lexicographically over their UTF-8
+                // encoding: the first differing byte decides, and a proper
+                // prefix orders before every longer string it begins.
+                let ordering = match (left_value, right_value) {
+                    (Value::Integer(left), Value::Integer(right)) => left.cmp(&right),
+                    (Value::String(left), Value::String(right)) => {
+                        left.as_bytes().cmp(right.as_bytes())
+                    }
+                    (left, right) => {
+                        return Err(kind_pair_error("comparison operator", &left, &right, span));
+                    }
+                };
                 let result = match operator {
-                    BinaryOperator::Less => left < right,
-                    BinaryOperator::LessEqual => left <= right,
-                    BinaryOperator::Greater => left > right,
-                    BinaryOperator::GreaterEqual => left >= right,
+                    BinaryOperator::Less => ordering.is_lt(),
+                    BinaryOperator::LessEqual => ordering.is_le(),
+                    BinaryOperator::Greater => ordering.is_gt(),
+                    BinaryOperator::GreaterEqual => ordering.is_ge(),
                     _ => unreachable!("operator was matched above"),
                 };
                 Ok(Value::Boolean(result))
@@ -1132,6 +1143,29 @@ mod tests {
     fn detects_checked_overflow() {
         let error = run("println(9223372036854775807 + 1);").expect_err("program should fail");
         assert_eq!(error.code(), "K4005");
+    }
+
+    #[test]
+    fn orders_strings_byte_lexicographically_over_utf8() {
+        let (output, _) = run(r#"
+            println("" < "a");
+            println("abc" < "abcd");
+            println("abd" > "abcd");
+            println("B" < "a");
+            println("\u{7f}" < "\u{80}");
+            println("e\u{301}" < "\u{e9}");
+            println("\u{ffff}" < "\u{10000}");
+            println("same" <= "same" && "same" >= "same");
+            println("hi " + "there" > "hi ");
+            "#)
+        .expect("String ordering should run");
+        assert_eq!(
+            output,
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"
+        );
+
+        let error = run("println(1 < \"one\");").expect_err("mixed kinds should fail");
+        assert_eq!(error.code(), "K4001");
     }
 
     #[test]

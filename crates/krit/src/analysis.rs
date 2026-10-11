@@ -811,6 +811,7 @@ struct TypeConstraint {
 enum ConstraintKind {
     Addable,
     Comparable,
+    Orderable,
     JsonValue,
     OpaqueArgument,
     Printable,
@@ -1898,8 +1899,12 @@ impl Analyzer {
             | BinaryOperator::LessEqual
             | BinaryOperator::Greater
             | BinaryOperator::GreaterEqual => {
-                self.unify(InferType::Int, left.ty, span, "comparison operand")?;
-                self.unify(InferType::Int, right.ty, span, "comparison operand")?;
+                let ty = self.unify(left.ty, right.ty, span, "comparison operands")?;
+                self.constraints.push(TypeConstraint {
+                    ty,
+                    span,
+                    kind: ConstraintKind::Orderable,
+                });
                 InferType::Bool
             }
             BinaryOperator::And | BinaryOperator::Or => {
@@ -2461,7 +2466,7 @@ impl Analyzer {
     fn validate_constraints(&self) -> Result<(), Diagnostic> {
         for constraint in &self.constraints {
             let valid = match constraint.kind {
-                ConstraintKind::Addable => matches!(
+                ConstraintKind::Addable | ConstraintKind::Orderable => matches!(
                     self.resolve_head(&constraint.ty),
                     InferType::Int | InferType::String | InferType::Variable(_)
                 ),
@@ -2494,6 +2499,7 @@ impl Analyzer {
                         ConstraintKind::Printable => "printed",
                         ConstraintKind::StructuralValue => "placed into ordinary structural data",
                         ConstraintKind::Addable => "used by `+`",
+                        ConstraintKind::Orderable => "ordered",
                     };
                     return Err(Diagnostic::new(
                         "K3010",
@@ -2511,6 +2517,7 @@ impl Analyzer {
                         ConstraintKind::Printable => "printed",
                         ConstraintKind::StructuralValue => "placed into ordinary structural data",
                         ConstraintKind::Addable => "used by `+`",
+                        ConstraintKind::Orderable => "ordered",
                     };
                     return Err(Diagnostic::new(
                         "K3009",
@@ -2523,6 +2530,13 @@ impl Analyzer {
                         "K3001",
                         format!(
                             "`+` requires two integers or two strings, found `{}`",
+                            self.render_type(&constraint.ty)
+                        ),
+                    ),
+                    ConstraintKind::Orderable => (
+                        "K3001",
+                        format!(
+                            "`<`, `<=`, `>`, and `>=` require two integers or two strings, found `{}`",
                             self.render_type(&constraint.ty)
                         ),
                     ),
@@ -3645,6 +3659,55 @@ mod tests {
         assert!(first.effects().is_empty());
         assert_eq!(first, second);
         assert_eq!(first.effects().to_string(), "{}");
+    }
+
+    #[test]
+    fn orders_two_integers_or_two_strings_only() {
+        let analysis = check(
+            r#"
+            fn before(left: String, right: String) {
+                left < right
+            }
+            fn later(left, right) {
+                left >= right
+            }
+            let numbers = later(2, 1);
+            let words = before("a", "b") && "b" > "a" && "a" <= "a";
+            "#,
+        )
+        .expect("String and Int ordering should check");
+        assert_eq!(
+            analysis.bindings()[0].ty().to_string(),
+            "fn(String, String) -> Bool effects {}"
+        );
+        assert_eq!(
+            analysis.bindings()[1].ty().to_string(),
+            "fn(Int, Int) -> Bool effects {}"
+        );
+
+        for (source, code) in [
+            ("let value = 1 < \"one\";", "K3001"),
+            ("let value = true < false;", "K3001"),
+            ("let value = [1] <= [2];", "K3001"),
+            ("let value = record { a: 1 } > record { a: 2 };", "K3001"),
+            (
+                "fn later(left, right) { left > right }\nlet value = later(1, \"one\");",
+                "K3001",
+            ),
+        ] {
+            let error = check(source).expect_err("ordering should reject other operands");
+            assert_eq!(error.code(), code, "{source}");
+        }
+        let secret = check(
+            r#"
+            fn compare(left: Secret, right: Secret) -> Bool {
+                left < right
+            }
+            "#,
+        )
+        .expect_err("secrets must not be ordered");
+        assert_eq!(secret.code(), "K3009");
+        assert!(secret.message().contains("ordered"), "{}", secret.message());
     }
 
     #[test]

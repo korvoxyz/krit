@@ -32,7 +32,13 @@ krit check --diagnostic-format json program.krit
 ```
 
 It compares status and diagnostic codes and requires that checking never
-execute program effects or emit program output.
+execute program effects or emit program output. Files that declare a
+webhook, queue, or schedule entrypoint are checked against the component
+target by default, so `K7001`/`K7002` build-target diagnostics are part of
+their expected output, in source order. `conformance/check/target` pins the
+current bounded backend: as the backend grows, these cases move from failure
+to success. A front-end-only harness treats a case whose expected codes are
+all `K7xxx` as passing analysis.
 
 `conformance/package` contains manifest-validation cases. Each case
 directory holds `krit.pkg`, the entry it names, `expect.status`, and optional
@@ -87,6 +93,7 @@ network service, or nondeterministic value.
 | `core/arithmetic` | checked integer operators and precedence |
 | `core/booleans` | strict booleans and short-circuiting |
 | `core/strings` | UTF-8 strings and concatenation |
+| `core/string-ordering` | byte-lexicographic UTF-8 string ordering and string equality |
 | `scope/closures` | immutable lexical capture and shadowing |
 | `functions/recursion` | recursive declaration and calls |
 | `lists/match` | list construction and exhaustive decomposition |
@@ -94,6 +101,7 @@ network service, or nondeterministic value.
 | `variants/option-match` | exhaustive Option matching |
 | `variants/result-match` | exhaustive Result matching |
 | `json/round-trip` | deterministic JSON conversion |
+| `json/string-escapes` | every JSON string escape, surrogate pairs, and surrounding whitespace decode |
 | `types/annotations` | parsed binding, parameter, return, and generic types |
 | `errors/syntax` | missing required syntax |
 | `errors/undefined-name` | lexical name resolution |
@@ -108,6 +116,8 @@ network service, or nondeterministic value.
 | `errors/mixed-variant-match` | one variant family per match |
 | `errors/json-function` | functions cannot be JSON encoded |
 | `errors/json-invalid` | invalid JSON input |
+| `errors/json-lone-surrogate` | an unpaired surrogate escape is invalid JSON |
+| `errors/json-invalid-escape` | an unknown escape is invalid JSON |
 | `errors/missing-record-field` | field access requires an existing field |
 | `check/valid/inference` | recursion, closures, empty lists, None, and effects infer together |
 | `check/name/*` | lexical undefined and duplicate name diagnostics |
@@ -115,6 +125,7 @@ network service, or nondeterministic value.
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |

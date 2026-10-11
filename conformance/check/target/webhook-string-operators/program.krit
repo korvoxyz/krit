@@ -1,0 +1,20 @@
+fn route(request: HttpRequest) -> String {
+    if request.method == "POST" && request.path == "/x" {
+        "hi " + request.path
+    } else {
+        if request.path < "/m" {
+            "early " + request.method
+        } else {
+            ""
+        }
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let body = route(request);
+    if body != "" {
+        record { status: 200, headers: [], body: body }
+    } else {
+        record { status: 404, headers: [], body: "no route for " + request.path }
+    }
+}

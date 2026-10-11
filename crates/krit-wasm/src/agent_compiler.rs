@@ -12,13 +12,15 @@ use krit::{
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
     ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
-    Instruction, MemArg, MemorySection, MemoryType, Module, RefType, TableSection, TableType,
-    TypeSection,
+    Instruction, MemArg, MemorySection, MemoryType, Module, NameMap, NameSection, RefType,
+    TableSection, TableType, TypeSection,
 };
 
 use crate::{
     BuildError,
-    compiler::EncodedCore,
+    compiler::{EncodedCore, eliminated_function},
+    strings::{self, StringHelper},
+    support::LiveFunctions,
     wit::{ProgramKind, Scalar, Signature, WitContract},
 };
 
@@ -99,10 +101,11 @@ pub(crate) fn encode_webhook_core(
     entrypoint: FunctionId,
     contract: &WitContract,
     minimum_literal_operands: &BTreeSet<ValueId>,
+    live: &LiveFunctions,
 ) -> Result<EncodedCore, BuildError> {
-    let literals = StaticMemory::collect(module)?;
+    let literals = StaticMemory::collect(module, live)?;
     let builtin_values = collect_builtin_values(module);
-    let stdout_flavors = collect_stdout_flavors(module)?;
+    let stdout_flavors = collect_stdout_flavors(module, live)?;
     let stdout_slots = stdout_flavors
         .iter()
         .copied()
@@ -116,6 +119,7 @@ pub(crate) fn encode_webhook_core(
         })
         .collect::<Result<BTreeMap<_, _>, BuildError>>()?;
     let static_functions = static_function_bindings(module);
+    let string_helpers = strings::used_helpers(module, live);
 
     let mut signatures = BTreeSet::new();
     signatures.extend(
@@ -125,7 +129,7 @@ pub(crate) fn encode_webhook_core(
             .map(|function| function.signature.clone()),
     );
     for function in module.functions() {
-        signatures.insert(function_signature(function)?);
+        signatures.insert(function_signature(function, live)?);
     }
     signatures.extend(stdout_flavors.iter().copied().map(StdoutFlavor::signature));
     signatures.insert(contract.entry_signature.clone());
@@ -135,6 +139,7 @@ pub(crate) fn encode_webhook_core(
         results: vec![Scalar::I32],
     };
     signatures.insert(realloc_signature.clone());
+    signatures.extend(string_helpers.iter().map(|helper| helper.signature()));
 
     let signature_indices = signatures
         .into_iter()
@@ -171,10 +176,24 @@ pub(crate) fn encode_webhook_core(
     let adapter_index = import_count + core_count + wrapper_count;
     let realloc_index = adapter_index + 1;
     let post_index = realloc_index + 1;
+    // String runtime helpers follow every other definition, so modules that
+    // use no String operator keep their function indices and bytes.
+    let string_helper_indices = string_helpers
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(offset, helper)| {
+            u32::try_from(offset)
+                .ok()
+                .and_then(|offset| post_index.checked_add(1)?.checked_add(offset))
+                .map(|index| (helper, index))
+                .ok_or_else(|| BuildError::artifact("too many WebAssembly functions"))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
 
     let mut functions = FunctionSection::new();
     for function in module.functions() {
-        functions.function(signature_indices[&function_signature(function)?]);
+        functions.function(signature_indices[&function_signature(function, live)?]);
     }
     for flavor in &stdout_flavors {
         functions.function(signature_indices[&flavor.signature()]);
@@ -182,6 +201,9 @@ pub(crate) fn encode_webhook_core(
     functions.function(signature_indices[&contract.entry_signature]);
     functions.function(signature_indices[&realloc_signature]);
     functions.function(signature_indices[&contract.post_entry_signature]);
+    for helper in &string_helpers {
+        functions.function(signature_indices[&helper.signature()]);
+    }
 
     let table_size = core_count
         .checked_add(wrapper_count)
@@ -252,10 +274,19 @@ pub(crate) fn encode_webhook_core(
             .iter()
             .any(|interface| interface == crate::HTTP_INTERFACE),
         realloc_index,
+        string_helpers: &string_helper_indices,
+        live,
     };
     let mut code = CodeSection::new();
     for function in module.functions() {
-        code.function(&encode_function(function, &shared)?);
+        if live.contains(function.id) {
+            code.function(
+                &encode_function(function, &shared)
+                    .map_err(|error| error.or_span(function.source))?,
+            );
+        } else {
+            code.function(&eliminated_function());
+        }
     }
     for flavor in &stdout_flavors {
         code.function(&encode_stdout_wrapper(*flavor, contract)?);
@@ -267,6 +298,9 @@ pub(crate) fn encode_webhook_core(
     )?);
     code.function(&encode_realloc());
     code.function(&encode_post_return(&contract.post_entry_signature));
+    for helper in &string_helpers {
+        code.function(&helper.encode(realloc_index));
+    }
 
     let mut data = DataSection::new();
     data.active(
@@ -277,6 +311,15 @@ pub(crate) fn encode_webhook_core(
         ),
         literals.data().iter().copied(),
     );
+
+    // Only helpers whose traps the host attributes are named, so a module
+    // without them has no name section.
+    let mut helper_names = NameMap::new();
+    for (helper, index) in &string_helper_indices {
+        if let Some(name) = helper.name() {
+            helper_names.append(*index, name);
+        }
+    }
 
     let mut wasm = Module::new();
     wasm.section(&types)
@@ -289,6 +332,11 @@ pub(crate) fn encode_webhook_core(
         .section(&elements)
         .section(&code)
         .section(&data);
+    if !helper_names.is_empty() {
+        let mut names = NameSection::new();
+        names.functions(&helper_names);
+        wasm.section(&names);
+    }
 
     Ok(EncodedCore {
         bytes: wasm.finish(),
@@ -303,12 +351,12 @@ struct StaticMemory {
 }
 
 impl StaticMemory {
-    fn collect(module: &CoreModule) -> Result<Self, BuildError> {
+    fn collect(module: &CoreModule, live: &LiveFunctions) -> Result<Self, BuildError> {
         let mut builder = StaticMemoryBuilder {
             data: Vec::new(),
             offsets: BTreeMap::new(),
         };
-        for function in module.functions() {
+        for function in live.functions(module) {
             builder.collect_block(&function.body)?;
         }
         let end = STATIC_MEMORY_BASE
@@ -420,6 +468,8 @@ struct EncodeContext<'a> {
     import_indices: &'a BTreeMap<String, u32>,
     http_bearer: bool,
     realloc_index: u32,
+    string_helpers: &'a BTreeMap<StringHelper, u32>,
+    live: &'a LiveFunctions,
 }
 
 struct FunctionContext<'a> {
@@ -427,8 +477,6 @@ struct FunctionContext<'a> {
     locals: BTreeMap<ValueId, u32>,
     value_types: BTreeMap<ValueId, Arc<Type>>,
     scratch_i32: u32,
-    scratch_i32_2: u32,
-    scratch_i32_3: u32,
 }
 
 fn encode_function(
@@ -469,6 +517,7 @@ fn encode_function(
     }
     collect_block_locals(
         &core.body,
+        shared.live,
         next_parameter,
         &mut locals,
         &mut value_types,
@@ -480,13 +529,7 @@ fn encode_function(
                 .map_err(|_| BuildError::artifact("too many WebAssembly locals"))?,
         )
         .ok_or_else(|| BuildError::artifact("too many WebAssembly locals"))?;
-    let scratch_i32_2 = scratch_i32
-        .checked_add(1)
-        .ok_or_else(|| BuildError::artifact("too many WebAssembly locals"))?;
-    let scratch_i32_3 = scratch_i32
-        .checked_add(2)
-        .ok_or_else(|| BuildError::artifact("too many WebAssembly locals"))?;
-    local_declarations.extend([Scalar::I32; 3]);
+    local_declarations.push(Scalar::I32);
 
     let mut function = Function::new(
         local_declarations
@@ -499,8 +542,6 @@ fn encode_function(
         locals,
         value_types,
         scratch_i32,
-        scratch_i32_2,
-        scratch_i32_3,
     };
 
     for capture in &core.captures {
@@ -535,6 +576,7 @@ fn encode_function(
 
 fn collect_block_locals(
     block: &CoreBlock,
+    live: &LiveFunctions,
     parameter_count: u32,
     locals: &mut BTreeMap<ValueId, u32>,
     value_types: &mut BTreeMap<ValueId, Arc<Type>>,
@@ -551,6 +593,9 @@ fn collect_block_locals(
         )?;
     }
     for operation in &block.operations {
+        if live.is_dead_closure(operation) {
+            continue;
+        }
         value_types.insert(operation.result, Arc::clone(&operation.ty));
         push_local(
             operation.result,
@@ -558,10 +603,18 @@ fn collect_block_locals(
             parameter_count,
             locals,
             declarations,
-        )?;
+        )
+        .map_err(|error| error.or_span(operation.source))?;
         match &operation.kind {
             OperationKind::Block { block } => {
-                collect_block_locals(block, parameter_count, locals, value_types, declarations)?;
+                collect_block_locals(
+                    block,
+                    live,
+                    parameter_count,
+                    locals,
+                    value_types,
+                    declarations,
+                )?;
             }
             OperationKind::If {
                 consequent,
@@ -570,6 +623,7 @@ fn collect_block_locals(
             } => {
                 collect_block_locals(
                     consequent,
+                    live,
                     parameter_count,
                     locals,
                     value_types,
@@ -577,6 +631,7 @@ fn collect_block_locals(
                 )?;
                 collect_block_locals(
                     alternative,
+                    live,
                     parameter_count,
                     locals,
                     value_types,
@@ -584,13 +639,28 @@ fn collect_block_locals(
                 )?;
             }
             OperationKind::MatchList { empty, cons, .. } => {
-                collect_block_locals(empty, parameter_count, locals, value_types, declarations)?;
-                collect_block_locals(cons, parameter_count, locals, value_types, declarations)?;
+                collect_block_locals(
+                    empty,
+                    live,
+                    parameter_count,
+                    locals,
+                    value_types,
+                    declarations,
+                )?;
+                collect_block_locals(
+                    cons,
+                    live,
+                    parameter_count,
+                    locals,
+                    value_types,
+                    declarations,
+                )?;
             }
             OperationKind::MatchVariant { arms, .. } => {
                 for arm in arms {
                     collect_block_locals(
                         &arm.block,
+                        live,
                         parameter_count,
                         locals,
                         value_types,
@@ -633,7 +703,11 @@ fn encode_block(
     block: &CoreBlock,
 ) -> Result<(), BuildError> {
     for operation in &block.operations {
-        encode_operation(function, context, operation)?;
+        if context.shared.live.is_dead_closure(operation) {
+            continue;
+        }
+        encode_operation(function, context, operation)
+            .map_err(|error| error.or_span(operation.source))?;
     }
     Ok(())
 }
@@ -1197,99 +1271,23 @@ fn encode_builtin_call(
     Ok(())
 }
 
+/// Lowers `json_decode` into `String` to the guest JSON string decoder,
+/// which returns a fresh pair or traps on anything but one JSON string.
 fn encode_json_string_decode(
     function: &mut Function,
     context: &FunctionContext<'_>,
     result: ValueId,
     input: ValueId,
 ) -> Result<(), BuildError> {
+    let decoder = context
+        .shared
+        .string_helpers
+        .get(&StringHelper::JsonDecode)
+        .copied()
+        .ok_or_else(|| BuildError::invalid_core("JSON string decoder was not emitted"))?;
     load_value(function, context, input)?;
-    function.instruction(&Instruction::I32Load(memarg(0, 2)));
-    function.instruction(&Instruction::LocalSet(context.scratch_i32));
-    load_value(function, context, input)?;
-    function.instruction(&Instruction::I32Load(memarg(4, 2)));
-    function.instruction(&Instruction::LocalSet(context.scratch_i32_2));
-
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
-    function.instruction(&Instruction::I32Const(2));
-    function.instruction(&Instruction::I32LtU);
-    trap_unreachable_if(function);
-
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
-    function.instruction(&Instruction::I32Const(34));
-    function.instruction(&Instruction::I32Ne);
-    trap_unreachable_if(function);
-
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
-    function.instruction(&Instruction::I32Const(34));
-    function.instruction(&Instruction::I32Ne);
-    trap_unreachable_if(function);
-
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::LocalSet(context.scratch_i32_3));
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
-    function.instruction(&Instruction::I32Const(32));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
-    function.instruction(&Instruction::I32Const(34));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::I32Or);
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
-    function.instruction(&Instruction::I32Const(92));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::I32Or);
-    trap_unreachable_if(function);
-
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(context.scratch_i32_3));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::End);
-
-    allocate_result(function, context, result, 8, 4)?;
-    load_value(function, context, result)?;
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store(memarg(0, 2)));
-    load_value(function, context, result)?;
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
-    function.instruction(&Instruction::I32Const(2));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Store(memarg(4, 2)));
-    Ok(())
-}
-
-fn trap_unreachable_if(function: &mut Function) {
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::Unreachable);
-    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::Call(decoder));
+    store_value(function, context, result)
 }
 
 fn encode_variant(
@@ -1940,9 +1938,29 @@ fn encode_binary(
     operator: BinaryOperator,
     right: ValueId,
 ) -> Result<(), BuildError> {
+    let operand_type = context
+        .value_types
+        .get(&left)
+        .ok_or_else(|| BuildError::invalid_core(format!("missing type for {left}")))?;
+    if operand_type.as_ref() == &Type::String
+        && let Some(helper) = StringHelper::for_operator(operator)
+    {
+        let index = context
+            .shared
+            .string_helpers
+            .get(&helper)
+            .copied()
+            .ok_or_else(|| BuildError::invalid_core("string runtime helper was not emitted"))?;
+        load_pair(function, context, left, right)?;
+        function.instruction(&Instruction::Call(index));
+        if helper == StringHelper::Compare {
+            strings::emit_comparison_result(function, operator);
+        }
+        return store_value(function, context, result);
+    }
     match operator {
         BinaryOperator::Add => {
-            require_int_operand(context, left, operator)?;
+            require_int_operand(operand_type, operator)?;
             load_pair(function, context, left, right)?;
             function.instruction(&Instruction::I64Add);
             store_value(function, context, result)?;
@@ -2007,10 +2025,6 @@ fn encode_binary(
             store_value(function, context, result)?;
         }
         BinaryOperator::Equal | BinaryOperator::NotEqual => {
-            let operand_type = context
-                .value_types
-                .get(&left)
-                .ok_or_else(|| BuildError::invalid_core(format!("missing type for {left}")))?;
             match operand_type.as_ref() {
                 Type::Int => {
                     load_pair(function, context, left, right)?;
@@ -2046,6 +2060,7 @@ fn encode_binary(
         | BinaryOperator::LessEqual
         | BinaryOperator::Greater
         | BinaryOperator::GreaterEqual => {
+            require_int_operand(operand_type, operator)?;
             load_pair(function, context, left, right)?;
             function.instruction(match operator {
                 BinaryOperator::Less => &Instruction::I64LtS,
@@ -2066,16 +2081,12 @@ fn encode_binary(
     Ok(())
 }
 
-fn require_int_operand(
-    context: &FunctionContext<'_>,
-    value: ValueId,
-    operator: BinaryOperator,
-) -> Result<(), BuildError> {
-    if context.value_types.get(&value).map(Arc::as_ref) == Some(&Type::Int) {
+fn require_int_operand(operand: &Type, operator: BinaryOperator) -> Result<(), BuildError> {
+    if operand == &Type::Int {
         Ok(())
     } else {
         Err(BuildError::unsupported(
-            format!("`{operator:?}` on String is outside the bounded webhook ABI"),
+            format!("`{operator:?}` on `{operand}` is outside the bounded webhook ABI"),
             None,
         ))
     }
@@ -2177,9 +2188,12 @@ fn collect_block_builtins(block: &CoreBlock, values: &mut BTreeMap<ValueId, Buil
     }
 }
 
-fn collect_stdout_flavors(module: &CoreModule) -> Result<Vec<StdoutFlavor>, BuildError> {
+fn collect_stdout_flavors(
+    module: &CoreModule,
+    live: &LiveFunctions,
+) -> Result<Vec<StdoutFlavor>, BuildError> {
     let mut flavors = BTreeSet::new();
-    for function in module.functions() {
+    for function in live.functions(module) {
         collect_block_stdout_flavors(&function.body, &mut flavors)?;
     }
     Ok(flavors.into_iter().collect())
@@ -2193,7 +2207,10 @@ fn collect_block_stdout_flavors(
         if let OperationKind::Builtin(builtin @ (Builtin::Print | Builtin::Println)) =
             &operation.kind
         {
-            flavors.insert(StdoutFlavor::from_builtin(*builtin, &operation.ty)?);
+            flavors.insert(
+                StdoutFlavor::from_builtin(*builtin, &operation.ty)
+                    .map_err(|error| error.or_span(operation.source))?,
+            );
         }
         match &operation.kind {
             OperationKind::Block { block } => collect_block_stdout_flavors(block, flavors)?,
@@ -2254,8 +2271,20 @@ fn static_function_bindings(module: &CoreModule) -> BTreeMap<BindingId, Function
     bindings
 }
 
-fn function_signature(function: &CoreFunction) -> Result<Signature, BuildError> {
+/// Signature of a lowered function, or the empty stub signature of an
+/// eliminated one.
+fn function_signature(
+    function: &CoreFunction,
+    live: &LiveFunctions,
+) -> Result<Signature, BuildError> {
+    if !live.contains(function.id) {
+        return Ok(Signature {
+            params: Vec::new(),
+            results: Vec::new(),
+        });
+    }
     type_signature(&function.signature.parameters, &function.signature.result)
+        .map_err(|error| error.or_span(function.source))
 }
 
 fn type_signature(parameters: &[Arc<Type>], result: &Type) -> Result<Signature, BuildError> {

@@ -51,6 +51,19 @@ impl BuildError {
         Self::new("K7004", BuildErrorKind::Metadata, message, None)
     }
 
+    /// Attaches `span` when the error does not already name a source location.
+    ///
+    /// Emission helpers that only see a type or a value raise spanless errors;
+    /// the enclosing Core operation or function supplies its own span here so
+    /// that no source construct is reported without a location.
+    #[must_use]
+    pub(crate) fn or_span(mut self, span: Option<Span>) -> Self {
+        if self.span.is_none() {
+            self.span = span;
+        }
+        self
+    }
+
     fn new(
         code: &'static str,
         kind: BuildErrorKind,
@@ -89,3 +102,72 @@ impl fmt::Display for BuildError {
 }
 
 impl Error for BuildError {}
+
+/// Orders target diagnostics by source position and removes repeated reports.
+///
+/// Located diagnostics sort by span start, span end, then code; diagnostics
+/// without a location (internal artifact failures) follow them in the order
+/// they were raised. One code is reported at most once per source position:
+/// when nested constructs that start together (a built-in and its call, for
+/// example) both fail, the narrowest span is kept, and among equal spans the
+/// first finding in deterministic traversal order.
+pub(crate) fn normalize(errors: &mut Vec<BuildError>) {
+    errors.sort_by(|left, right| {
+        (left.span.is_none(), left.span, left.code).cmp(&(
+            right.span.is_none(),
+            right.span,
+            right.code,
+        ))
+    });
+    let mut seen = std::collections::BTreeSet::new();
+    errors.retain(|error| match error.span {
+        Some(span) => seen.insert((span.start, error.code)),
+        None => true,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use krit::Span;
+
+    use super::{BuildError, normalize};
+
+    #[test]
+    fn spans_are_only_filled_when_missing() {
+        let located = BuildError::unsupported("located", Some(Span::new(4, 9)));
+        assert_eq!(
+            located.or_span(Some(Span::new(0, 1))).span(),
+            Some(Span::new(4, 9))
+        );
+        let spanless = BuildError::unsupported("spanless", None);
+        assert_eq!(
+            spanless.or_span(Some(Span::new(2, 3))).span(),
+            Some(Span::new(2, 3))
+        );
+    }
+
+    #[test]
+    fn normalization_sorts_by_span_and_keeps_one_code_per_position() {
+        let mut errors = vec![
+            BuildError::unsupported("late", Some(Span::new(20, 25))),
+            BuildError::artifact("internal"),
+            BuildError::unsupported("outer", Some(Span::new(10, 18))),
+            BuildError::residual("residual", Some(Span::new(10, 18))),
+            BuildError::unsupported("inner", Some(Span::new(10, 12))),
+            BuildError::unsupported("repeat", Some(Span::new(20, 25))),
+        ];
+        normalize(&mut errors);
+        assert_eq!(
+            errors
+                .iter()
+                .map(|error| (error.code(), error.message()))
+                .collect::<Vec<_>>(),
+            [
+                ("K7002", "inner"),
+                ("K7001", "residual"),
+                ("K7002", "late"),
+                ("K7003", "internal"),
+            ]
+        );
+    }
+}

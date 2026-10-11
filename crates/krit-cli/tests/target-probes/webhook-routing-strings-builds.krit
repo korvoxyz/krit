@@ -1,0 +1,8 @@
+// Path routing and string composition: the 0.2 backend rejected both.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    if request.method == "POST" {
+        record { status: 201, headers: [], body: "created " + request.path }
+    } else {
+        record { status: 405, headers: [], body: request.method }
+    }
+}

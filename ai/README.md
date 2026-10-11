@@ -70,9 +70,9 @@ krit invoke --request request.json --host-config host.json # webhook artifacts
 `krit check` accepts the full bootstrap language. `krit build` accepts the
 scalar policy-1 subset and a bounded webhook subset containing strings, fixed
 HTTP records, header lists, Result/Option matching, static non-capturing
-helpers, config, secrets, HTTP, AI strings, log fields, and bounded unescaped
-JSON-string decoding. A model must still avoid arbitrary composites, general
-JSON in components, escaped JSON strings, data captures, and dynamic string
+helpers, config, secrets, HTTP, AI strings, log fields, and `json_decode`
+into `String` with every JSON escape. A model must still avoid arbitrary
+composites, general JSON in components, data captures, and dynamic string
 operators. A K7001 or K7002 build diagnostic must be repaired in source
 rather than bypassed with host interpretation.
 `krit sandbox` never builds or falls back to the full direct evaluator, so the

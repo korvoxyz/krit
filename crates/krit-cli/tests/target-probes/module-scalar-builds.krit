@@ -1,0 +1,10 @@
+// The complete scalar subset builds as a module program.
+fn apply(function, value) {
+    function(value)
+}
+
+fn increment(value) {
+    value + 1
+}
+
+println(apply(increment, 41) == 42);

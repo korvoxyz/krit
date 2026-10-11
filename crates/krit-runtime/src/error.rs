@@ -19,6 +19,7 @@ pub enum RuntimeErrorKind {
     OutputLimit,
     DivisionByZero,
     IntegerOverflow,
+    InvalidJson,
     GuestTrap,
     RuntimeSetup,
     DurableState,
@@ -93,6 +94,7 @@ impl RuntimeError {
         let kind = match code {
             "K4004" => RuntimeErrorKind::DivisionByZero,
             "K4005" => RuntimeErrorKind::IntegerOverflow,
+            "K4009" => RuntimeErrorKind::InvalidJson,
             _ => RuntimeErrorKind::GuestTrap,
         };
         Self::new(code, kind, message)

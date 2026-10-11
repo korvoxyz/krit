@@ -327,7 +327,8 @@ Operators evaluate left to right.
 | `+` | two strings | concatenation |
 | `-`, `*` | two integers | checked arithmetic |
 | `/`, `%` | two integers | checked division or remainder |
-| `<`, `<=`, `>`, `>=` | two integers | boolean |
+| `<`, `<=`, `>`, `>=` | two integers | boolean (numeric order) |
+| `<`, `<=`, `>`, `>=` | two strings | boolean (byte-lexicographic order) |
 | `==`, `!=` | comparable values | boolean |
 | `!` | boolean | boolean |
 | `&&`, `||` | booleans | boolean |
@@ -338,6 +339,16 @@ operands.
 Equality is structural for integers, booleans, strings, unit, lists, records,
 `Option`, and `Result`. Comparing a function directly or inside any composite
 value is a runtime error.
+
+Strings are ordered byte-lexicographically over their UTF-8 encoding: the
+first differing byte, compared as an unsigned value, decides, and a proper
+prefix orders before every longer string it begins. The order therefore
+follows Unicode scalar values, not UTF-16 code units, locale collation, or
+normalization (`"e\u{301}"` and `"é"` are different strings and
+`"e\u{301}" < "é"`). Ordering any other operand kind, or mixing kinds, is
+rejected statically (`K3001`, or `K3009`/`K3010` for opaque values) and is a
+`K4001` runtime error in direct execution. String equality is byte equality,
+so `a == b` exactly when neither `a < b` nor `b < a`.
 
 No implicit conversions occur. In particular, integers and strings are not
 automatically converted for `+`, and non-booleans are not truthy.
@@ -469,11 +480,21 @@ numbers are rejected. Encoding a function directly or inside another value is
 `K4008`. `Secret` is rejected statically and can never reach JSON conversion.
 Invalid JSON or JSON without a Krit representation is `K4009`.
 
+Decoded JSON text may be surrounded by JSON whitespace (space, tab, line
+feed, carriage return). Strings decode every RFC 8259 escape: `\"`, `\\`,
+`\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\uXXXX`. A `\u` surrogate escape
+must be a high surrogate immediately followed by a low surrogate, and the
+pair decodes to one scalar value. A lone surrogate is invalid JSON (`K4009`),
+because Krit strings hold only Unicode scalar values, and so are any other
+escape and an unescaped control character below U+0020.
+
 The policy-2 component backend implements one additional fail-closed
-specialization: when the inferred result is `String`, an unescaped JSON string
-is validated and decoded without importing a host interface. Escapes and all
-other component JSON shapes remain `K7002` or a bounded guest validation trap;
-there is no evaluator fallback.
+specialization: when the inferred result is `String`, a JSON string with any
+of these escapes is validated and decoded in the guest without importing a
+host interface. Text the evaluator rejects is `K4009` there too; so is valid
+JSON that is not a string, which the evaluator would return unchecked. All
+other component JSON shapes remain `K7002`; there is no evaluator fallback
+(see `WASM-SANDBOX.md`, "Guest JSON string decoding").
 
 ## 13.1 Configuration, secret, HTTP, AI, logging, durable-state, queue, and object host contracts
 

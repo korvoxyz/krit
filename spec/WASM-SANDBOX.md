@@ -241,7 +241,8 @@ sockets, and databases are never imported.
 Krit source
     -> resolve + type/effect check
     -> typed Core IR
-    -> policy-1 layout/support check
+    -> dead-function elimination from the selected entrypoint
+    -> exhaustive residual-type and layout/support check (policy 1 or 2)
     -> wasm-encoder core module
     -> restricted core validation
     -> embed parsed WIT component types
@@ -255,7 +256,8 @@ Krit source
 `krit build` performs this complete pipeline in memory before writing. The
 component and adjacent JSON are staged beside their destinations and replaced
 with rollback on failure. The digest is `blake3:<hex>` and is stored beside,
-not inside, the hashed bytes.
+not inside, the hashed bytes. `krit check --target` runs the same pipeline
+with the output discarded (see [Target checks](#target-checks)).
 
 ## Implemented backend support
 
@@ -281,6 +283,9 @@ K4005.
 Policy 2 adds a deliberately bounded webhook ABI:
 
 - canonical UTF-8 strings and checked linear-memory allocation/reallocation
+- String concatenation (`+`), equality (`==`, `!=`), and byte-lexicographic
+  ordering (`<`, `<=`, `>`, `>=`) through the guest string runtime below
+- `json_decode` into `String` through the guest JSON string decoder below
 - fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` records
 - ordered lists of headers
 - the Result/Option shapes returned by config, secrets, and HTTP
@@ -294,15 +299,161 @@ The core uses guest linear-memory offsets, never host pointers. Canonical
 parameters/results, list elements, records, variants, UTF-8, and allocation
 bounds are checked by the component adapter and host.
 
+### Guest string runtime
+
+A policy-2 `String` value is an `i32` guest offset of an 8-byte canonical
+`(ptr, len)` pair describing immutable UTF-8 bytes, whether the bytes are a
+static literal, were written by the host when lifting a canonical argument
+or result, or were produced by concatenation. String operators lower to calls
+of two generated core functions:
+
+- `compare(left, right) -> i32` returns `-1`, `0`, or `1`. It compares the
+  shared prefix eight bytes at a time until a word differs, then byte by
+  byte as unsigned values; an equal shared prefix orders the shorter string
+  first. `==`, `!=`, `<`, `<=`, `>`, and `>=` test that result against zero,
+  so the guest order is exactly the byte-lexicographic UTF-8 order the
+  direct evaluator uses (see `LANGUAGE.md` section 9).
+- `concat(left, right) -> pair` returns the other operand's pair unchanged
+  when one operand is empty (pairs are never mutated). Otherwise it checks
+  the 32-bit length sum, allocates the joined bytes and a fresh pair through
+  the module's bounded `realloc`, and copies both operands into the new
+  allocation.
+
+Each helper is a plain loop over MVP instructions (no bulk-memory or other
+proposal), so the core validator keeps its empty feature set. A helper is
+emitted at most once per module and only when a live function uses it; the
+helpers follow every other function definition, so a module without String
+operators contains no helper, no helper type, and unchanged function
+indices. Allocation never frees: the bump allocator is bounded by the
+16 MiB memory maximum and the host's memory limit. A 32-bit length overflow
+traps (`K4001`) and a memory growth the host refuses traps (`K5103`), both
+before any byte of the result is written; copies only ever target the fresh
+allocation, and a trapping invocation publishes no response. Fuel bounds the
+copy and compare loops like any other guest code.
+
+### Guest JSON string decoding
+
+`json_decode` whose inferred result is `String` lowers to a call of one more
+generated core function, `json-decode-string(text) -> pair`, emitted under the
+same rules as the string helpers (at most once per module, only when a live
+function calls it, after every other definition). It accepts exactly the
+texts for which the direct evaluator yields a string:
+
+- The text is one JSON string, optionally preceded and followed by JSON
+  whitespace: space, tab, line feed, and carriage return (RFC 8259 section
+  2). Any other byte outside the string, including a byte-order mark or a
+  form feed, is rejected.
+- Inside the quotes every byte below 0x20 and every unescaped `"` is
+  rejected. Every other byte, including DEL and multibyte UTF-8, is kept
+  unchanged.
+- The escapes are `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and
+  `\uXXXX` with hex digits in either case (RFC 8259 section 7). A high
+  surrogate escape (`\uD800`-`\uDBFF`) must be followed immediately by a low
+  surrogate escape (`\uDC00`-`\uDFFF`), and the pair decodes to the one
+  supplementary scalar value it encodes, as four UTF-8 bytes. A lone or
+  reversed surrogate is rejected, as is any other escape.
+- Valid JSON that is not a string (a number, `true`, `null`, an object, an
+  array) is rejected. The direct evaluator returns such a value unchecked,
+  because `json_decode` is not yet schema-directed; a component decoding into
+  `String` has no layout for it and fails closed.
+
+Every String is valid UTF-8 and escapes produce only scalar values, so the
+result is valid UTF-8. RFC 8259 lets a parser accept lone surrogates and
+ignore a byte-order mark; Krit rejects both, exactly as the evaluator does,
+because a Krit string holds only Unicode scalar values.
+
+The decoder first validates the whole text and measures its decoded length
+without allocating, so a rejected text never allocates and is rejected the
+same way at any size. A text without escapes decodes to a pair that shares
+the input's content bytes (bytes are never mutated). Otherwise the exact
+decoded length is allocated through the module's bounded `realloc`, which
+traps with `K5103` when guest memory is exhausted, and a second pass writes
+the decoded bytes into that fresh allocation only. Both passes consume runs
+of plain bytes eight at a time with MVP integer instructions. Fuel bounds
+them like any other guest code; a text with escapes is scanned twice and so
+costs more than twice the fuel of plain text of the same length.
+
+Rejection executes `unreachable` inside the decoder. The decoder is the only
+function the core module names in its standard `name` custom section, as
+`krit:json-decode-string` (no Krit identifier can contain `:`), and the
+runtime reports an `unreachable` trap whose innermost frame is that function
+as `K4009`, the code the direct evaluator uses for invalid JSON, with a fixed
+message that never contains the input. The trap aborts the invocation and
+publishes no response. Like every guest trap it is reported at the artifact
+(`artifact.wasm:1:1`) rather than at the `json_decode` call, because
+artifacts carry no source map. A module that never decodes JSON into `String`
+has neither the decoder nor a `name` section.
+
+### Support checking
+
 Builds fail with `K7001` for residual parametric layouts and `K7002` for
 unsupported semantics. Policy 1 rejects strings, lists, records, options,
 results, JSON conversion, lexical captures, matches, unsupported print
 values, and any operation without a correct lowering. It never substitutes a
-trapping placeholder or direct-evaluator fallback.
+trapping placeholder or direct-evaluator fallback. Policy 1 has no linear
+memory, so a String operator in a module program is reported where the
+String value is produced (the literal, parameter, or field), with the
+"String has no concrete guest layout in WebAssembly policy 1" message.
 
 Policy 2 does not generalize these layouts to arbitrary records/lists,
-capturing closures, JSON, or dynamic string operators. Those shapes continue
-to fail closed rather than receiving fake values.
+capturing closures, JSON other than `json_decode` into `String`, or
+composite equality (`==` over options, results, records, or lists). Those
+shapes continue to fail closed rather than receiving fake values.
+
+Before any layout is chosen, dead-function elimination keeps only the
+functions reachable from module initialization and the selected entrypoint.
+A function is reachable when a reachable function uses its closure value as
+an operand (call, argument, field, list element, branch result, and so on)
+or captures a binding bound to it; binding or discarding a closure is not a
+use. An unreferenced top-level helper is therefore neither checked nor
+lowered, so an unused generic helper no longer fails the module with
+`K7001`. Eliminated functions keep their Core identifiers and table slots
+and are emitted as trapping stubs that no live code references.
+
+The support check then reports every finding rather than the first: each
+residual type (`K7001`) and each unsupported construct (`K7002`) in a live
+function, at the originating Core operation's source span, falling back to
+the enclosing block, parameter, or function declaration. A type that still
+contains an inference variable is reported only as `K7001`. Diagnostics are
+sorted by span start, span end, and code; one code is reported at most once
+per source position (the narrowest span wins when nested constructs start
+together). Code generation runs only after the support check passes and is
+a backstop: any error it raises is attached to the Core operation or
+function being lowered, so no source construct is reported without a
+location. Only internal failures that no source construct causes (a Core
+verification error, or `K7003`/`K7004` artifact failures) can be spanless.
+
+`K7002` messages name the layout policy of the program kind: module programs
+use "WebAssembly policy 1", and webhook, queue, and schedule entrypoint
+programs use "the bounded webhook ABI (WebAssembly policy 2)". This layout
+policy is distinct from the metadata validation `policyVersion`, which
+records whether the artifact imports host surfaces introduced after artifact
+policy 1.
+
+## Target checks
+
+`krit check [--target component|module|none] FILE` adds a target check after
+successful analysis and Core lowering. A target check runs the complete
+`krit build` pipeline above (dead-function elimination, support checking,
+code generation, componentization, metadata attachment, and validation)
+with the output discarded, so it reports exactly the `K7001`/`K7002` set,
+codes and spans, that `krit build` reports for the same source. It reads no
+manifest: package grants (`K5001`) remain a `build` check.
+
+- `component` checks the artifact `krit build` would emit: the selected
+  webhook, queue, or schedule world, or the module-program world.
+- `module` checks the file as a module program; a webhook, queue, or
+  schedule entrypoint is reported as `K7002` at its declaration because
+  entrypoint programs build only as components.
+- `none` skips the target check.
+
+Without `--target`, a file that declares a webhook, queue, or schedule
+entrypoint is checked as `component`, because a component is the only way
+such a file can run. Other files default to `none`; `krit run` executes them
+directly. Every target diagnostic is printed in the selected
+`--diagnostic-format`, in the sorted order above, and the command exits `1`
+without printing its success line. The language server does not run target
+checks in 0.3.
 
 ## Artifact policy
 
@@ -597,19 +748,26 @@ converts the configured Wasm stack limit into `K5103`. The runtime joins this
 thread before returning, including after traps and deadline interruption.
 
 Exhaustion produces a stable resource diagnostic distinct from capability
-denial and application failure.
+denial and application failure. A memory or table growth that the limits
+refuse traps the guest and is reported as `K5103`, including when the
+refusal arrives wrapped in a guest backtrace, as it does when the guest's
+bounded allocator grows memory for a string.
 
 ## CLI execution and inspection
 
 ```text
-krit build [--manifest PATH] [--output PATH]
+krit check [--diagnostic-format human|json] [--target component|module|none] FILE
+krit build [--manifest PATH] [--output PATH] [--diagnostic-format human|json]
 krit sandbox [--manifest PATH] [--artifact PATH]
 krit invoke [--manifest PATH] [--artifact PATH] [--host-config PATH] --request FILE
 krit serve [--manifest PATH] [--artifact PATH] [--host-config PATH] [--bind IP:PORT] [--once]
 krit permissions --artifact PATH [--json] [MANIFEST]
 ```
 
-`sandbox` defaults to `krit.pkg` and
+`build` prints every manifest, source, authority, and target diagnostic in
+the selected format (human by default, JSON Lines with
+`--diagnostic-format json`); on a target failure it prints all backend
+diagnostics in span order. `sandbox` defaults to `krit.pkg` and
 `target/krit/<package-name>.wasm`, with metadata at `<artifact>.json`. It never
 builds, interprets source, or searches for a fallback artifact. Missing files
 are K7003 errors. Artifact-aware `permissions` validates the component and

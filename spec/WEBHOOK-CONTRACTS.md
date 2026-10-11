@@ -196,6 +196,9 @@ before a source webhook item.
 ## Runtime and build boundary
 
 `krit check` and `krit explain` implement these contracts without a manifest.
+Because a webhook can only run as a component, `krit check` also runs the
+component target check for webhook files and reports every `K7001`/`K7002`
+that `krit build` would.
 Package build planning rejects missing exact manifest resources with `K5001`.
 Direct `krit run` rejects webhook/config/secret/HTTP hosts with `K5003`;
 runtime access is only through a validated component.

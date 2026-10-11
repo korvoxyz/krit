@@ -1,0 +1,15 @@
+// Several independent constructs outside the bounded webhook ABI.
+fn first(items: List<Int>) -> Int {
+    match items {
+        [] => 0,
+        [head, ..tail] => head,
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let pair = record { left: 1, right: 2 };
+    let count = first([1, 2]);
+    let encoded = json_encode(count);
+    let parsed: Record { value: String } = json_decode(request.body);
+    record { status: 200, headers: [], body: parsed.value }
+}
