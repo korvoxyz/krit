@@ -468,7 +468,7 @@ impl Runtime {
         }
         Component::new(&self.engine, bytes).map_err(|error| {
             RuntimeError::setup(format!(
-                "validated delivery component could not be compiled by Wasmtime 47.x: {error}"
+                "validated delivery component could not be compiled by Wasmtime 48.x: {error}"
             ))
         })
     }

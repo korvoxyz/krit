@@ -293,10 +293,11 @@ progress callback. Inbound response idempotency defaults to process-local bounde
 Phase 6 adds explicit opt-in durable storage. Both replay paths validate
 responses against the current invocation's body and header limits.
 
-Wasmtime 47 is a short-supported non-LTS line. `Cargo.toml` accepts security
-patches compatible with 47.0.4, and `Cargo.lock` records the exact tested
-patch. The project plans an audited move to Wasmtime 48 LTS before 47 support
-ends on 2026-09-20. Runtime-major and MSRV changes require explicit CI,
+The host follows Wasmtime long-term-support lines only. It runs Wasmtime 48
+LTS, released 2026-08-20 and supported upstream through 2028-08-20.
+`Cargo.toml` accepts security patches compatible with 48.0.5, and `Cargo.lock`
+records the exact tested patch. Wasmtime 48 requires Rust 1.95, which is the
+workspace MSRV. Runtime-major and MSRV changes require explicit CI,
 documentation, and changelog updates. Untrusted multi-tenant execution still
 adds a restricted OS process or container. `spec/WASM-SANDBOX.md` defines the
 exact limits and security contract.

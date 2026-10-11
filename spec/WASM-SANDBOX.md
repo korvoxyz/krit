@@ -417,14 +417,16 @@ execution deadline starts; this limitation is explicit and compilation is
 still bounded by component and metadata input limits.
 
 Under the [upstream release
-policy](https://docs.wasmtime.dev/stability-release.html), Wasmtime 47 is a
-non-LTS monthly release with a two-month support window (through 2026-09-20
-for version 47). The dependency requirement is compatible `47.0.4`, while
-`Cargo.lock` pins the exact tested patch. Security patches within 47 may be
-adopted with `cargo update` plus the complete host test suite. Krit plans an
-audited move to the Wasmtime 48 LTS line before 47 leaves support. A runtime
-major or Rust MSRV increase is never implicit: it requires CI validation,
-documentation, and a changelog entry.
+policy](https://docs.wasmtime.dev/stability-release.html), a Wasmtime release
+whose major version is a multiple of 12 is a long-term-support (LTS) release
+supported for 24 months; other monthly releases are supported for two months.
+Krit follows LTS lines only. The host runs Wasmtime 48 LTS, released
+2026-08-20 and supported through 2028-08-20. The dependency requirement is
+compatible `48.0.5`, while `Cargo.lock` pins the exact tested patch. Security
+patches within 48 may be adopted with `cargo update` plus the complete host
+test suite. Wasmtime 48 requires Rust 1.95, which is the workspace MSRV. A
+runtime major or Rust MSRV increase is never implicit: it requires CI
+validation, documentation, and a changelog entry.
 
 URL parsing is pinned to `url` 2.5.8, HTTP types to `http` 1.5.0, the blocking
 HTTP/TLS client to `curl` 0.4.50, secret clearing to `zeroize` 1.9.0, and CLI
@@ -554,6 +556,15 @@ Wasm stack limit plus 2 MiB of fixed host headroom. This prevents guest
 recursion from reaching the caller thread's native guard page before Wasmtime
 converts the configured Wasm stack limit into `K5103`. The runtime joins this
 thread before returning, including after traps and deadline interruption.
+
+Fuel uses Wasmtime's default cost model. Each function invocation costs one
+unit, and each executed operator costs one unit except `nop`, `drop`, `block`,
+`loop`, `else`, `end`, `return`, and `unreachable`, which are free.
+`memory.grow` costs one unit however many pages it requests. Wasmtime also
+charges bulk memory, table, and GC array operators per byte or element, and
+checks the epoch deadline only once per such operator; the feature policy
+rejects all of them, so neither behavior reaches an accepted artifact. Host
+tests pin this model so a runtime upgrade that changes it fails before release.
 
 Exhaustion produces a stable resource diagnostic distinct from capability
 denial and application failure.

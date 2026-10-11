@@ -7,7 +7,7 @@ Krit and the Krit language are owned by Akshay Bhardwaj.
 
 ## Setup
 
-Install Rust 1.94 or newer, then run:
+Install Rust 1.95 or newer, then run:
 
 ```sh
 cargo build --workspace --locked

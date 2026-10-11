@@ -322,7 +322,7 @@ impl Runtime {
         }
         let component = Component::new(&self.engine, bytes).map_err(|error| {
             RuntimeError::setup(format!(
-                "validated component could not be compiled by Wasmtime 47.x: {error}"
+                "validated component could not be compiled by Wasmtime 48.x: {error}"
             ))
         })?;
         let worker_stack_bytes = self
@@ -412,7 +412,7 @@ impl Runtime {
         }
         let component = Component::new(&self.engine, bytes).map_err(|error| {
             RuntimeError::setup(format!(
-                "validated webhook component could not be compiled by Wasmtime 47.x: {error}"
+                "validated webhook component could not be compiled by Wasmtime 48.x: {error}"
             ))
         })?;
         let worker_stack_bytes = self
@@ -3203,5 +3203,143 @@ mod phase4_policy_tests {
                 Duration::from_millis(25)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod engine_contract_tests {
+    //! Pins the reference engine's fuel model for the operators policy
+    //! validation admits, independent of the Krit compiler. A Wasmtime upgrade
+    //! that changes per-operator costs, adds a size-dependent charge to an
+    //! admitted operator, or remaps fuel exhaustion fails here instead of
+    //! silently shifting every artifact's budget.
+
+    use super::*;
+    use wasm_encoder::{
+        BlockType, CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
+        MemorySection, MemoryType, Module as ModuleEncoder, TypeSection, ValType,
+    };
+    use wasmtime::{Instance, Module};
+
+    /// Exports `sum(n) -> n + (n - 1) + ... + 1` as a counted loop and
+    /// `grow(pages) -> previous_pages` over a 0..4 page memory, using only
+    /// MVP operators.
+    fn accounting_module() -> Vec<u8> {
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I64], [ValType::I64]);
+        types.ty().function([ValType::I32], [ValType::I32]);
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        functions.function(1);
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 0,
+            maximum: Some(4),
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut exports = ExportSection::new();
+        exports.export("sum", ExportKind::Func, 0);
+        exports.export("grow", ExportKind::Func, 1);
+
+        // Flat costs: each function invocation costs one unit, `block`,
+        // `loop`, and `end` are free, and every other operator costs one unit.
+        // A full iteration therefore costs 12, and entry, the exit test, and
+        // the final `local.get` cost 5.
+        let mut sum = Function::new([(1, ValType::I64)]);
+        for instruction in [
+            Instruction::Block(BlockType::Empty),
+            Instruction::Loop(BlockType::Empty),
+            Instruction::LocalGet(0),
+            Instruction::I64Eqz,
+            Instruction::BrIf(1),
+            Instruction::LocalGet(1),
+            Instruction::LocalGet(0),
+            Instruction::I64Add,
+            Instruction::LocalSet(1),
+            Instruction::LocalGet(0),
+            Instruction::I64Const(1),
+            Instruction::I64Sub,
+            Instruction::LocalSet(0),
+            Instruction::Br(0),
+            Instruction::End,
+            Instruction::End,
+            Instruction::LocalGet(1),
+            Instruction::End,
+        ] {
+            sum.instruction(&instruction);
+        }
+        let mut grow = Function::new([]);
+        for instruction in [
+            Instruction::LocalGet(0),
+            Instruction::MemoryGrow(0),
+            Instruction::End,
+        ] {
+            grow.instruction(&instruction);
+        }
+        let mut code = CodeSection::new();
+        code.function(&sum);
+        code.function(&grow);
+
+        let mut module = ModuleEncoder::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&memories)
+            .section(&exports)
+            .section(&code);
+        module.finish()
+    }
+
+    fn fresh_store(runtime: &Runtime, fuel: u64) -> Store<()> {
+        let mut store = Store::new(&runtime.engine, ());
+        store.set_fuel(fuel).expect("fuel is enabled");
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_trap();
+        store
+    }
+
+    #[test]
+    fn admitted_operators_keep_the_flat_fuel_model() {
+        let runtime = Runtime::new(RuntimeLimits::default()).expect("default engine");
+        let module = Module::new(&runtime.engine, accounting_module()).expect("valid module");
+        let budget = runtime.limits.fuel();
+
+        for (n, expected_sum) in [(0_i64, 0_i64), (1, 1), (10, 55), (1_000, 500_500)] {
+            let mut store = fresh_store(&runtime, budget);
+            let instance = Instance::new(&mut store, &module, &[]).expect("instantiates");
+            let sum = instance
+                .get_typed_func::<i64, i64>(&mut store, "sum")
+                .expect("sum export");
+            assert_eq!(sum.call(&mut store, n).expect("sum runs"), expected_sum);
+            let consumed = budget - store.get_fuel().expect("fuel is enabled");
+            assert_eq!(consumed, 12 * n.unsigned_abs() + 5, "sum({n})");
+        }
+
+        // Krit's guest allocator grows memory, so `memory.grow` must stay a
+        // flat charge no matter how many pages it requests.
+        for (pages, previous) in [(0, 0), (1, 0), (4, 0), (5, -1)] {
+            let mut store = fresh_store(&runtime, budget);
+            let instance = Instance::new(&mut store, &module, &[]).expect("instantiates");
+            let grow = instance
+                .get_typed_func::<i32, i32>(&mut store, "grow")
+                .expect("grow export");
+            assert_eq!(grow.call(&mut store, pages).expect("grow runs"), previous);
+            let consumed = budget - store.get_fuel().expect("fuel is enabled");
+            assert_eq!(consumed, 3, "grow({pages})");
+        }
+
+        let mut store = fresh_store(&runtime, 1_000);
+        let instance = Instance::new(&mut store, &module, &[]).expect("instantiates");
+        let sum = instance
+            .get_typed_func::<i64, i64>(&mut store, "sum")
+            .expect("sum export");
+        let error = map_wasmtime_error(
+            sum.call(&mut store, 1_000_000)
+                .expect_err("budget must run out"),
+        );
+        assert_eq!(error.kind(), RuntimeErrorKind::FuelExhausted);
+        assert_eq!(error.code(), "K5101");
     }
 }
