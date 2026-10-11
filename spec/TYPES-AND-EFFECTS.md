@@ -71,8 +71,9 @@ fn total(items: List<Int>) -> Int {
 
 The exact implemented annotation grammar is normative in `LANGUAGE.md`.
 `krit check` enforces annotations without evaluating source. `krit run`
-continues to use the direct dynamic evaluator in this milestone, so runtime
-conformance diagnostics remain unchanged. Ordinary public declarations,
+performs the same checking first and evaluates only a program that passes it,
+reporting check's diagnostic and exit status otherwise (`LANGUAGE.md`
+section 14). Ordinary public declarations,
 source-level generic declarations, and effect annotation syntax are still
 future work. A webhook declaration is the one implemented public boundary and
 requires the exact annotated `(HttpRequest) -> HttpResponse` signature.

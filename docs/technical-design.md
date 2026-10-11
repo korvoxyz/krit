@@ -46,8 +46,9 @@ resolution, type/effect analysis, a verified typed Core IR, a direct evaluator
 that establishes runtime semantics, and `krit-wasm`, a strict Core-to-component
 artifact backend, plus `krit-runtime`, a bounded component host and `krit-lsp`,
 a deterministic editor boundary. `krit build` emits validated artifacts,
-`krit sandbox` executes only those artifacts, `krit run` remains the broader
-direct evaluator, and `krit lsp` never executes source.
+`krit sandbox` executes only those artifacts, `krit run` checks source like
+`krit check` and then evaluates it directly, and `krit lsp` never executes
+source.
 
 ## Workspace
 

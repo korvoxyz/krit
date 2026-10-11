@@ -47,7 +47,14 @@ pub fn parse_source(source: &Source) -> Result<Program, Diagnostic> {
     parser::parse(tokens)
 }
 
+/// Parses and analyzes `source`, then evaluates it directly.
+///
+/// Evaluation starts only after the program passes the same analysis that
+/// `krit check` performs, so a program that analysis rejects fails with that
+/// diagnostic and produces no output. [`execute`] evaluates a program without
+/// analyzing it.
 pub fn run_source(source: &Source, output: &mut dyn std::io::Write) -> Result<Value, Diagnostic> {
     let program = parse_source(source)?;
+    analyze(&program)?;
     execute(&program, output)
 }

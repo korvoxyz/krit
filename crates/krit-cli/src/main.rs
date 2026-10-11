@@ -12,8 +12,8 @@ use std::{
 };
 
 use krit::{
-    Analysis, CoreModule, Diagnostic, EntrypointKind, RequirementSet, Source, Span, analyze,
-    execute, format_source, lower, parse_source, run_on_thread,
+    Analysis, CoreModule, Diagnostic, EntrypointKind, Program, RequirementSet, Source, Span,
+    analyze, execute, format_source, lower, parse_source, run_on_thread,
 };
 use krit_package::Manifest;
 use krit_runtime::{
@@ -1164,30 +1164,42 @@ fn source_command(arguments: &[String], action: SourceAction) -> u8 {
         }
     };
     let source = Source::new(path.to_string_lossy().into_owned(), text);
-    if matches!(action, SourceAction::Check) {
-        let program = match parse_source(&source) {
-            Ok(program) => program,
-            Err(diagnostic) => return report(&diagnostic, &source, format),
-        };
-        let analysis = match analyze(&program) {
-            Ok(analysis) => analysis,
-            Err(diagnostic) => return report(&diagnostic, &source, format),
-        };
-        if let Err(error) = lower(&program, &analysis) {
-            return internal_error("KICE0001", "lowering Core IR", &error);
+    // `run` performs exactly the checking `check` does and refuses with the
+    // same diagnostic and status, so no program that fails checking is ever
+    // evaluated.
+    let (program, analysis) = match check_source(&source, format) {
+        Ok(checked) => checked,
+        Err(status) => return status,
+    };
+    match action {
+        SourceAction::Check => {
+            println!("checked {}", path.display());
+            0
         }
-        println!("checked {}", path.display());
-        0
-    } else {
-        execute_source(&source, format)
+        SourceAction::Run => execute_checked(&source, &program, &analysis, format),
     }
 }
 
-fn execute_source(source: &Source, format: DiagnosticFormat) -> u8 {
-    let program = match parse_source(source) {
-        Ok(program) => program,
-        Err(diagnostic) => return report(&diagnostic, source, format),
-    };
+/// Parses, analyzes, and lowers `source` the way `krit check` does. On failure
+/// the diagnostic has already been reported and the command's exit status is
+/// returned.
+fn check_source(source: &Source, format: DiagnosticFormat) -> Result<(Program, Analysis), u8> {
+    let program = parse_source(source).map_err(|diagnostic| report(&diagnostic, source, format))?;
+    let analysis = analyze(&program).map_err(|diagnostic| report(&diagnostic, source, format))?;
+    if let Err(error) = lower(&program, &analysis) {
+        return Err(internal_error("KICE0001", "lowering Core IR", &error));
+    }
+    Ok((program, analysis))
+}
+
+/// Evaluates a program that has passed checking, after refusing entrypoints
+/// and host capabilities that direct execution cannot provide.
+fn execute_checked(
+    source: &Source,
+    program: &Program,
+    analysis: &Analysis,
+    format: DiagnosticFormat,
+) -> u8 {
     if let Some((kind, span)) = program.statements.iter().find_map(|statement| {
         let kind = match statement.kind {
             krit::StatementKind::Webhook { .. } => EntrypointKind::Webhook,
@@ -1208,9 +1220,7 @@ fn execute_source(source: &Source, format: DiagnosticFormat) -> u8 {
         let _ = report(&diagnostic, source, format);
         return 4;
     }
-    if let Ok(analysis) = analyze(&program)
-        && let Some((requirement, span)) = first_analysis_requirement(&analysis)
-    {
+    if let Some((requirement, span)) = first_analysis_requirement(analysis) {
         let diagnostic = Diagnostic::new(
             "K5003",
             format!(
@@ -1228,7 +1238,7 @@ fn execute_source(source: &Source, format: DiagnosticFormat) -> u8 {
     // native stack is exhausted.
     let result = run_on_thread("krit-evaluator", krit::EVALUATOR_STACK_BYTES, || {
         let mut output = io::stdout().lock();
-        execute(&program, &mut output).map(|_| ())
+        execute(program, &mut output).map(|_| ())
     });
     match result {
         Ok(Ok(())) => 0,

@@ -389,7 +389,11 @@ fn detach_captured_scopes(value: &mut Value, pending: &mut Vec<Option<Rc<Binding
     }
 }
 
-/// Evaluates a parsed program directly.
+/// Evaluates a parsed program directly, without analyzing it.
+///
+/// `krit run` and [`crate::run_source`] evaluate only programs that pass
+/// analysis. The runtime kind, arity, and depth checks here remain so that a
+/// program that bypassed analysis still fails with a diagnostic.
 ///
 /// Evaluation fails with `K4010` once more than [`MAX_CALL_DEPTH`] function
 /// calls or [`MAX_EVALUATION_DEPTH`] nested evaluations are active. Callers
@@ -1040,9 +1044,14 @@ fn negate_literal(value: i128, span: Span) -> Result<Value, Diagnostic> {
         .map_err(|_| Diagnostic::new("K4005", "integer overflow during negation", span))
 }
 
+/// Resolves `name` as analysis does: the innermost lexical binding wins, and
+/// a built-in applies only where no binding of that name is in scope. A match
+/// binder may, for example, shadow a host built-in name that the parser does
+/// not reserve.
 fn variable(name: &str, environment: &Environment, span: Span) -> Result<Value, Diagnostic> {
-    builtin_value(name)
-        .or_else(|| environment.lookup(name))
+    environment
+        .lookup(name)
+        .or_else(|| builtin_value(name))
         .ok_or_else(|| Diagnostic::new("K2001", format!("undefined name `{name}`"), span))
 }
 
@@ -1423,8 +1432,14 @@ fn json_to_value(value: serde_json::Value, span: Span) -> Result<Value, Diagnost
 
 #[cfg(test)]
 mod tests {
-    use crate::{Diagnostic, MAX_CALL_DEPTH, MAX_VALUE_DEPTH, Source, Value, run_source};
+    use super::execute;
+    use crate::{
+        Diagnostic, MAX_CALL_DEPTH, MAX_VALUE_DEPTH, Source, Value, parse_source, run_source,
+    };
 
+    type Run = fn(&str) -> Result<(String, Value), Diagnostic>;
+
+    /// Runs `text` as `krit run` does: analysis first, then evaluation.
     fn run(text: &str) -> Result<(String, Value), Diagnostic> {
         let source = Source::new("test.krit", text);
         let mut output = Vec::new();
@@ -1435,9 +1450,26 @@ mod tests {
         ))
     }
 
+    /// Evaluates `text` without analyzing it, which exercises the runtime
+    /// checks that guard programs analysis would reject.
+    fn run_unchecked(text: &str) -> Result<(String, Value), Diagnostic> {
+        let source = Source::new("test.krit", text);
+        let program = parse_source(&source)?;
+        let mut output = Vec::new();
+        let value = execute(&program, &mut output)?;
+        Ok((
+            String::from_utf8(output).expect("output should be UTF-8"),
+            value,
+        ))
+    }
+
     /// Runs on the stack `krit run` gives the evaluator and returns the output
     /// or the diagnostic code.
     fn run_on_evaluator_stack(text: String) -> Result<String, Diagnostic> {
+        on_evaluator_stack(text, run)
+    }
+
+    fn on_evaluator_stack(text: String, run: Run) -> Result<String, Diagnostic> {
         crate::run_on_thread("evaluator-test", crate::EVALUATOR_STACK_BYTES, move || {
             run(&text).map(|(output, _)| output)
         })
@@ -1502,6 +1534,9 @@ mod tests {
     /// A program that wraps `0` in `levels` layers of `wrapper`, `chunk` calls
     /// at a time so no call chain approaches the call-depth limit, and then
     /// evaluates `finish` with the result bound to `value`.
+    ///
+    /// `wrap` has no finite type, so analysis rejects the program and only
+    /// unchecked evaluation can build these values.
     fn wrapped_value(wrapper: &str, levels: usize, chunk: usize, finish: &str) -> String {
         let mut text = format!(
             "fn wrap(x, n) {{ if n == 0 {{ x }} else {{ wrap({wrapper}, n - 1) }} }}\nlet value = 0;\n"
@@ -1548,12 +1583,15 @@ mod tests {
 
     #[test]
     fn values_at_the_depth_limit_print_compare_and_encode() {
-        let output = run_on_evaluator_stack(wrapped_value(
-            "[x]",
-            MAX_VALUE_DEPTH,
-            5_000,
-            "println(value == value);\nprintln(value);\nprintln(json_encode(value));\n",
-        ))
+        let output = on_evaluator_stack(
+            wrapped_value(
+                "[x]",
+                MAX_VALUE_DEPTH,
+                5_000,
+                "println(value == value);\nprintln(value);\nprintln(json_encode(value));\n",
+            ),
+            run_unchecked,
+        )
         .expect("values at the depth limit should work");
         let list = format!(
             "{}0{}",
@@ -1569,12 +1607,10 @@ mod tests {
             // The reviewer's shape, 1,000 sequential calls each nesting the
             // value 9,000 levels deeper, fails during the second call instead
             // of building a value nine million levels deep.
-            let error = run_on_evaluator_stack(wrapped_value(
-                wrapper,
-                1_000 * 9_000,
-                9_000,
-                "println(value);\n",
-            ))
+            let error = on_evaluator_stack(
+                wrapped_value(wrapper, 1_000 * 9_000, 9_000, "println(value);\n"),
+                run_unchecked,
+            )
             .expect_err("a nine-million-level value should be rejected");
             assert_eq!(error.code(), "K4010", "{wrapper}");
             assert!(
@@ -1583,14 +1619,17 @@ mod tests {
                 error.message()
             );
 
-            let error = run_on_evaluator_stack(wrapped_value(
-                wrapper,
-                MAX_VALUE_DEPTH + 1,
-                5_000,
-                "println(1);\n",
-            ))
+            let error = on_evaluator_stack(
+                wrapped_value(wrapper, MAX_VALUE_DEPTH + 1, 5_000, "println(1);\n"),
+                run_unchecked,
+            )
             .expect_err("one level past the limit should be rejected");
             assert_eq!(error.code(), "K4010", "{wrapper}");
+
+            // Analysis rejects the program, so `run` never reaches the limit.
+            let error = run(&wrapped_value(wrapper, 2, 1, "println(value);\n"))
+                .expect_err("analysis should reject an infinitely nested type");
+            assert_eq!(error.code(), "K3001", "{wrapper}");
         }
 
         // Decoded JSON is bounded by the decoder's own nesting limit, far
@@ -1692,27 +1731,106 @@ mod tests {
             "println(Some(fn(value) { value }) == Some(fn(value) { value }));",
             "println(Err(fn(value) { value }) == Err(fn(value) { value }));",
         ] {
-            let error = run(source).expect_err("nested functions should not compare");
+            let error = run_unchecked(source).expect_err("nested functions should not compare");
             assert_eq!(error.code(), "K4006");
+            let error = run(source).expect_err("analysis should reject the comparison");
+            assert_eq!(error.code(), "K3006");
         }
     }
 
     #[test]
-    fn run_source_keeps_annotations_dynamically_inert() {
-        let (output, _) = run(r#"
+    fn run_source_refuses_programs_that_fail_analysis() {
+        // Each program would print before reaching its error if it were
+        // evaluated; analysis refuses it first, so nothing is printed.
+        for (source, code) in [
+            ("println(\"before\");\nprintln(1 + true);\n", "K3001"),
+            (
+                "println(\"before\");\nlet value: Int = \"text\";\nprintln(value);\n",
+                "K3001",
+            ),
+            ("println(\"before\");\nprintln(missing);\n", "K2001"),
+            (
+                "println(\"before\");\nlet value = 1;\nlet value = 2;\n",
+                "K2002",
+            ),
+            (
+                "println(\"before\");\nlet identity = fn(value) { value };\nidentity(1, 2);\n",
+                "K3003",
+            ),
+        ] {
+            let source_text = Source::new("test.krit", source);
+            let mut output = Vec::new();
+            let error = run_source(&source_text, &mut output)
+                .expect_err("analysis should refuse the program");
+            assert_eq!(error.code(), code, "{source}");
+            assert!(output.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn execute_keeps_annotations_dynamically_inert() {
+        // `execute` itself does not consult annotations; only analysis does.
+        let source = r#"
             let value: Int = "still dynamic";
             fn identity(input: Bool) -> Unit { input }
             println(identity(value));
-            "#)
-        .expect("run_source should remain dynamically compatible");
-
+            "#;
+        let (output, _) = run_unchecked(source).expect("execute should ignore annotations");
         assert_eq!(output, "still dynamic\n");
+        assert_eq!(
+            run(source)
+                .expect_err("analysis should enforce annotations")
+                .code(),
+            "K3001"
+        );
+    }
+
+    #[test]
+    fn bindings_shadow_unreserved_builtin_names() {
+        // Analysis lets a match binder reuse a host built-in name that the
+        // parser does not reserve, and resolves it to the binder. Evaluation
+        // must agree, with and without analysis.
+        let source = r#"
+            let value = match Some(41) {
+                Some(state_get) => state_get + 1,
+                None => 0,
+            };
+            println(value);
+            fn total(items) {
+                match items {
+                    [] => 0,
+                    [cache_get, ..object_put] => cache_get + total(object_put),
+                }
+            }
+            println(total([1, 2, 3]));
+            let doubled = match Ok(fn(input) { input * 2 }) {
+                Ok(queue_publish) => queue_publish(21),
+                Err(db_commit) => db_commit,
+            };
+            println(doubled);
+            println(match None {
+                None => "unbound",
+                Some(search_query) => search_query,
+            });
+            "#;
+        for run in [run as Run, run_unchecked] {
+            let (output, _) = run(source).expect("shadowing bindings should run");
+            assert_eq!(output, "42\n6\n42\nunbound\n");
+        }
+
+        // Outside the binder's scope the name is the built-in again.
+        let error = run(
+            "let value = match Some(1) { Some(state_get) => state_get, None => 0 };\n\
+             state_get(\"agent-work\", \"key\");\n",
+        )
+        .expect_err("the host built-in is unavailable in direct evaluation");
+        assert_eq!(error.code(), "K5003");
     }
 
     #[test]
     fn encodes_and_decodes_json_deterministically() {
         let (output, _) = run(r#"
-            let value = record { z: 2, option: Some([true, None]), a: 1 };
+            let value = record { z: 2, option: Some([Some(true), None]), a: 1 };
             let encoded = json_encode(value);
             println(encoded);
             println(json_decode(encoded) == value);
@@ -1725,15 +1843,18 @@ mod tests {
 
         assert_eq!(
             output,
-            "{\"a\":1,\"option\":{\"Some\":[true,{\"None\":null}]},\"z\":2}\ntrue\nErr(\"failed\")\nnull\ntrue\n"
+            "{\"a\":1,\"option\":{\"Some\":[{\"Some\":true},{\"None\":null}]},\"z\":2}\ntrue\nErr(\"failed\")\nnull\ntrue\n"
         );
     }
 
     #[test]
     fn reports_json_failures() {
-        let encode_error =
-            run("json_encode(fn(value) { value });").expect_err("functions should not encode");
+        let encode_error = run_unchecked("json_encode(fn(value) { value });")
+            .expect_err("functions should not encode");
         assert_eq!(encode_error.code(), "K4008");
+        let encode_error = run("json_encode(fn(value) { value });")
+            .expect_err("analysis should reject encoding a function");
+        assert_eq!(encode_error.code(), "K3006");
 
         let decode_error = run(r#"json_decode("{");"#).expect_err("invalid JSON should not decode");
         assert_eq!(decode_error.code(), "K4009");

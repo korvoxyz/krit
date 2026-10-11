@@ -151,6 +151,11 @@ An internal compiler error is always a Krit bug. It must include a stable crash
 identifier but must not include source content, environment variables, or
 secrets in telemetry without explicit consent.
 
+`krit run` checks source exactly as `krit check` does before evaluating it.
+For a program that fails checking it emits check's diagnostic and exits with
+check's status, so it reports runtime codes (`K4000`-`K4999`) only for
+programs that pass checking.
+
 ## Determinism and privacy
 
 Diagnostics must not include:

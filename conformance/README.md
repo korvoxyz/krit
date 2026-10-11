@@ -14,7 +14,8 @@ Each directory contains:
 - `expect.diagnostics` — optional ordered diagnostic codes, one per line;
   absent means no diagnostics
 
-The harness invokes the equivalent of:
+`conformance/cases` contains runtime cases. The harness invokes the
+equivalent of:
 
 ```text
 krit run --diagnostic-format json program.krit
@@ -24,6 +25,13 @@ It compares status and standard output exactly. It decodes JSON Lines from
 standard error and compares the ordered `code` fields. Additional diagnostic
 prose and labels may vary within `spec/DIAGNOSTICS.md`.
 
+`krit run` checks a program exactly as `krit check` does before evaluating it
+(`spec/LANGUAGE.md` section 14), so every runtime case must pass `krit check`,
+and the harness asserts that it does. A runtime case therefore defines
+evaluation behavior, including runtime errors such as overflow, division by
+zero, invalid JSON, and depth limits. A program that checking rejects belongs
+in `conformance/check`.
+
 `conformance/check` contains implementation-neutral static-analysis cases.
 That harness invokes the equivalent of:
 
@@ -32,7 +40,9 @@ krit check --diagnostic-format json program.krit
 ```
 
 It compares status and diagnostic codes and requires that checking never
-execute program effects or emit program output.
+execute program effects or emit program output. Because `krit run` checks
+first, the harness also requires that `krit run` refuse every failing check
+case with the same diagnostics and status and no program output.
 
 `conformance/format` contains formatter input/output pairs. Each
 `input.krit` must parse, and formatting must exactly equal
@@ -53,6 +63,7 @@ network service, or nondeterministic value.
 | `core/chains` | `else if` chains and left-associative operator chains, including short-circuiting |
 | `core/else-if-chain` | a 300-branch `else if` chain adds no nesting levels |
 | `scope/closures` | immutable lexical capture and shadowing |
+| `scope/builtin-shadowing` | match binders shadow unreserved built-in names, as in checking |
 | `functions/recursion` | recursive declaration and calls |
 | `functions/deep-recursion` | 9,000 nested calls stay within the call-depth limit |
 | `lists/match` | list construction and exhaustive decomposition |
@@ -61,28 +72,18 @@ network service, or nondeterministic value.
 | `variants/result-match` | exhaustive Result matching |
 | `json/round-trip` | deterministic JSON conversion |
 | `types/annotations` | parsed binding, parameter, return, and generic types |
-| `errors/syntax` | missing required syntax |
-| `errors/undefined-name` | lexical name resolution |
-| `errors/wrong-kind` | runtime kind checks |
-| `errors/arity` | exact function arity |
 | `errors/division-zero` | checked division |
 | `errors/overflow` | checked signed 64-bit arithmetic |
-| `errors/function-comparison` | non-comparable functions, including in lists |
-| `errors/duplicate-record-field` | unique record field names |
-| `errors/duplicate-variant-arm` | unique Option and Result arms |
-| `errors/incomplete-option-match` | exhaustive Option arms |
-| `errors/mixed-variant-match` | one variant family per match |
-| `errors/json-function` | functions cannot be JSON encoded |
 | `errors/json-invalid` | invalid JSON input |
-| `errors/missing-record-field` | field access requires an existing field |
-| `errors/nesting-depth` | syntax nested past 256 levels fails with `K1005` |
 | `errors/call-depth` | runaway recursion fails with `K4010` instead of aborting |
 | `check/valid/inference` | recursion, closures, empty lists, None, and effects infer together |
-| `check/name/*` | lexical undefined and duplicate name diagnostics |
-| `check/type/*` | stable static operator, condition, field, call, annotation, and match errors |
+| `check/syntax/missing-semicolon` | missing required syntax |
+| `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
+| `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors |
+| `check/match/*` | unique, exhaustive, single-family Option and Result arms (`K1003`) |
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
-| `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including chains hidden by parentheses and types that grow after they are bound |
+| `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, and types that grow after they are bound |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |

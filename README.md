@@ -318,9 +318,10 @@ Wasmtime engine with a fresh Store and instance, no WASI or inherited stdout,
 and buffered output released only on success. The exact default and hard
 limits plus the serialized epoch-scheduling and pre-deadline compilation
 limitations are documented in [the sandbox specification](spec/WASM-SANDBOX.md).
-`krit run` remains the full-language direct evaluator for pure/stdout source;
-it rejects webhook, queue, and schedule entrypoints and host-only operations
-with `K5003` rather than fabricating values.
+`krit run` checks source exactly as `krit check` does, refuses any program
+that fails with check's diagnostic and status, and then evaluates pure/stdout
+source directly; it rejects webhook, queue, and schedule entrypoints and
+host-only operations with `K5003` rather than fabricating values.
 
 Invoke a webhook deterministically from an exact JSON fixture:
 

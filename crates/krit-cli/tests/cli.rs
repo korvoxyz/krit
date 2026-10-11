@@ -1039,10 +1039,32 @@ fn direct_run_rejects_all_deployment_entrypoints_before_module_execution() {
 }"#,
         ),
     ] {
-        for prefix in [
-            "println(\"must not run\");\n",
-            "println(\"must not run\");\nlet invalid = 1 + true;\n",
-        ] {
+        // `run` checks first, so a module that also fails checking reports
+        // check's diagnostic and status instead of the entrypoint refusal.
+        let directory = TestDirectory::new("run-ill-typed-deployment-entrypoint");
+        let source =
+            format!("println(\"must not run\");\nlet invalid = 1 + true;\n{declaration}\n");
+        directory.file("main.krit", &source);
+        for format in ["human", "json"] {
+            let check = krit_in(&directory)
+                .args(["check", "--diagnostic-format", format, "main.krit"])
+                .output()
+                .expect("Krit should start");
+            let run = krit_in(&directory)
+                .args(["run", "--diagnostic-format", format, "main.krit"])
+                .output()
+                .expect("Krit should start");
+            assert_eq!(run.status.code(), Some(1), "{kind} {format}");
+            assert_eq!(run.status.code(), check.status.code(), "{kind} {format}");
+            assert!(run.stdout.is_empty(), "{kind} {format}");
+            assert_eq!(run.stderr, check.stderr, "{kind} {format}");
+            assert!(
+                String::from_utf8_lossy(&run.stderr).contains("K3001"),
+                "{kind} {format}"
+            );
+        }
+
+        for prefix in ["println(\"must not run\");\n"] {
             let directory = TestDirectory::new("run-deployment-entrypoint");
             let source = format!("{prefix}{declaration}\nprintln(\"must not run either\");\n");
             let path = directory.file("main.krit", &source);
@@ -1192,6 +1214,8 @@ fn direct_run_fails_closed_for_unavailable_agent_hosts() {
     assert_eq!(config_diagnostic["code"], "K5003");
     assert_eq!(config_diagnostic["span"]["start"]["column"], 13);
 
+    // Checking comes first: an ill-typed program that also uses an
+    // unavailable host reports check's diagnostic, not the host refusal.
     let mixed = directory.file(
         "mixed.krit",
         "let model = config_string(\"agent.model\");\nlet bad = 1 + true;\n",
@@ -1201,12 +1225,12 @@ fn direct_run_fails_closed_for_unavailable_agent_hosts() {
         .arg(&mixed)
         .output()
         .expect("Krit should start");
-    assert_eq!(mixed_output.status.code(), Some(4));
+    assert_eq!(mixed_output.status.code(), Some(1));
     assert!(mixed_output.stdout.is_empty());
     assert!(
         String::from_utf8(mixed_output.stderr)
             .expect("diagnostic should be UTF-8")
-            .contains("error[K5003]")
+            .contains("error[K3001]")
     );
 
     let webhook = directory.file(
@@ -1574,7 +1598,7 @@ fn emits_machine_readable_diagnostics() {
             "run",
             "--diagnostic-format",
             "json",
-            "conformance/cases/errors/undefined-name/program.krit",
+            "conformance/check/name/undefined-argument/program.krit",
         ])
         .output()
         .expect("Krit should start");
@@ -1585,6 +1609,148 @@ fn emits_machine_readable_diagnostics() {
     assert!(diagnostic.starts_with("{\"schema\":1,"));
     assert!(diagnostic.contains("\"code\":\"K2001\""));
     assert!(diagnostic.ends_with('\n'));
+}
+
+/// Every conformance case directory under `conformance/<suite>`, as sorted
+/// repository-relative paths.
+fn conformance_cases(suite: &str) -> Vec<PathBuf> {
+    let root = repository_root();
+    let mut pending = vec![root.join("conformance").join(suite)];
+    let mut cases = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).expect("conformance directory should be readable") {
+            let path = entry.expect("directory entry should be readable").path();
+            if path.join("program.krit").is_file() {
+                cases.push(
+                    path.strip_prefix(root)
+                        .expect("case should be inside the repository")
+                        .to_path_buf(),
+                );
+            } else if path.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    cases.sort();
+    assert!(!cases.is_empty(), "no {suite} conformance cases found");
+    cases
+}
+
+fn conformance_expectation(case: &Path, name: &str) -> String {
+    let path = repository_root().join(case).join(name);
+    if path.is_file() {
+        fs::read_to_string(path).expect("expectation should be readable")
+    } else {
+        String::new()
+    }
+}
+
+#[test]
+fn run_refuses_every_check_failure_with_checks_diagnostic_and_status() {
+    for case in conformance_cases("check") {
+        let program = case.join("program.krit");
+        let expected_status = conformance_expectation(&case, "expect.status");
+        for format in ["human", "json"] {
+            let check = krit()
+                .args(["check", "--diagnostic-format", format])
+                .arg(&program)
+                .output()
+                .expect("Krit should start");
+            assert_eq!(
+                check.status.code().map(|status| status.to_string()),
+                Some(expected_status.trim().to_owned()),
+                "{} {format}",
+                case.display()
+            );
+            let run = krit()
+                .args(["run", "--diagnostic-format", format])
+                .arg(&program)
+                .output()
+                .expect("Krit should start");
+            if check.status.success() {
+                // A valid program runs, or is refused only because direct
+                // execution has no entrypoint or host to offer (K5003).
+                assert!(
+                    matches!(run.status.code(), Some(0 | 4)),
+                    "{} {format}: {}",
+                    case.display(),
+                    String::from_utf8_lossy(&run.stderr)
+                );
+                continue;
+            }
+            assert_eq!(
+                run.status.code(),
+                check.status.code(),
+                "{} {format}",
+                case.display()
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&run.stderr),
+                String::from_utf8_lossy(&check.stderr),
+                "{} {format}",
+                case.display()
+            );
+            assert!(run.stdout.is_empty(), "{} {format}", case.display());
+        }
+    }
+}
+
+#[test]
+fn runtime_conformance_cases_pass_check_and_run_through_the_cli() {
+    for case in conformance_cases("cases") {
+        let program = case.join("program.krit");
+        let check = krit()
+            .arg("check")
+            .arg(&program)
+            .output()
+            .expect("Krit should start");
+        assert!(
+            check.status.success(),
+            "runtime case {} must pass check: {}",
+            case.display(),
+            String::from_utf8_lossy(&check.stderr)
+        );
+
+        let run = krit()
+            .args(["run", "--diagnostic-format", "json"])
+            .arg(&program)
+            .output()
+            .expect("Krit should start");
+        assert_eq!(
+            run.status.code().map(|status| status.to_string()),
+            Some(
+                conformance_expectation(&case, "expect.status")
+                    .trim()
+                    .to_owned()
+            ),
+            "{}",
+            case.display()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            conformance_expectation(&case, "expect.stdout"),
+            "{}",
+            case.display()
+        );
+        let codes = parse_json_lines(&run.stderr)
+            .iter()
+            .map(|diagnostic| {
+                diagnostic["code"]
+                    .as_str()
+                    .expect("diagnostic code should be a string")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            conformance_expectation(&case, "expect.diagnostics")
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            "{}",
+            case.display()
+        );
+    }
 }
 
 #[test]
@@ -1961,12 +2127,11 @@ fn language_server_reports_k1005_for_a_parenthesized_operator_spine() {
 }
 
 #[test]
-fn direct_run_reports_k4010_for_runaway_value_nesting() {
-    // `run` does not consult static checking, so this ill-typed program
-    // reaches the evaluator: 1,000 sequential calls each wrap the value in
-    // 9,000 more lists. Printing it used to overflow the native stack; it now
-    // fails during the second call, when the value would nest more than
-    // 10,000 levels.
+fn direct_run_refuses_runaway_value_nesting_before_evaluation() {
+    // Evaluated, this ill-typed program would wrap the value in 9,000 more
+    // lists on each of 1,000 sequential calls. `run` refuses it with check's
+    // diagnostic before evaluating anything, so it never reaches the
+    // evaluator's value-depth limit (covered by the evaluator's own tests).
     let directory = TestDirectory::new("value-depth");
     let mut text = String::from(
         "fn wrap(x, n) {\n    if n == 0 {\n        x\n    } else {\n        wrap([x], n - 1)\n    }\n}\n\nlet v0 = 0;\n",
@@ -1976,6 +2141,11 @@ fn direct_run_reports_k4010_for_runaway_value_nesting() {
     }
     text.push_str("println(v1000);\nprintln(json_encode(v1000));\nprintln(v1000 == v1000);\n");
     let source = directory.file("main.krit", &text);
+    let check = krit()
+        .args(["check", "--diagnostic-format", "json"])
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
     let output = krit()
         .args(["run", "--diagnostic-format", "json"])
         .arg(&source)
@@ -1984,9 +2154,10 @@ fn direct_run_reports_k4010_for_runaway_value_nesting() {
     assert_ne!(output.status.code(), Some(134));
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, check.stderr);
     let diagnostics = parse_json_lines(&output.stderr);
     assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0]["code"], "K4010");
+    assert_eq!(diagnostics[0]["code"], "K3001");
 }
 
 #[test]

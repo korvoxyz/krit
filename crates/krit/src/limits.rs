@@ -71,9 +71,9 @@ pub const MAX_EVALUATION_DEPTH: usize = 100_000;
 /// Printing, comparing, JSON-encoding, and releasing a value recurse once per
 /// level of its nesting, so constructing a deeper value fails instead. A
 /// value nests no deeper than its static type, which analysis bounds far
-/// below this, so only programs run without analysis can reach it, for
-/// example a function that wraps its argument in one more list on every
-/// call.
+/// below this. `krit run` analyzes first, so only a program evaluated with
+/// [`crate::execute`] and no analysis can reach it, for example a function
+/// that wraps its argument in one more list on every call.
 pub const MAX_VALUE_DEPTH: usize = 10_000;
 
 /// Native stack reserved for the thread that runs the direct evaluator: 1 GiB.

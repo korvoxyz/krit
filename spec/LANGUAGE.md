@@ -14,7 +14,7 @@ exact-origin outbound HTTP, provider-neutral AI invocation, and structured
 logging, transactional durable string state, checkpoints, and explicit
 HTTP/AI replay. The direct evaluator remains intentionally hostless; these
 operations execute only through the bounded Component Model runtime. General
-component generation remains narrower than the full dynamic language.
+component generation remains narrower than the full checked language.
 
 The historical Racket S-expression syntax is not accepted by Krit 0.2.
 
@@ -256,8 +256,7 @@ The normative runtime value kinds are:
 Integer overflow is a runtime error. Division truncates toward zero. Division
 or remainder by zero is a runtime error.
 
-Lists may contain values of different kinds in the dynamic baseline. The
-static type system will require a common element type.
+The elements of a list share one static type (`TYPES-AND-EFFECTS.md`).
 
 Records preserve their source field order for rendering. A record literal or
 record type cannot repeat a field name. Record equality is structural by field
@@ -281,7 +280,14 @@ A lexical scope cannot declare the same name more than once. This applies
 across `let` and function declarations in that scope. A nested scope may
 shadow a name from an outer scope. A binding cannot be read before its
 declaration. `krit check` enforces these rules as a deliberate readability
-constraint for both human- and AI-authored code.
+constraint for both human- and AI-authored code, and `krit run` enforces them
+by checking first (section 14).
+
+A lexical binding shadows a built-in name of the same spelling for the
+binding's whole scope, in checking and evaluation alike. `let`, function, and
+parameter names cannot reuse a built-in name (`K2002`). A match binder can
+reuse a built-in name that the parser does not reserve, such as `state_get`,
+and within its arm the name refers to the binder.
 
 Function declarations are visible from their declaration to the end of their
 containing scope and may call themselves recursively. Mutually recursive
@@ -310,7 +316,8 @@ let add_one = fn(value) {
 ```
 
 Arguments evaluate from left to right. The argument count must equal the
-parameter count. Calling a non-function is a runtime error.
+parameter count, and only a function can be called; checking reports either
+violation before evaluation (section 14).
 
 Function values and opaque `Secret` values cannot be compared, including when
 nested in an ordinary structural value.
@@ -329,9 +336,10 @@ fn attempt(value: Int) -> Result<Int, String> {
 
 Annotations are parsed and retained by the compiler. `krit check` enforces
 them through static analysis without executing the program. `krit run`
-remains the transitional direct dynamic evaluator and preserves runtime
-conformance behavior, but preflights valid webhook/configuration/secret
-contracts so unavailable hosts fail explicitly rather than fabricating a
+performs the same checking before it evaluates anything and refuses a
+program that fails it (section 14), so annotations hold in direct evaluation
+too. It then refuses checked programs that need an entrypoint or host
+contract so unavailable hosts fail explicitly rather than fabricating a
 value. Static checking is specified in `TYPES-AND-EFFECTS.md`.
 
 ## 8.1 Webhook contract types
@@ -643,43 +651,64 @@ with explicit immutable host inputs.
 
 ## 14. Evaluation failure
 
-The following are errors rather than implementation-defined behavior:
+`krit run` first checks the source exactly as `krit check` does: lexing,
+parsing, name resolution, type, effect, and capability analysis, and Core
+verification. A program that fails checking is never evaluated: `run`
+reports the same diagnostic with the same exit status as `check` and writes
+no program output.
+
+A program that passes checking is still refused before evaluation, with
+`K5003` and exit status 4, when it declares a webhook, queue, or schedule
+entrypoint or requires any host capability, because direct evaluation
+provides no entrypoint invocation and no host other than standard output.
+
+The following are errors rather than implementation-defined behavior.
+Checking reports these, so a program containing one is never evaluated:
 
 - malformed UTF-8 or tokens
 - malformed syntax
 - unresolved names
-- integer literal outside signed 64-bit range
-- integer overflow
 - wrong operand, condition, subject, or callee kind
 - incorrect argument count
-- division or remainder by zero
 - function comparison
 - missing record field
 - JSON encoding of a function
 - non-literal configuration, secret, HTTP-origin, AI-adapter, log-event,
   state-store, checkpoint, or replay-operation resource
 - printing, comparing, encoding, or structurally storing an opaque secret
-- unavailable webhook, configuration, secret, HTTP, AI, or logging direct-run
-  host contract
+
+Evaluation reports these:
+
+- integer literal outside signed 64-bit range
+- integer overflow
+- division or remainder by zero
 - invalid or unsupported JSON
+- a value decoded by `json_decode` that does not have the kind or fields its
+  use requires (`K4001`), because decoding does not validate the inferred type
 - more than 10,000 active function calls, more than 100,000 nested
   expression and block evaluations, or a list, record, or variant value
   nesting more than 10,000 levels, in direct evaluation (`K4010`)
 
-Evaluation stops at the first error. Errors follow `DIAGNOSTICS.md`.
+Evaluation stops at the first error. Errors follow `DIAGNOSTICS.md`. The
+evaluator keeps its own kind, callee, arity, comparison, and encoding checks
+(`K4001`, `K4002`, `K4003`, `K4006`, `K4008`). In a checked program only a
+decoded JSON value can fail one of them; otherwise they make a program
+evaluated without checking, which `krit run` never does, fail with a
+diagnostic.
 
 The direct-evaluation limits count active frames, not total work: sequential
 calls that each recurse 9,000 levels deep are valid. A typical recursive
 function evaluates three to six nested expressions per call, so it reaches the
 call limit first; a function body nested unusually deeply reaches the
 evaluation limit first. The value limit applies when a list, record, or
-variant is built: a value nests no deeper than its static type, which section
-4.1 bounds far below 10,000 levels, so only a program that is not statically
-valid, such as a function that wraps its argument in one more list on every
-call, can reach it. Printing, comparing, JSON-encoding, and releasing a value
-therefore recurse at most 10,000 levels, and releasing a long chain of
-closures that each capture the previous one does not recurse once per
-closure.
+variant is built. A checked program's values nest no deeper than their static
+types (which section 4.1 bounds far below 10,000 levels) plus the JSON
+decoder's own small nesting bound, so `krit run` never reaches the value
+limit; it bounds programs evaluated without checking, such as a function that
+wraps its argument in one more list on every call. Printing, comparing,
+JSON-encoding, and releasing a value therefore recurse at most 10,000 levels,
+and releasing a long chain of closures that each capture the previous one
+does not recurse once per closure.
 
 `krit run` evaluates on a dedicated thread with a 1 GiB stack reservation.
 The most stack measured at these limits is about 120 MiB in optimized builds

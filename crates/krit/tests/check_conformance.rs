@@ -28,18 +28,14 @@ fn on_compiler_stack(work: impl FnOnce() + Send) {
         .expect("check thread should start");
 }
 
+/// `krit run` refuses any program that fails checking, so every runtime case,
+/// including those that expect a runtime error, must pass static checking.
 #[test]
-fn all_runtime_success_cases_and_examples_are_statically_valid() {
+fn all_runtime_cases_and_examples_are_statically_valid() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let runtime_root = repository.join("conformance/cases");
     let mut cases = Vec::new();
     collect_cases(&runtime_root, &mut cases);
-    cases.retain(|case| {
-        fs::read_to_string(case.join("expect.status"))
-            .expect("expect.status should be readable")
-            .trim()
-            == "0"
-    });
     cases.extend([
         repository.join("examples/factorial.krit"),
         repository.join("examples/lists.krit"),
