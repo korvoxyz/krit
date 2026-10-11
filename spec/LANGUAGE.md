@@ -14,7 +14,7 @@ exact-origin outbound HTTP, provider-neutral AI invocation, and structured
 logging, transactional durable string state, checkpoints, and explicit
 HTTP/AI replay. The direct evaluator remains intentionally hostless; these
 operations execute only through the bounded Component Model runtime. General
-component generation remains narrower than the full dynamic language.
+component generation remains narrower than the full checked language.
 
 The historical Racket S-expression syntax is not accepted by Krit 0.2.
 
@@ -58,6 +58,10 @@ comment     = "//", non-line-break* ;
 
 Integer separators cannot be leading, trailing, or repeated. Integers are
 signed through unary `-`; the sign is not part of the token.
+
+`?` is a token of its own. Edition 2026 gives it no meaning, so it appears in
+no valid program; the parser uses it only to recognize another language's
+conditional operator (section 4.2).
 
 Strings support these escapes:
 
@@ -163,7 +167,10 @@ record-type-field
                 = identifier, ":", type ;
 ```
 
-Assignments and mutable bindings do not exist in edition 2026.
+Assignments and mutable bindings do not exist in edition 2026. Neither do
+`return`, loops, classes, modules, `async`, exceptions, indexing, arrow
+functions, the conditional operator, or `switch`; section 4.2 specifies how
+the parser reports them.
 
 A `webhook` declaration is valid only as a direct program item. A source
 module contains zero or one webhook. Nested or duplicate webhook declarations
@@ -179,6 +186,136 @@ webhook fn name(request: HttpRequest) -> HttpResponse {
 The source name is a compiler fact. The component host exports the declaration
 through the canonical `krit:runtime/webhook@0.2.0` interface's `handle`
 operation; the name does not create an ambient network listener.
+
+## 4.1 Nesting limits
+
+A source file may nest syntax at most **256 levels** deep. Each of the
+following opens one level for what it contains:
+
+- a parenthesized expression, a block, a list literal, and a record literal
+- the argument list of a call, and each call or field-access link of a
+  postfix chain (`a.b(c).d` opens three levels for what follows `a`)
+- the operand of a unary operator
+- the condition of an `if`, and the subject and the arm list of a `match`
+- the argument list of `List<…>`, `Option<…>`, or `Result<…, …>`, and the
+  field list of `Record { … }`
+
+An `else if` continuation stays at the level of the `if` it continues, and a
+chain of binary operators such as `a + b + c` stays at the level of its first
+operand, so long flat chains are not nesting. They still nest in the
+program's syntax tree, so a separate **structural depth** limit applies: the
+nesting level of any point plus the number of `else if` continuations, binary
+operators, and call or field-access links above it in the tree may not exceed
+**4,096**.
+
+Operator and postfix chains nest to the left: their first operand lies below
+every operator or link of the chain. Parentheses group without changing that,
+so in `(a + b) + c` the operand `a` has nesting level 1 and two operators
+above it, a structural depth of 3, and wrapping a chain in parentheses cannot
+hide its length from an enclosing chain. A 1,000-branch `else if` chain and a
+4,000-operator sum are valid; a 2,100-operator sum whose first operand is a
+parenthesized 2,100-operator sum is not.
+
+Inferred types are bounded too. Inference solves for an unknown type at every
+binding, parameter, function result, and list element, and rejects any step
+that would make one of them stand for a type nesting more than 256 type
+constructors deep. That covers a binding deeper than the one before it, such
+as the 257th binding of a chain of `let next = [previous];` declarations, and
+a type inferred earlier that grows later: after `let e = []; let top = [[e]];`,
+the type of `top` deepens whenever a later expression resolves the element
+type of `e` to a deeper list, including by comparing `e` with another binding
+whose type is already known to be deeper. Types spelled out by nested literals
+and annotations are bounded by the nesting limit, so every static type stays
+within a fixed depth.
+
+Exceeding any of these limits is error `K1005` at the construct, operator, or
+inference step that crosses it. Parsing, static checking, Core lowering and
+verification, formatting, and component generation all enforce the same
+bounds, so no accepted program can exhaust the compiler's native stack. The
+later stages also count their own recursion, to reject syntax trees built
+without the parser; every tree within the limits above stays inside those
+internal bounds, so a source program only ever sees the limits stated here.
+
+## 4.2 Constructs from other languages
+
+Constructs that other languages have and Krit does not are reported with
+their own codes (`K1101`-`K1112`), each with a one-line fix in the
+diagnostic's notes (`DIAGNOSTICS.md`), instead of a generic syntax error.
+Their words are not keywords: each remains an ordinary identifier, and
+`let for = 1;`, `use(value)`, and `record { from: a, default: b }` are valid.
+The parser reports a construct only where its tokens cannot be part of any
+valid program.
+
+A **habit word** is one of these identifiers:
+
+| Code | Construct | Words |
+|---|---|---|
+| `K1101` | `return` | `return` |
+| `K1102` | loops | `for` `while` `loop` `do` |
+| `K1103` | mutable bindings | `mut` `var` `const` |
+| `K1104` | type declarations | `struct` `class` `impl` `trait` `interface` |
+| `K1105` | imports | `import` `use` `require` `from` |
+| `K1106` | async functions | `async` `await` |
+| `K1107` | exceptions | `try` `catch` `throw` `raise` `except` `finally` |
+| `K1111` | `switch` | `switch` `case` `default` |
+
+A habit word reports its construct's code when:
+
+- it is an operand followed, on the same line, by a token that can only start
+  an operand, which never follows a complete expression: an identifier,
+  integer, string, `true`, `false`, `record`, `if`, `match`, `fn`, `!`, or a
+  `[` with whitespace between it and the word (`return value`,
+  `for item in items`, `const limit = 3`, `class Point`, `async fn`,
+  `throw "empty"`, `return [a, b]`). When a line break comes between them,
+  the word stays an ordinary name and the program reports the generic error
+  of the `;` or `,` that is missing (`let x = from` followed by `println(x);`
+  on the next line is `K1002`);
+- it is an operand followed by a parenthesized group and then `=>`
+  (`async (x) => e`);
+- it starts a statement and is followed by `{`, by `:`, or by a parenthesized
+  group and then `{` (`try {`, `loop {`, `default:`,
+  `while (ready) {`, `for (let i = 0; i < n; i++) {`); or
+- it is `mut`, written where a binding name is expected and followed by
+  another name (`let mut x`, `fn f(mut x)`, `Some(mut x)`), which reports
+  `K1103`.
+
+These constructs are reported wherever they occur:
+
+- `K1103`: an expression statement, a block's final expression, or a `let`
+  value followed by `=` (`count = count + 1;`, `record.field = value;`); and
+  `+=`, `-=`, `*=`, `/=`, `%=`, `++`, or `--` written as two touching tokens
+  where an operand is missing (`x += 1`, `x++`, `x--`).
+- `K1108`: a `[` touching the end of an operand in a postfix chain
+  (`items[0]`, `load()[0]`, `[a, b][0]`). With whitespace before the `[`
+  (`items [0]`), the program is still invalid but is not reported as
+  indexing.
+- `K1109`: an identifier or a parenthesized group followed by `=>`
+  (`x => e`, `(x, y) => e`, `(x: Int) => e`, `() => e`). No expression is
+  ever followed by `=>`; only match patterns are.
+- `K1110`: a `?` after an operand, followed by an expression and then `:`
+  (`ready ? 1 : 2`). When the tokens after the `?` start an expression that
+  does not parse, the `?` is still `K1110` if a `:` follows it at the same
+  bracket depth before the end of the file, a closing bracket opened before
+  the `?`, or the first `;`, `,`, or `let` at that depth
+  (`ready ? items[0] : None`, `ok ? { status: 200 } : { status: 500 }`). The
+  parser examines the tokens after the `?` without consuming them. A `?` in
+  any other position is an unexpected token (`K1001`).
+- `K1112`: `else` followed by `return` and a token that can only start an
+  operand, as above, either as the first tokens of its block or directly
+  (`else { return 0; }`, `else return 0;`).
+
+To find the end of a parenthesized group, the parser matches parentheses and
+looks no further than the first `;` when it expects `=>` after the group, or
+the first `{` or `}` when it expects `{`.
+
+Where a habit word could still be an ordinary name (`return;`,
+`return -1;`, `await(job)`), the program parses, and if the name is not bound
+checking reports `K2001` with the construct's fix. Parsing stops at the first
+error, so the first construct reached in source order is the one reported,
+with two exceptions inside the first branch of a conditional operator: a
+conditional operator there is reported in place of the outer one
+(`a ? b ? c : d : e` reports `? c :`), and so is a nesting limit (`K1005`)
+crossed there.
 
 ## 5. Program and block values
 
@@ -211,8 +348,7 @@ The normative runtime value kinds are:
 Integer overflow is a runtime error. Division truncates toward zero. Division
 or remainder by zero is a runtime error.
 
-Lists may contain values of different kinds in the dynamic baseline. The
-static type system will require a common element type.
+The elements of a list share one static type (`TYPES-AND-EFFECTS.md`).
 
 Records preserve their source field order for rendering. A record literal or
 record type cannot repeat a field name. Record equality is structural by field
@@ -233,10 +369,29 @@ The binding extends from the following item in the current scope to the end of
 that scope.
 
 A lexical scope cannot declare the same name more than once. This applies
-across `let` and function declarations in that scope. A nested scope may
+across `let` and function declarations in that scope. The discard name `_` is
+the only exception (below). A nested scope may
 shadow a name from an outer scope. A binding cannot be read before its
 declaration. `krit check` enforces these rules as a deliberate readability
-constraint for both human- and AI-authored code.
+constraint for both human- and AI-authored code, and `krit run` enforces them
+by checking first (section 14).
+
+The identifier `_` alone is the discard name. It is exempt from the
+one-declaration rule: any number of `let` bindings, function declarations,
+parameters, and match binders in one scope may use it, including both names of
+one `[_, .._]` list pattern. A program should bind `_` only for a value it
+does not use. Reading `_` as a value, that is, an identifier expression `_`
+that resolves to a binding, is valid in edition 2026 and refers to the most
+recent `_` binding in scope, exactly as shadowing does, but checking reports
+warning `K2003`; edition 2027 makes it an error. An identifier expression `_`
+with no `_` binding in scope is an undefined name (`K2001`). Warnings never
+change whether a program checks or runs (`DIAGNOSTICS.md`).
+
+A lexical binding shadows a built-in name of the same spelling for the
+binding's whole scope, in checking and evaluation alike. `let`, function, and
+parameter names cannot reuse a built-in name (`K2002`). A match binder can
+reuse a built-in name that the parser does not reserve, such as `state_get`,
+and within its arm the name refers to the binder.
 
 Function declarations are visible from their declaration to the end of their
 containing scope and may call themselves recursively. Mutually recursive
@@ -250,7 +405,7 @@ single exported host entrypoint.
 Krit uses lexical scope. A function expression captures bindings from the
 environment where it is created, not where it is called.
 
-Duplicate parameters are a compile error.
+Duplicate parameters are a compile error, except for the discard name `_`.
 
 ## 8. Functions and calls
 
@@ -265,7 +420,8 @@ let add_one = fn(value) {
 ```
 
 Arguments evaluate from left to right. The argument count must equal the
-parameter count. Calling a non-function is a runtime error.
+parameter count, and only a function can be called; checking reports either
+violation before evaluation (section 14).
 
 Function values and opaque `Secret` values cannot be compared, including when
 nested in an ordinary structural value.
@@ -284,9 +440,10 @@ fn attempt(value: Int) -> Result<Int, String> {
 
 Annotations are parsed and retained by the compiler. `krit check` enforces
 them through static analysis without executing the program. `krit run`
-remains the transitional direct dynamic evaluator and preserves runtime
-conformance behavior, but preflights valid webhook/configuration/secret
-contracts so unavailable hosts fail explicitly rather than fabricating a
+performs the same checking before it evaluates anything and refuses a
+program that fails it (section 14), so annotations hold in direct evaluation
+too. It then refuses checked programs that need an entrypoint or host
+contract so unavailable hosts fail explicitly rather than fabricating a
 value. Static checking is specified in `TYPES-AND-EFFECTS.md`.
 
 ## 8.1 Webhook contract types
@@ -364,8 +521,9 @@ if condition {
 ```
 
 The condition must be boolean. Only the selected branch evaluates.
-`else if` is accepted through the grammar above. Both branches should
-eventually have the same static type.
+`else if` is accepted through the grammar above; a continuation does not add
+a nesting level (section 4.1). Both branches should eventually have the same
+static type.
 
 ## 11. Records, lists, and matching
 
@@ -379,6 +537,12 @@ println(response.status);
 The `record` prefix distinguishes a record literal from a block. Fields
 evaluate from left to right. Accessing a field requires a record containing
 that field.
+
+Values have no methods. `value.name(arguments)` reads field `name` of the
+record `value` and calls the function stored there. When `value` has no such
+field, because it is not a record or is a record without that field, checking
+reports the method call (`K3011`) with the standard-library function to use
+instead when there is one, such as `string_byte_len(s)` for `s.len()`.
 
 List literal:
 
@@ -403,8 +567,9 @@ The subject evaluates once and must be a list.
 - `tail` receives the remaining immutable list.
 - Pattern bindings exist only in the non-empty arm.
 
-The two pattern names must differ. Both arms are mandatory and their order is
-fixed, making the match visibly exhaustive.
+The two pattern names must differ unless both are the discard name `_`
+(section 7). Both arms are mandatory and their order is fixed, making the
+match visibly exhaustive.
 
 `Option` and `Result` matches contain exactly the two variants of one family.
 Their arms may appear in either order:
@@ -621,27 +786,72 @@ with explicit immutable host inputs.
 
 ## 14. Evaluation failure
 
-The following are errors rather than implementation-defined behavior:
+`krit run` first checks the source exactly as `krit check` does: lexing,
+parsing, name resolution, type, effect, and capability analysis, and Core
+verification. It never runs the WebAssembly target check that `krit check`
+adds for `--target` or for entrypoint files (`DIAGNOSTICS.md`, Build-target
+diagnostics), because direct evaluation builds no artifact. A program that
+fails checking is never evaluated: `run` reports the same diagnostic with the
+same exit status as `check` and writes no program output. Warnings that checking reports, such as `K2003`, are
+printed exactly as `check` prints them and never prevent evaluation.
+
+A program that passes checking is still refused before evaluation, with
+`K5003` and exit status 4, when it declares a webhook, queue, or schedule
+entrypoint or requires any host capability, because direct evaluation
+provides no entrypoint invocation and no host other than standard output.
+
+The following are errors rather than implementation-defined behavior.
+Checking reports these, so a program containing one is never evaluated:
 
 - malformed UTF-8 or tokens
 - malformed syntax
 - unresolved names
-- integer literal outside signed 64-bit range
-- integer overflow
 - wrong operand, condition, subject, or callee kind
 - incorrect argument count
-- division or remainder by zero
 - function comparison
 - missing record field
 - JSON encoding of a function
 - non-literal configuration, secret, HTTP-origin, AI-adapter, log-event,
   state-store, checkpoint, or replay-operation resource
 - printing, comparing, encoding, or structurally storing an opaque secret
-- unavailable webhook, configuration, secret, HTTP, AI, or logging direct-run
-  host contract
-- invalid or unsupported JSON
 
-Evaluation stops at the first error. Errors follow `DIAGNOSTICS.md`.
+Evaluation reports these:
+
+- integer literal outside signed 64-bit range
+- integer overflow
+- division or remainder by zero
+- invalid or unsupported JSON
+- a value decoded by `json_decode` that does not have the kind or fields its
+  use requires (`K4001`), because decoding does not validate the inferred type
+- more than 10,000 active function calls, more than 100,000 nested
+  expression and block evaluations, or a list, record, or variant value
+  nesting more than 10,000 levels, in direct evaluation (`K4010`)
+
+Evaluation stops at the first error. Errors follow `DIAGNOSTICS.md`. The
+evaluator keeps its own kind, callee, arity, comparison, and encoding checks
+(`K4001`, `K4002`, `K4003`, `K4006`, `K4008`). In a checked program only a
+decoded JSON value can fail one of them; otherwise they make a program
+evaluated without checking, which `krit run` never does, fail with a
+diagnostic.
+
+The direct-evaluation limits count active frames, not total work: sequential
+calls that each recurse 9,000 levels deep are valid. A typical recursive
+function evaluates three to six nested expressions per call, so it reaches the
+call limit first; a function body nested unusually deeply reaches the
+evaluation limit first. The value limit applies when a list, record, or
+variant is built. A checked program's values nest no deeper than their static
+types (which section 4.1 bounds far below 10,000 levels) plus the JSON
+decoder's own small nesting bound, so `krit run` never reaches the value
+limit; it bounds programs evaluated without checking, such as a function that
+wraps its argument in one more list on every call. Printing, comparing,
+JSON-encoding, and releasing a value therefore recurse at most 10,000 levels,
+and releasing a long chain of closures that each capture the previous one
+does not recurse once per closure.
+
+`krit run` evaluates on a dedicated thread with a 1 GiB stack reservation.
+The most stack measured at these limits is about 120 MiB in optimized builds
+and 500 MiB in unoptimized builds, so `K4010` is reported before the native
+stack is exhausted.
 
 ## 15. Determinism
 

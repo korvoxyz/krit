@@ -14,6 +14,8 @@ use crate::{
         Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral,
         VariantFamily, VariantName,
     },
+    habits::{MethodReceiver, method_hint, undefined_name_note},
+    limits::{MAX_NESTING_DEPTH, MAX_TREE_DEPTH, tree_depth_error},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -715,9 +717,44 @@ impl fmt::Display for RequirementSet {
     }
 }
 
+/// Analyzes `program` and returns its analysis or the first error.
+///
+/// Warnings are discarded; [`analyze_with_warnings`] performs the same
+/// analysis and also returns them.
 pub fn analyze(program: &Program) -> Result<Analysis, Diagnostic> {
-    Analyzer::new().program(program)
+    analyze_with_warnings(program).result
 }
+
+/// The outcome of analyzing a program together with its warnings.
+///
+/// Warnings never decide the outcome: a program that analysis accepts still
+/// produces an [`Analysis`] when it has warnings, and a program that analysis
+/// rejects still reports every warning found before its error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalysisReport {
+    /// The analysis, or the first error that rejected the program.
+    pub result: Result<Analysis, Diagnostic>,
+    /// Every warning analysis found, ordered by source span and then code.
+    pub warnings: Vec<Diagnostic>,
+}
+
+/// Analyzes `program` exactly as [`analyze`] does and also returns the
+/// warnings found, whether analysis succeeds or fails.
+pub fn analyze_with_warnings(program: &Program) -> AnalysisReport {
+    let mut analyzer = Analyzer::new();
+    let result = analyzer.program(program);
+    let mut warnings = analyzer.warnings;
+    warnings.sort_by(|left, right| {
+        left.span()
+            .cmp(&right.span())
+            .then_with(|| left.code().cmp(right.code()))
+    });
+    AnalysisReport { result, warnings }
+}
+
+/// The discard name. Any number of bindings in one scope may use it, and
+/// reading it is warning K2003 in edition 2026.
+const DISCARD: &str = "_";
 
 #[derive(Clone, Debug)]
 enum InferType {
@@ -833,6 +870,25 @@ struct Analyzer {
     host_builtin_references: Vec<(Span, Builtin)>,
     direct_host_builtin_references: BTreeSet<Span>,
     allowed_secret_constructor_spans: BTreeSet<Span>,
+    /// Nested expression and block analyses currently open.
+    depth: usize,
+    /// The resolved height of each root type variable: how many type
+    /// constructors its binding nests with every type variable inside it
+    /// resolved, or 0 while it is unbound. Kept current whenever a binding
+    /// changes and bounded by [`MAX_NESTING_DEPTH`].
+    type_heights: Vec<usize>,
+    /// For each type variable, the type variables whose bindings mention it,
+    /// so a change to its height reaches every type that contains it.
+    type_dependents: Vec<BTreeSet<TypeVariable>>,
+    /// A binding that would have nested an inferred type too deeply; it takes
+    /// precedence over the generic mismatch reported by the failing
+    /// unification.
+    type_depth_error: Option<Diagnostic>,
+    /// Warnings found so far, in analysis order. They never stop analysis.
+    warnings: Vec<Diagnostic>,
+    /// The span of the field access `call` is about to analyze as its callee,
+    /// so a failed access reports the method call it is part of (`K3011`).
+    method_callee: Option<Span>,
 }
 
 #[derive(Clone)]
@@ -858,10 +914,16 @@ impl Analyzer {
             host_builtin_references: Vec::new(),
             direct_host_builtin_references: BTreeSet::new(),
             allowed_secret_constructor_spans: BTreeSet::new(),
+            depth: 0,
+            type_heights: Vec::new(),
+            type_dependents: Vec::new(),
+            type_depth_error: None,
+            warnings: Vec::new(),
+            method_callee: None,
         }
     }
 
-    fn program(mut self, program: &Program) -> Result<Analysis, Diagnostic> {
+    fn program(&mut self, program: &Program) -> Result<Analysis, Diagnostic> {
         let mut effects = InferEffects::default();
         for statement in &program.statements {
             effects.union(self.statement(statement)?);
@@ -871,7 +933,7 @@ impl Analyzer {
 
         let expanded_effects = self.expanded_effects();
         let expanded_requirements = self.expanded_requirements();
-        let mut normalizer = TypeNormalizer::new(&self, &expanded_effects, &expanded_requirements);
+        let mut normalizer = TypeNormalizer::new(self, &expanded_effects, &expanded_requirements);
         let bindings = self
             .bindings
             .iter()
@@ -1167,7 +1229,28 @@ impl Analyzer {
         }
     }
 
+    /// Counts one level of analyzer recursion.
+    ///
+    /// The parser's structural limit keeps every source program within
+    /// [`MAX_TREE_DEPTH`], and `else if` and binary-operator chains are
+    /// analyzed iteratively, so this only rejects hand-built syntax trees that
+    /// bypassed the parser.
+    fn enter(&mut self, span: Span) -> Result<(), Diagnostic> {
+        if self.depth >= MAX_TREE_DEPTH {
+            return Err(tree_depth_error(span));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
     fn block(&mut self, block: &Block) -> Result<ExpressionInfo, Diagnostic> {
+        self.enter(block.span)?;
+        let info = self.block_contents(block);
+        self.depth -= 1;
+        info
+    }
+
+    fn block_contents(&mut self, block: &Block) -> Result<ExpressionInfo, Diagnostic> {
         self.push_scope();
         let mut effects = InferEffects::default();
         for statement in &block.statements {
@@ -1191,6 +1274,16 @@ impl Analyzer {
     }
 
     fn expression(&mut self, expression: &Expression) -> Result<ExpressionInfo, Diagnostic> {
+        self.enter(expression.span)?;
+        let info = self.expression_contents(expression);
+        self.depth -= 1;
+        info
+    }
+
+    fn expression_contents(
+        &mut self,
+        expression: &Expression,
+    ) -> Result<ExpressionInfo, Diagnostic> {
         let mut resolved_name = None;
         let info = match &expression.kind {
             ExpressionKind::Literal(literal) => Ok(ExpressionInfo {
@@ -1203,6 +1296,13 @@ impl Analyzer {
             }),
             ExpressionKind::Variable(name) => {
                 let (ty, resolution) = self.lookup(name, expression.span)?;
+                if name == DISCARD && matches!(resolution, ResolvedName::Symbol(_)) {
+                    self.warnings.push(Diagnostic::warning(
+                        "K2003",
+                        "`_` is a discard; reading it will be an error in edition 2027",
+                        expression.span,
+                    ));
+                }
                 if matches!(
                     resolution,
                     ResolvedName::Builtin(
@@ -1277,40 +1377,25 @@ impl Analyzer {
                 })
             }
             ExpressionKind::FieldAccess { value, field } => {
-                let value = self.expression(value)?;
-                let ty = self.require_field(value.ty, field, expression.span)?;
+                let called = self.method_callee.take() == Some(expression.span);
+                let receiver = value;
+                let value = self.expression(receiver)?;
+                let receiver_type = called.then(|| value.ty.clone());
+                let ty = self
+                    .require_field(value.ty, field, expression.span)
+                    .map_err(|error| match receiver_type {
+                        Some(receiver_type) if error.code() == "K3004" => {
+                            self.method_call_error(&receiver_type, receiver, field, expression.span)
+                        }
+                        _ => error,
+                    })?;
                 Ok(ExpressionInfo {
                     ty,
                     effects: value.effects,
                 })
             }
             ExpressionKind::Block(block) => self.block(block),
-            ExpressionKind::If {
-                condition,
-                consequent,
-                alternative,
-            } => {
-                let condition_source_span = condition.span;
-                let condition = self.expression(condition)?;
-                self.unify(
-                    InferType::Bool,
-                    condition.ty,
-                    condition_source_span,
-                    "if condition",
-                )?;
-                let consequent = self.block(consequent)?;
-                let alternative = self.expression(alternative)?;
-                let ty = self.unify(
-                    consequent.ty,
-                    alternative.ty,
-                    expression.span,
-                    "if branches",
-                )?;
-                let mut effects = condition.effects;
-                effects.union(consequent.effects);
-                effects.union(alternative.effects);
-                Ok(ExpressionInfo { ty, effects })
-            }
+            ExpressionKind::If { .. } => self.if_chain(expression),
             ExpressionKind::Function {
                 parameters,
                 return_type,
@@ -1334,18 +1419,96 @@ impl Analyzer {
                     effects: operand.effects,
                 })
             }
-            ExpressionKind::Binary {
-                left,
-                operator,
-                right,
-            } => self.binary(left, *operator, right, expression.span),
+            ExpressionKind::Binary { .. } => self.binary_chain(expression),
         }?;
+        self.record_expression(expression.span, &info, resolved_name);
+        Ok(info)
+    }
+
+    fn record_expression(
+        &mut self,
+        span: Span,
+        info: &ExpressionInfo,
+        resolved_name: Option<ResolvedName>,
+    ) {
         self.expressions.push(PendingExpression {
-            span: expression.span,
+            span,
             ty: info.ty.clone(),
             effects: info.effects.clone(),
             resolved_name,
         });
+    }
+
+    /// Analyzes an `if` expression and its whole `else if` chain.
+    ///
+    /// The chain is walked iteratively so its length never deepens analyzer
+    /// recursion. Conditions and consequents are analyzed in source order and
+    /// branch types are unified from the innermost link outward, exactly as a
+    /// recursive walk would.
+    fn if_chain(&mut self, expression: &Expression) -> Result<ExpressionInfo, Diagnostic> {
+        let mut links = Vec::new();
+        let mut current = expression;
+        let mut info = loop {
+            let ExpressionKind::If {
+                condition,
+                consequent,
+                alternative,
+            } = &current.kind
+            else {
+                break self.expression(current)?;
+            };
+            let condition_source_span = condition.span;
+            let condition = self.expression(condition)?;
+            self.unify(
+                InferType::Bool,
+                condition.ty,
+                condition_source_span,
+                "if condition",
+            )?;
+            let consequent = self.block(consequent)?;
+            links.push((current.span, condition.effects, consequent));
+            current = alternative;
+        };
+        while let Some((span, condition_effects, consequent)) = links.pop() {
+            let ty = self.unify(consequent.ty, info.ty, span, "if branches")?;
+            let mut effects = condition_effects;
+            effects.union(consequent.effects);
+            effects.union(info.effects);
+            info = ExpressionInfo { ty, effects };
+            // The outermost link is recorded by `expression`.
+            if !links.is_empty() {
+                self.record_expression(span, &info, None);
+            }
+        }
+        Ok(info)
+    }
+
+    /// Analyzes a left-nested chain of binary operators such as `a + b + c`.
+    ///
+    /// The left spine is walked iteratively so a long chain never deepens
+    /// analyzer recursion; operands are still analyzed left to right.
+    fn binary_chain(&mut self, expression: &Expression) -> Result<ExpressionInfo, Diagnostic> {
+        let mut spine = Vec::new();
+        let mut current = expression;
+        while let ExpressionKind::Binary { left, .. } = &current.kind {
+            spine.push(current);
+            current = left;
+        }
+        let mut info = self.expression(current)?;
+        while let Some(node) = spine.pop() {
+            let ExpressionKind::Binary {
+                operator, right, ..
+            } = &node.kind
+            else {
+                unreachable!("the binary spine holds only binary expressions")
+            };
+            let right = self.expression(right)?;
+            info = self.binary(info, *operator, right, node.span)?;
+            // The outermost operator is recorded by `expression`.
+            if !spine.is_empty() {
+                self.record_expression(node.span, &info, None);
+            }
+        }
         Ok(info)
     }
 
@@ -1637,6 +1800,9 @@ impl Analyzer {
         } else {
             Vec::new()
         };
+        if matches!(callee.kind, ExpressionKind::FieldAccess { .. }) {
+            self.method_callee = Some(callee.span);
+        }
         let callee_info = self.expression(callee)?;
         let mut effects = callee_info.effects;
         let mut argument_types = Vec::with_capacity(arguments.len());
@@ -1672,11 +1838,22 @@ impl Analyzer {
                 (parameters, return_type, effect)
             }
             other => {
-                return Err(Diagnostic::new(
+                let diagnostic = Diagnostic::new(
                     "K3002",
                     format!("cannot call value of type `{}`", self.render_type(&other)),
                     callee.span,
-                ));
+                );
+                // `None()`: the reserved name always means the built-in.
+                return Err(
+                    if matches!(&callee.kind, ExpressionKind::Variable(name) if name == "None") {
+                        diagnostic.with_note(
+                            "`None` is a value, not a function: write `None` without \
+                             parentheses, or `Some(value)` for a present value",
+                        )
+                    } else {
+                        diagnostic
+                    },
+                );
             }
         };
 
@@ -1755,10 +1932,12 @@ impl Analyzer {
             MatchKind::List {
                 empty_case,
                 head_name,
+                head_span,
                 tail_name,
+                tail_span,
                 cons_case,
             } => {
-                if head_name == tail_name {
+                if head_name == tail_name && head_name != DISCARD {
                     return Err(Diagnostic::new(
                         "K2002",
                         format!("duplicate match binding `{tail_name}`"),
@@ -1774,11 +1953,17 @@ impl Analyzer {
                 )?;
                 let empty = self.expression(empty_case)?;
                 self.push_scope();
-                self.define_symbol(head_name, element.clone(), span, SymbolKind::Match, false);
+                self.define_symbol(
+                    head_name,
+                    element.clone(),
+                    *head_span,
+                    SymbolKind::Match,
+                    false,
+                );
                 self.define_symbol(
                     tail_name,
                     InferType::List(Box::new(element)),
-                    span,
+                    *tail_span,
                     SymbolKind::Match,
                     false,
                 );
@@ -1858,13 +2043,11 @@ impl Analyzer {
 
     fn binary(
         &mut self,
-        left: &Expression,
+        left: ExpressionInfo,
         operator: BinaryOperator,
-        right: &Expression,
+        right: ExpressionInfo,
         span: Span,
     ) -> Result<ExpressionInfo, Diagnostic> {
-        let left = self.expression(left)?;
-        let right = self.expression(right)?;
         let mut effects = left.effects;
         effects.union(right.effects);
 
@@ -2046,17 +2229,18 @@ impl Analyzer {
                 if let Some(existing) = self.substitutions.get(&variable).cloned() {
                     let (field_type, widened) =
                         self.require_field_and_widen(existing, field, span)?;
-                    self.substitutions.insert(variable, widened);
+                    self.set_binding(variable, widened, span)?;
                     Ok(field_type)
                 } else {
                     let field_type = self.fresh_type();
-                    self.substitutions.insert(
+                    self.set_binding(
                         variable,
                         InferType::Record {
                             fields: BTreeMap::from([(field.to_owned(), field_type.clone())]),
                             open: true,
                         },
-                    );
+                        span,
+                    )?;
                     Ok(field_type)
                 }
             }
@@ -2122,8 +2306,9 @@ impl Analyzer {
         span: Span,
         context: &str,
     ) -> Result<InferType, Diagnostic> {
-        self.unify_inner(expected.clone(), actual.clone(), span)
-            .map_err(|()| {
+        match self.unify_inner(expected.clone(), actual.clone(), span) {
+            Ok(unified) => Ok(unified),
+            Err(()) => Err(self.type_depth_error.take().unwrap_or_else(|| {
                 Diagnostic::new(
                     "K3001",
                     format!(
@@ -2133,7 +2318,8 @@ impl Analyzer {
                     ),
                     span,
                 )
-            })
+            })),
+        }
     }
 
     fn unify_inner(
@@ -2261,24 +2447,36 @@ impl Analyzer {
                 } else {
                     (right, left)
                 };
-                self.type_parents[alias as usize] = root;
+                self.alias_variable(alias, root, span).map_err(|_| ())?;
                 Ok(InferType::Variable(root))
             }
             (Some(binding), None) => {
                 if self.occurs(right, &binding) {
                     return Err(());
                 }
-                self.type_parents[right as usize] = left;
+                self.alias_variable(right, left, span).map_err(|_| ())?;
                 Ok(InferType::Variable(left))
             }
             (None, Some(binding)) => {
                 if self.occurs(left, &binding) {
                     return Err(());
                 }
-                self.type_parents[left as usize] = right;
+                self.alias_variable(left, right, span).map_err(|_| ())?;
                 Ok(InferType::Variable(right))
             }
             (Some(left_binding), Some(right_binding)) => {
+                // Both bindings are detached while they are unified, so the
+                // occurs checks made meanwhile cannot see through `left` or
+                // `right`. A binding that mentions the other variable would
+                // make the merged type infinite, and unifying it could bind a
+                // variable inside one binding to a type containing the other,
+                // leaving a cycle that every later walk over types would
+                // follow forever (`let e = []; let w = [[e]]; e == w;`).
+                // Reject it first; otherwise neither variable is reachable
+                // from either binding, and the checks below stay exact.
+                if self.occurs(left, &right_binding) || self.occurs(right, &left_binding) {
+                    return Err(());
+                }
                 self.substitutions.remove(&left);
                 self.substitutions.remove(&right);
                 let unified =
@@ -2300,8 +2498,8 @@ impl Analyzer {
                 } else {
                     (right, left)
                 };
-                self.type_parents[alias as usize] = root;
-                self.substitutions.insert(root, unified);
+                self.alias_variable(alias, root, span).map_err(|_| ())?;
+                self.set_binding(root, unified, span).map_err(|_| ())?;
                 Ok(InferType::Variable(root))
             }
         }
@@ -2349,27 +2547,34 @@ impl Analyzer {
         context: &str,
     ) -> Result<InferType, Diagnostic> {
         let variable = self.root_variable(variable);
+        // A depth failure stays recorded in `type_depth_error` (cloned, not
+        // taken) so an enclosing `unify` still reports it instead of a
+        // generic mismatch.
         if let InferType::Variable(other) = ty {
             return self.unify_variables(variable, other, span).map_err(|()| {
-                Diagnostic::new(
-                    "K3001",
-                    format!("{context} would create an infinite type"),
-                    span,
-                )
+                self.type_depth_error.clone().unwrap_or_else(|| {
+                    Diagnostic::new(
+                        "K3001",
+                        format!("{context} would create an infinite type"),
+                        span,
+                    )
+                })
             });
         }
         if let Some(existing) = self.substitutions.get(&variable).cloned() {
-            let unified = self.unify_inner(existing, ty.clone(), span).map_err(|()| {
-                Diagnostic::new(
-                    "K3001",
-                    format!(
-                        "{context} type mismatch: incompatible with `{}`",
-                        self.render_type(&ty)
-                    ),
-                    span,
-                )
-            })?;
-            self.substitutions.insert(variable, unified);
+            let Ok(unified) = self.unify_inner(existing, ty.clone(), span) else {
+                return Err(self.type_depth_error.clone().unwrap_or_else(|| {
+                    Diagnostic::new(
+                        "K3001",
+                        format!(
+                            "{context} type mismatch: incompatible with `{}`",
+                            self.render_type(&ty)
+                        ),
+                        span,
+                    )
+                }));
+            };
+            self.set_binding(variable, unified, span)?;
             return Ok(InferType::Variable(variable));
         }
         if self.occurs(variable, &ty) {
@@ -2379,8 +2584,206 @@ impl Analyzer {
                 span,
             ));
         }
-        self.substitutions.insert(variable, ty);
+        self.set_binding(variable, ty, span)?;
         Ok(InferType::Variable(variable))
+    }
+
+    /// Makes `ty` the binding of the root type variable `variable`.
+    ///
+    /// Every inferred type deeper than its syntax grows through bindings, so
+    /// this is where inferred types are bounded. Binding a variable can deepen
+    /// not only its own type but every type already containing it (`top`
+    /// below grows when `next` is bound later), so the resolved heights of
+    /// `variable` and of everything depending on it are refreshed, and the
+    /// binding fails with `K1005` if any of them would nest more than
+    /// [`MAX_NESTING_DEPTH`] type constructors:
+    ///
+    /// ```text
+    /// let next = [];
+    /// let top = [[next]];
+    /// let deeper = next == [[[]]];
+    /// ```
+    fn set_binding(
+        &mut self,
+        variable: TypeVariable,
+        ty: InferType,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        for mentioned in self.mentioned_roots(&ty) {
+            self.type_dependents[mentioned as usize].insert(variable);
+        }
+        self.substitutions.insert(variable, ty);
+        self.refresh_type_heights(vec![variable], span)
+    }
+
+    /// Makes `alias` an alias of the root `root`, so every type mentioning
+    /// `alias` now resolves through `root`'s binding.
+    ///
+    /// `root` keeps the larger of the two cached heights, and the types that
+    /// mention either variable are rechecked against it. Rechecking the types
+    /// that mention `root` matters when both variables were solved:
+    /// `unify_variables` detaches both bindings while it unifies them, so
+    /// refreshes during that unification stop at both variables, and their
+    /// merged binding may be no taller than `alias` already was. Those types
+    /// would otherwise keep a stale height and could grow past
+    /// [`MAX_NESTING_DEPTH`] unnoticed (`top` below gains seven levels):
+    ///
+    /// ```text
+    /// let shallow = [[[]]];
+    /// let top = [[[[shallow]]]];
+    /// let deep = [[[[[[[[[[1]]]]]]]]]];
+    /// let grows = shallow == deep;
+    /// ```
+    fn alias_variable(
+        &mut self,
+        alias: TypeVariable,
+        root: TypeVariable,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        self.type_parents[alias as usize] = root;
+        let alias_height = self.type_heights[alias as usize];
+        let mut pending = Vec::new();
+        if alias_height > self.type_heights[root as usize] {
+            self.type_heights[root as usize] = alias_height;
+            pending.extend(self.type_dependents[root as usize].iter().copied());
+        }
+        let dependents = std::mem::take(&mut self.type_dependents[alias as usize]);
+        pending.extend(dependents.iter().copied());
+        self.type_dependents[root as usize].extend(dependents);
+        self.refresh_type_heights(pending, span)
+    }
+
+    /// Recomputes the resolved heights of the `pending` type variables and,
+    /// whenever one grows, of every type variable whose binding mentions it.
+    ///
+    /// Heights only grow and are bounded, so each variable grows at most
+    /// [`MAX_NESTING_DEPTH`] times and the propagation stays linear in the
+    /// size of the bindings. Fails with `K1005` at `span`, the inference step
+    /// being checked, as soon as any height would exceed the bound.
+    fn refresh_type_heights(
+        &mut self,
+        mut pending: Vec<TypeVariable>,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        while let Some(variable) = pending.pop() {
+            let root = self.root_variable(variable);
+            let Some(binding) = self.substitutions.get(&root) else {
+                continue;
+            };
+            let height = self.resolved_height(binding, 0);
+            if height <= self.type_heights[root as usize] {
+                continue;
+            }
+            if height > MAX_NESTING_DEPTH {
+                let error = Diagnostic::new(
+                    "K1005",
+                    format!(
+                        "nesting depth limit exceeded: inferred types may nest at most \
+                         {MAX_NESTING_DEPTH} levels"
+                    ),
+                    span,
+                );
+                self.type_depth_error = Some(error.clone());
+                return Err(error);
+            }
+            self.type_heights[root as usize] = height;
+            pending.extend(self.type_dependents[root as usize].iter().copied());
+        }
+        Ok(())
+    }
+
+    /// Returns how many type constructors `ty` nests, with each type variable
+    /// counted at its cached resolved height, once `depth` constructors
+    /// already enclose it.
+    ///
+    /// The walk stops below `MAX_NESTING_DEPTH + 1` enclosing constructors and
+    /// reports at least that height for anything it cuts off, so its recursion
+    /// is bounded and a result above the limit is exact enough to reject.
+    fn resolved_height(&self, ty: &InferType, depth: usize) -> usize {
+        const CUTOFF: usize = MAX_NESTING_DEPTH + 1;
+        if depth >= CUTOFF {
+            return CUTOFF;
+        }
+        let nested = |children: &mut dyn Iterator<Item = &InferType>| {
+            1 + children
+                .map(|child| self.resolved_height(child, depth + 1))
+                .max()
+                .unwrap_or(0)
+        };
+        match ty {
+            InferType::Variable(variable) => {
+                self.type_heights[self.root_variable(*variable) as usize]
+            }
+            InferType::List(element) | InferType::Option(element) => {
+                nested(&mut std::iter::once(element.as_ref()))
+            }
+            InferType::Result(value, error) => {
+                nested(&mut [value.as_ref(), error.as_ref()].into_iter())
+            }
+            InferType::Record { fields, .. } => nested(&mut fields.values()),
+            InferType::Function {
+                parameters,
+                return_type,
+                ..
+            } => nested(
+                &mut parameters
+                    .iter()
+                    .chain(std::iter::once(return_type.as_ref())),
+            ),
+            InferType::Int
+            | InferType::Bool
+            | InferType::String
+            | InferType::Unit
+            | InferType::HttpHeader
+            | InferType::HttpRequest
+            | InferType::HttpResponse
+            | InferType::LogField
+            | InferType::QueueJob
+            | InferType::ScheduleEvent
+            | InferType::DatabaseTransaction
+            | InferType::Secret => 0,
+        }
+    }
+
+    /// Returns the root of every type variable `ty` mentions directly, without
+    /// following bindings.
+    fn mentioned_roots(&self, ty: &InferType) -> BTreeSet<TypeVariable> {
+        let mut roots = BTreeSet::new();
+        let mut pending = vec![ty];
+        while let Some(ty) = pending.pop() {
+            match ty {
+                InferType::Variable(variable) => {
+                    roots.insert(self.root_variable(*variable));
+                }
+                InferType::List(element) | InferType::Option(element) => pending.push(element),
+                InferType::Result(value, error) => {
+                    pending.push(value);
+                    pending.push(error);
+                }
+                InferType::Record { fields, .. } => pending.extend(fields.values()),
+                InferType::Function {
+                    parameters,
+                    return_type,
+                    ..
+                } => {
+                    pending.extend(parameters);
+                    pending.push(return_type);
+                }
+                InferType::Int
+                | InferType::Bool
+                | InferType::String
+                | InferType::Unit
+                | InferType::HttpHeader
+                | InferType::HttpRequest
+                | InferType::HttpResponse
+                | InferType::LogField
+                | InferType::QueueJob
+                | InferType::ScheduleEvent
+                | InferType::DatabaseTransaction
+                | InferType::Secret => {}
+            }
+        }
+        roots
     }
 
     fn occurs(&self, variable: TypeVariable, ty: &InferType) -> bool {
@@ -2442,11 +2845,15 @@ impl Analyzer {
     }
 
     fn root_variable(&self, variable: TypeVariable) -> TypeVariable {
-        let parent = self.type_parents[variable as usize];
-        if parent == variable {
-            variable
-        } else {
-            self.root_variable(parent)
+        // Iterative: alias chains grow with flat source such as a long list
+        // of distinct unannotated parameters.
+        let mut current = variable;
+        loop {
+            let parent = self.type_parents[current as usize];
+            if parent == current {
+                return current;
+            }
+            current = parent;
         }
     }
 
@@ -2728,8 +3135,69 @@ impl Analyzer {
                 return Ok((binding.ty.clone(), ResolvedName::Symbol(binding.id)));
             }
         }
-        self.builtin(name, span)
-            .ok_or_else(|| Diagnostic::new("K2001", format!("undefined name `{name}`"), span))
+        if let Some(builtin) = self.builtin(name, span) {
+            return Ok(builtin);
+        }
+        let diagnostic = Diagnostic::new("K2001", format!("undefined name `{name}`"), span);
+        // Suggestions come from the names visible here: bindings in scope,
+        // built-ins, and the Boolean literals (`True` -> `true`).
+        let candidates = self
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.keys().map(String::as_str))
+            .chain(Builtin::ALL.iter().map(|builtin| builtin.as_str()))
+            .chain(["true", "false"]);
+        Err(match undefined_name_note(name, candidates) {
+            Some(note) => diagnostic.with_note(note),
+            None => diagnostic,
+        })
+    }
+
+    /// The error for calling `.method()` on `receiver`, a value of
+    /// `receiver_type` that has no field of that name (`K3011`).
+    ///
+    /// Krit values have no methods; `value.name(...)` is valid only as a call
+    /// of a function stored in a record field. The note names the standard
+    /// library function that does the job when one exists or is planned.
+    fn method_call_error(
+        &self,
+        receiver_type: &InferType,
+        receiver: &Expression,
+        method: &str,
+        span: Span,
+    ) -> Diagnostic {
+        let head = self.resolve_head(receiver_type);
+        let rendered = self.render_type(&head);
+        let (kind, message) = match head {
+            InferType::Record { .. }
+            | InferType::HttpHeader
+            | InferType::HttpRequest
+            | InferType::HttpResponse
+            | InferType::LogField
+            | InferType::QueueJob
+            | InferType::ScheduleEvent => (
+                MethodReceiver::Other,
+                format!(
+                    "cannot call `.{method}()`: `{rendered}` has no field `{method}`, and Krit \
+                     values have no methods"
+                ),
+            ),
+            head => (
+                match head {
+                    InferType::String => MethodReceiver::String,
+                    InferType::Int => MethodReceiver::Int,
+                    InferType::List(_) => MethodReceiver::List,
+                    InferType::Option(_) | InferType::Result(..) => MethodReceiver::Variant,
+                    _ => MethodReceiver::Other,
+                },
+                format!(
+                    "cannot call `.{method}()` on a value of type `{rendered}`: Krit values have \
+                     no methods"
+                ),
+            ),
+        };
+        let value = receiver_path(receiver).unwrap_or_else(|| "value".to_owned());
+        Diagnostic::new("K3011", message, span).with_note(method_hint(kind, method, &value))
     }
 
     fn builtin(&mut self, name: &str, span: Span) -> Option<(InferType, ResolvedName)> {
@@ -3156,12 +3624,16 @@ impl Analyzer {
         Some((ty, ResolvedName::Builtin(builtin)))
     }
 
+    /// Rejects a declaration that reuses a built-in name or a name already
+    /// declared in the current scope. The discard name `_` may be declared any
+    /// number of times; reading it refers to the most recent declaration.
     fn ensure_name_available(&self, name: &str, span: Span) -> Result<(), Diagnostic> {
         if Builtin::from_name(name).is_some()
-            || self
-                .scopes
-                .last()
-                .is_some_and(|scope| scope.contains_key(name))
+            || (name != DISCARD
+                && self
+                    .scopes
+                    .last()
+                    .is_some_and(|scope| scope.contains_key(name)))
         {
             Err(Diagnostic::new(
                 "K2002",
@@ -3210,6 +3682,8 @@ impl Analyzer {
         let variable = self.next_type_variable;
         self.next_type_variable += 1;
         self.type_parents.push(variable);
+        self.type_heights.push(0);
+        self.type_dependents.push(BTreeSet::new());
         InferType::Variable(variable)
     }
 
@@ -3381,6 +3855,30 @@ impl<'a> TypeNormalizer<'a> {
             }
         }
     }
+}
+
+/// The source spelling of a method call's receiver when it is a name or a
+/// short field path (`s`, `request.body`), for use in a fix; `None` for any
+/// other expression.
+fn receiver_path(receiver: &Expression) -> Option<String> {
+    const MAX_FIELDS: usize = 4;
+    let mut fields = Vec::new();
+    let mut current = receiver;
+    loop {
+        match &current.kind {
+            ExpressionKind::Variable(name) => {
+                fields.push(name.as_str());
+                break;
+            }
+            ExpressionKind::FieldAccess { value, field } if fields.len() < MAX_FIELDS => {
+                fields.push(field);
+                current = value;
+            }
+            _ => return None,
+        }
+    }
+    fields.reverse();
+    Some(fields.join("."))
 }
 
 fn contract_record(nominal: &InferType) -> InferType {
@@ -3580,7 +4078,12 @@ fn type_variable_name(id: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Source, parse_source};
+    use crate::{
+        Source,
+        habits::Habit,
+        limits::deepest::{self, Level},
+        parse_source,
+    };
 
     use super::*;
 
@@ -3734,6 +4237,118 @@ mod tests {
         let duplicate_nested =
             check("{ let value = 1; let value = 2; };").expect_err("same block should fail");
         assert_eq!(duplicate_nested.code(), "K2002");
+    }
+
+    fn check_with_warnings(text: &str) -> AnalysisReport {
+        let source = Source::new("test.krit", text);
+        analyze_with_warnings(&parse_source(&source).expect("source should parse"))
+    }
+
+    fn warning_codes(warnings: &[Diagnostic]) -> Vec<&'static str> {
+        warnings.iter().map(Diagnostic::code).collect()
+    }
+
+    #[test]
+    fn reading_a_discard_warns_without_rejecting_the_program() {
+        let text = "let _ = 1;\nprintln(_);";
+        let report = check_with_warnings(text);
+
+        assert_eq!(report.warnings.len(), 1);
+        let warning = &report.warnings[0];
+        assert_eq!(warning.severity(), crate::Severity::Warning);
+        assert_eq!(warning.code(), "K2003");
+        assert_eq!(
+            warning.message(),
+            "`_` is a discard; reading it will be an error in edition 2027"
+        );
+        assert_eq!(warning.span(), Span::new(19, 20));
+        let analysis = report.result.expect("reading `_` should still check");
+        assert_eq!(
+            check(text).expect("analyze should accept the same program"),
+            analysis
+        );
+
+        let unbound = check_with_warnings("println(_);");
+        assert_eq!(
+            unbound
+                .result
+                .expect_err("an unbound `_` is undefined")
+                .code(),
+            "K2001"
+        );
+        assert!(unbound.warnings.is_empty());
+
+        let unread =
+            check_with_warnings("let _ = 1; let _ = 2; fn ignore(_, _) { 0 } ignore(1, 2);");
+        unread
+            .result
+            .expect("binding `_` without reading it should check");
+        assert!(unread.warnings.is_empty());
+    }
+
+    #[test]
+    fn discard_may_be_bound_repeatedly_and_reads_the_most_recent_binding() {
+        // Each annotation holds only if `_` refers to the most recent binding.
+        let report = check_with_warnings(
+            r#"
+            let _ = 1;
+            let _ = "two";
+            let text: String = _;
+            fn pick(_, _: Bool) { _ }
+            let flag: Bool = pick(1, true);
+            let rest: List<Int> = match [1, 2] {
+                [] => [],
+                [_, .._] => _,
+            };
+            let ignore = fn(_, _) { 0 };
+            fn _() { 3 }
+            fn _() { 4 }
+            "#,
+        );
+
+        report.result.expect("repeated discards should check");
+        assert_eq!(warning_codes(&report.warnings), ["K2003", "K2003", "K2003"]);
+        assert!(
+            report
+                .warnings
+                .windows(2)
+                .all(|pair| pair[0].span() < pair[1].span()),
+            "warnings should be in source order"
+        );
+
+        for (text, message) in [
+            (
+                "let value = 1; let value = 2;",
+                "duplicate declaration `value`",
+            ),
+            (
+                "fn pair(value, value) { value }",
+                "duplicate parameter `value`",
+            ),
+            (
+                "match [1] { [] => 0, [value, ..value] => 1 };",
+                "duplicate match binding `value`",
+            ),
+        ] {
+            let error = check(text).expect_err("non-discard duplicates should still fail");
+            assert_eq!(error.code(), "K2002", "{text}");
+            assert_eq!(error.message(), message, "{text}");
+        }
+    }
+
+    #[test]
+    fn reports_warnings_found_before_an_error() {
+        let report = check_with_warnings("let _ = 1;\nlet text = _ + \"a\";");
+
+        assert_eq!(
+            report
+                .result
+                .expect_err("the type error should still reject the program")
+                .code(),
+            "K3001"
+        );
+        assert_eq!(warning_codes(&report.warnings), ["K2003"]);
+        assert_eq!(report.warnings[0].span(), Span::new(22, 23));
     }
 
     #[test]
@@ -3954,6 +4569,470 @@ mod tests {
     }
 
     #[test]
+    fn analyzes_long_else_if_and_operator_chains_iteratively() {
+        // Runs on the default test stack: recursive analysis of either chain
+        // would need far more.
+        let mut text = String::from("fn pick(n) {\n    if n == 0 {\n        0\n    }");
+        for branch in 1..1_000 {
+            text.push_str(&format!(
+                " else if n == {branch} {{\n        {branch}\n    }}"
+            ));
+        }
+        text.push_str(" else {\n        -1\n    }\n}\n\nlet total = 0");
+        text.push_str(&" + pick(1)".repeat(4_000));
+        text.push_str(";\nprintln(total);\n");
+        let source = Source::new("test.krit", text);
+        let program = parse_source(&source).expect("long chains should parse");
+        let analysis = analyze(&program).expect("long chains should analyze");
+
+        let StatementKind::Function { body, .. } = &program.statements[0].kind else {
+            panic!("first statement should be a function");
+        };
+        let mut current = body.tail.as_deref().expect("function should have a tail");
+        let mut links = 0;
+        while let ExpressionKind::If { alternative, .. } = &current.kind {
+            let fact = analysis
+                .expression(current.span)
+                .expect("every else-if link should have a fact");
+            assert_eq!(fact.ty(), &Type::Int);
+            links += 1;
+            current = alternative;
+        }
+        assert_eq!(links, 1_000);
+
+        let StatementKind::Let { value, .. } = &program.statements[1].kind else {
+            panic!("second statement should be a let");
+        };
+        let mut current = value;
+        let mut operators = 0;
+        while let ExpressionKind::Binary { left, .. } = &current.kind {
+            let fact = analysis
+                .expression(current.span)
+                .expect("every chained operator should have a fact");
+            assert_eq!(fact.ty(), &Type::Int);
+            operators += 1;
+            current = left;
+        }
+        assert_eq!(operators, 4_000);
+    }
+
+    #[test]
+    fn analyzes_every_tree_the_parser_accepts() {
+        // A block expression counts two levels of analysis recursion for its
+        // one syntactic level and an `else` block three, so 256 nested `else`
+        // blocks at the structural limit need `MAX_TREE_DEPTH - 1` levels.
+        for level in [Level::Else, Level::Block] {
+            check_on_compiler_stack(deepest::source(level, 0)).unwrap_or_else(|error| {
+                panic!("{level:?}: the deepest accepted tree should analyze: {error:?}")
+            });
+            let error = check_on_compiler_stack(deepest::source(level, 1))
+                .expect_err("one more link should exceed the structural limit");
+            assert_eq!(error.code(), "K1005", "{level:?}");
+            assert!(
+                error.message().contains("4096"),
+                "{level:?}: {}",
+                error.message()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_hand_built_syntax_trees_beyond_the_tree_limit() {
+        let depth = MAX_TREE_DEPTH + 10;
+        let error = crate::run_on_thread("analysis-test", crate::COMPILER_STACK_BYTES, move || {
+            let mut expression = Expression {
+                kind: ExpressionKind::Literal(ValueLiteral::Boolean(true)),
+                span: Span::new(depth, depth + 4),
+            };
+            for level in 1..=depth {
+                expression = Expression {
+                    kind: ExpressionKind::Unary {
+                        operator: UnaryOperator::Not,
+                        operand: Box::new(expression),
+                    },
+                    span: Span::new(depth - level, depth + 4),
+                };
+            }
+            let program = Program {
+                statements: vec![Statement {
+                    kind: StatementKind::Expression(expression),
+                    span: Span::new(0, depth + 5),
+                }],
+            };
+            analyze(&program).expect_err("an over-deep syntax tree should be rejected")
+        })
+        .expect("analysis test thread should start");
+        assert_eq!(error.code(), "K1005");
+        assert!(
+            error.message().contains("syntax tree"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn rejects_inferred_types_nested_beyond_the_limit() {
+        let chain = |levels: usize| {
+            let mut text = String::from("let level0 = 0;\n");
+            for level in 1..=levels {
+                text.push_str(&format!("let level{level} = [level{}];\n", level - 1));
+            }
+            text
+        };
+        let analysis = check(&chain(MAX_NESTING_DEPTH)).expect("types at the limit should analyze");
+        assert!(
+            analysis
+                .bindings()
+                .last()
+                .expect("chain should bind")
+                .ty()
+                .to_string()
+                .starts_with("List<List<")
+        );
+
+        let text = chain(MAX_NESTING_DEPTH + 1);
+        let error = check(&text).expect_err("one more level should be rejected");
+        assert_eq!(error.code(), "K1005");
+        assert!(
+            error.message().contains("inferred types"),
+            "{}",
+            error.message()
+        );
+        let crossing = format!("let level{} =", MAX_NESTING_DEPTH + 1);
+        assert_eq!(
+            error.span().start,
+            text.find(&crossing).expect("crossing binding should exist")
+        );
+
+        // Long chains fail at the same binding instead of slowing analysis.
+        let error = check(&chain(5_000)).expect_err("a long chain should be rejected");
+        assert_eq!(error.code(), "K1005");
+    }
+
+    fn list_depth(ty: &Type) -> usize {
+        ty.to_string().matches("List<").count()
+    }
+
+    /// Checks on the stack the CLI gives the compiler pipeline; unoptimized
+    /// builds need more than a default test thread to parse 200 levels.
+    fn check_on_compiler_stack(text: String) -> Result<Analysis, Diagnostic> {
+        crate::run_on_thread("analysis-test", crate::COMPILER_STACK_BYTES, move || {
+            check(&text)
+        })
+        .expect("analysis test thread should start")
+    }
+
+    #[test]
+    fn rejects_inferred_types_that_grow_after_they_are_bound() {
+        // `top` is bound first around the still-unknown element type of `e0`;
+        // each later comparison resolves the previous element type to a deeper
+        // list, so `top` grows by `width` levels per step.
+        let program = |steps: usize, width: usize| {
+            let wrap = |inner: &str| format!("{}{inner}{}", "[".repeat(width), "]".repeat(width));
+            let mut text = format!("let e0 = [];\nlet top = {};\n", wrap("e0"));
+            for step in 1..=steps {
+                text.push_str(&format!(
+                    "let e{step} = [];\nlet c{step} = e{} == {};\n",
+                    step - 1,
+                    wrap(&format!("e{step}"))
+                ));
+            }
+            text
+        };
+        let analysis = check(&program(4, 50)).expect("251 levels should analyze");
+        let top = analysis
+            .bindings()
+            .iter()
+            .find(|binding| binding.name() == "top")
+            .expect("top should be bound");
+        assert_eq!(list_depth(top.ty()), 251);
+
+        let text = program(5, 50);
+        let error = check(&text).expect_err("301 levels should be rejected");
+        assert_eq!(error.code(), "K1005");
+        assert!(
+            error.message().contains("inferred types"),
+            "{}",
+            error.message()
+        );
+        // Reported at the step that deepens `top` past the limit.
+        let step = text.find("let c5 =").expect("fifth step should exist");
+        let line_end = step + text[step..].find('\n').expect("step should end");
+        assert!(
+            (step..line_end).contains(&error.span().start),
+            "{:?}",
+            error.span()
+        );
+
+        // The reviewer's shape: 200 levels per step fails at the first step
+        // instead of growing `top` by 200 levels per binding.
+        let error =
+            check_on_compiler_stack(program(100, 200)).expect_err("deep growth should be rejected");
+        assert_eq!(error.code(), "K1005");
+    }
+
+    #[test]
+    fn rejects_inferred_types_that_grow_through_an_alias() {
+        // The list match makes the unknown element type inside `top` the type
+        // of `head`; unifying the arms then aliases it to the type of `deep`,
+        // so `top` resolves through `deep` without being bound again.
+        let program = |deep: usize| {
+            format!(
+                "let e = [];\nlet top = {}e{};\nlet deep = {}0{};\n\
+                 let h = match e {{ [] => deep, [head, ..rest] => head }};\n",
+                "[".repeat(100),
+                "]".repeat(100),
+                "[".repeat(deep),
+                "]".repeat(deep)
+            )
+        };
+        let analysis = check_on_compiler_stack(program(150)).expect("251 levels should analyze");
+        let top = analysis
+            .bindings()
+            .iter()
+            .find(|binding| binding.name() == "top")
+            .expect("top should be bound");
+        assert_eq!(list_depth(top.ty()), 251);
+
+        let error =
+            check_on_compiler_stack(program(200)).expect_err("301 levels should be rejected");
+        assert_eq!(error.code(), "K1005");
+        assert!(
+            error.message().contains("inferred types"),
+            "{}",
+            error.message()
+        );
+    }
+
+    /// Asserts that `error` is the inferred-type `K1005` reported on the line
+    /// of `text` that starts with `line`.
+    fn assert_inferred_type_limit_at(text: &str, error: &Diagnostic, line: &str) {
+        assert_eq!(error.code(), "K1005", "{}", error.message());
+        assert!(
+            error.message().contains("inferred types"),
+            "{}",
+            error.message()
+        );
+        let start = text.find(line).expect("the crossing line should exist");
+        let end = start + text[start..].find('\n').expect("the line should end");
+        assert!(
+            (start..end).contains(&error.span().start),
+            "expected the error on `{line}`, found {:?}",
+            error.span()
+        );
+    }
+
+    #[test]
+    fn rejects_inferred_types_that_grow_when_two_solved_types_unify() {
+        // `shallow` and `deep` both have solved types. Unifying them solves
+        // the element type inside `shallow` to a seven-level list, which
+        // deepens `top` although the merged type of `shallow` and `deep` is no
+        // deeper than `deep` already was.
+        let program = |width: usize| {
+            format!(
+                "let shallow = [[[]]];\nlet top = {}shallow{};\n\
+                 let deep = [[[[[[[[[[1]]]]]]]]]];\nlet grows = shallow == deep;\n",
+                "[".repeat(width),
+                "]".repeat(width)
+            )
+        };
+        let analysis = check_on_compiler_stack(program(246)).expect("256 levels should analyze");
+        let top = analysis
+            .bindings()
+            .iter()
+            .find(|binding| binding.name() == "top")
+            .expect("top should be bound");
+        assert_eq!(list_depth(top.ty()), 256);
+
+        let text = program(247);
+        let error = check_on_compiler_stack(text.clone()).expect_err("257 levels should fail");
+        assert_inferred_type_limit_at(&text, &error, "let grows =");
+
+        // Repeating the step would stack about 252 levels per step; it fails
+        // at the second step instead of accepting ever deeper types.
+        let mut text = String::from("let s0 = 1;\n");
+        for step in 1..=100 {
+            text.push_str(&format!(
+                "let r{step} = [[]];\nlet top{step} = {}r{step}{};\n\
+                 let a{step} = [[s{}]];\nlet c{step} = r{step} == a{step};\n\
+                 let s{step} = top{step};\n",
+                "[".repeat(250),
+                "]".repeat(250),
+                step - 1
+            ));
+        }
+        let error = check_on_compiler_stack(text.clone()).expect_err("stacked steps should fail");
+        assert_inferred_type_limit_at(&text, &error, "let c2 =");
+    }
+
+    #[test]
+    fn rejects_infinite_types_between_two_solved_types_without_cycles() {
+        // `w` contains `e`, so unifying their solved types would make the
+        // element type of `e` contain itself. Rejecting it must not leave a
+        // cyclic binding for the error message to render forever.
+        for unify in [
+            "e == w",
+            "w == e",
+            "match [e] { [] => w, [head, ..rest] => head }",
+        ] {
+            let text = format!("let e = [];\nlet w = [[e]];\nlet c = {unify};\n");
+            let error = check_on_compiler_stack(text).expect_err("the type would be infinite");
+            assert_eq!(error.code(), "K3001", "{unify}: {}", error.message());
+        }
+    }
+
+    /// Recomputes the resolved height of `ty` from the solved bindings alone,
+    /// without the analyzer's cached heights.
+    fn exact_height(
+        analyzer: &Analyzer,
+        ty: &InferType,
+        memo: &mut BTreeMap<TypeVariable, usize>,
+    ) -> usize {
+        let children: Vec<&InferType> = match ty {
+            InferType::Variable(variable) => {
+                let root = analyzer.root_variable(*variable);
+                if let Some(height) = memo.get(&root) {
+                    return *height;
+                }
+                let height = analyzer
+                    .substitutions
+                    .get(&root)
+                    .map_or(0, |binding| exact_height(analyzer, binding, memo));
+                memo.insert(root, height);
+                return height;
+            }
+            InferType::List(element) | InferType::Option(element) => vec![element],
+            InferType::Result(value, error) => vec![value, error],
+            InferType::Record { fields, .. } => fields.values().collect(),
+            InferType::Function {
+                parameters,
+                return_type,
+                ..
+            } => parameters
+                .iter()
+                .chain(std::iter::once(return_type.as_ref()))
+                .collect(),
+            _ => return 0,
+        };
+        1 + children
+            .into_iter()
+            .map(|child| exact_height(analyzer, child, memo))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Generates a short program of list bindings, comparisons, and list
+    /// matches whose inferred types sometimes grow past the limit: either
+    /// random statements over earlier bindings, or steps that each unify a
+    /// shallow solved type, already wrapped by another binding, with a deeper
+    /// one built from the previous step.
+    fn random_unification_program(state: &mut u64) -> String {
+        let mut next = |bound: u64| {
+            // xorshift64: deterministic, so failures reproduce.
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state % bound
+        };
+        let wrap = |width: u64, inner: &str| {
+            let width = width as usize;
+            format!("{}{inner}{}", "[".repeat(width), "]".repeat(width))
+        };
+        if next(2) == 0 {
+            let mut text = format!("let s0 = {};\n", wrap(next(4), "1"));
+            for step in 1..=1 + next(4) {
+                let unify = match next(3) {
+                    0 => format!("r{step} == d{step}"),
+                    1 => format!("d{step} == r{step}"),
+                    _ => format!("match [r{step}] {{ [] => d{step}, [head, ..rest] => head }}"),
+                };
+                text.push_str(&format!(
+                    "let r{step} = {};\nlet top{step} = {};\nlet d{step} = {};\n\
+                     let u{step} = {unify};\nlet s{step} = top{step};\n",
+                    wrap(next(4), "[]"),
+                    wrap(next(120), &format!("r{step}")),
+                    wrap(next(4), &format!("s{}", step - 1)),
+                ));
+            }
+            return text;
+        }
+        let mut text = String::from("let v0 = [];\n");
+        let mut values = 1;
+        for statement in 0..4 + next(12) {
+            let width = if next(4) == 0 { 30 + next(90) } else { next(5) };
+            let value = match next(20) {
+                0..=5 => wrap(width, "[]"),
+                6 => wrap(width, "1"),
+                7..=11 => wrap(width, &format!("v{}", next(values))),
+                12..=16 => {
+                    let (left, right) = (next(values), next(values));
+                    text.push_str(&format!("let c{statement} = v{left} == v{right};\n"));
+                    continue;
+                }
+                _ => {
+                    let (list, other) = (next(values), next(values));
+                    format!("match v{list} {{ [] => v{other}, [head, ..rest] => head }}")
+                }
+            };
+            text.push_str(&format!("let v{values} = {value};\n"));
+            values += 1;
+        }
+        text
+    }
+
+    #[test]
+    fn cached_type_heights_stay_exact_through_every_unification() {
+        // Every accepted program must leave each type variable's cached
+        // height equal to the height of its solved type; a stale, too-low
+        // height is how an inferred type escapes the limit. A cyclic binding
+        // left behind by a rejected program would instead overflow the stack.
+        let (accepted, too_deep) = crate::run_on_thread(
+            "analysis-test",
+            crate::COMPILER_STACK_BYTES,
+            check_type_heights,
+        )
+        .expect("analysis test thread should start");
+        // The generator is deterministic; these guard its coverage.
+        assert!(accepted >= 200, "only {accepted} programs were accepted");
+        assert!(too_deep >= 20, "only {too_deep} programs were too deep");
+    }
+
+    /// Analyzes generated programs, checks the cached heights of each one
+    /// that is accepted, and returns how many were accepted and how many
+    /// failed with `K1005`.
+    fn check_type_heights() -> (usize, usize) {
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        let (mut accepted, mut too_deep) = (0, 0);
+        for _ in 0..500 {
+            let text = random_unification_program(&mut state);
+            let source = Source::new("heights.krit", text.as_str());
+            let program = parse_source(&source).expect("generated programs should parse");
+            let mut analyzer = Analyzer::new();
+            match analyzer.program(&program) {
+                Ok(_) => {
+                    accepted += 1;
+                    let mut memo = BTreeMap::new();
+                    for variable in 0..analyzer.next_type_variable {
+                        if analyzer.root_variable(variable) != variable {
+                            continue;
+                        }
+                        let exact =
+                            exact_height(&analyzer, &InferType::Variable(variable), &mut memo);
+                        assert_eq!(
+                            analyzer.type_heights[variable as usize], exact,
+                            "type variable {variable} of:\n{text}"
+                        );
+                        assert!(exact <= MAX_NESTING_DEPTH, "{text}");
+                    }
+                }
+                Err(error) if error.code() == "K1005" => too_deep += 1,
+                Err(_) => {}
+            }
+        }
+        (accepted, too_deep)
+    }
+
+    #[test]
     fn bounded_type_rendering_stops_shared_dag_expansion() {
         let mut source = "let value0 = record { leaf: 0 };\n".to_owned();
         for level in 1..=20 {
@@ -3975,5 +5054,151 @@ mod tests {
             Some(expected.as_str())
         );
         assert!(large.render_bounded(16 * 1024).is_none());
+    }
+
+    fn error_notes(text: &str) -> (&'static str, String, Vec<String>) {
+        let error = check(text).expect_err("program should not check");
+        (
+            error.code(),
+            error.message().to_owned(),
+            error.notes().to_vec(),
+        )
+    }
+
+    #[test]
+    fn suggests_the_closest_visible_name_for_an_undefined_name() {
+        let (code, message, notes) = error_notes("let total = 1;\nprintln(totl);");
+        assert_eq!(code, "K2001");
+        assert_eq!(message, "undefined name `totl`");
+        assert_eq!(notes, ["did you mean `total`?"]);
+
+        // Built-ins, inner scopes, and the Boolean literals are candidates;
+        // a binding that has gone out of scope is not.
+        let (_, _, notes) = error_notes("pritnln(1);");
+        assert_eq!(notes, ["did you mean `println`?"]);
+        let (_, _, notes) = error_notes("fn f(count) { let counter = count; conuter }");
+        assert_eq!(notes, ["did you mean `counter`?"]);
+        let (_, _, notes) = error_notes("fn f() { let inner = 1; inner }\nprintln(innr);");
+        assert!(notes.is_empty(), "{notes:?}");
+        let (_, _, notes) = error_notes("let flag = True;");
+        assert_eq!(notes, ["did you mean `true`?"]);
+        let (_, _, notes) = error_notes("let value = some(1);");
+        assert_eq!(notes, ["did you mean `Some`?"]);
+
+        // Ties go to the fewest edits, then the bytewise smallest name.
+        let (_, _, notes) = error_notes("let tokb = 1;\nlet toka = 2;\ntok;");
+        assert_eq!(notes, ["did you mean `toka`?"]);
+        let (_, _, notes) = error_notes("let missing_value = 1;\nlet value = missing;");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn explains_null_and_foreign_keywords_used_as_names() {
+        for name in ["null", "nil", "undefined"] {
+            let (code, _, notes) = error_notes(&format!("let value = {name};"));
+            assert_eq!(code, "K2001");
+            assert_eq!(
+                notes,
+                [format!(
+                    "Krit has no `{name}`; write `None` for an absent `Option` value"
+                )]
+            );
+        }
+        for (text, habit) in [
+            ("fn f() { return; }", Habit::Return),
+            ("fn f() { return -1 }", Habit::Return),
+            ("fn f(g) { await(g) }", Habit::Async),
+            ("let json = require(\"json\");", Habit::Import),
+        ] {
+            let (code, _, notes) = error_notes(text);
+            assert_eq!(code, "K2001", "{text}");
+            assert_eq!(notes, [habit.hint()], "{text}");
+        }
+
+        let (code, _, notes) = error_notes("let value = None();");
+        assert_eq!(code, "K3002");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("`None` is a value, not a function"));
+        let (code, _, notes) = error_notes("let value = 1;\nvalue();");
+        assert_eq!(code, "K3002");
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn reports_method_calls_with_a_standard_library_hint() {
+        for (text, message, note) in [
+            (
+                "let name = \"krit\";\nname.len();",
+                "cannot call `.len()` on a value of type `String`: Krit values have no methods",
+                "call `string_byte_len(name)` instead",
+            ),
+            (
+                "fn f(path: String) { path.startsWith(\"/\") }",
+                "cannot call `.startsWith()` on a value of type `String`: Krit values have no \
+                 methods",
+                "call `string_starts_with(path, prefix)` instead",
+            ),
+            (
+                "let count = 1;\ncount.toString();",
+                "cannot call `.toString()` on a value of type `Int`: Krit values have no methods",
+                "call `int_to_string(count)` instead",
+            ),
+            (
+                "let items = [1];\nitems.len();",
+                "cannot call `.len()` on a value of type `List<Int>`: Krit values have no methods",
+                "match the list with `[]` and `[head, ..tail]` patterns instead",
+            ),
+            (
+                "let found = Some(1);\nfound.unwrap();",
+                "cannot call `.unwrap()` on a value of type `Option<Int>`: Krit values have no \
+                 methods",
+                "handle both outcomes with `match` instead",
+            ),
+            (
+                "let item = record { body: \"x\" };\nitem.body.len();",
+                "cannot call `.len()` on a value of type `String`: Krit values have no methods",
+                "call `string_byte_len(item.body)` instead",
+            ),
+            (
+                "let item = record { a: 1 };\nitem.send(1);",
+                "cannot call `.send()`: `Record { a: Int }` has no field `send`, and Krit values \
+                 have no methods",
+                "pass the value to a function instead, as in `f(item)`",
+            ),
+            (
+                "webhook fn handle(request: HttpRequest) -> HttpResponse {\n\
+                 request.json()\n}",
+                "cannot call `.json()`: `HttpRequest` has no field `json`, and Krit values have \
+                 no methods",
+                "pass the value to a function instead, as in `f(request)`",
+            ),
+        ] {
+            let (code, actual, notes) = error_notes(text);
+            assert_eq!(code, "K3011", "{text}");
+            assert_eq!(actual, message, "{text}");
+            assert_eq!(notes.len(), 1, "{text}");
+            assert!(notes[0].starts_with(note), "{text}: {}", notes[0]);
+        }
+    }
+
+    #[test]
+    fn field_access_and_calls_of_function_fields_keep_their_meaning() {
+        // A call of a function stored in a record field is not a method call.
+        check("let item = record { run: fn() { 1 } };\nitem.run();")
+            .expect("a function field should be callable");
+        check("fn f(item) { item.run() }").expect("an open record may hold a function field");
+
+        // A plain field access is still K3004, and so is a failing access in
+        // the receiver of a method call.
+        let (code, _, notes) = error_notes("let name = \"krit\";\nname.len;");
+        assert_eq!(code, "K3004");
+        assert!(notes.is_empty());
+        let (code, message, _) = error_notes("let item = record { a: 1 };\nitem.b.c();");
+        assert_eq!(code, "K3004");
+        assert_eq!(message, "record type has no field `b`");
+
+        // A field that exists but does not hold a function is a call error.
+        let (code, _, _) = error_notes("let item = record { a: 1 };\nitem.a();");
+        assert_eq!(code, "K3002");
     }
 }

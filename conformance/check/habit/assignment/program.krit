@@ -1,0 +1,5 @@
+fn count(items: List<Int>) -> Int {
+    let size = 0;
+    size = size + 1;
+    size
+}

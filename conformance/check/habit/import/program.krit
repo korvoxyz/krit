@@ -1,0 +1,3 @@
+import json;
+
+println(json_encode(1));

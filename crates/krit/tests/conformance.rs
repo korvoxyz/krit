@@ -3,21 +3,69 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use krit::{Source, run_source};
+use krit::{Source, analyze_with_warnings, lower, parse_source, run_source};
 
 #[test]
 fn normative_conformance_cases() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("conformance/cases");
+    let root = conformance_root("cases");
     let mut cases = Vec::new();
     collect_cases(&root, &mut cases);
     cases.sort();
 
     assert!(!cases.is_empty(), "no conformance cases found");
-    for case in cases {
-        run_case(&case);
-    }
+    // `krit run` evaluates on a thread with this stack, so the depth limits
+    // are reached before the native stack is exhausted.
+    krit::run_on_thread("conformance", krit::EVALUATOR_STACK_BYTES, || {
+        for case in cases {
+            run_case(&case, &root);
+        }
+    })
+    .expect("conformance thread should start");
+}
+
+/// `run` performs the same analysis as `check`, so every program that check
+/// rejects is refused by run with the same diagnostic and no output.
+///
+/// Build-target diagnostics (`K7xxx`) come from the target check that
+/// `krit check` adds for entrypoint files; `run` builds no artifact and so
+/// performs no target check, and this crate has no backend to produce them.
+#[test]
+fn run_refuses_every_check_failure() {
+    let root = conformance_root("check");
+    let mut cases = Vec::new();
+    collect_cases(&root, &mut cases);
+    cases.retain(|case| {
+        let codes = read_codes(case);
+        let target_only = !codes.is_empty() && codes.iter().all(|code| code.starts_with("K7"));
+        read_status(case) != 0 && !target_only
+    });
+    cases.sort();
+
+    assert!(!cases.is_empty(), "no failing check cases found");
+    krit::run_on_thread("check-refusal", krit::EVALUATOR_STACK_BYTES, || {
+        for case in cases {
+            let case_name = case_name(&case, &root);
+            let source = read_program(&case);
+            let mut output = Vec::new();
+            let Err(diagnostic) = run_source(&source, &mut output) else {
+                panic!("run should refuse {case_name}");
+            };
+            assert_eq!(
+                vec![diagnostic.code().to_owned()],
+                read_codes(&case),
+                "diagnostic mismatch in {case_name}"
+            );
+            assert!(output.is_empty(), "run printed output for {case_name}");
+        }
+    })
+    .expect("check refusal thread should start");
+}
+
+fn conformance_root(suite: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("conformance")
+        .join(suite)
 }
 
 fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) {
@@ -33,38 +81,28 @@ fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) {
     }
 }
 
-fn run_case(case: &Path) {
-    let program_path = case.join("program.krit");
-    let text = fs::read_to_string(&program_path).expect("program should be readable");
-    let source = Source::new("program.krit", text);
+fn run_case(case: &Path, root: &Path) {
+    let case_name = case_name(case, root);
+    let source = read_program(case);
+    let warnings = assert_passes_check(&source, &case_name);
+    assert_eq!(
+        warnings,
+        read_lines(case.join("expect.warnings")),
+        "warning mismatch in {case_name}"
+    );
+
     let mut output = Vec::new();
     let result = run_source(&source, &mut output);
 
-    let expected_status = fs::read_to_string(case.join("expect.status"))
-        .expect("expect.status should be readable")
-        .trim()
-        .parse::<u8>()
-        .expect("expect.status should contain a number");
+    let expected_status = read_status(case);
     let expected_output = read_optional(case.join("expect.stdout"));
-    let expected_codes = read_optional(case.join("expect.diagnostics"))
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let expected_codes = read_codes(case);
 
     let (actual_status, actual_codes) = match result {
         Ok(_) => (0, Vec::new()),
         Err(diagnostic) => (1, vec![diagnostic.code().to_owned()]),
     };
     let actual_output = String::from_utf8(output).expect("Krit output should be UTF-8");
-    let case_name = case
-        .strip_prefix(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join("conformance/cases"),
-        )
-        .unwrap_or(case)
-        .display()
-        .to_string();
 
     assert_eq!(
         actual_status, expected_status,
@@ -78,6 +116,60 @@ fn run_case(case: &Path) {
         actual_codes, expected_codes,
         "diagnostic mismatch in {case_name}"
     );
+}
+
+/// Runtime cases define evaluation behavior, so each must pass `krit check`
+/// (parsing, analysis, and Core lowering). A program that check rejects never
+/// reaches the evaluator and belongs in `conformance/check` instead. Returns
+/// the codes of the warnings check reports.
+fn assert_passes_check(source: &Source, case_name: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let program = parse_source(source).and_then(|program| {
+        let report = analyze_with_warnings(&program);
+        warnings = report.warnings;
+        Ok((program, report.result?))
+    });
+    let (program, analysis) = program.unwrap_or_else(|diagnostic| {
+        panic!(
+            "runtime case {case_name} must pass check; move it to conformance/check: {}",
+            diagnostic.render_human(source)
+        )
+    });
+    if let Err(error) = lower(&program, &analysis) {
+        panic!("runtime case {case_name} should lower to Core IR: {error}");
+    }
+    warnings
+        .iter()
+        .map(|warning| warning.code().to_owned())
+        .collect()
+}
+
+fn case_name(case: &Path, root: &Path) -> String {
+    case.strip_prefix(root)
+        .unwrap_or(case)
+        .display()
+        .to_string()
+}
+
+fn read_program(case: &Path) -> Source {
+    let text = fs::read_to_string(case.join("program.krit")).expect("program should be readable");
+    Source::new("program.krit", text)
+}
+
+fn read_status(case: &Path) -> u8 {
+    fs::read_to_string(case.join("expect.status"))
+        .expect("expect.status should be readable")
+        .trim()
+        .parse::<u8>()
+        .expect("expect.status should contain a number")
+}
+
+fn read_codes(case: &Path) -> Vec<String> {
+    read_lines(case.join("expect.diagnostics"))
+}
+
+fn read_lines(path: PathBuf) -> Vec<String> {
+    read_optional(path).lines().map(str::to_owned).collect()
 }
 
 fn read_optional(path: PathBuf) -> String {

@@ -11,18 +11,34 @@ Each directory contains:
 - `program.krit` — UTF-8 source
 - `expect.status` — required decimal process status plus line feed
 - `expect.stdout` — optional exact standard-output bytes; absent means empty
-- `expect.diagnostics` — optional ordered diagnostic codes, one per line;
-  absent means no diagnostics
+- `expect.diagnostics` — optional ordered error codes, one per line; absent
+  means no errors
+- `expect.warnings` — optional ordered warning codes, one per line; absent
+  means no warnings
+- `expect.notes` — optional decimal number of notes (fix hints) the error
+  carries, plus line feed, for `conformance/check` cases; absent means one
+  for a habit code (`K1101`-`K1112`) or `K3011` and none for any other error
 
-The harness invokes the equivalent of:
+`conformance/cases` contains runtime cases. The harness invokes the
+equivalent of:
 
 ```text
 krit run --diagnostic-format json program.krit
 ```
 
 It compares status and standard output exactly. It decodes JSON Lines from
-standard error and compares the ordered `code` fields. Additional diagnostic
-prose and labels may vary within `spec/DIAGNOSTICS.md`.
+standard error and compares the ordered `code` fields of the diagnostics whose
+`severity` is `error` with `expect.diagnostics` and of those whose `severity`
+is `warning` with `expect.warnings`. Every diagnostic must be one or the
+other. Additional diagnostic prose and labels may vary within
+`spec/DIAGNOSTICS.md`.
+
+`krit run` checks a program exactly as `krit check` does, apart from the
+build-target check, before evaluating it (`spec/LANGUAGE.md` section 14), so
+every runtime case must pass `krit check`, and the harness asserts that it
+does. A runtime case therefore defines evaluation behavior, including
+runtime errors such as overflow, division by zero, invalid JSON, and depth
+limits. A program that checking rejects belongs in `conformance/check`.
 
 `conformance/check` contains implementation-neutral static-analysis cases.
 That harness invokes the equivalent of:
@@ -31,14 +47,20 @@ That harness invokes the equivalent of:
 krit check --diagnostic-format json program.krit
 ```
 
-It compares status and diagnostic codes and requires that checking never
-execute program effects or emit program output. Files that declare a
-webhook, queue, or schedule entrypoint are checked against the component
-target by default, so `K7001`/`K7002` build-target diagnostics are part of
-their expected output, in source order. `conformance/check/target` pins the
-current bounded backend: as the backend grows, these cases move from failure
-to success. A front-end-only harness treats a case whose expected codes are
-all `K7xxx` as passing analysis.
+It compares status, error codes, and warning codes as the runtime harness does,
+and requires that checking never execute program effects or emit program
+output. The error must carry exactly the number of notes that `expect.notes`
+gives, and every note must be one line (`spec/DIAGNOSTICS.md`, Fix hints);
+the wording of notes is not compared. Files that declare a webhook, queue, or
+schedule entrypoint are checked against the component target by default, so
+`K7001`/`K7002` build-target diagnostics are part of their expected output, in
+source order. `conformance/check/target` pins the current bounded backend: as
+the backend grows, these cases move from failure to success. A front-end-only
+harness treats a case whose expected codes are all `K7xxx` as passing
+analysis. Because `krit run` performs check's front-end checking first, the
+harness also requires that `krit run` refuse every case that fails it with the
+same diagnostics and status and no program output; `krit run` performs no
+target check, since direct execution builds no artifact.
 
 `conformance/package` contains manifest-validation cases. Each case
 directory holds `krit.pkg`, the entry it names, `expect.status`, and optional
@@ -94,8 +116,13 @@ network service, or nondeterministic value.
 | `core/booleans` | strict booleans and short-circuiting |
 | `core/strings` | UTF-8 strings and concatenation |
 | `core/string-ordering` | byte-lexicographic UTF-8 string ordering and string equality |
+| `core/chains` | `else if` chains and left-associative operator chains, including short-circuiting |
+| `core/else-if-chain` | a 300-branch `else if` chain adds no nesting levels |
 | `scope/closures` | immutable lexical capture and shadowing |
+| `scope/builtin-shadowing` | match binders shadow unreserved built-in names, as in checking |
+| `scope/discard` | repeated `_` bindings in one scope; reading `_` evaluates the most recent one and warns (`K2003`) |
 | `functions/recursion` | recursive declaration and calls |
+| `functions/deep-recursion` | 9,000 nested calls stay within the call-depth limit |
 | `lists/match` | list construction and exhaustive decomposition |
 | `records/fields` | ordered record rendering and field access |
 | `variants/option-match` | exhaustive Option matching |
@@ -103,29 +130,27 @@ network service, or nondeterministic value.
 | `json/round-trip` | deterministic JSON conversion |
 | `json/string-escapes` | every JSON string escape, surrogate pairs, and surrounding whitespace decode |
 | `types/annotations` | parsed binding, parameter, return, and generic types |
-| `errors/syntax` | missing required syntax |
-| `errors/undefined-name` | lexical name resolution |
-| `errors/wrong-kind` | runtime kind checks |
-| `errors/arity` | exact function arity |
 | `errors/division-zero` | checked division |
 | `errors/overflow` | checked signed 64-bit arithmetic |
-| `errors/function-comparison` | non-comparable functions, including in lists |
-| `errors/duplicate-record-field` | unique record field names |
-| `errors/duplicate-variant-arm` | unique Option and Result arms |
-| `errors/incomplete-option-match` | exhaustive Option arms |
-| `errors/mixed-variant-match` | one variant family per match |
-| `errors/json-function` | functions cannot be JSON encoded |
 | `errors/json-invalid` | invalid JSON input |
 | `errors/json-lone-surrogate` | an unpaired surrogate escape is invalid JSON |
 | `errors/json-invalid-escape` | an unknown escape is invalid JSON |
-| `errors/missing-record-field` | field access requires an existing field |
+| `errors/call-depth` | runaway recursion fails with `K4010` instead of aborting |
 | `check/valid/inference` | recursion, closures, empty lists, None, and effects infer together |
-| `check/name/*` | lexical undefined and duplicate name diagnostics |
-| `check/type/*` | stable static operator, condition, field, call, annotation, and match errors |
+| `check/syntax/missing-semicolon` | missing required syntax |
+| `check/syntax/habit-word-line-break` | a bound habit word ending a line before a missing `;` stays an ordinary name (`K1002`) |
+| `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
+| `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, and an unbound `_` is undefined |
+| `check/name/did-you-mean`, `check/name/null` | undefined names (`K2001`) that carry a did-you-mean or `None` note |
+| `check/habit/*` | one case per construct from another language (`K1101`-`K1112`): `return`, loops, assignment, `struct`, `import`, `await`, `throw`, indexing, arrow functions, the conditional operator, `switch`, and `else { return ... }`; plus a conditional operator whose first branch does not parse |
+| `check/valid/habit-words-as-names` | habit words stay ordinary identifiers outside foreign constructs |
+| `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings and a method call on a string (`K3011`) |
+| `check/match/*` | unique, exhaustive, single-family Option and Result arms (`K1003`) |
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
+| `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, types that grow after they are bound, and types that grow when two solved types unify |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
-| `check/target/*` | entrypoint files report every build-target diagnostic at check time; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |

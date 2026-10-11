@@ -1,0 +1,3 @@
+let e = [];
+let wrapped = [[e]];
+let same = e == wrapped;

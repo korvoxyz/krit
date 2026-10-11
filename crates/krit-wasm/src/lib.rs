@@ -143,6 +143,20 @@ fn emit_component(
     grants: Grants,
 ) -> Result<BuiltComponent, Vec<BuildError>> {
     options.validate().map_err(|error| vec![error])?;
+    // Support checking and both code generators recurse through nested Core
+    // blocks. Verification already bounds every lowered module; re-check here
+    // so the compilers fail closed rather than relying on that invariant.
+    let (depth, span) = module.deepest_block();
+    if depth > krit::MAX_CORE_BLOCK_DEPTH {
+        return Err(vec![BuildError::nesting(
+            format!(
+                "nesting depth limit exceeded: Core blocks nest {depth} levels, more than the \
+                 {} the WebAssembly compilers accept",
+                krit::MAX_CORE_BLOCK_DEPTH
+            ),
+            span,
+        )]);
+    }
     let checked = support::check_module(module)?;
     if grants == Grants::Enforce
         && let Some(effect) = checked
@@ -341,6 +355,20 @@ mod tests {
 
     #[test]
     fn emission_never_fails_after_the_support_check_passes() {
+        // The corpus includes the deepest programs the parser accepts, so the
+        // pipeline runs on the stack `krit` gives its compiler stages.
+        let checked =
+            krit::run_on_thread("emission-corpus", krit::COMPILER_STACK_BYTES, emit_corpus)
+                .expect("corpus thread should start");
+        assert!(
+            checked >= 15,
+            "the corpus should contain buildable programs"
+        );
+    }
+
+    /// Emits every corpus program that passes the support check and returns
+    /// how many there were.
+    fn emit_corpus() -> usize {
         let options = BuildOptions::new("2026", "test/corpus", "1.0.0", "main.krit");
         let mut checked = 0;
         for path in corpus() {
@@ -364,9 +392,6 @@ mod tests {
                 );
             }
         }
-        assert!(
-            checked >= 15,
-            "the corpus should contain buildable programs"
-        );
+        checked
     }
 }

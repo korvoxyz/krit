@@ -71,8 +71,9 @@ fn total(items: List<Int>) -> Int {
 
 The exact implemented annotation grammar is normative in `LANGUAGE.md`.
 `krit check` enforces annotations without evaluating source. `krit run`
-continues to use the direct dynamic evaluator in this milestone, so runtime
-conformance diagnostics remain unchanged. Ordinary public declarations,
+performs the same checking first and evaluates only a program that passes it,
+reporting check's diagnostic and exit status otherwise (`LANGUAGE.md`
+section 14). Ordinary public declarations,
 source-level generic declarations, and effect annotation syntax are still
 future work. A webhook declaration is the one implemented public boundary and
 requires the exact annotated `(HttpRequest) -> HttpResponse` signature.
@@ -218,6 +219,15 @@ Implementation requirements:
 - unification must be deterministic
 - type variable numbering must be stable
 - errors should identify the originating constraints
+- no inference variable may stand for a type nesting more than 256 type
+  constructors deep (`K1005`, `LANGUAGE.md` section 4.1); solving a variable
+  rechecks every type that contains it, and unifying two solved variables
+  rechecks every type that contains either, so a type bound earlier cannot
+  grow past the limit when a variable inside it is solved later, and every
+  later walk over types stays bounded
+- unifying two solved variables fails as an infinite type (`K3001`) before
+  either solution changes when one solution mentions the other variable, so
+  a rejected unification never leaves a type that contains itself
 - checking one changed module should not require unrelated modules (draft)
 - exported signatures form module cache boundaries (draft)
 
@@ -235,6 +245,14 @@ traces remain draft. The intended complete error should state:
 
 The compiler must not emit a cascade of speculative errors after a binding's
 type becomes unknown.
+
+A call whose callee is a field access, `value.name(...)`, calls the function
+stored in that record field. When `value`'s type has no field `name`, because
+it is not a record type or is a closed record type without that field, the
+error is a method call (`K3011`) rather than a field-access error (`K3004`),
+and its note names the standard-library function to use instead where there
+is one (`DIAGNOSTICS.md`, Fix hints). An undefined name (`K2001`) carries a
+did-you-mean note chosen from the names visible at the reference.
 
 ## Open decisions
 

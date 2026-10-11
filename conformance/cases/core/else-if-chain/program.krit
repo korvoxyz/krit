@@ -1,0 +1,609 @@
+fn pick(n) {
+    if n == 0 {
+        0
+    } else if n == 1 {
+        2
+    } else if n == 2 {
+        4
+    } else if n == 3 {
+        6
+    } else if n == 4 {
+        8
+    } else if n == 5 {
+        10
+    } else if n == 6 {
+        12
+    } else if n == 7 {
+        14
+    } else if n == 8 {
+        16
+    } else if n == 9 {
+        18
+    } else if n == 10 {
+        20
+    } else if n == 11 {
+        22
+    } else if n == 12 {
+        24
+    } else if n == 13 {
+        26
+    } else if n == 14 {
+        28
+    } else if n == 15 {
+        30
+    } else if n == 16 {
+        32
+    } else if n == 17 {
+        34
+    } else if n == 18 {
+        36
+    } else if n == 19 {
+        38
+    } else if n == 20 {
+        40
+    } else if n == 21 {
+        42
+    } else if n == 22 {
+        44
+    } else if n == 23 {
+        46
+    } else if n == 24 {
+        48
+    } else if n == 25 {
+        50
+    } else if n == 26 {
+        52
+    } else if n == 27 {
+        54
+    } else if n == 28 {
+        56
+    } else if n == 29 {
+        58
+    } else if n == 30 {
+        60
+    } else if n == 31 {
+        62
+    } else if n == 32 {
+        64
+    } else if n == 33 {
+        66
+    } else if n == 34 {
+        68
+    } else if n == 35 {
+        70
+    } else if n == 36 {
+        72
+    } else if n == 37 {
+        74
+    } else if n == 38 {
+        76
+    } else if n == 39 {
+        78
+    } else if n == 40 {
+        80
+    } else if n == 41 {
+        82
+    } else if n == 42 {
+        84
+    } else if n == 43 {
+        86
+    } else if n == 44 {
+        88
+    } else if n == 45 {
+        90
+    } else if n == 46 {
+        92
+    } else if n == 47 {
+        94
+    } else if n == 48 {
+        96
+    } else if n == 49 {
+        98
+    } else if n == 50 {
+        100
+    } else if n == 51 {
+        102
+    } else if n == 52 {
+        104
+    } else if n == 53 {
+        106
+    } else if n == 54 {
+        108
+    } else if n == 55 {
+        110
+    } else if n == 56 {
+        112
+    } else if n == 57 {
+        114
+    } else if n == 58 {
+        116
+    } else if n == 59 {
+        118
+    } else if n == 60 {
+        120
+    } else if n == 61 {
+        122
+    } else if n == 62 {
+        124
+    } else if n == 63 {
+        126
+    } else if n == 64 {
+        128
+    } else if n == 65 {
+        130
+    } else if n == 66 {
+        132
+    } else if n == 67 {
+        134
+    } else if n == 68 {
+        136
+    } else if n == 69 {
+        138
+    } else if n == 70 {
+        140
+    } else if n == 71 {
+        142
+    } else if n == 72 {
+        144
+    } else if n == 73 {
+        146
+    } else if n == 74 {
+        148
+    } else if n == 75 {
+        150
+    } else if n == 76 {
+        152
+    } else if n == 77 {
+        154
+    } else if n == 78 {
+        156
+    } else if n == 79 {
+        158
+    } else if n == 80 {
+        160
+    } else if n == 81 {
+        162
+    } else if n == 82 {
+        164
+    } else if n == 83 {
+        166
+    } else if n == 84 {
+        168
+    } else if n == 85 {
+        170
+    } else if n == 86 {
+        172
+    } else if n == 87 {
+        174
+    } else if n == 88 {
+        176
+    } else if n == 89 {
+        178
+    } else if n == 90 {
+        180
+    } else if n == 91 {
+        182
+    } else if n == 92 {
+        184
+    } else if n == 93 {
+        186
+    } else if n == 94 {
+        188
+    } else if n == 95 {
+        190
+    } else if n == 96 {
+        192
+    } else if n == 97 {
+        194
+    } else if n == 98 {
+        196
+    } else if n == 99 {
+        198
+    } else if n == 100 {
+        200
+    } else if n == 101 {
+        202
+    } else if n == 102 {
+        204
+    } else if n == 103 {
+        206
+    } else if n == 104 {
+        208
+    } else if n == 105 {
+        210
+    } else if n == 106 {
+        212
+    } else if n == 107 {
+        214
+    } else if n == 108 {
+        216
+    } else if n == 109 {
+        218
+    } else if n == 110 {
+        220
+    } else if n == 111 {
+        222
+    } else if n == 112 {
+        224
+    } else if n == 113 {
+        226
+    } else if n == 114 {
+        228
+    } else if n == 115 {
+        230
+    } else if n == 116 {
+        232
+    } else if n == 117 {
+        234
+    } else if n == 118 {
+        236
+    } else if n == 119 {
+        238
+    } else if n == 120 {
+        240
+    } else if n == 121 {
+        242
+    } else if n == 122 {
+        244
+    } else if n == 123 {
+        246
+    } else if n == 124 {
+        248
+    } else if n == 125 {
+        250
+    } else if n == 126 {
+        252
+    } else if n == 127 {
+        254
+    } else if n == 128 {
+        256
+    } else if n == 129 {
+        258
+    } else if n == 130 {
+        260
+    } else if n == 131 {
+        262
+    } else if n == 132 {
+        264
+    } else if n == 133 {
+        266
+    } else if n == 134 {
+        268
+    } else if n == 135 {
+        270
+    } else if n == 136 {
+        272
+    } else if n == 137 {
+        274
+    } else if n == 138 {
+        276
+    } else if n == 139 {
+        278
+    } else if n == 140 {
+        280
+    } else if n == 141 {
+        282
+    } else if n == 142 {
+        284
+    } else if n == 143 {
+        286
+    } else if n == 144 {
+        288
+    } else if n == 145 {
+        290
+    } else if n == 146 {
+        292
+    } else if n == 147 {
+        294
+    } else if n == 148 {
+        296
+    } else if n == 149 {
+        298
+    } else if n == 150 {
+        300
+    } else if n == 151 {
+        302
+    } else if n == 152 {
+        304
+    } else if n == 153 {
+        306
+    } else if n == 154 {
+        308
+    } else if n == 155 {
+        310
+    } else if n == 156 {
+        312
+    } else if n == 157 {
+        314
+    } else if n == 158 {
+        316
+    } else if n == 159 {
+        318
+    } else if n == 160 {
+        320
+    } else if n == 161 {
+        322
+    } else if n == 162 {
+        324
+    } else if n == 163 {
+        326
+    } else if n == 164 {
+        328
+    } else if n == 165 {
+        330
+    } else if n == 166 {
+        332
+    } else if n == 167 {
+        334
+    } else if n == 168 {
+        336
+    } else if n == 169 {
+        338
+    } else if n == 170 {
+        340
+    } else if n == 171 {
+        342
+    } else if n == 172 {
+        344
+    } else if n == 173 {
+        346
+    } else if n == 174 {
+        348
+    } else if n == 175 {
+        350
+    } else if n == 176 {
+        352
+    } else if n == 177 {
+        354
+    } else if n == 178 {
+        356
+    } else if n == 179 {
+        358
+    } else if n == 180 {
+        360
+    } else if n == 181 {
+        362
+    } else if n == 182 {
+        364
+    } else if n == 183 {
+        366
+    } else if n == 184 {
+        368
+    } else if n == 185 {
+        370
+    } else if n == 186 {
+        372
+    } else if n == 187 {
+        374
+    } else if n == 188 {
+        376
+    } else if n == 189 {
+        378
+    } else if n == 190 {
+        380
+    } else if n == 191 {
+        382
+    } else if n == 192 {
+        384
+    } else if n == 193 {
+        386
+    } else if n == 194 {
+        388
+    } else if n == 195 {
+        390
+    } else if n == 196 {
+        392
+    } else if n == 197 {
+        394
+    } else if n == 198 {
+        396
+    } else if n == 199 {
+        398
+    } else if n == 200 {
+        400
+    } else if n == 201 {
+        402
+    } else if n == 202 {
+        404
+    } else if n == 203 {
+        406
+    } else if n == 204 {
+        408
+    } else if n == 205 {
+        410
+    } else if n == 206 {
+        412
+    } else if n == 207 {
+        414
+    } else if n == 208 {
+        416
+    } else if n == 209 {
+        418
+    } else if n == 210 {
+        420
+    } else if n == 211 {
+        422
+    } else if n == 212 {
+        424
+    } else if n == 213 {
+        426
+    } else if n == 214 {
+        428
+    } else if n == 215 {
+        430
+    } else if n == 216 {
+        432
+    } else if n == 217 {
+        434
+    } else if n == 218 {
+        436
+    } else if n == 219 {
+        438
+    } else if n == 220 {
+        440
+    } else if n == 221 {
+        442
+    } else if n == 222 {
+        444
+    } else if n == 223 {
+        446
+    } else if n == 224 {
+        448
+    } else if n == 225 {
+        450
+    } else if n == 226 {
+        452
+    } else if n == 227 {
+        454
+    } else if n == 228 {
+        456
+    } else if n == 229 {
+        458
+    } else if n == 230 {
+        460
+    } else if n == 231 {
+        462
+    } else if n == 232 {
+        464
+    } else if n == 233 {
+        466
+    } else if n == 234 {
+        468
+    } else if n == 235 {
+        470
+    } else if n == 236 {
+        472
+    } else if n == 237 {
+        474
+    } else if n == 238 {
+        476
+    } else if n == 239 {
+        478
+    } else if n == 240 {
+        480
+    } else if n == 241 {
+        482
+    } else if n == 242 {
+        484
+    } else if n == 243 {
+        486
+    } else if n == 244 {
+        488
+    } else if n == 245 {
+        490
+    } else if n == 246 {
+        492
+    } else if n == 247 {
+        494
+    } else if n == 248 {
+        496
+    } else if n == 249 {
+        498
+    } else if n == 250 {
+        500
+    } else if n == 251 {
+        502
+    } else if n == 252 {
+        504
+    } else if n == 253 {
+        506
+    } else if n == 254 {
+        508
+    } else if n == 255 {
+        510
+    } else if n == 256 {
+        512
+    } else if n == 257 {
+        514
+    } else if n == 258 {
+        516
+    } else if n == 259 {
+        518
+    } else if n == 260 {
+        520
+    } else if n == 261 {
+        522
+    } else if n == 262 {
+        524
+    } else if n == 263 {
+        526
+    } else if n == 264 {
+        528
+    } else if n == 265 {
+        530
+    } else if n == 266 {
+        532
+    } else if n == 267 {
+        534
+    } else if n == 268 {
+        536
+    } else if n == 269 {
+        538
+    } else if n == 270 {
+        540
+    } else if n == 271 {
+        542
+    } else if n == 272 {
+        544
+    } else if n == 273 {
+        546
+    } else if n == 274 {
+        548
+    } else if n == 275 {
+        550
+    } else if n == 276 {
+        552
+    } else if n == 277 {
+        554
+    } else if n == 278 {
+        556
+    } else if n == 279 {
+        558
+    } else if n == 280 {
+        560
+    } else if n == 281 {
+        562
+    } else if n == 282 {
+        564
+    } else if n == 283 {
+        566
+    } else if n == 284 {
+        568
+    } else if n == 285 {
+        570
+    } else if n == 286 {
+        572
+    } else if n == 287 {
+        574
+    } else if n == 288 {
+        576
+    } else if n == 289 {
+        578
+    } else if n == 290 {
+        580
+    } else if n == 291 {
+        582
+    } else if n == 292 {
+        584
+    } else if n == 293 {
+        586
+    } else if n == 294 {
+        588
+    } else if n == 295 {
+        590
+    } else if n == 296 {
+        592
+    } else if n == 297 {
+        594
+    } else if n == 298 {
+        596
+    } else if n == 299 {
+        598
+    } else {
+        -1
+    }
+}
+
+println(pick(0));
+println(pick(299));
+println(pick(300));

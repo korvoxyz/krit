@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use krit::{Source, analyze, parse_source};
+use krit::{Diagnostic, Severity, Source, analyze, analyze_with_warnings, parse_source};
 
 #[test]
 fn static_check_conformance_cases() {
@@ -15,29 +15,37 @@ fn static_check_conformance_cases() {
     cases.sort();
 
     assert!(!cases.is_empty(), "no static check cases found");
-    for case in cases {
-        run_case(&case, &root);
-    }
+    on_compiler_stack(|| {
+        for case in cases {
+            run_case(&case, &root);
+        }
+    });
 }
 
+/// Runs `work` with the stack `krit check` gives the compiler pipeline.
+fn on_compiler_stack(work: impl FnOnce() + Send) {
+    krit::run_on_thread("check-conformance", krit::COMPILER_STACK_BYTES, work)
+        .expect("check thread should start");
+}
+
+/// `krit run` refuses any program that fails checking, so every runtime case,
+/// including those that expect a runtime error, must pass static checking.
 #[test]
-fn all_runtime_success_cases_and_examples_are_statically_valid() {
+fn all_runtime_cases_and_examples_are_statically_valid() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let runtime_root = repository.join("conformance/cases");
     let mut cases = Vec::new();
     collect_cases(&runtime_root, &mut cases);
-    cases.retain(|case| {
-        fs::read_to_string(case.join("expect.status"))
-            .expect("expect.status should be readable")
-            .trim()
-            == "0"
-    });
     cases.extend([
         repository.join("examples/factorial.krit"),
         repository.join("examples/lists.krit"),
     ]);
     cases.sort();
 
+    on_compiler_stack(|| check_all_valid(cases));
+}
+
+fn check_all_valid(cases: Vec<PathBuf>) {
     for case in cases {
         let program_path = if case.is_dir() {
             case.join("program.krit")
@@ -73,7 +81,13 @@ fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) {
 fn run_case(case: &Path, root: &Path) {
     let text = fs::read_to_string(case.join("program.krit")).expect("program should be readable");
     let source = Source::new("program.krit", text);
-    let result = parse_source(&source).and_then(|program| analyze(&program));
+    let (result, warnings) = match parse_source(&source) {
+        Ok(program) => {
+            let report = analyze_with_warnings(&program);
+            (report.result.map(|_| ()), report.warnings)
+        }
+        Err(diagnostic) => (Err(diagnostic), Vec::new()),
+    };
 
     let mut expected_status = fs::read_to_string(case.join("expect.status"))
         .expect("expect.status should be readable")
@@ -92,15 +106,26 @@ fn run_case(case: &Path, root: &Path) {
         expected_status = 0;
         expected_codes.clear();
     }
-    let (actual_status, actual_codes) = match result {
-        Ok(_) => (0, Vec::new()),
-        Err(diagnostic) => (1, vec![diagnostic.code().to_owned()]),
-    };
+    let expected_warnings = read_optional(case.join("expect.warnings"))
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let actual_warnings = warnings
+        .iter()
+        .map(|warning| warning.code().to_owned())
+        .collect::<Vec<_>>();
     let case_name = case
         .strip_prefix(root)
         .unwrap_or(case)
         .display()
         .to_string();
+    if let Err(diagnostic) = &result {
+        assert_notes(diagnostic, case, &case_name);
+    }
+    let (actual_status, actual_codes) = match result {
+        Ok(_) => (0, Vec::new()),
+        Err(diagnostic) => (1, vec![diagnostic.code().to_owned()]),
+    };
 
     assert_eq!(
         actual_status, expected_status,
@@ -109,6 +134,50 @@ fn run_case(case: &Path, root: &Path) {
     assert_eq!(
         actual_codes, expected_codes,
         "diagnostic mismatch in {case_name}"
+    );
+    assert_eq!(
+        actual_warnings, expected_warnings,
+        "warning mismatch in {case_name}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| warning.severity() == Severity::Warning),
+        "analysis returned a non-warning beside its result in {case_name}"
+    );
+}
+
+/// The error carries the number of notes in `expect.notes`, which defaults to
+/// exactly one fix for habit codes (`K1101`-`K1112`) and method calls
+/// (`K3011`) and to none otherwise (`spec/DIAGNOSTICS.md`). Every note is one
+/// line; its wording may vary.
+fn assert_notes(diagnostic: &Diagnostic, case: &Path, case_name: &str) {
+    let code = diagnostic.code();
+    let requires_hint = code == "K3011"
+        || code
+            .strip_prefix("K11")
+            .and_then(|number| number.parse::<u8>().ok())
+            .is_some_and(|number| (1..=12).contains(&number));
+    let expected = read_optional(case.join("expect.notes"));
+    let expected = if expected.is_empty() {
+        usize::from(requires_hint)
+    } else {
+        expected
+            .trim()
+            .parse::<usize>()
+            .expect("expect.notes should contain a number")
+    };
+    assert_eq!(
+        diagnostic.notes().len(),
+        expected,
+        "note count of {code} in {case_name}"
+    );
+    assert!(
+        diagnostic
+            .notes()
+            .iter()
+            .all(|note| !note.is_empty() && !note.contains(['\n', '\r'])),
+        "every note in {case_name} is one line"
     );
 }
 

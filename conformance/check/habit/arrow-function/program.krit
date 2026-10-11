@@ -1,0 +1,5 @@
+fn apply(f, value) {
+    f(value)
+}
+
+println(apply((x) => x + 1, 41));

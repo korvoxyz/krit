@@ -1039,10 +1039,32 @@ fn direct_run_rejects_all_deployment_entrypoints_before_module_execution() {
 }"#,
         ),
     ] {
-        for prefix in [
-            "println(\"must not run\");\n",
-            "println(\"must not run\");\nlet invalid = 1 + true;\n",
-        ] {
+        // `run` checks first, so a module that also fails checking reports
+        // check's diagnostic and status instead of the entrypoint refusal.
+        let directory = TestDirectory::new("run-ill-typed-deployment-entrypoint");
+        let source =
+            format!("println(\"must not run\");\nlet invalid = 1 + true;\n{declaration}\n");
+        directory.file("main.krit", &source);
+        for format in ["human", "json"] {
+            let check = krit_in(&directory)
+                .args(["check", "--diagnostic-format", format, "main.krit"])
+                .output()
+                .expect("Krit should start");
+            let run = krit_in(&directory)
+                .args(["run", "--diagnostic-format", format, "main.krit"])
+                .output()
+                .expect("Krit should start");
+            assert_eq!(run.status.code(), Some(1), "{kind} {format}");
+            assert_eq!(run.status.code(), check.status.code(), "{kind} {format}");
+            assert!(run.stdout.is_empty(), "{kind} {format}");
+            assert_eq!(run.stderr, check.stderr, "{kind} {format}");
+            assert!(
+                String::from_utf8_lossy(&run.stderr).contains("K3001"),
+                "{kind} {format}"
+            );
+        }
+
+        for prefix in ["println(\"must not run\");\n"] {
             let directory = TestDirectory::new("run-deployment-entrypoint");
             let source = format!("{prefix}{declaration}\nprintln(\"must not run either\");\n");
             let path = directory.file("main.krit", &source);
@@ -1192,6 +1214,8 @@ fn direct_run_fails_closed_for_unavailable_agent_hosts() {
     assert_eq!(config_diagnostic["code"], "K5003");
     assert_eq!(config_diagnostic["span"]["start"]["column"], 13);
 
+    // Checking comes first: an ill-typed program that also uses an
+    // unavailable host reports check's diagnostic, not the host refusal.
     let mixed = directory.file(
         "mixed.krit",
         "let model = config_string(\"agent.model\");\nlet bad = 1 + true;\n",
@@ -1201,12 +1225,12 @@ fn direct_run_fails_closed_for_unavailable_agent_hosts() {
         .arg(&mixed)
         .output()
         .expect("Krit should start");
-    assert_eq!(mixed_output.status.code(), Some(4));
+    assert_eq!(mixed_output.status.code(), Some(1));
     assert!(mixed_output.stdout.is_empty());
     assert!(
         String::from_utf8(mixed_output.stderr)
             .expect("diagnostic should be UTF-8")
-            .contains("error[K5003]")
+            .contains("error[K3001]")
     );
 
     let webhook = directory.file(
@@ -1574,7 +1598,7 @@ fn emits_machine_readable_diagnostics() {
             "run",
             "--diagnostic-format",
             "json",
-            "conformance/cases/errors/undefined-name/program.krit",
+            "conformance/check/name/undefined-argument/program.krit",
         ])
         .output()
         .expect("Krit should start");
@@ -1585,6 +1609,419 @@ fn emits_machine_readable_diagnostics() {
     assert!(diagnostic.starts_with("{\"schema\":1,"));
     assert!(diagnostic.contains("\"code\":\"K2001\""));
     assert!(diagnostic.ends_with('\n'));
+}
+
+const DISCARD_READ_SOURCE: &str = "let _ = 1;\nprintln(_);\n";
+const DISCARD_READ_WARNING: &str = "main.krit:2:9: warning[K2003]: `_` is a discard; reading it will be an error in edition 2027\n";
+
+fn assert_discard_read_json_warning(stderr: &[u8]) {
+    let diagnostics = parse_json_lines(stderr);
+    assert_eq!(diagnostics.len(), 1, "{}", String::from_utf8_lossy(stderr));
+    let warning = &diagnostics[0];
+    assert_eq!(warning["schema"], 1);
+    assert_eq!(warning["severity"], "warning");
+    assert_eq!(warning["code"], "K2003");
+    assert_eq!(warning["file"], "main.krit");
+    assert_eq!(warning["span"]["start"]["line"], 2);
+    assert_eq!(warning["span"]["start"]["column"], 9);
+    assert_eq!(warning["span"]["end"]["column"], 10);
+}
+
+#[test]
+fn check_and_run_print_fix_hints_as_help_lines_and_json_notes() {
+    let directory = TestDirectory::new("habit-hints");
+    directory.file("main.krit", "fn f(x) {\n    return x;\n}\n");
+    directory.file("typo.krit", "let total = 1;\nprintln(totl);\n");
+
+    for command in ["check", "run"] {
+        let human = krit_in(&directory)
+            .args([command, "main.krit"])
+            .output()
+            .expect("Krit should start");
+        assert_eq!(human.status.code(), Some(1), "{command}");
+        assert!(human.stdout.is_empty(), "{command}");
+        assert_eq!(
+            String::from_utf8_lossy(&human.stderr),
+            "main.krit:2:5: error[K1101]: `return` is not Krit syntax\n\
+             help: a block's value is its final expression, written without `return` or `;`; \
+             for early exit, `?` and let-else arrive in Krit 0.3\n",
+            "{command}"
+        );
+
+        let json = krit_in(&directory)
+            .args([command, "--diagnostic-format", "json", "typo.krit"])
+            .output()
+            .expect("Krit should start");
+        assert_eq!(json.status.code(), Some(1), "{command}");
+        let diagnostics = parse_json_lines(&json.stderr);
+        assert_eq!(diagnostics.len(), 1, "{command}");
+        assert_eq!(diagnostics[0]["code"], "K2001");
+        assert_eq!(diagnostics[0]["message"], "undefined name `totl`");
+        assert_eq!(
+            diagnostics[0]["notes"],
+            serde_json::json!(["did you mean `total`?"])
+        );
+    }
+}
+
+#[test]
+fn check_run_and_explain_print_warnings_without_changing_the_exit_status() {
+    let directory = TestDirectory::new("discard-warning");
+    directory.file("main.krit", DISCARD_READ_SOURCE);
+
+    let check = krit_in(&directory)
+        .args(["check", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(check.status.code(), Some(0));
+    assert_eq!(check.stdout, b"checked main.krit\n");
+    assert_eq!(String::from_utf8_lossy(&check.stderr), DISCARD_READ_WARNING);
+
+    let check_json = krit_in(&directory)
+        .args(["check", "--diagnostic-format", "json", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(check_json.status.code(), Some(0));
+    assert_eq!(check_json.stdout, b"checked main.krit\n");
+    assert_discard_read_json_warning(&check_json.stderr);
+
+    let run = krit_in(&directory)
+        .args(["run", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(run.status.code(), Some(0));
+    assert_eq!(run.stdout, b"1\n");
+    assert_eq!(String::from_utf8_lossy(&run.stderr), DISCARD_READ_WARNING);
+
+    let run_json = krit_in(&directory)
+        .args(["run", "--diagnostic-format=json", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(run_json.status.code(), Some(0));
+    assert_eq!(run_json.stdout, b"1\n");
+    assert_discard_read_json_warning(&run_json.stderr);
+
+    let explain = krit_in(&directory)
+        .args(["explain", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(explain.status.code(), Some(0));
+    assert!(explain.stdout.starts_with(b"Krit explanation (schema 1)\n"));
+    assert_eq!(
+        String::from_utf8_lossy(&explain.stderr),
+        DISCARD_READ_WARNING
+    );
+
+    let explain_json = krit_in(&directory)
+        .args(["explain", "--json", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(explain_json.status.code(), Some(0));
+    let explanation: serde_json::Value =
+        serde_json::from_slice(&explain_json.stdout).expect("explanation should be JSON");
+    assert_eq!(explanation["schema"], 1);
+    assert_discard_read_json_warning(&explain_json.stderr);
+}
+
+#[test]
+fn build_prints_warnings_and_still_builds() {
+    let directory = TestDirectory::new("discard-warning-build");
+    directory.file("main.krit", DISCARD_READ_SOURCE);
+    directory.file("krit.pkg", &package_manifest(true));
+
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("Krit should build");
+    assert_eq!(
+        build.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&build.stderr), DISCARD_READ_WARNING);
+    assert!(build.stdout.starts_with(b"built "));
+    assert_valid_artifact(&directory.path.join("target/krit/program.wasm"));
+}
+
+#[test]
+fn warnings_found_before_an_error_are_printed_before_it() {
+    let directory = TestDirectory::new("discard-warning-error");
+    directory.file("main.krit", "let _ = 1;\nlet text = _ + \"a\";\n");
+
+    for command in ["check", "run"] {
+        let human = krit_in(&directory)
+            .args([command, "main.krit"])
+            .output()
+            .expect("Krit should start");
+        assert_eq!(human.status.code(), Some(1), "{command}");
+        assert!(human.stdout.is_empty(), "{command}");
+        let stderr = String::from_utf8(human.stderr).expect("diagnostics should be UTF-8");
+        let lines = stderr.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "{command}: {stderr}");
+        assert!(
+            lines[0].starts_with("main.krit:2:12: warning[K2003]: "),
+            "{command}: {stderr}"
+        );
+        assert!(
+            lines[1].starts_with("main.krit:2:12: error[K3001]: "),
+            "{command}: {stderr}"
+        );
+
+        let json = krit_in(&directory)
+            .args([command, "--diagnostic-format", "json", "main.krit"])
+            .output()
+            .expect("Krit should start");
+        assert_eq!(json.status.code(), Some(1), "{command}");
+        let diagnostics = parse_json_lines(&json.stderr);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic["severity"].as_str().unwrap_or_default(),
+                    diagnostic["code"].as_str().unwrap_or_default()
+                ))
+                .collect::<Vec<_>>(),
+            [("warning", "K2003"), ("error", "K3001")],
+            "{command}"
+        );
+    }
+}
+
+/// Every conformance case directory under `conformance/<suite>`, as sorted
+/// repository-relative paths.
+fn conformance_cases(suite: &str) -> Vec<PathBuf> {
+    let root = repository_root();
+    let mut pending = vec![root.join("conformance").join(suite)];
+    let mut cases = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).expect("conformance directory should be readable") {
+            let path = entry.expect("directory entry should be readable").path();
+            if path.join("program.krit").is_file() {
+                cases.push(
+                    path.strip_prefix(root)
+                        .expect("case should be inside the repository")
+                        .to_path_buf(),
+                );
+            } else if path.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    cases.sort();
+    assert!(!cases.is_empty(), "no {suite} conformance cases found");
+    cases
+}
+
+fn conformance_expectation(case: &Path, name: &str) -> String {
+    let path = repository_root().join(case).join(name);
+    if path.is_file() {
+        fs::read_to_string(path).expect("expectation should be readable")
+    } else {
+        String::new()
+    }
+}
+
+fn conformance_codes(case: &Path, name: &str) -> Vec<String> {
+    conformance_expectation(case, name)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The codes of the JSON Lines diagnostics with `severity`, in output order.
+fn diagnostic_codes(diagnostics: &[serde_json::Value], severity: &str) -> Vec<String> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic["severity"] == severity)
+        .map(|diagnostic| {
+            diagnostic["code"]
+                .as_str()
+                .expect("diagnostic code should be a string")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// An error carries the number of JSON `notes` in `expect.notes`, which
+/// defaults to exactly one fix for habit codes (`K1101`-`K1112`) and method
+/// calls (`K3011`) and to none otherwise; every note is a one-line string.
+fn assert_notes(diagnostics: &[serde_json::Value], case: &Path) {
+    let expected = conformance_expectation(case, "expect.notes");
+    for diagnostic in diagnostics {
+        let code = diagnostic["code"]
+            .as_str()
+            .expect("code should be a string");
+        let notes = diagnostic["notes"]
+            .as_array()
+            .expect("notes should be an array");
+        if diagnostic["severity"] == "error" {
+            let habit = code
+                .strip_prefix("K11")
+                .and_then(|number| number.parse::<u8>().ok())
+                .is_some_and(|number| (1..=12).contains(&number));
+            let expected = if expected.is_empty() {
+                usize::from(habit || code == "K3011")
+            } else {
+                expected
+                    .trim()
+                    .parse::<usize>()
+                    .expect("expect.notes should contain a number")
+            };
+            assert_eq!(
+                notes.len(),
+                expected,
+                "{}: note count of {code}",
+                case.display()
+            );
+        }
+        assert!(
+            notes.iter().all(|note| note
+                .as_str()
+                .is_some_and(|note| !note.is_empty() && !note.contains('\n'))),
+            "{}: every note is a one-line string",
+            case.display()
+        );
+    }
+}
+
+#[test]
+fn run_refuses_every_check_failure_with_checks_diagnostic_and_status() {
+    for case in conformance_cases("check") {
+        let program = case.join("program.krit");
+        let expected_status = conformance_expectation(&case, "expect.status");
+        for format in ["human", "json"] {
+            let check = krit()
+                .args(["check", "--diagnostic-format", format])
+                .arg(&program)
+                .output()
+                .expect("Krit should start");
+            assert_eq!(
+                check.status.code().map(|status| status.to_string()),
+                Some(expected_status.trim().to_owned()),
+                "{} {format}",
+                case.display()
+            );
+            if format == "json" {
+                let diagnostics = parse_json_lines(&check.stderr);
+                assert_eq!(
+                    diagnostic_codes(&diagnostics, "error"),
+                    conformance_codes(&case, "expect.diagnostics"),
+                    "{}",
+                    case.display()
+                );
+                assert_eq!(
+                    diagnostic_codes(&diagnostics, "warning"),
+                    conformance_codes(&case, "expect.warnings"),
+                    "{}",
+                    case.display()
+                );
+                assert_eq!(
+                    diagnostics.len(),
+                    diagnostic_codes(&diagnostics, "error").len()
+                        + diagnostic_codes(&diagnostics, "warning").len(),
+                    "{}: every diagnostic is an error or a warning",
+                    case.display()
+                );
+                assert_notes(&diagnostics, &case);
+            }
+            let run = krit()
+                .args(["run", "--diagnostic-format", format])
+                .arg(&program)
+                .output()
+                .expect("Krit should start");
+            // `run` performs check's front-end checking but no build-target
+            // check, since direct execution builds no artifact: a case that
+            // fails only with target diagnostics (`K7xxx`) passes it.
+            let expected_errors = conformance_codes(&case, "expect.diagnostics");
+            let target_only = !expected_errors.is_empty()
+                && expected_errors.iter().all(|code| code.starts_with("K7"));
+            if check.status.success() || target_only {
+                // A valid program runs, or is refused only because direct
+                // execution has no entrypoint or host to offer (K5003).
+                assert!(
+                    matches!(run.status.code(), Some(0 | 4)),
+                    "{} {format}: {}",
+                    case.display(),
+                    String::from_utf8_lossy(&run.stderr)
+                );
+                continue;
+            }
+            assert_eq!(
+                run.status.code(),
+                check.status.code(),
+                "{} {format}",
+                case.display()
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&run.stderr),
+                String::from_utf8_lossy(&check.stderr),
+                "{} {format}",
+                case.display()
+            );
+            assert!(run.stdout.is_empty(), "{} {format}", case.display());
+        }
+    }
+}
+
+#[test]
+fn runtime_conformance_cases_pass_check_and_run_through_the_cli() {
+    for case in conformance_cases("cases") {
+        let program = case.join("program.krit");
+        let check = krit()
+            .arg("check")
+            .arg(&program)
+            .output()
+            .expect("Krit should start");
+        assert!(
+            check.status.success(),
+            "runtime case {} must pass check: {}",
+            case.display(),
+            String::from_utf8_lossy(&check.stderr)
+        );
+
+        let run = krit()
+            .args(["run", "--diagnostic-format", "json"])
+            .arg(&program)
+            .output()
+            .expect("Krit should start");
+        assert_eq!(
+            run.status.code().map(|status| status.to_string()),
+            Some(
+                conformance_expectation(&case, "expect.status")
+                    .trim()
+                    .to_owned()
+            ),
+            "{}",
+            case.display()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            conformance_expectation(&case, "expect.stdout"),
+            "{}",
+            case.display()
+        );
+        let diagnostics = parse_json_lines(&run.stderr);
+        assert_eq!(
+            diagnostic_codes(&diagnostics, "error"),
+            conformance_codes(&case, "expect.diagnostics"),
+            "{}",
+            case.display()
+        );
+        assert_eq!(
+            diagnostic_codes(&diagnostics, "warning"),
+            conformance_codes(&case, "expect.warnings"),
+            "{}",
+            case.display()
+        );
+        assert_eq!(
+            diagnostics.len(),
+            diagnostic_codes(&diagnostics, "error").len()
+                + diagnostic_codes(&diagnostics, "warning").len(),
+            "{}: every diagnostic is an error or a warning",
+            case.display()
+        );
+    }
 }
 
 #[test]
@@ -1762,6 +2199,423 @@ println(factorial(6));
     assert!(sandbox.status.success());
     assert_eq!(sandbox.stdout, b"720\n");
     assert!(sandbox.stderr.is_empty());
+}
+
+/// Generates 2,000 levels of one nesting construct as a package entry.
+fn deeply_nested_source(construct: &str) -> String {
+    const DEPTH: usize = 2_000;
+    let (prefix, open, inner, close) = match construct {
+        "parens" => ("", "(", "1", ")"),
+        "blocks" => ("", "{ ", "1", " }"),
+        "lists" => ("", "[", "1", "]"),
+        "records" => ("", "record { a: ", "1", " }"),
+        "if" => ("", "if true { ", "1", " } else { 0 }"),
+        "match" => ("", "match Some(1) { None => 0, Some(x) => ", "1", " }"),
+        "calls" => ("fn f(x) { x }\n", "f(", "1", ")"),
+        "types" => {
+            return format!(
+                "let value: {}Int{} = [];\nprintln(1);\n",
+                "List<".repeat(DEPTH),
+                ">".repeat(DEPTH)
+            );
+        }
+        _ => unreachable!("unknown construct {construct}"),
+    };
+    format!(
+        "{prefix}println({}{inner}{});\n",
+        open.repeat(DEPTH),
+        close.repeat(DEPTH)
+    )
+}
+
+#[test]
+fn deep_nesting_reports_k1005_from_every_command_without_aborting() {
+    for construct in [
+        "parens", "blocks", "lists", "records", "if", "match", "calls", "types",
+    ] {
+        let directory = TestDirectory::new("deep-nesting");
+        let source = directory.file("main.krit", &deeply_nested_source(construct));
+        directory.file("krit.pkg", &package_manifest(true));
+        for command in [
+            vec!["check".into(), source.clone().into_os_string()],
+            vec!["run".into(), source.clone().into_os_string()],
+            vec!["fmt".into(), source.clone().into_os_string()],
+            vec!["build".into()],
+        ] {
+            let output = krit_in(&directory)
+                .args(&command)
+                .output()
+                .expect("Krit should start");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // A native stack overflow aborts with SIGABRT (shell status 134).
+            assert_ne!(output.status.code(), Some(134), "{construct} {command:?}");
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{construct} {command:?}: {stderr}"
+            );
+            assert!(
+                stderr.contains("error[K1005]"),
+                "{construct} {command:?}: {stderr}"
+            );
+            assert!(output.stdout.is_empty(), "{construct} {command:?}");
+        }
+    }
+}
+
+fn countdown_source(depth: usize) -> String {
+    format!(
+        "fn count(n) {{\n    if n == 0 {{\n        0\n    }} else {{\n        1 + count(n - 1)\n    }}\n}}\n\nprintln(count({depth}));\n"
+    )
+}
+
+#[test]
+fn direct_run_reports_k4010_for_runaway_recursion_and_runs_deep_recursion() {
+    let directory = TestDirectory::new("recursion-depth");
+    let runaway = directory.file("runaway.krit", &countdown_source(100_000));
+    let output = krit()
+        .args(["run", "--diagnostic-format", "json"])
+        .arg(&runaway)
+        .output()
+        .expect("Krit should start");
+    assert_ne!(output.status.code(), Some(134));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let diagnostics = parse_json_lines(&output.stderr);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "K4010");
+
+    let deep = directory.file("deep.krit", &countdown_source(9_000));
+    let output = krit()
+        .arg("run")
+        .arg(&deep)
+        .output()
+        .expect("Krit should start");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"9000\n");
+    assert!(output.stderr.is_empty());
+}
+
+/// Operator chains that each sit inside the parentheses of the next, so the
+/// innermost operand lies below every operator of every level.
+fn parenthesized_spine(levels: usize, operators: usize, operator: &str) -> String {
+    let mut expression = format!("1{}", operator.repeat(operators));
+    for _ in 1..levels {
+        expression = format!("({expression}){}", operator.repeat(operators));
+    }
+    expression
+}
+
+#[test]
+fn parenthesized_operator_spines_report_k1005_from_every_command() {
+    let directory = TestDirectory::new("operator-spine");
+    let source = directory.file(
+        "main.krit",
+        &format!("println({});\n", parenthesized_spine(3, 2_000, " + 1")),
+    );
+    directory.file("krit.pkg", &package_manifest(true));
+    for command in [
+        vec!["check".into(), source.clone().into_os_string()],
+        vec!["run".into(), source.clone().into_os_string()],
+        vec!["fmt".into(), source.clone().into_os_string()],
+        vec!["build".into()],
+    ] {
+        let output = krit_in(&directory)
+            .args(&command)
+            .output()
+            .expect("Krit should start");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_ne!(output.status.code(), Some(134), "{command:?}");
+        assert_eq!(output.status.code(), Some(1), "{command:?}: {stderr}");
+        assert!(stderr.contains("error[K1005]"), "{command:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{command:?}");
+    }
+}
+
+#[test]
+fn language_server_reports_k1005_for_a_parenthesized_operator_spine() {
+    // 125 levels of 3,900 operators: a document just under the language
+    // server's 1 MiB limit whose syntax tree would be almost half a million
+    // operators deep.
+    let directory = TestDirectory::new("lsp-operator-spine");
+    let text = format!("let value = {};\n", parenthesized_spine(125, 3_900, "+1"));
+    assert!(text.len() < 1024 * 1024);
+    let source = directory.file("main.krit", &text);
+    let uri = format!("file://{}", source.display());
+    let messages = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "capabilities": {}, "workspaceFolders": null}
+        }),
+        serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {"uri": uri, "languageId": "krit", "version": 1, "text": text}
+            }
+        }),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": null}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "exit", "params": null}),
+    ];
+    let mut input = Vec::new();
+    for message in &messages {
+        input.extend_from_slice(&lsp_frame(message));
+    }
+
+    let mut child = krit_in(&directory)
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Krit language server should start");
+    child
+        .stdin
+        .take()
+        .expect("language server stdin should be piped")
+        .write_all(&input)
+        .expect("LSP input should be written");
+    let output = child
+        .wait_with_output()
+        .expect("language server should finish");
+
+    assert_ne!(output.status.code(), Some(134));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let frames = parse_lsp_frames(&output.stdout);
+    assert_eq!(frames[1]["method"], "textDocument/publishDiagnostics");
+    assert_eq!(frames[1]["params"]["diagnostics"][0]["code"], "K1005");
+}
+
+#[test]
+fn direct_run_refuses_runaway_value_nesting_before_evaluation() {
+    // Evaluated, this ill-typed program would wrap the value in 9,000 more
+    // lists on each of 1,000 sequential calls. `run` refuses it with check's
+    // diagnostic before evaluating anything, so it never reaches the
+    // evaluator's value-depth limit (covered by the evaluator's own tests).
+    let directory = TestDirectory::new("value-depth");
+    let mut text = String::from(
+        "fn wrap(x, n) {\n    if n == 0 {\n        x\n    } else {\n        wrap([x], n - 1)\n    }\n}\n\nlet v0 = 0;\n",
+    );
+    for level in 1..=1_000 {
+        text.push_str(&format!("let v{level} = wrap(v{}, 9000);\n", level - 1));
+    }
+    text.push_str("println(v1000);\nprintln(json_encode(v1000));\nprintln(v1000 == v1000);\n");
+    let source = directory.file("main.krit", &text);
+    let check = krit()
+        .args(["check", "--diagnostic-format", "json"])
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+    let output = krit()
+        .args(["run", "--diagnostic-format", "json"])
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+    assert_ne!(output.status.code(), Some(134));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, check.stderr);
+    let diagnostics = parse_json_lines(&output.stderr);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "K3001");
+}
+
+#[test]
+fn long_else_if_chains_check_run_format_build_and_execute() {
+    let directory = TestDirectory::new("else-if-chain");
+    let mut text = String::from("fn pick(n) {\n    if n == 0 {\n        0\n    }");
+    for branch in 1..1_000 {
+        text.push_str(&format!(
+            " else if n == {branch} {{\n        {}\n    }}",
+            branch * 3
+        ));
+    }
+    text.push_str(" else {\n        -1\n    }\n}\n\nprintln(pick(999));\n");
+    let source = directory.file("main.krit", &text);
+    directory.file("krit.pkg", &package_manifest(true));
+
+    let check = krit()
+        .arg("check")
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let run = krit()
+        .arg("run")
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"2997\n");
+
+    let format = krit()
+        .args(["fmt", "--check"])
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+    assert!(
+        format.status.success(),
+        "{}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("Krit should start");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let sandbox = krit_in(&directory)
+        .arg("sandbox")
+        .output()
+        .expect("Krit should start");
+    assert!(
+        sandbox.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sandbox.stderr)
+    );
+    assert_eq!(sandbox.stdout, b"2997\n");
+}
+
+/// The deepest syntax tree the parser accepts: 256 nested `else` blocks (or
+/// block expressions), each called as often as the nesting limit allows until
+/// the innermost point reaches the structural limit. Analysis and Core
+/// lowering recurse through more levels for it than for any other tree.
+/// Every call applies `g`, a curried function of 200 parameters, so the
+/// program prints `0`.
+fn deepest_tree_source(else_blocks: bool) -> String {
+    const ARITY: usize = 200;
+    let mut text = String::from("fn g(x0) { ");
+    for parameter in 1..ARITY {
+        text.push_str(&format!("fn(x{parameter}) {{ "));
+    }
+    text.push('0');
+    text.push_str(&" }".repeat(ARITY));
+    text.push('\n');
+    let mut remaining = krit::MAX_STRUCTURAL_DEPTH - krit::MAX_NESTING_DEPTH;
+    let links = (1..=krit::MAX_NESTING_DEPTH)
+        .map(|nesting| {
+            let count = ARITY
+                .min(krit::MAX_NESTING_DEPTH + 1 - nesting)
+                .min(remaining);
+            remaining -= count;
+            count
+        })
+        .collect::<Vec<_>>();
+    let mut expression = String::from("0");
+    for count in links.into_iter().rev() {
+        let level = if else_blocks {
+            format!("if false {{ g }} else {{ let h = {expression}; g }}")
+        } else {
+            format!("{{ let h = {expression}; g }}")
+        };
+        expression = format!("{level}{}", "(1)".repeat(count));
+    }
+    text.push_str(&format!("let value = {expression};\nprintln(value);\n"));
+    text
+}
+
+#[test]
+fn deepest_accepted_trees_pass_every_command() {
+    for else_blocks in [true, false] {
+        let directory = TestDirectory::new("deepest-tree");
+        directory.file("main.krit", &deepest_tree_source(else_blocks));
+        directory.file("krit.pkg", &package_manifest(true));
+        // Formatting rewrites the file, so checking it again shows the
+        // formatted program stays within the limits too.
+        for (command, stdout) in [
+            (vec!["check", "main.krit"], None),
+            (vec!["explain", "--json", "main.krit"], None),
+            (vec!["run", "main.krit"], Some(&b"0\n"[..])),
+            (vec!["build"], None),
+            (vec!["sandbox"], Some(&b"0\n"[..])),
+            (vec!["fmt", "main.krit"], None),
+            (vec!["check", "main.krit"], None),
+        ] {
+            let output = krit_in(&directory)
+                .args(&command)
+                .output()
+                .expect("Krit should start");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "else blocks {else_blocks} {command:?}: {stderr}"
+            );
+            assert!(
+                stderr.is_empty(),
+                "else blocks {else_blocks} {command:?}: {stderr}"
+            );
+            if let Some(stdout) = stdout {
+                assert_eq!(
+                    output.stdout, stdout,
+                    "else blocks {else_blocks} {command:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unifying_solved_types_reports_limits_without_aborting() {
+    // Unifying `shallow` with `deep` deepens `top` to 260 levels; unifying
+    // `e` with a type containing it would be infinite.
+    let directory = TestDirectory::new("solved-type-unification");
+    let cases = [
+        (
+            format!(
+                "let shallow = [[[]]];\nlet top = {}shallow{};\n\
+                 let deep = [[[[[[[[[[1]]]]]]]]]];\nlet grows = shallow == deep;\n",
+                "[".repeat(250),
+                "]".repeat(250)
+            ),
+            "K1005",
+        ),
+        (
+            "let e = [];\nlet wrapped = [[e]];\nlet same = e == wrapped;\n".to_owned(),
+            "K3001",
+        ),
+    ];
+    for (index, (text, code)) in cases.iter().enumerate() {
+        let source = directory.file(&format!("case{index}.krit"), text);
+        for command in ["check", "explain", "run"] {
+            let output = krit()
+                .arg(command)
+                .arg(&source)
+                .output()
+                .expect("Krit should start");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_ne!(output.status.code(), Some(134), "{code} {command}");
+            assert_eq!(output.status.code(), Some(1), "{code} {command}: {stderr}");
+            assert!(
+                stderr.contains(&format!("error[{code}]")),
+                "{code} {command}: {stderr}"
+            );
+            assert!(output.stdout.is_empty(), "{code} {command}");
+        }
+    }
 }
 
 #[test]

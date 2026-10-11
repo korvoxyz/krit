@@ -60,8 +60,14 @@ fn json_lines(output: &Output) -> Vec<serde_json::Value> {
 }
 
 fn codes(output: &Output) -> Vec<String> {
+    severity_codes(output, "error")
+}
+
+/// The codes of the reported diagnostics with `severity`, in output order.
+fn severity_codes(output: &Output, severity: &str) -> Vec<String> {
     json_lines(output)
         .iter()
+        .filter(|diagnostic| diagnostic["severity"] == severity)
         .map(|diagnostic| {
             diagnostic["code"]
                 .as_str()
@@ -128,32 +134,12 @@ fn collect_programs(directory: &Path, files: &mut Vec<PathBuf>) {
 /// `K5001`. Programs that fail analysis get an empty grant set.
 fn package_for(program: &Path, text: &str, directory: &ScratchDirectory) -> PathBuf {
     let mut grants = BTreeMap::<&'static str, BTreeSet<String>>::new();
-    let source = Source::new("main.krit", text);
-    let mut requirements = BTreeSet::new();
-    if let Ok(parsed) = parse_source(&source)
-        && let Ok(analysis) = analyze(&parsed)
-    {
-        for expression in analysis.expressions() {
-            for requirement in expression.requirements().iter() {
-                requirements.insert((
-                    requirement.capability().as_str().to_owned(),
-                    requirement.resource().to_owned(),
-                ));
-            }
-        }
-        // Entrypoint declarations add requirements (such as the consumed
-        // queue) that no expression carries.
-        if let Ok(module) = lower(&parsed, &analysis) {
-            for function in module.functions() {
-                for requirement in function.signature.requirements.iter() {
-                    requirements.insert((
-                        requirement.capability().as_str().to_owned(),
-                        requirement.resource().to_owned(),
-                    ));
-                }
-            }
-        }
-    }
+    // The corpus includes the deepest programs the parser accepts, so the
+    // compiler stages run on the stack `krit` gives them.
+    let requirements = krit::run_on_thread("package-for", krit::COMPILER_STACK_BYTES, || {
+        required_capabilities(text)
+    })
+    .expect("analysis thread should start");
     for (capability, resource) in requirements {
         let key = match capability.as_str() {
             "config.read" => "config",
@@ -190,6 +176,38 @@ fn package_for(program: &Path, text: &str, directory: &ScratchDirectory) -> Path
     let manifest_path = directory.path.join("krit.pkg");
     fs::write(&manifest_path, manifest).expect("manifest should be written");
     manifest_path
+}
+
+/// The capability requirements of `text`'s analysis and entrypoints, or none
+/// when it fails analysis.
+fn required_capabilities(text: &str) -> BTreeSet<(String, String)> {
+    let source = Source::new("main.krit", text);
+    let mut requirements = BTreeSet::new();
+    if let Ok(parsed) = parse_source(&source)
+        && let Ok(analysis) = analyze(&parsed)
+    {
+        for expression in analysis.expressions() {
+            for requirement in expression.requirements().iter() {
+                requirements.insert((
+                    requirement.capability().as_str().to_owned(),
+                    requirement.resource().to_owned(),
+                ));
+            }
+        }
+        // Entrypoint declarations add requirements (such as the consumed
+        // queue) that no expression carries.
+        if let Ok(module) = lower(&parsed, &analysis) {
+            for function in module.functions() {
+                for requirement in function.signature.requirements.iter() {
+                    requirements.insert((
+                        requirement.capability().as_str().to_owned(),
+                        requirement.resource().to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    requirements
 }
 
 fn build(program: &Path, directory: &ScratchDirectory) -> Output {
@@ -469,14 +487,31 @@ fn static_conformance_cases_pass_through_the_cli() {
             .lines()
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        let expected_warnings = read_expectation(case.join("expect.warnings"))
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         assert_eq!(
             output.status.code(),
             Some(expected_status),
             "{name}: status"
         );
         assert_eq!(codes(&output), expected_codes, "{name}: diagnostics");
+        assert_eq!(
+            severity_codes(&output, "warning"),
+            expected_warnings,
+            "{name}: warnings"
+        );
+        assert_eq!(
+            json_lines(&output).len(),
+            expected_codes.len() + expected_warnings.len(),
+            "{name}: every diagnostic is an error or a warning"
+        );
         if expected_status == 0 {
-            assert!(output.stderr.is_empty(), "{name}: unexpected diagnostics");
+            assert!(
+                expected_warnings.is_empty() == output.stderr.is_empty(),
+                "{name}: unexpected diagnostics"
+            );
         } else {
             assert!(
                 output.stdout.is_empty(),

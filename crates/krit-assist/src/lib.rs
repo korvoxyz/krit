@@ -10,10 +10,10 @@ pub use context::{
 };
 pub use error::{AssistError, AssistErrorKind};
 pub use proposal::{
-    AcceptedProposal, AssistProposal, CompilerSnapshot, DiagnosticSnapshot, PermissionFact,
-    PermissionKey, PermissionReview, RequestedPermissionReview, ReviewReport, ReviewedProposal,
-    SetDelta, TypeSnapshot, accept_reviewed, build_proposal, load_proposal, review_loaded_proposal,
-    review_proposal, suggest, write_proposal,
+    AcceptedProposal, AssistProposal, CompilerSnapshot, DiagnosticSeverity, DiagnosticSnapshot,
+    PermissionFact, PermissionKey, PermissionReview, RequestedPermissionReview, ReviewReport,
+    ReviewedProposal, SetDelta, TypeSnapshot, accept_reviewed, build_proposal, load_proposal,
+    review_loaded_proposal, review_proposal, suggest, write_proposal,
 };
 pub use protocol::{
     AUTHORING_PROTOCOL_VERSION, AssistRequest, AssistResponse, ContextRedaction, ContextRole,

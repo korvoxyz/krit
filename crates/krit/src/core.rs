@@ -9,6 +9,7 @@ use crate::{
     Analysis, BinaryOperator, Block, Builtin, EffectSet, Expression, ExpressionKind, FunctionType,
     MatchKind, Parameter, Program, RequirementSet, ResolvedName, Span, Statement, StatementKind,
     SymbolId, SymbolKind, Type, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+    limits::{MAX_CORE_BLOCK_DEPTH, MAX_TREE_DEPTH},
 };
 
 macro_rules! id_type {
@@ -326,6 +327,48 @@ impl CoreModule {
         Verifier::new(self).verify()
     }
 
+    /// Returns the nesting depth of the most deeply nested Core block in any
+    /// function, counting a function body as depth one, with that block's
+    /// source span.
+    ///
+    /// The walk uses an explicit stack, so it is safe on any module.
+    pub fn deepest_block(&self) -> (usize, Option<Span>) {
+        let mut deepest = (0, None);
+        let mut pending = self
+            .functions
+            .iter()
+            .rev()
+            .map(|function| (&function.body, 1))
+            .collect::<Vec<_>>();
+        while let Some((block, depth)) = pending.pop() {
+            if depth > deepest.0 {
+                deepest = (depth, block.source);
+            }
+            for operation in &block.operations {
+                match &operation.kind {
+                    OperationKind::Block { block } => pending.push((block, depth + 1)),
+                    OperationKind::If {
+                        consequent,
+                        alternative,
+                        ..
+                    } => {
+                        pending.push((consequent, depth + 1));
+                        pending.push((alternative, depth + 1));
+                    }
+                    OperationKind::MatchList { empty, cons, .. } => {
+                        pending.push((empty, depth + 1));
+                        pending.push((cons, depth + 1));
+                    }
+                    OperationKind::MatchVariant { arms, .. } => {
+                        pending.extend(arms.iter().map(|arm| (&arm.block, depth + 1)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        deepest
+    }
+
     /// Returns whether any Core boundary or operation still contains an
     /// inference variable that must be specialized before choosing a layout.
     pub fn has_residual_types(&self) -> bool {
@@ -468,6 +511,8 @@ struct Lowerer<'a> {
     next_closure: u32,
     next_match_binding: u32,
     webhook_entrypoint: Option<CoreEntrypoint>,
+    /// Nested expression and block lowerings currently open.
+    depth: usize,
 }
 
 impl<'a> Lowerer<'a> {
@@ -502,6 +547,7 @@ impl<'a> Lowerer<'a> {
             next_closure: 0,
             next_match_binding: 0,
             webhook_entrypoint: None,
+            depth: 0,
         })
     }
 
@@ -567,7 +613,37 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    /// Counts one level of lowering recursion.
+    ///
+    /// The parser keeps source programs within this bound, and analysis
+    /// applies it to the same tree, so this only rejects a hand-built syntax
+    /// tree that differs from the one that was analyzed.
+    fn enter(&mut self, span: Option<Span>) -> Result<(), IrError> {
+        if self.depth >= MAX_TREE_DEPTH {
+            return Err(IrError::new(format!(
+                "nesting depth limit exceeded: the syntax tree nests deeper than \
+                 {MAX_TREE_DEPTH} levels at {span:?}"
+            )));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
     fn lower_statements_block(
+        &mut self,
+        id: BlockId,
+        statements: &[Statement],
+        tail: Option<&Expression>,
+        facts: BlockFacts,
+        source: Option<Span>,
+    ) -> Result<CoreBlock, IrError> {
+        self.enter(source)?;
+        let block = self.lower_statements_block_contents(id, statements, tail, facts, source);
+        self.depth -= 1;
+        block
+    }
+
+    fn lower_statements_block_contents(
         &mut self,
         id: BlockId,
         statements: &[Statement],
@@ -772,6 +848,17 @@ impl<'a> Lowerer<'a> {
         expression: &Expression,
         operations: &mut Vec<CoreOperation>,
     ) -> Result<ValueId, IrError> {
+        self.enter(Some(expression.span))?;
+        let value = self.lower_expression_contents(expression, operations);
+        self.depth -= 1;
+        value
+    }
+
+    fn lower_expression_contents(
+        &mut self,
+        expression: &Expression,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<ValueId, IrError> {
         let fact = self.expression_fact(expression)?;
         let ty = fact.shared_type();
         let expression_requirements = fact.requirements().clone();
@@ -873,30 +960,7 @@ impl<'a> Lowerer<'a> {
                     OperationKind::Block { block },
                 ))
             }
-            ExpressionKind::If {
-                condition,
-                consequent,
-                alternative,
-            } => {
-                let condition = self.lower_expression(condition, operations)?;
-                let consequent = self.lower_block(consequent)?;
-                let alternative = self.lower_expression_block(alternative, Vec::new())?;
-                let effects = EffectSet::union([&consequent.effects, &alternative.effects]);
-                let requirements =
-                    RequirementSet::union([&consequent.requirements, &alternative.requirements]);
-                Ok(self.emit_with_requirements(
-                    operations,
-                    ty,
-                    effects,
-                    requirements,
-                    source,
-                    OperationKind::If {
-                        condition,
-                        consequent,
-                        alternative,
-                    },
-                ))
-            }
+            ExpressionKind::If { .. } => self.lower_if_chain(expression, operations),
             ExpressionKind::Function {
                 parameters, body, ..
             } => self
@@ -932,20 +996,16 @@ impl<'a> Lowerer<'a> {
                     MatchKind::List {
                         empty_case,
                         head_name,
+                        head_span,
                         tail_name,
+                        tail_span,
                         cons_case,
                     } => {
                         let empty = self.lower_expression_block(empty_case, Vec::new())?;
-                        let head_binding = self.declaration_binding(
-                            expression.span,
-                            head_name,
-                            SymbolKind::Match,
-                        )?;
-                        let tail_binding = self.declaration_binding(
-                            expression.span,
-                            tail_name,
-                            SymbolKind::Match,
-                        )?;
+                        let head_binding =
+                            self.declaration_binding(*head_span, head_name, SymbolKind::Match)?;
+                        let tail_binding =
+                            self.declaration_binding(*tail_span, tail_name, SymbolKind::Match)?;
                         let head = self.block_parameter(head_binding)?;
                         let tail = self.block_parameter(tail_binding)?;
                         let head_id = head.match_binding;
@@ -1019,47 +1079,165 @@ impl<'a> Lowerer<'a> {
                     },
                 ))
             }
-            ExpressionKind::Binary {
-                left,
-                operator: BinaryOperator::And,
-                right,
-            } => self.lower_short_circuit(expression, left, right, false, operations),
-            ExpressionKind::Binary {
-                left,
-                operator: BinaryOperator::Or,
-                right,
-            } => self.lower_short_circuit(expression, left, right, true, operations),
-            ExpressionKind::Binary {
-                left,
-                operator,
-                right,
-            } => {
-                let left = self.lower_expression(left, operations)?;
-                let right = self.lower_expression(right, operations)?;
-                Ok(self.emit(
-                    operations,
-                    ty,
-                    EffectSet::default(),
-                    source,
-                    OperationKind::Binary {
-                        left,
-                        operator: *operator,
-                        right,
-                    },
-                ))
-            }
+            ExpressionKind::Binary { .. } => self.lower_binary_chain(expression, operations),
         }
+    }
+
+    /// Lowers an `if` expression and its whole `else if` chain.
+    ///
+    /// Each continuation becomes the only operation of the previous link's
+    /// alternative block, exactly as a recursive lowering would produce and
+    /// with identifiers allocated in the same order, but the chain is walked
+    /// iteratively so its length never deepens lowering recursion.
+    fn lower_if_chain(
+        &mut self,
+        expression: &Expression,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<ValueId, IrError> {
+        struct OpenLink {
+            ty: Arc<Type>,
+            source: Option<Span>,
+            condition: ValueId,
+            consequent: CoreBlock,
+            alternative_id: BlockId,
+            alternative_facts: BlockFacts,
+            alternative_source: Option<Span>,
+        }
+
+        let mut links = Vec::new();
+        // Operations of each open link's alternative block; the next link's
+        // condition and `if` operation are emitted into the last one.
+        let mut alternative_operations: Vec<Vec<CoreOperation>> = Vec::new();
+        let mut current = expression;
+        let mut result = loop {
+            let target = alternative_operations
+                .last_mut()
+                .unwrap_or(&mut *operations);
+            let ExpressionKind::If {
+                condition,
+                consequent,
+                alternative,
+            } = &current.kind
+            else {
+                break self.lower_expression(current, target)?;
+            };
+            let ty = self.expression_fact(current)?.shared_type();
+            let condition = self.lower_expression(condition, target)?;
+            let consequent = self.lower_block(consequent)?;
+            let alternative_fact = self.expression_fact(alternative)?;
+            let alternative_facts = BlockFacts {
+                ty: alternative_fact.shared_type(),
+                effects: alternative_fact.effects().clone(),
+                requirements: alternative_fact.requirements().clone(),
+            };
+            let alternative_id = self.allocate_block();
+            self.push_scope();
+            alternative_operations.push(Vec::new());
+            links.push(OpenLink {
+                ty,
+                source: Some(current.span),
+                condition,
+                consequent,
+                alternative_id,
+                alternative_facts,
+                alternative_source: Some(alternative.span),
+            });
+            current = alternative;
+        };
+        while let Some(link) = links.pop() {
+            self.pop_scope();
+            let alternative = CoreBlock {
+                id: link.alternative_id,
+                parameters: Vec::new(),
+                operations: alternative_operations
+                    .pop()
+                    .expect("every open link has alternative operations"),
+                result,
+                ty: link.alternative_facts.ty,
+                effects: link.alternative_facts.effects,
+                requirements: link.alternative_facts.requirements,
+                source: link.alternative_source,
+            };
+            let effects = EffectSet::union([&link.consequent.effects, &alternative.effects]);
+            let requirements =
+                RequirementSet::union([&link.consequent.requirements, &alternative.requirements]);
+            let target = alternative_operations
+                .last_mut()
+                .unwrap_or(&mut *operations);
+            result = self.emit_with_requirements(
+                target,
+                link.ty,
+                effects,
+                requirements,
+                link.source,
+                OperationKind::If {
+                    condition: link.condition,
+                    consequent: link.consequent,
+                    alternative,
+                },
+            );
+        }
+        Ok(result)
+    }
+
+    /// Lowers a left-nested chain of binary operators such as `a + b + c`.
+    ///
+    /// The left spine is walked iteratively so a long chain never deepens
+    /// lowering recursion; operands are still lowered left to right.
+    fn lower_binary_chain(
+        &mut self,
+        expression: &Expression,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<ValueId, IrError> {
+        let mut spine = Vec::new();
+        let mut current = expression;
+        while let ExpressionKind::Binary { left, .. } = &current.kind {
+            spine.push(current);
+            current = left;
+        }
+        let mut value = self.lower_expression(current, operations)?;
+        while let Some(node) = spine.pop() {
+            let ExpressionKind::Binary {
+                operator, right, ..
+            } = &node.kind
+            else {
+                unreachable!("the binary spine holds only binary expressions")
+            };
+            value = match operator {
+                BinaryOperator::And => {
+                    self.lower_short_circuit(node, value, right, false, operations)?
+                }
+                BinaryOperator::Or => {
+                    self.lower_short_circuit(node, value, right, true, operations)?
+                }
+                _ => {
+                    let right = self.lower_expression(right, operations)?;
+                    let ty = self.expression_fact(node)?.shared_type();
+                    self.emit(
+                        operations,
+                        ty,
+                        EffectSet::default(),
+                        Some(node.span),
+                        OperationKind::Binary {
+                            left: value,
+                            operator: *operator,
+                            right,
+                        },
+                    )
+                }
+            };
+        }
+        Ok(value)
     }
 
     fn lower_short_circuit(
         &mut self,
         expression: &Expression,
-        left: &Expression,
+        condition: ValueId,
         right: &Expression,
         short_circuit_value: bool,
         operations: &mut Vec<CoreOperation>,
     ) -> Result<ValueId, IrError> {
-        let condition = self.lower_expression(left, operations)?;
         let right_block = self.lower_expression_block(right, Vec::new())?;
         let constant_block = self.boolean_block(short_circuit_value, expression.span);
         let (consequent, alternative) = if short_circuit_value {
@@ -1443,6 +1621,14 @@ impl<'a> Verifier<'a> {
     }
 
     fn verify(mut self) -> Result<(), IrError> {
+        // Every later walk over this module recurses through nested blocks.
+        let (depth, _) = self.module.deepest_block();
+        if depth > MAX_CORE_BLOCK_DEPTH {
+            return Err(IrError::new(format!(
+                "nesting depth limit exceeded: Core blocks nest {depth} levels, more than \
+                 {MAX_CORE_BLOCK_DEPTH}"
+            )));
+        }
         self.verify_contiguous_bindings()?;
         if self.module.entrypoints.is_empty()
             || self.module.entrypoints.len() > 2
@@ -3503,7 +3689,11 @@ const fn variant_family_name(family: VariantFamily) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Source, analyze, parse_source};
+    use crate::{
+        Source, analyze,
+        limits::deepest::{self, Level},
+        parse_source,
+    };
 
     use super::*;
 
@@ -3796,6 +3986,104 @@ mod tests {
                 .to_string()
                 .contains("capability requirements")
         );
+    }
+
+    #[test]
+    fn lowers_long_else_if_chains_and_operator_chains() {
+        let mut text = String::from("fn pick(n) {\n    if n == 0 {\n        0\n    }");
+        for branch in 1..1_000 {
+            text.push_str(&format!(
+                " else if n == {branch} {{\n        {branch}\n    }}"
+            ));
+        }
+        text.push_str(" else {\n        -1\n    }\n}\n\nlet total = 0");
+        text.push_str(&" + pick(1) * 2".repeat(1_000));
+        text.push_str(" == 1");
+        text.push_str(&" && true".repeat(1_000));
+        text.push_str(";\n");
+        // Verification walks nested blocks recursively, so it gets the stack
+        // the CLI gives the compiler pipeline.
+        let module = crate::run_on_thread("core-test", crate::COMPILER_STACK_BYTES, move || {
+            lowered(&text)
+        })
+        .expect("core test thread should start");
+
+        // Each continuation is the only operation of the previous link's
+        // alternative block, and the final `else` block nests once more.
+        let pick = &module.functions[1];
+        let (depth, span) = module.deepest_block();
+        assert_eq!(depth, 1 + 1_000 + 1);
+        assert!(span.is_some());
+        let mut block = &pick.body;
+        let mut links = 0;
+        while let Some(CoreOperation {
+            kind: OperationKind::If { alternative, .. },
+            result,
+            ..
+        }) = block.operations.last()
+        {
+            assert_eq!(block.result, *result);
+            links += 1;
+            block = alternative;
+        }
+        assert_eq!(links, 1_000);
+    }
+
+    #[test]
+    fn lowers_and_verifies_the_deepest_trees_the_parser_accepts() {
+        // Lowering recurses one level deeper than analysis, inside the module
+        // initialization block, so 256 nested `else` blocks at the structural
+        // limit need exactly `MAX_TREE_DEPTH` levels.
+        for level in [Level::Else, Level::Block] {
+            let text = deepest::source(level, 0);
+            let module =
+                crate::run_on_thread("core-test", crate::COMPILER_STACK_BYTES, move || {
+                    lowered(&text)
+                })
+                .expect("core test thread should start");
+            assert!(
+                module.deepest_block().0 <= MAX_CORE_BLOCK_DEPTH,
+                "{level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verification_rejects_blocks_nested_beyond_the_core_limit() {
+        let error = crate::run_on_thread("core-test", crate::COMPILER_STACK_BYTES, || {
+            let mut module = lowered("println(1);");
+            let mut body = module.functions[0].body.clone();
+            for _ in 0..MAX_CORE_BLOCK_DEPTH {
+                let result = body.result;
+                let ty = Arc::clone(&body.ty);
+                let effects = body.effects.clone();
+                let source = body.source;
+                body = CoreBlock {
+                    id: body.id,
+                    parameters: Vec::new(),
+                    operations: vec![CoreOperation {
+                        result,
+                        ty: Arc::clone(&ty),
+                        effects: effects.clone(),
+                        requirements: RequirementSet::default(),
+                        source,
+                        kind: OperationKind::Block { block: body },
+                    }],
+                    result,
+                    ty,
+                    effects,
+                    requirements: RequirementSet::default(),
+                    source,
+                };
+            }
+            module.functions[0].body = body;
+            assert_eq!(module.deepest_block().0, MAX_CORE_BLOCK_DEPTH + 1);
+            module
+                .verify()
+                .expect_err("over-deep Core should be rejected")
+        })
+        .expect("core test thread should start");
+        assert!(error.to_string().contains("nesting depth"), "{error}");
     }
 
     #[test]

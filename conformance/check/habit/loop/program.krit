@@ -1,0 +1,7 @@
+fn total(items: List<Int>) -> Int {
+    let sum = 0;
+    for item in items {
+        println(item);
+    }
+    sum
+}

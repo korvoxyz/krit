@@ -824,80 +824,95 @@ fn ast_sensitive_literal_spans(
         visited: &mut BTreeSet<(usize, usize)>,
         targets: &mut RedactionTargets,
     ) {
-        if !visited.insert((expression.span.start, expression.span.end)) {
-            return;
-        }
-        match &expression.kind {
-            ExpressionKind::Literal(ValueLiteral::String(_)) => {
-                if let Some(span) =
-                    literal_content_span(source, expression.span.start, expression.span.end)
-                {
-                    targets.add_span(span);
-                }
-            }
-            ExpressionKind::Literal(_) => {}
-            ExpressionKind::Variable(name) => {
-                if let Some(bound) = resolve(scopes, name) {
-                    targets.merge(bound);
-                }
-            }
-            ExpressionKind::List(elements) => {
-                for element in elements {
-                    collect(source, element, scopes, visited, targets);
-                }
-            }
-            ExpressionKind::Record(fields) => {
-                for field in fields {
-                    collect(source, &field.value, scopes, visited, targets);
-                }
-            }
-            ExpressionKind::FieldAccess { value, .. } => {
-                collect(source, value, scopes, visited, targets);
-            }
-            ExpressionKind::Block(block) => collect_block(source, block, scopes, visited, targets),
-            ExpressionKind::If {
-                condition,
-                consequent,
-                alternative,
-            } => {
-                collect(source, condition, scopes, visited, targets);
-                collect_block(source, consequent, scopes, visited, targets);
-                collect(source, alternative, scopes, visited, targets);
-            }
-            ExpressionKind::Function { body, .. } => {
-                collect_block(source, body, scopes, visited, targets);
-            }
-            ExpressionKind::Call { callee, arguments } => {
-                collect(source, callee, scopes, visited, targets);
-                for argument in arguments {
-                    collect(source, argument, scopes, visited, targets);
-                }
-            }
-            ExpressionKind::Match { subject, kind } => {
-                collect(source, subject, scopes, visited, targets);
-                match kind {
-                    MatchKind::List {
-                        empty_case,
-                        cons_case,
-                        ..
+        // `else if` continuations and the left spine of an operator chain are
+        // followed by this loop rather than by recursion, so a long chain
+        // never deepens the walk; expressions are still visited in source
+        // order.
+        let mut pending_operands = Vec::new();
+        let mut current = expression;
+        loop {
+            if visited.insert((current.span.start, current.span.end)) {
+                match &current.kind {
+                    ExpressionKind::If {
+                        condition,
+                        consequent,
+                        alternative,
                     } => {
-                        collect(source, empty_case, scopes, visited, targets);
-                        collect(source, cons_case, scopes, visited, targets);
+                        collect(source, condition, scopes, visited, targets);
+                        collect_block(source, consequent, scopes, visited, targets);
+                        current = alternative;
+                        continue;
                     }
-                    MatchKind::Variants { arms, .. } => {
-                        for arm in arms {
-                            collect(source, &arm.value, scopes, visited, targets);
+                    ExpressionKind::Binary { left, right, .. } => {
+                        pending_operands.push(right.as_ref());
+                        current = left;
+                        continue;
+                    }
+                    ExpressionKind::Literal(ValueLiteral::String(_)) => {
+                        if let Some(span) =
+                            literal_content_span(source, current.span.start, current.span.end)
+                        {
+                            targets.add_span(span);
                         }
                     }
+                    ExpressionKind::Literal(_) => {}
+                    ExpressionKind::Variable(name) => {
+                        if let Some(bound) = resolve(scopes, name) {
+                            targets.merge(bound);
+                        }
+                    }
+                    ExpressionKind::List(elements) => {
+                        for element in elements {
+                            collect(source, element, scopes, visited, targets);
+                        }
+                    }
+                    ExpressionKind::Record(fields) => {
+                        for field in fields {
+                            collect(source, &field.value, scopes, visited, targets);
+                        }
+                    }
+                    ExpressionKind::FieldAccess { value, .. } => {
+                        collect(source, value, scopes, visited, targets);
+                    }
+                    ExpressionKind::Block(block) => {
+                        collect_block(source, block, scopes, visited, targets);
+                    }
+                    ExpressionKind::Function { body, .. } => {
+                        collect_block(source, body, scopes, visited, targets);
+                    }
+                    ExpressionKind::Call { callee, arguments } => {
+                        collect(source, callee, scopes, visited, targets);
+                        for argument in arguments {
+                            collect(source, argument, scopes, visited, targets);
+                        }
+                    }
+                    ExpressionKind::Match { subject, kind } => {
+                        collect(source, subject, scopes, visited, targets);
+                        match kind {
+                            MatchKind::List {
+                                empty_case,
+                                cons_case,
+                                ..
+                            } => {
+                                collect(source, empty_case, scopes, visited, targets);
+                                collect(source, cons_case, scopes, visited, targets);
+                            }
+                            MatchKind::Variants { arms, .. } => {
+                                for arm in arms {
+                                    collect(source, &arm.value, scopes, visited, targets);
+                                }
+                            }
+                        }
+                    }
+                    ExpressionKind::Unary { operand, .. } => {
+                        collect(source, operand, scopes, visited, targets);
+                    }
                 }
             }
-            ExpressionKind::Unary { operand, .. } => {
-                collect(source, operand, scopes, visited, targets);
-            }
-            ExpressionKind::Binary { left, right, .. } => {
-                collect(source, left, scopes, visited, targets);
-                collect(source, right, scopes, visited, targets);
-            }
+            let Some(operand) = pending_operands.pop() else {
+                break;
+            };
+            current = operand;
         }
     }
 
@@ -935,94 +950,108 @@ fn ast_sensitive_literal_spans(
         scopes: &mut Vec<Bindings<'a>>,
         spans: &mut BTreeMap<(usize, usize), &'static str>,
     ) {
-        if let ExpressionKind::Literal(ValueLiteral::String(value)) = &expression.kind
-            && looks_secret_like(value)
-            && let Some((start, end)) =
-                literal_content_span(source, expression.span.start, expression.span.end)
-        {
-            // A more specific category, if one is found later, replaces this.
-            spans.entry((start, end)).or_insert("secret-like");
-        }
-        match &expression.kind {
-            ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
-            ExpressionKind::List(elements) => {
-                for element in elements {
-                    expression_spans(source, element, scopes, spans);
+        // `else if` continuations and the left spine of an operator chain are
+        // followed by this loop rather than by recursion, so a long chain
+        // never deepens the walk; expressions are still visited in source
+        // order.
+        let mut pending_operands = Vec::new();
+        let mut current = expression;
+        loop {
+            if let ExpressionKind::Literal(ValueLiteral::String(value)) = &current.kind
+                && looks_secret_like(value)
+                && let Some((start, end)) =
+                    literal_content_span(source, current.span.start, current.span.end)
+            {
+                // A more specific category, if one is found later, replaces this.
+                spans.entry((start, end)).or_insert("secret-like");
+            }
+            match &current.kind {
+                ExpressionKind::If {
+                    condition,
+                    consequent,
+                    alternative,
+                } => {
+                    expression_spans(source, condition, scopes, spans);
+                    block_spans(source, consequent, scopes, spans);
+                    current = alternative;
+                    continue;
                 }
-            }
-            ExpressionKind::Record(fields) => {
-                for field in fields {
-                    expression_spans(source, &field.value, scopes, spans);
+                ExpressionKind::Binary { left, right, .. } => {
+                    pending_operands.push(right.as_ref());
+                    current = left;
+                    continue;
                 }
-            }
-            ExpressionKind::FieldAccess { value, .. } => {
-                expression_spans(source, value, scopes, spans);
-            }
-            ExpressionKind::Block(block) => block_spans(source, block, scopes, spans),
-            ExpressionKind::If {
-                condition,
-                consequent,
-                alternative,
-            } => {
-                expression_spans(source, condition, scopes, spans);
-                block_spans(source, consequent, scopes, spans);
-                expression_spans(source, alternative, scopes, spans);
-            }
-            ExpressionKind::Function {
-                parameters, body, ..
-            } => {
-                let mut frame = Bindings::new();
-                for parameter in parameters {
-                    frame.insert(parameter.name.as_str(), RedactionTargets::opaque());
+                ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+                ExpressionKind::List(elements) => {
+                    for element in elements {
+                        expression_spans(source, element, scopes, spans);
+                    }
                 }
-                scopes.push(frame);
-                block_spans(source, body, scopes, spans);
-                scopes.pop();
-            }
-            ExpressionKind::Call { callee, arguments } => {
-                // Children are walked first so a nested sensitive call records
-                // its own categories; this call's argument categories are then
-                // applied on top and take precedence.
-                expression_spans(source, callee, scopes, spans);
-                for argument in arguments {
-                    expression_spans(source, argument, scopes, spans);
+                ExpressionKind::Record(fields) => {
+                    for field in fields {
+                        expression_spans(source, &field.value, scopes, spans);
+                    }
                 }
-                if let ExpressionKind::Variable(name) = &callee.kind {
-                    for (index, category) in sensitive_arguments(name.as_str()) {
-                        let Some(argument) = arguments.get(*index) else {
-                            continue;
-                        };
-                        for (start, end) in snapshot(source, argument, scopes).targets() {
-                            spans.insert((start, end), category);
+                ExpressionKind::FieldAccess { value, .. } => {
+                    expression_spans(source, value, scopes, spans);
+                }
+                ExpressionKind::Block(block) => block_spans(source, block, scopes, spans),
+                ExpressionKind::Function {
+                    parameters, body, ..
+                } => {
+                    let mut frame = Bindings::new();
+                    for parameter in parameters {
+                        frame.insert(parameter.name.as_str(), RedactionTargets::opaque());
+                    }
+                    scopes.push(frame);
+                    block_spans(source, body, scopes, spans);
+                    scopes.pop();
+                }
+                ExpressionKind::Call { callee, arguments } => {
+                    // Children are walked first so a nested sensitive call
+                    // records its own categories; this call's argument
+                    // categories are then applied on top and take precedence.
+                    expression_spans(source, callee, scopes, spans);
+                    for argument in arguments {
+                        expression_spans(source, argument, scopes, spans);
+                    }
+                    if let ExpressionKind::Variable(name) = &callee.kind {
+                        for (index, category) in sensitive_arguments(name.as_str()) {
+                            let Some(argument) = arguments.get(*index) else {
+                                continue;
+                            };
+                            for (start, end) in snapshot(source, argument, scopes).targets() {
+                                spans.insert((start, end), category);
+                            }
                         }
                     }
                 }
-            }
-            ExpressionKind::Match { subject, kind } => {
-                expression_spans(source, subject, scopes, spans);
-                match kind {
-                    MatchKind::List {
-                        empty_case,
-                        cons_case,
-                        ..
-                    } => {
-                        expression_spans(source, empty_case, scopes, spans);
-                        expression_spans(source, cons_case, scopes, spans);
-                    }
-                    MatchKind::Variants { arms, .. } => {
-                        for arm in arms {
-                            expression_spans(source, &arm.value, scopes, spans);
+                ExpressionKind::Match { subject, kind } => {
+                    expression_spans(source, subject, scopes, spans);
+                    match kind {
+                        MatchKind::List {
+                            empty_case,
+                            cons_case,
+                            ..
+                        } => {
+                            expression_spans(source, empty_case, scopes, spans);
+                            expression_spans(source, cons_case, scopes, spans);
+                        }
+                        MatchKind::Variants { arms, .. } => {
+                            for arm in arms {
+                                expression_spans(source, &arm.value, scopes, spans);
+                            }
                         }
                     }
                 }
+                ExpressionKind::Unary { operand, .. } => {
+                    expression_spans(source, operand, scopes, spans);
+                }
             }
-            ExpressionKind::Unary { operand, .. } => {
-                expression_spans(source, operand, scopes, spans);
-            }
-            ExpressionKind::Binary { left, right, .. } => {
-                expression_spans(source, left, scopes, spans);
-                expression_spans(source, right, scopes, spans);
-            }
+            let Some(operand) = pending_operands.pop() else {
+                break;
+            };
+            current = operand;
         }
     }
 
@@ -1973,6 +2002,32 @@ mod tests {
             .into_iter()
             .map(|(start, end, category)| (source[start..end].to_owned(), category))
             .collect()
+    }
+
+    #[test]
+    fn walks_long_else_if_and_operator_chains_iteratively() {
+        let mut source = String::from("fn pick(n) {\n    if n == 0 {\n        \"zero\"\n    }");
+        for branch in 1..2_000 {
+            source.push_str(&format!(
+                " else if n == {branch} {{\n        \"branch\"\n    }}"
+            ));
+        }
+        source.push_str(" else {\n        \"other\"\n    }\n}\n\nlet resource = \"agent\"");
+        source.push_str(&" + \".part\"".repeat(4_000));
+        source.push_str(";\nlet value = config_string(resource);\n");
+        // Runs on a 1 MiB thread: walking either chain recursively, once per
+        // link, would need several times more.
+        let spans = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || redacted(&source))
+            .expect("test thread should start")
+            .join()
+            .expect("long chains should be walked on a small stack");
+        // The aliased chain has too many literals to track one by one, so
+        // its whole value is redacted as the resource.
+        let chain = format!("\"agent\"{}", " + \".part\"".repeat(4_000));
+        assert!(spans.contains(&(chain, "capability-resource")));
+        assert!(!spans.iter().any(|(text, _)| text.contains("branch")));
     }
 
     #[test]

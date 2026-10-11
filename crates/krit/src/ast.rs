@@ -116,7 +116,9 @@ pub enum MatchKind {
     List {
         empty_case: Box<Expression>,
         head_name: String,
+        head_span: Span,
         tail_name: String,
+        tail_span: Span,
         cons_case: Box<Expression>,
     },
     Variants {

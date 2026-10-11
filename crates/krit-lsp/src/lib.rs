@@ -13,11 +13,12 @@ use document::{ServerState, request_failed, uri_to_file_path};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CodeActionKind, CodeActionOptions, CodeActionProviderCapability, CompletionOptions,
-    CompletionParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbolParams, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, OneOf, PositionEncodingKind,
-    PublishDiagnosticsParams, ServerCapabilities, ServerInfo, TextDocumentIdentifier,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    CompletionParams, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
+    DocumentSymbolParams, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    NumberOrString, OneOf, PositionEncodingKind, PublishDiagnosticsParams, Range,
+    ServerCapabilities, ServerInfo, TextDocumentIdentifier, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::json;
@@ -251,7 +252,7 @@ pub fn serve(connection: Connection) -> Result<(), ServerError> {
                 if !shutting_down
                     && let Some(diagnostics) = handle_notification(&mut state, notification)
                 {
-                    send_notification(&connection, "textDocument/publishDiagnostics", diagnostics)?;
+                    publish_diagnostics(&connection, diagnostics)?;
                 }
             }
             Message::Response(_) => {}
@@ -500,17 +501,54 @@ fn send_response(connection: &Connection, response: Response) -> Result<(), Serv
         .map_err(|_| ServerError::Disconnected)
 }
 
-fn send_notification(
+/// Publishes a document's diagnostics.
+///
+/// A document bounds the warnings and the error it publishes, so its
+/// notification fits in a protocol frame. Should one still not fit, the
+/// document is reported with a single `K8002` error instead of ending the
+/// server.
+fn publish_diagnostics(
     connection: &Connection,
-    method: &str,
-    params: impl serde::Serialize,
+    diagnostics: PublishDiagnosticsParams,
 ) -> Result<(), ServerError> {
-    let message = Message::Notification(Notification::new(method.to_owned(), params));
-    validate_outgoing_message(&message)?;
+    let message = publish_diagnostics_message(&diagnostics);
+    let message = if fits_protocol_frame(&message)? {
+        message
+    } else {
+        let fallback = publish_diagnostics_message(&oversized_diagnostics(diagnostics));
+        validate_outgoing_message(&fallback)?;
+        fallback
+    };
     connection
         .sender
         .send(message)
         .map_err(|_| ServerError::Disconnected)
+}
+
+fn publish_diagnostics_message(diagnostics: &PublishDiagnosticsParams) -> Message {
+    Message::Notification(Notification::new(
+        "textDocument/publishDiagnostics".to_owned(),
+        diagnostics,
+    ))
+}
+
+/// The diagnostics that stand in for a document whose own diagnostics do not
+/// fit in a protocol frame.
+fn oversized_diagnostics(diagnostics: PublishDiagnosticsParams) -> PublishDiagnosticsParams {
+    PublishDiagnosticsParams::new(
+        diagnostics.uri,
+        vec![Diagnostic {
+            range: Range::default(),
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("K8002".to_owned())),
+            source: Some(SERVER_NAME.to_owned()),
+            message: "document diagnostics exceed the language-server output limit; \
+                      `krit check` reports them"
+                .to_owned(),
+            ..Diagnostic::default()
+        }],
+        diagnostics.version,
+    )
 }
 
 fn read_protocol_message(reader: &mut impl BufRead) -> io::Result<Option<Message>> {
@@ -634,15 +672,19 @@ fn write_protocol_message(writer: &mut impl Write, message: &Message) -> io::Res
 }
 
 fn validate_outgoing_message(message: &Message) -> Result<(), ServerError> {
-    let mut frame = Vec::new();
-    message.write(&mut frame).map_err(ServerError::Io)?;
-    if protocol_body_length(&frame)? > MAX_PROTOCOL_MESSAGE_BYTES {
+    if !fits_protocol_frame(message)? {
         return Err(ServerError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             "LSP response exceeds the bounded output limit",
         )));
     }
     Ok(())
+}
+
+fn fits_protocol_frame(message: &Message) -> Result<bool, ServerError> {
+    let mut frame = Vec::new();
+    message.write(&mut frame).map_err(ServerError::Io)?;
+    Ok(protocol_body_length(&frame)? <= MAX_PROTOCOL_MESSAGE_BYTES)
 }
 
 fn protocol_body_length(frame: &[u8]) -> io::Result<usize> {
@@ -794,5 +836,50 @@ mod tests {
         let error =
             validate_outgoing_message(&message).expect_err("oversized output should fail closed");
         assert!(error.to_string().contains("bounded output limit"));
+    }
+
+    #[test]
+    fn oversized_document_diagnostics_publish_one_error_instead_of_ending_the_server() {
+        let (server, client) = Connection::memory();
+        let uri = "file:///workspace/main.krit"
+            .parse::<lsp_types::Uri>()
+            .expect("URI should parse");
+        let oversized = PublishDiagnosticsParams::new(
+            uri.clone(),
+            vec![Diagnostic {
+                message: "x".repeat(MAX_PROTOCOL_MESSAGE_BYTES),
+                ..Diagnostic::default()
+            }],
+            Some(7),
+        );
+
+        publish_diagnostics(&server, oversized).expect("publishing should not fail");
+        let Ok(Message::Notification(notification)) = client.receiver.try_recv() else {
+            panic!("a notification should be published");
+        };
+        assert_eq!(notification.method, "textDocument/publishDiagnostics");
+        let published: PublishDiagnosticsParams =
+            serde_json::from_value(notification.params).expect("params should decode");
+        assert_eq!(published.uri, uri);
+        assert_eq!(published.version, Some(7));
+        assert_eq!(published.diagnostics.len(), 1);
+        let diagnostic = &published.diagnostics[0];
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("K8002".to_owned()))
+        );
+        assert!(diagnostic.message.contains("krit check"));
+
+        let fitting = PublishDiagnosticsParams::new(uri, Vec::new(), Some(8));
+        publish_diagnostics(&server, fitting.clone()).expect("publishing should not fail");
+        let Ok(Message::Notification(notification)) = client.receiver.try_recv() else {
+            panic!("a notification should be published");
+        };
+        assert_eq!(
+            serde_json::from_value::<PublishDiagnosticsParams>(notification.params)
+                .expect("params should decode"),
+            fitting
+        );
     }
 }

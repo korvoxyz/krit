@@ -12,8 +12,8 @@ use std::{
 };
 
 use krit::{
-    Analysis, CoreModule, Diagnostic, EntrypointKind, RequirementSet, Source, Span, analyze,
-    execute, format_source, lower, parse_source,
+    Analysis, CoreModule, Diagnostic, EntrypointKind, Program, RequirementSet, Source, Span,
+    analyze_with_warnings, execute, format_source, lower, parse_source, run_on_thread,
 };
 use krit_package::Manifest;
 use krit_runtime::{
@@ -47,7 +47,17 @@ enum TargetSelection {
 const TARGET_CHECK_EDITION: &str = "2026";
 
 fn main() -> ExitCode {
-    ExitCode::from(run(env::args().skip(1).collect()))
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    // Every compiler stage recurses through nested syntax. Run commands on a
+    // thread whose stack is sized for the deepest program the parser accepts
+    // instead of relying on the platform's main-thread stack.
+    match run_on_thread("krit", krit::COMPILER_STACK_BYTES, move || run(arguments)) {
+        Ok(status) => ExitCode::from(status),
+        Err(error) => {
+            eprintln!("krit: could not start the compiler thread: {error}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn run(arguments: Vec<String>) -> u8 {
@@ -142,9 +152,9 @@ fn build_command(arguments: &[String]) -> u8 {
         Ok(program) => program,
         Err(diagnostic) => return report(&diagnostic, &source, format),
     };
-    let analysis = match analyze(&program) {
+    let analysis = match analyze_reported(&program, &source, format) {
         Ok(analysis) => analysis,
-        Err(diagnostic) => return report(&diagnostic, &source, format),
+        Err(status) => return status,
     };
     let module = match lower(&program, &analysis) {
         Ok(module) => module,
@@ -657,33 +667,18 @@ fn explain_command(arguments: &[String]) -> u8 {
         }
     };
     let source = Source::new(path.to_string_lossy().into_owned(), text);
+    let format = if json {
+        DiagnosticFormat::Json
+    } else {
+        DiagnosticFormat::Human
+    };
     let program = match parse_source(&source) {
         Ok(program) => program,
-        Err(diagnostic) => {
-            return report(
-                &diagnostic,
-                &source,
-                if json {
-                    DiagnosticFormat::Json
-                } else {
-                    DiagnosticFormat::Human
-                },
-            );
-        }
+        Err(diagnostic) => return report(&diagnostic, &source, format),
     };
-    let analysis = match analyze(&program) {
+    let analysis = match analyze_reported(&program, &source, format) {
         Ok(analysis) => analysis,
-        Err(diagnostic) => {
-            return report(
-                &diagnostic,
-                &source,
-                if json {
-                    DiagnosticFormat::Json
-                } else {
-                    DiagnosticFormat::Human
-                },
-            );
-        }
+        Err(status) => return status,
     };
     let module = match lower(&program, &analysis) {
         Ok(module) => module,
@@ -1212,40 +1207,68 @@ fn source_command(arguments: &[String], action: SourceAction) -> u8 {
         }
     };
     let source = Source::new(path.to_string_lossy().into_owned(), text);
-    if matches!(action, SourceAction::Check) {
-        let program = match parse_source(&source) {
-            Ok(program) => program,
-            Err(diagnostic) => return report(&diagnostic, &source, format),
-        };
-        let analysis = match analyze(&program) {
-            Ok(analysis) => analysis,
-            Err(diagnostic) => return report(&diagnostic, &source, format),
-        };
-        let module = match lower(&program, &analysis) {
-            Ok(module) => module,
-            Err(error) => return internal_error("KICE0001", "lowering Core IR", &error),
-        };
-        if let Some(target) = resolve_check_target(target, &module) {
-            let options =
-                BuildOptions::new(TARGET_CHECK_EDITION, "krit/check", "0.0.0", "main.krit");
-            let errors = check_target(&module, &options, target);
-            if !errors.is_empty() {
-                report_build_errors(&errors, &source, format);
-                return 1;
+    // `run` performs exactly the front-end checking `check` does and refuses
+    // with the same diagnostic and status, so no program that fails checking
+    // is ever evaluated. Only `check` adds the build-target check below:
+    // direct evaluation builds no artifact.
+    let Checked {
+        program,
+        analysis,
+        module,
+    } = match check_source(&source, format) {
+        Ok(checked) => checked,
+        Err(status) => return status,
+    };
+    match action {
+        SourceAction::Check => {
+            // The complete backend emission runs with its output discarded
+            // and every target diagnostic is reported.
+            if let Some(target) = resolve_check_target(target, &module) {
+                let options =
+                    BuildOptions::new(TARGET_CHECK_EDITION, "krit/check", "0.0.0", "main.krit");
+                let errors = check_target(&module, &options, target);
+                if !errors.is_empty() {
+                    report_build_errors(&errors, &source, format);
+                    return 1;
+                }
             }
+            println!("checked {}", path.display());
+            0
         }
-        println!("checked {}", path.display());
-        0
-    } else {
-        execute_source(&source, format)
+        SourceAction::Run => execute_checked(&source, &program, &analysis, format),
     }
 }
 
-fn execute_source(source: &Source, format: DiagnosticFormat) -> u8 {
-    let program = match parse_source(source) {
-        Ok(program) => program,
-        Err(diagnostic) => return report(&diagnostic, source, format),
-    };
+/// A source file that passed the front-end checking `check` and `run` share.
+struct Checked {
+    program: Program,
+    analysis: Analysis,
+    module: CoreModule,
+}
+
+/// Parses, analyzes, and lowers `source` the way `krit check` does, reporting
+/// analysis warnings as it goes. On failure the diagnostic has already been
+/// reported and the command's exit status is returned.
+fn check_source(source: &Source, format: DiagnosticFormat) -> Result<Checked, u8> {
+    let program = parse_source(source).map_err(|diagnostic| report(&diagnostic, source, format))?;
+    let analysis = analyze_reported(&program, source, format)?;
+    let module = lower(&program, &analysis)
+        .map_err(|error| internal_error("KICE0001", "lowering Core IR", &error))?;
+    Ok(Checked {
+        program,
+        analysis,
+        module,
+    })
+}
+
+/// Evaluates a program that has passed checking, after refusing entrypoints
+/// and host capabilities that direct execution cannot provide.
+fn execute_checked(
+    source: &Source,
+    program: &Program,
+    analysis: &Analysis,
+    format: DiagnosticFormat,
+) -> u8 {
     if let Some((kind, span)) = program.statements.iter().find_map(|statement| {
         let kind = match statement.kind {
             krit::StatementKind::Webhook { .. } => EntrypointKind::Webhook,
@@ -1266,9 +1289,7 @@ fn execute_source(source: &Source, format: DiagnosticFormat) -> u8 {
         let _ = report(&diagnostic, source, format);
         return 4;
     }
-    if let Ok(analysis) = analyze(&program)
-        && let Some((requirement, span)) = first_analysis_requirement(&analysis)
-    {
+    if let Some((requirement, span)) = first_analysis_requirement(analysis) {
         let diagnostic = Diagnostic::new(
             "K5003",
             format!(
@@ -1281,12 +1302,22 @@ fn execute_source(source: &Source, format: DiagnosticFormat) -> u8 {
         let _ = report(&diagnostic, source, format);
         return 4;
     }
-    let mut output = io::stdout().lock();
-    match execute(&program, &mut output) {
-        Ok(_) => 0,
-        Err(diagnostic) => {
+    // The evaluator gets its own thread with a stack large enough that its
+    // call and evaluation depth limits (K4010) are always reached before the
+    // native stack is exhausted.
+    let result = run_on_thread("krit-evaluator", krit::EVALUATOR_STACK_BYTES, || {
+        let mut output = io::stdout().lock();
+        execute(program, &mut output).map(|_| ())
+    });
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(diagnostic)) => {
             let _ = report(&diagnostic, source, format);
             if diagnostic.code() == "K5003" { 4 } else { 1 }
+        }
+        Err(error) => {
+            eprintln!("krit: could not start the evaluator thread: {error}");
+            1
         }
     }
 }
@@ -1443,12 +1474,35 @@ fn parse_diagnostic_format(value: &str) -> Result<DiagnosticFormat, String> {
     }
 }
 
+/// Analyzes `program` and reports every analysis warning, followed by the
+/// error when analysis fails. Warnings never change the exit status; on
+/// failure the returned status is the error's.
+fn analyze_reported(
+    program: &Program,
+    source: &Source,
+    format: DiagnosticFormat,
+) -> Result<Analysis, u8> {
+    let analysis = analyze_with_warnings(program);
+    for warning in &analysis.warnings {
+        emit(warning, source, format);
+    }
+    analysis
+        .result
+        .map_err(|diagnostic| report(&diagnostic, source, format))
+}
+
+/// Reports an error diagnostic and returns the source-failure exit status.
 fn report(diagnostic: &Diagnostic, source: &Source, format: DiagnosticFormat) -> u8 {
+    emit(diagnostic, source, format);
+    1
+}
+
+/// Writes one diagnostic of any severity to standard error.
+fn emit(diagnostic: &Diagnostic, source: &Source, format: DiagnosticFormat) {
     match format {
         DiagnosticFormat::Human => eprintln!("{}", diagnostic.render_human(source)),
         DiagnosticFormat::Json => eprintln!("{}", diagnostic.render_json(source)),
     }
-    1
 }
 
 /// Reports target diagnostics in the order the backend sorted them.
@@ -2860,7 +2914,14 @@ mod tests {
             let end = code.find("\n```").expect("Krit code fence should close");
             let source = Source::new(format!("<prompt-example-{count}>"), &code[..end]);
             let program = parse_source(&source).expect("prompt example should parse");
-            analyze(&program).expect("prompt example should pass semantic analysis");
+            let analysis = analyze_with_warnings(&program);
+            analysis
+                .result
+                .expect("prompt example should pass semantic analysis");
+            assert!(
+                analysis.warnings.is_empty(),
+                "prompt example should have no warnings"
+            );
             let formatted = format_source(&source).expect("prompt example should format");
             assert_eq!(
                 formatted,
@@ -2873,7 +2934,9 @@ mod tests {
             );
             let program =
                 parse_source(&formatted_source).expect("formatted prompt example should parse");
-            analyze(&program).expect("formatted prompt example should pass semantic analysis");
+            analyze_with_warnings(&program)
+                .result
+                .expect("formatted prompt example should pass semantic analysis");
             assert_eq!(
                 format_source(&formatted_source).expect("formatting should be idempotent"),
                 formatted

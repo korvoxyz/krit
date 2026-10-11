@@ -1,0 +1,131 @@
+core module
+entry f0 module-init effects {io.stdout}
+bindings
+  b0 function classify: fn(Int) -> String effects {}
+  b1 parameter value: Int
+  b2 function in_range: fn(Int) -> Bool effects {}
+  b3 parameter value: Int
+function f0 $module_init () -> Unit effects {io.stdout}
+  block bb0 -> Unit effects {io.stdout}
+    v16: fn(Int) -> String effects {} = closure cl0 f1 []
+    v17: Unit = bind b0 = v16
+    v34: fn(Int) -> Bool effects {} = closure cl1 f2 []
+    v35: Unit = bind b2 = v34
+    v36: fn(String) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v37: Int = int 3
+    v38: Int = neg v37
+    v39: String = call v16(v38)
+    v40: Unit = call v36(v39) effects {io.stdout}
+    v41: Unit = discard v40
+    v42: fn(String) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v43: Int = int 0
+    v44: String = call v16(v43)
+    v45: Unit = call v42(v44) effects {io.stdout}
+    v46: Unit = discard v45
+    v47: fn(String) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v48: Int = int 7
+    v49: String = call v16(v48)
+    v50: Unit = call v47(v49) effects {io.stdout}
+    v51: Unit = discard v50
+    v52: fn(String) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v53: Int = int 12
+    v54: String = call v16(v53)
+    v55: Unit = call v52(v54) effects {io.stdout}
+    v56: Unit = discard v55
+    v57: fn(Bool) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v58: Int = int 3
+    v59: Bool = call v34(v58)
+    v60: Unit = call v57(v59) effects {io.stdout}
+    v61: Unit = discard v60
+    v62: fn(Bool) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v63: Int = int 5
+    v64: Bool = call v34(v63)
+    v65: Unit = call v62(v64) effects {io.stdout}
+    v66: Unit = discard v65
+    v67: fn(Bool) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v68: Int = int 42
+    v69: Bool = call v34(v68)
+    v70: Unit = call v67(v69) effects {io.stdout}
+    v71: Unit = discard v70
+    v72: fn(Int) -> Unit effects {io.stdout} = builtin println [host-effect]
+    v73: Int = int 1
+    v74: Int = int 2
+    v75: Int = int 3
+    v76: Int = mul v74 v75
+    v77: Int = add v73 v76
+    v78: Int = int 4
+    v79: Int = sub v77 v78
+    v80: Int = int 5
+    v81: Int = add v79 v80
+    v82: Unit = call v72(v81) effects {io.stdout}
+    v83: Unit = discard v82
+    v84: Unit = unit
+    return v84
+function f1 classify (p0 b1 v1: Int) -> String effects {}
+  self b0 v0: fn(Int) -> String effects {}
+  block bb1 -> String effects {}
+    v2: Int = int 0
+    v3: Bool = lt v1 v2
+    v15: String = if v3 effects {}
+      block bb2 -> String effects {}
+        v4: String = string "negative"
+        return v4
+    else
+      block bb3 -> String effects {}
+        v5: Int = int 0
+        v6: Bool = eq v1 v5
+        v14: String = if v6 effects {}
+          block bb4 -> String effects {}
+            v7: String = string "zero"
+            return v7
+        else
+          block bb5 -> String effects {}
+            v8: Int = int 10
+            v9: Bool = lt v1 v8
+            v13: String = if v9 effects {}
+              block bb6 -> String effects {}
+                v10: String = string "small"
+                return v10
+            else
+              block bb7 -> String effects {}
+                v12: String = block effects {}
+                  block bb8 -> String effects {}
+                    v11: String = string "large"
+                    return v11
+                return v12
+            return v13
+        return v14
+    return v15
+function f2 in_range (p1 b3 v19: Int) -> Bool effects {}
+  self b2 v18: fn(Int) -> Bool effects {}
+  block bb9 -> Bool effects {}
+    v20: Int = int 0
+    v21: Bool = ge v19 v20
+    v25: Bool = if v21 effects {}
+      block bb10 -> Bool effects {}
+        v22: Int = int 10
+        v23: Bool = lt v19 v22
+        return v23
+    else
+      block bb11 -> Bool effects {}
+        v24: Bool = bool false
+        return v24
+    v29: Bool = if v25 effects {}
+      block bb12 -> Bool effects {}
+        v26: Int = int 5
+        v27: Bool = ne v19 v26
+        return v27
+    else
+      block bb13 -> Bool effects {}
+        v28: Bool = bool false
+        return v28
+    v33: Bool = if v29 effects {}
+      block bb15 -> Bool effects {}
+        v32: Bool = bool true
+        return v32
+    else
+      block bb14 -> Bool effects {}
+        v30: Int = int 42
+        v31: Bool = eq v19 v30
+        return v31
+    return v33

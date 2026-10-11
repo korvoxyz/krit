@@ -139,13 +139,18 @@ The language server exposes versioned structured facts:
 - canonical formatting edits
 
 The implemented protocol is synchronous LSP over stdio. It uses full-document
-synchronization and UTF-16 positions, publishes compiler diagnostics, and
-supports standard hover, completion, document symbols, formatting, and code
-actions. `krit/compilerFacts` accepts a standard `textDocument` identifier and
-returns schema 1 with:
+synchronization and UTF-16 positions, publishes compiler errors and warnings
+with their LSP severities and their notes as `help:` lines, and supports
+standard hover, completion, document symbols, formatting, and code actions.
+`krit/compilerFacts` accepts a standard `textDocument` identifier and returns
+schema 1 with:
 
 - language and authoring-protocol versions
-- stable diagnostics with byte spans and UTF-16 ranges
+- stable diagnostics, each with its `error` or `warning` severity, byte span,
+  UTF-16 range, and `notes` (one-line fix hints, such as a did-you-mean
+  suggestion or the Krit spelling of a construct from another language),
+  bounded like published diagnostics (with an `info` `K8003` notice for
+  warnings left out)
 - module effects, literal-resource requirements, and entrypoints
 - symbols with inferred/declared types, reference status, and visibility
 - expression syntax kinds, inferred types, effects, requirements, and
@@ -156,9 +161,12 @@ returns schema 1 with:
 
 The server limits each protocol frame to 16 MiB, each open document to 1 MiB,
 the open set to 128 documents, and the applicable manifest read to 256 KiB.
-Completion, document symbols, recursive type rendering, and compiler-fact
-responses are separately bounded. Package facts are attached only when the
-nearest `krit.pkg` passes the normal canonical entry-containment validation.
+Each document publishes at most its first 100 warnings, and at most 64 KiB of
+warning message text; one `K8003` notice reports how many more were left out
+(see `DIAGNOSTICS.md`). Completion, document symbols, recursive type
+rendering, and compiler-fact responses are separately bounded. Package facts
+are attached only when the nearest `krit.pkg` passes the normal canonical
+entry-containment validation.
 The server reads only local source supplied by the editor and that validated
 manifest. It does not invoke the evaluator, lower/build components, install
 packages, open sockets, perform network requests, read host
@@ -283,15 +291,18 @@ provider summary, 4 MiB proposal, 256 KiB manifest, and 64 KiB
 Provider edits are applied only in memory. Krit then canonicalizes the complete
 candidate, parses and analyzes it, and verifies Core IR without evaluating,
 building, installing, invoking runtime code, or performing provider/network
-work. Invalid candidates are `K8105`.
+work. Invalid candidates are `K8105`. A candidate is invalid when checking
+reports an error; a warning, or the `K8003` notice for warnings left out,
+never makes a candidate invalid, as no warning changes a command's outcome
+(`DIAGNOSTICS.md`).
 
 The proposal records no timestamp or reviewed claim. It contains deterministic
 request/response identities, host-local full-source/context digests that were
 never sent to the provider, the canonical candidate digest, a unified diff,
-before/after diagnostics and top-level types, effect deltas,
-manifest-requested permission usage, exact required/granted/missing permission
-facts, and added or removed authority. The provider summary is labeled
-untrusted.
+before/after diagnostics (each with its `error`, `warning`, or `info`
+severity) and top-level types, effect deltas, manifest-requested permission
+usage, exact required/granted/missing permission facts, and added or removed
+authority. The provider summary is labeled untrusted.
 
 Review recomputes every source/context/manifest digest, redaction, filtered
 compiler fact, response range, candidate, diff, and report. `accept` requires

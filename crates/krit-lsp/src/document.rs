@@ -7,8 +7,8 @@ use std::{
 
 use krit::{
     Analysis, Block, Builtin, Diagnostic as CompilerDiagnostic, Effect, EntrypointKind, Expression,
-    ExpressionKind, MatchKind, Program, RequirementSet, ResolvedName, Source, Span, Statement,
-    StatementKind, SymbolKind as CompilerSymbolKind, Type, TypeAnnotation,
+    ExpressionKind, MatchKind, Program, RequirementSet, ResolvedName, Severity, Source, Span,
+    Statement, StatementKind, SymbolKind as CompilerSymbolKind, Type, TypeAnnotation,
 };
 use krit_package::Manifest;
 use lsp_server::ErrorCode;
@@ -36,6 +36,27 @@ const MAX_COMPILER_FACT_DYNAMIC_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_FIELD_REPAIR_WORK_BYTES: usize = 1024 * 1024;
 const MAX_FIELD_REPAIR_ATTEMPTS: usize = 16;
+/// The most analysis warnings one document publishes. A document can hold a
+/// warning for every few bytes of source (each read of `_` is one), so without
+/// this bound a document well under `MAX_DOCUMENT_BYTES` could need a
+/// `publishDiagnostics` notification above the protocol frame limit.
+const MAX_PUBLISHED_WARNINGS: usize = 100;
+/// The most warning message bytes one document publishes, so that warnings
+/// whose messages quote source stay bounded too.
+const MAX_PUBLISHED_WARNING_MESSAGE_BYTES: usize = 64 * 1024;
+/// The code of the notice that stands in for the warnings a document leaves
+/// out of its published diagnostics.
+const OMITTED_WARNINGS_CODE: &str = "K8003";
+/// The most message bytes the error rejecting a document publishes. Analysis
+/// messages render inferred types, and a type can grow far past the source
+/// that spells it, so an unbounded message could need a `publishDiagnostics`
+/// notification above the protocol frame limit.
+const MAX_PUBLISHED_ERROR_MESSAGE_BYTES: usize = 64 * 1024;
+/// The most bytes of each note the rejecting error publishes. Notes are fixed
+/// text, but a did-you-mean note quotes a source name.
+const MAX_PUBLISHED_ERROR_NOTE_BYTES: usize = 4 * 1024;
+/// Ends published error text cut to its bound.
+const TRUNCATION_MARKER: &str = " [truncated; `krit check` reports it in full]";
 
 pub(crate) struct ServerState {
     workspace_roots: Vec<PathBuf>,
@@ -197,13 +218,120 @@ struct Document {
     source: Source,
     lines: LineIndex,
     analysis: Option<Analysis>,
-    compiler_diagnostic: Option<CompilerDiagnostic>,
+    /// The analysis warnings the document publishes: a source-order prefix
+    /// bounded by `MAX_PUBLISHED_WARNINGS` and
+    /// `MAX_PUBLISHED_WARNING_MESSAGE_BYTES`.
+    warnings: Vec<CompilerDiagnostic>,
+    /// The analysis warnings left out of `warnings`, if any.
+    omitted_warnings: Option<OmittedWarnings>,
+    /// The parse or analysis error that rejected the document, if any, with
+    /// its text bounded by [`bounded_error`]. It is always published, after
+    /// the warnings and any omission notice.
+    error: Option<CompilerDiagnostic>,
     formatted: Result<String, CompilerDiagnostic>,
     declarations: Vec<DeclarationFact>,
     syntax_kinds: BTreeMap<Span, &'static str>,
     durable_operations: Vec<krit::DurableOperationFact>,
     package: Option<PackageContext>,
     oversized: bool,
+}
+
+/// The analysis warnings a document leaves out of its published diagnostics.
+/// One informational notice stands in for all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OmittedWarnings {
+    count: usize,
+    /// The span of the first warning left out, where the notice is reported.
+    span: Span,
+}
+
+impl OmittedWarnings {
+    fn message(self) -> String {
+        if self.count == 1 {
+            "1 more warning is not shown; `krit check` reports every warning".to_owned()
+        } else {
+            format!(
+                "{} more warnings are not shown; `krit check` reports every warning",
+                self.count
+            )
+        }
+    }
+}
+
+/// The text a published diagnostic carries: the compiler message, then each
+/// note on its own line as `help: <note>`, as the human format prints them.
+fn published_message(diagnostic: &CompilerDiagnostic) -> String {
+    let mut message = diagnostic.message().to_owned();
+    for note in diagnostic.notes() {
+        message.push_str("\nhelp: ");
+        message.push_str(note);
+    }
+    message
+}
+
+/// Splits source-ordered analysis warnings into the prefix a document
+/// publishes, at most `MAX_PUBLISHED_WARNINGS` warnings and
+/// `MAX_PUBLISHED_WARNING_MESSAGE_BYTES` of published message text (notes
+/// included), and the rest.
+fn bound_warnings(
+    mut warnings: Vec<CompilerDiagnostic>,
+) -> (Vec<CompilerDiagnostic>, Option<OmittedWarnings>) {
+    let mut message_bytes = 0_usize;
+    let mut kept = 0;
+    for warning in warnings.iter().take(MAX_PUBLISHED_WARNINGS) {
+        message_bytes = message_bytes.saturating_add(published_message(warning).len());
+        if message_bytes > MAX_PUBLISHED_WARNING_MESSAGE_BYTES {
+            break;
+        }
+        kept += 1;
+    }
+    let omitted = warnings.get(kept).map(|first| OmittedWarnings {
+        count: warnings.len() - kept,
+        span: first.span(),
+    });
+    warnings.truncate(kept);
+    // An open document holds only the published prefix, not an allocation
+    // sized for every warning analysis found.
+    warnings.shrink_to_fit();
+    (warnings, omitted)
+}
+
+/// `text` unchanged when it fits in `limit` bytes, and otherwise cut at a
+/// character boundary and ended with [`TRUNCATION_MARKER`], within `limit`.
+fn bounded_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit.saturating_sub(TRUNCATION_MARKER.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(end + TRUNCATION_MARKER.len());
+    bounded.push_str(&text[..end]);
+    bounded.push_str(TRUNCATION_MARKER);
+    bounded
+}
+
+/// The error rejecting a document as the document publishes it: its message
+/// cut to `MAX_PUBLISHED_ERROR_MESSAGE_BYTES` and each note to
+/// `MAX_PUBLISHED_ERROR_NOTE_BYTES`. Code, span, and every note are kept.
+fn bounded_error(error: CompilerDiagnostic) -> CompilerDiagnostic {
+    if error.message().len() <= MAX_PUBLISHED_ERROR_MESSAGE_BYTES
+        && error
+            .notes()
+            .iter()
+            .all(|note| note.len() <= MAX_PUBLISHED_ERROR_NOTE_BYTES)
+    {
+        return error;
+    }
+    let message = bounded_text(error.message(), MAX_PUBLISHED_ERROR_MESSAGE_BYTES);
+    let bounded = match error.severity() {
+        Severity::Error => CompilerDiagnostic::new(error.code(), message, error.span()),
+        Severity::Warning => CompilerDiagnostic::warning(error.code(), message, error.span()),
+    };
+    error.notes().iter().fold(bounded, |bounded, note| {
+        bounded.with_note(bounded_text(note, MAX_PUBLISHED_ERROR_NOTE_BYTES))
+    })
 }
 
 impl Document {
@@ -221,7 +349,9 @@ impl Document {
                 lines: LineIndex::new(source.text()),
                 source,
                 analysis: None,
-                compiler_diagnostic: None,
+                warnings: Vec::new(),
+                omitted_warnings: None,
+                error: None,
                 formatted: Err(CompilerDiagnostic::new(
                     "K8002",
                     format!(
@@ -241,13 +371,18 @@ impl Document {
         let source = Source::new(document_name(&uri), text);
         let lines = LineIndex::new(source.text());
         let formatted = krit::format_source(&source);
-        let (program, analysis, compiler_diagnostic) = match krit::parse_source(&source) {
-            Ok(program) => match krit::analyze(&program) {
-                Ok(analysis) => (Some(program), Some(analysis), None),
-                Err(diagnostic) => (Some(program), None, Some(diagnostic)),
-            },
-            Err(diagnostic) => (None, None, Some(diagnostic)),
+        let (program, analysis, all_warnings, error) = match krit::parse_source(&source) {
+            Ok(program) => {
+                let report = krit::analyze_with_warnings(&program);
+                match report.result {
+                    Ok(analysis) => (Some(program), Some(analysis), report.warnings, None),
+                    Err(diagnostic) => (Some(program), None, report.warnings, Some(diagnostic)),
+                }
+            }
+            Err(diagnostic) => (None, None, Vec::new(), Some(diagnostic)),
         };
+        let (warnings, omitted_warnings) = bound_warnings(all_warnings);
+        let error = error.map(bounded_error);
         let (declarations, syntax_kinds) = match (&program, &analysis) {
             (Some(program), Some(analysis)) => {
                 DeclarationCollector::collect(source.text(), program, analysis, source.text().len())
@@ -265,7 +400,9 @@ impl Document {
             source,
             lines,
             analysis,
-            compiler_diagnostic,
+            warnings,
+            omitted_warnings,
+            error,
             formatted,
             declarations,
             syntax_kinds,
@@ -275,6 +412,8 @@ impl Document {
         }
     }
 
+    /// Publishes the bounded warnings in source order, then the notice for
+    /// any warnings left out, then the rejecting error, if any.
     fn publish_diagnostics(&self) -> PublishDiagnosticsParams {
         let diagnostics = if self.oversized {
             vec![Diagnostic {
@@ -289,10 +428,27 @@ impl Document {
                 ..Diagnostic::default()
             }]
         } else {
-            self.compiler_diagnostic
-                .as_ref()
-                .map(|diagnostic| vec![self.lsp_diagnostic(diagnostic)])
-                .unwrap_or_default()
+            let mut diagnostics = self
+                .warnings
+                .iter()
+                .map(|diagnostic| self.lsp_diagnostic(diagnostic))
+                .collect::<Vec<_>>();
+            if let Some(omitted) = self.omitted_warnings {
+                diagnostics.push(Diagnostic {
+                    range: self.lines.range(self.source.text(), omitted.span),
+                    severity: Some(DiagnosticSeverity::INFORMATION),
+                    code: Some(NumberOrString::String(OMITTED_WARNINGS_CODE.to_owned())),
+                    source: Some("krit-lsp".to_owned()),
+                    message: omitted.message(),
+                    ..Diagnostic::default()
+                });
+            }
+            diagnostics.extend(
+                self.error
+                    .iter()
+                    .map(|diagnostic| self.lsp_diagnostic(diagnostic)),
+            );
+            diagnostics
         };
         PublishDiagnosticsParams::new(self.uri.clone(), diagnostics, Some(self.version))
     }
@@ -300,10 +456,13 @@ impl Document {
     fn lsp_diagnostic(&self, diagnostic: &CompilerDiagnostic) -> Diagnostic {
         Diagnostic {
             range: self.lines.range(self.source.text(), diagnostic.span()),
-            severity: Some(DiagnosticSeverity::ERROR),
+            severity: Some(match diagnostic.severity() {
+                Severity::Error => DiagnosticSeverity::ERROR,
+                Severity::Warning => DiagnosticSeverity::WARNING,
+            }),
             code: Some(NumberOrString::String(diagnostic.code().to_owned())),
             source: Some("krit".to_owned()),
-            message: diagnostic.message().to_owned(),
+            message: published_message(diagnostic),
             ..Diagnostic::default()
         }
     }
@@ -717,22 +876,34 @@ impl Document {
                     "document exceeds the {} byte language-server limit",
                     MAX_DOCUMENT_BYTES
                 ),
+                notes: Vec::new(),
                 span: ByteSpan { start: 0, end: 0 },
                 range: Range::new(Position::new(0, 0), Position::new(0, 0)),
             }]
         } else {
-            self.compiler_diagnostic
-                .as_ref()
-                .map(|diagnostic| {
-                    vec![CompilerDiagnosticFact {
-                        severity: "error",
-                        code: diagnostic.code().to_owned(),
-                        message: diagnostic.message().to_owned(),
-                        span: diagnostic.span().into(),
-                        range: self.lines.range(self.source.text(), diagnostic.span()),
-                    }]
-                })
-                .unwrap_or_default()
+            // The same bounded list, in the same order, that the document
+            // publishes.
+            let compiler_fact = |diagnostic: &CompilerDiagnostic| CompilerDiagnosticFact {
+                severity: diagnostic.severity().as_str(),
+                code: diagnostic.code().to_owned(),
+                message: diagnostic.message().to_owned(),
+                notes: diagnostic.notes().to_vec(),
+                span: diagnostic.span().into(),
+                range: self.lines.range(self.source.text(), diagnostic.span()),
+            };
+            let mut diagnostics = self.warnings.iter().map(compiler_fact).collect::<Vec<_>>();
+            if let Some(omitted) = self.omitted_warnings {
+                diagnostics.push(CompilerDiagnosticFact {
+                    severity: "info",
+                    code: OMITTED_WARNINGS_CODE.to_owned(),
+                    message: omitted.message(),
+                    notes: Vec::new(),
+                    span: omitted.span.into(),
+                    range: self.lines.range(self.source.text(), omitted.span),
+                });
+            }
+            diagnostics.extend(self.error.iter().map(compiler_fact));
+            diagnostics
         };
 
         let analysis = self.analysis.as_ref();
@@ -1312,77 +1483,90 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
     }
 
     fn expression_fields(expression: &Expression, fields: &mut BTreeSet<String>) {
-        match &expression.kind {
-            ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
-            ExpressionKind::List(elements) => {
-                for element in elements {
-                    expression_fields(element, fields);
+        // `else if` continuations and the left spine of an operator chain are
+        // followed by this loop rather than by recursion, so a long chain
+        // never deepens the walk.
+        let mut pending_operands = Vec::new();
+        let mut current = expression;
+        loop {
+            match &current.kind {
+                ExpressionKind::If {
+                    condition,
+                    consequent,
+                    alternative,
+                } => {
+                    expression_fields(condition, fields);
+                    block_fields(consequent, fields);
+                    current = alternative;
+                    continue;
                 }
-            }
-            ExpressionKind::Record(record_fields) => {
-                for field in record_fields {
-                    fields.insert(field.name.clone());
-                    expression_fields(&field.value, fields);
+                ExpressionKind::Binary { left, right, .. } => {
+                    pending_operands.push(right.as_ref());
+                    current = left;
+                    continue;
                 }
-            }
-            ExpressionKind::FieldAccess { value, field } => {
-                fields.insert(field.clone());
-                expression_fields(value, fields);
-            }
-            ExpressionKind::Block(block) => block_fields(block, fields),
-            ExpressionKind::If {
-                condition,
-                consequent,
-                alternative,
-            } => {
-                expression_fields(condition, fields);
-                block_fields(consequent, fields);
-                expression_fields(alternative, fields);
-            }
-            ExpressionKind::Function {
-                parameters,
-                return_type,
-                body,
-            } => {
-                for parameter in parameters {
-                    if let Some(annotation) = &parameter.annotation {
-                        annotation_fields(annotation, fields);
+                ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+                ExpressionKind::List(elements) => {
+                    for element in elements {
+                        expression_fields(element, fields);
                     }
                 }
-                if let Some(return_type) = return_type {
-                    annotation_fields(return_type, fields);
-                }
-                block_fields(body, fields);
-            }
-            ExpressionKind::Call { callee, arguments } => {
-                expression_fields(callee, fields);
-                for argument in arguments {
-                    expression_fields(argument, fields);
-                }
-            }
-            ExpressionKind::Match { subject, kind } => {
-                expression_fields(subject, fields);
-                match kind {
-                    MatchKind::List {
-                        empty_case,
-                        cons_case,
-                        ..
-                    } => {
-                        expression_fields(empty_case, fields);
-                        expression_fields(cons_case, fields);
+                ExpressionKind::Record(record_fields) => {
+                    for field in record_fields {
+                        fields.insert(field.name.clone());
+                        expression_fields(&field.value, fields);
                     }
-                    MatchKind::Variants { arms, .. } => {
-                        for arm in arms {
-                            expression_fields(&arm.value, fields);
+                }
+                ExpressionKind::FieldAccess { value, field } => {
+                    fields.insert(field.clone());
+                    expression_fields(value, fields);
+                }
+                ExpressionKind::Block(block) => block_fields(block, fields),
+                ExpressionKind::Function {
+                    parameters,
+                    return_type,
+                    body,
+                } => {
+                    for parameter in parameters {
+                        if let Some(annotation) = &parameter.annotation {
+                            annotation_fields(annotation, fields);
+                        }
+                    }
+                    if let Some(return_type) = return_type {
+                        annotation_fields(return_type, fields);
+                    }
+                    block_fields(body, fields);
+                }
+                ExpressionKind::Call { callee, arguments } => {
+                    expression_fields(callee, fields);
+                    for argument in arguments {
+                        expression_fields(argument, fields);
+                    }
+                }
+                ExpressionKind::Match { subject, kind } => {
+                    expression_fields(subject, fields);
+                    match kind {
+                        MatchKind::List {
+                            empty_case,
+                            cons_case,
+                            ..
+                        } => {
+                            expression_fields(empty_case, fields);
+                            expression_fields(cons_case, fields);
+                        }
+                        MatchKind::Variants { arms, .. } => {
+                            for arm in arms {
+                                expression_fields(&arm.value, fields);
+                            }
                         }
                     }
                 }
+                ExpressionKind::Unary { operand, .. } => expression_fields(operand, fields),
             }
-            ExpressionKind::Unary { operand, .. } => expression_fields(operand, fields),
-            ExpressionKind::Binary { left, right, .. } => {
-                expression_fields(left, fields);
-                expression_fields(right, fields);
-            }
+            let Some(operand) = pending_operands.pop() else {
+                break;
+            };
+            current = operand;
         }
     }
 
@@ -1862,102 +2046,118 @@ impl<'a> DeclarationCollector<'a> {
     }
 
     fn expression(&mut self, expression: &Expression) {
-        self.syntax_kinds
-            .insert(expression.span, expression_kind(&expression.kind));
-        match &expression.kind {
-            ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
-            ExpressionKind::List(elements) => {
-                for element in elements {
-                    self.expression(element);
+        // `else if` continuations and the left spine of an operator chain are
+        // followed by this loop rather than by recursion, so a long chain
+        // never deepens the walk; expressions are still visited in source
+        // order.
+        let mut pending_operands = Vec::new();
+        let mut current = expression;
+        loop {
+            self.syntax_kinds
+                .insert(current.span, expression_kind(&current.kind));
+            match &current.kind {
+                ExpressionKind::If {
+                    condition,
+                    consequent,
+                    alternative,
+                } => {
+                    self.expression(condition);
+                    self.block(consequent);
+                    current = alternative;
+                    continue;
                 }
-            }
-            ExpressionKind::Record(fields) => {
-                for field in fields {
-                    self.expression(&field.value);
+                ExpressionKind::Binary { left, right, .. } => {
+                    pending_operands.push(right.as_ref());
+                    current = left;
+                    continue;
                 }
-            }
-            ExpressionKind::FieldAccess { value, .. } => self.expression(value),
-            ExpressionKind::Block(block) => self.block(block),
-            ExpressionKind::If {
-                condition,
-                consequent,
-                alternative,
-            } => {
-                self.expression(condition);
-                self.block(consequent);
-                self.expression(alternative);
-            }
-            ExpressionKind::Function {
-                parameters, body, ..
-            } => {
-                for parameter in parameters {
-                    self.add(
-                        &parameter.name,
-                        CompilerSymbolKind::Parameter,
-                        parameter.span,
-                        Some(parameter.span),
-                        body.span,
-                        parameter.annotation.as_ref().map(ToString::to_string),
-                    );
-                }
-                self.block(body);
-            }
-            ExpressionKind::Call { callee, arguments } => {
-                self.expression(callee);
-                for argument in arguments {
-                    self.expression(argument);
-                }
-            }
-            ExpressionKind::Match { subject, kind } => {
-                self.expression(subject);
-                match kind {
-                    MatchKind::List {
-                        empty_case,
-                        head_name,
-                        tail_name,
-                        cons_case,
-                    } => {
-                        self.expression(empty_case);
-                        self.add(
-                            head_name,
-                            CompilerSymbolKind::Match,
-                            expression.span,
-                            None,
-                            cons_case.span,
-                            None,
-                        );
-                        self.add(
-                            tail_name,
-                            CompilerSymbolKind::Match,
-                            expression.span,
-                            None,
-                            cons_case.span,
-                            None,
-                        );
-                        self.expression(cons_case);
+                ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+                ExpressionKind::List(elements) => {
+                    for element in elements {
+                        self.expression(element);
                     }
-                    MatchKind::Variants { arms, .. } => {
-                        for arm in arms {
-                            if let Some(binding) = &arm.binding {
-                                self.add(
-                                    binding,
-                                    CompilerSymbolKind::Match,
-                                    arm.span,
-                                    find_identifier_span(self.text, arm.span, binding),
-                                    arm.value.span,
-                                    None,
-                                );
+                }
+                ExpressionKind::Record(fields) => {
+                    for field in fields {
+                        self.expression(&field.value);
+                    }
+                }
+                ExpressionKind::FieldAccess { value, .. } => self.expression(value),
+                ExpressionKind::Block(block) => self.block(block),
+                ExpressionKind::Function {
+                    parameters, body, ..
+                } => {
+                    for parameter in parameters {
+                        self.add(
+                            &parameter.name,
+                            CompilerSymbolKind::Parameter,
+                            parameter.span,
+                            Some(parameter.span),
+                            body.span,
+                            parameter.annotation.as_ref().map(ToString::to_string),
+                        );
+                    }
+                    self.block(body);
+                }
+                ExpressionKind::Call { callee, arguments } => {
+                    self.expression(callee);
+                    for argument in arguments {
+                        self.expression(argument);
+                    }
+                }
+                ExpressionKind::Match { subject, kind } => {
+                    self.expression(subject);
+                    match kind {
+                        MatchKind::List {
+                            empty_case,
+                            head_name,
+                            head_span,
+                            tail_name,
+                            tail_span,
+                            cons_case,
+                        } => {
+                            self.expression(empty_case);
+                            self.add(
+                                head_name,
+                                CompilerSymbolKind::Match,
+                                *head_span,
+                                Some(*head_span),
+                                cons_case.span,
+                                None,
+                            );
+                            self.add(
+                                tail_name,
+                                CompilerSymbolKind::Match,
+                                *tail_span,
+                                Some(*tail_span),
+                                cons_case.span,
+                                None,
+                            );
+                            self.expression(cons_case);
+                        }
+                        MatchKind::Variants { arms, .. } => {
+                            for arm in arms {
+                                if let Some(binding) = &arm.binding {
+                                    self.add(
+                                        binding,
+                                        CompilerSymbolKind::Match,
+                                        arm.span,
+                                        find_identifier_span(self.text, arm.span, binding),
+                                        arm.value.span,
+                                        None,
+                                    );
+                                }
+                                self.expression(&arm.value);
                             }
-                            self.expression(&arm.value);
                         }
                     }
                 }
+                ExpressionKind::Unary { operand, .. } => self.expression(operand),
             }
-            ExpressionKind::Unary { operand, .. } => self.expression(operand),
-            ExpressionKind::Binary { left, right, .. } => {
-                self.expression(left);
-                self.expression(right);
-            }
+            let Some(operand) = pending_operands.pop() else {
+                break;
+            };
+            current = operand;
         }
     }
 
@@ -2289,6 +2489,8 @@ struct CompilerDiagnosticFact {
     severity: &'static str,
     code: String,
     message: String,
+    /// One-line repair hints, as in the JSON Lines `notes` field.
+    notes: Vec<String>,
     span: ByteSpan,
     range: Range,
 }
@@ -2460,6 +2662,58 @@ mod tests {
         }
     }
 
+    /// A valid program with a 2,000-branch `else if` chain and a 4,000-term
+    /// operator chain, the longest flat chains the parser accepts.
+    fn long_chain_program() -> String {
+        let mut source = String::from("fn pick(n) {\n    if n == 0 {\n        0\n    }");
+        for branch in 1..2_000 {
+            source.push_str(&format!(
+                " else if n == {branch} {{\n        {branch}\n    }}"
+            ));
+        }
+        source.push_str(" else {\n        -1\n    }\n}\n\nlet total = 0");
+        source.push_str(&" + pick(1)".repeat(4_000));
+        source.push_str(";\n");
+        source
+    }
+
+    #[test]
+    fn walks_long_else_if_and_operator_chains_iteratively() {
+        // Runs on a 1 MiB thread: walking either chain recursively, once per
+        // link, would need several times more.
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let directory = TestDirectory::new();
+                let uri = directory.uri("main.krit");
+                let mut state = ServerState::new(vec![directory.path.clone()]);
+                let source = long_chain_program();
+                let diagnostics = state.open(uri.clone(), 1, source.clone());
+                assert!(diagnostics.diagnostics.is_empty());
+                let hover = state
+                    .hover(&uri, Position::new(0, 4))
+                    .expect("hover should succeed");
+                assert!(hover.is_some());
+
+                // An unknown receiver makes completion collect candidate field
+                // names from the whole program.
+                let source = format!("{source}let probe = unknown.;\n");
+                let line = source.lines().count() - 1;
+                state
+                    .change(&uri, 2, source)
+                    .expect("the document should change");
+                let CompletionResponse::List(_) = state
+                    .completion(&uri, Position::new(line as u32, 20))
+                    .expect("completion should succeed")
+                else {
+                    panic!("completion should return a bounded list")
+                };
+            })
+            .expect("test thread should start")
+            .join()
+            .expect("long chains should be walked on a small stack");
+    }
+
     #[test]
     fn publishes_compiler_diagnostics_with_utf16_ranges() {
         let directory = TestDirectory::new();
@@ -2479,6 +2733,362 @@ mod tests {
         );
         assert_eq!(diagnostic.range.start, Position::new(0, 30));
         assert_eq!(diagnostic.range.end, Position::new(0, 37));
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn publishes_fix_hints_as_help_lines_and_compiler_fact_notes() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let diagnostics = state.open(
+            uri.clone(),
+            1,
+            "let total = 1;\nprintln(totl);\n".to_owned(),
+        );
+
+        assert_eq!(diagnostics.diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.diagnostics[0].message,
+            "undefined name `totl`\nhelp: did you mean `total`?"
+        );
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        assert_eq!(facts["diagnostics"][0]["code"], "K2001");
+        assert_eq!(facts["diagnostics"][0]["message"], "undefined name `totl`");
+        assert_eq!(
+            facts["diagnostics"][0]["notes"],
+            serde_json::json!(["did you mean `total`?"])
+        );
+
+        let changed = state
+            .change(&uri, 2, "fn f(x) {\n    return x;\n}\n".to_owned())
+            .expect("change should succeed");
+        let diagnostic = &changed.diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("K1101".to_owned()))
+        );
+        assert!(
+            diagnostic
+                .message
+                .starts_with("`return` is not Krit syntax\nhelp: a block's value")
+        );
+        assert_eq!(diagnostic.range.start, Position::new(1, 4));
+    }
+
+    #[test]
+    fn publishes_warnings_beside_valid_analysis_and_before_errors() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+
+        let valid = state.open(
+            uri.clone(),
+            1,
+            "let _ = 1;\nlet _ = 2;\nprintln(_);\n".to_owned(),
+        );
+        assert_eq!(valid.diagnostics.len(), 1);
+        let warning = &valid.diagnostics[0];
+        assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(
+            warning.code,
+            Some(NumberOrString::String("K2003".to_owned()))
+        );
+        assert_eq!(warning.range.start, Position::new(2, 8));
+        assert_eq!(warning.range.end, Position::new(2, 9));
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        assert_eq!(facts["valid"], true);
+        assert_eq!(facts["diagnostics"][0]["severity"], "warning");
+        assert_eq!(facts["diagnostics"][0]["code"], "K2003");
+        assert_eq!(
+            facts["diagnostics"]
+                .as_array()
+                .expect("diagnostics should be an array")
+                .len(),
+            1
+        );
+
+        let invalid = state
+            .change(&uri, 2, "let _ = 1;\nlet text = _ + \"a\";\n".to_owned())
+            .expect("change should succeed");
+        let published = invalid
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.severity, diagnostic.code.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            published,
+            vec![
+                (
+                    Some(DiagnosticSeverity::WARNING),
+                    Some(NumberOrString::String("K2003".to_owned()))
+                ),
+                (
+                    Some(DiagnosticSeverity::ERROR),
+                    Some(NumberOrString::String("K3001".to_owned()))
+                ),
+            ]
+        );
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        assert_eq!(facts["valid"], false);
+        assert_eq!(facts["diagnostics"][0]["severity"], "warning");
+        assert_eq!(facts["diagnostics"][1]["severity"], "error");
+    }
+
+    /// A valid program that binds `_` on its first line and reads it once on
+    /// each of the next `reads` lines.
+    fn discard_reads_program(reads: usize) -> String {
+        let mut source = String::from("let _ = 1;\n");
+        source.push_str(&"_;\n".repeat(reads));
+        source
+    }
+
+    #[test]
+    fn bounds_published_warnings_and_reports_the_rest_in_one_notice() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+
+        // About 300 KB of source: every one of its warnings, published, would
+        // take a notification past the 16 MiB protocol frame limit.
+        let reads = 100_001;
+        let source = discard_reads_program(reads);
+        assert!(source.len() < MAX_DOCUMENT_BYTES);
+        let valid = state.open(uri.clone(), 1, source.clone());
+        assert_eq!(valid.diagnostics.len(), MAX_PUBLISHED_WARNINGS + 1);
+        for (index, warning) in valid.diagnostics[..MAX_PUBLISHED_WARNINGS]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(
+                warning.code,
+                Some(NumberOrString::String("K2003".to_owned()))
+            );
+            assert_eq!(warning.range.start, Position::new(index as u32 + 1, 0));
+        }
+        let notice = &valid.diagnostics[MAX_PUBLISHED_WARNINGS];
+        assert_eq!(notice.severity, Some(DiagnosticSeverity::INFORMATION));
+        assert_eq!(
+            notice.code,
+            Some(NumberOrString::String("K8003".to_owned()))
+        );
+        assert_eq!(notice.source.as_deref(), Some("krit-lsp"));
+        assert_eq!(
+            notice.message,
+            "99901 more warnings are not shown; `krit check` reports every warning"
+        );
+        // The notice sits on the first warning left out.
+        assert_eq!(
+            notice.range.start,
+            Position::new(MAX_PUBLISHED_WARNINGS as u32 + 1, 0)
+        );
+        let published = serde_json::to_vec(&valid).expect("diagnostics should serialize");
+        assert!(published.len() < 64 * 1024);
+        assert!(
+            state
+                .hover(&uri, Position::new(0, 4))
+                .expect("hover should succeed")
+                .is_some()
+        );
+
+        // The rejecting error is always published, after the notice, and
+        // compiler facts carry the same bounded list.
+        let invalid = state
+            .change(&uri, 2, format!("{source}missing;\n"))
+            .expect("change should succeed");
+        assert_eq!(invalid.diagnostics.len(), MAX_PUBLISHED_WARNINGS + 2);
+        assert_eq!(invalid.diagnostics[MAX_PUBLISHED_WARNINGS], *notice);
+        let error = &invalid.diagnostics[MAX_PUBLISHED_WARNINGS + 1];
+        assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(error.code, Some(NumberOrString::String("K2001".to_owned())));
+        assert_eq!(error.range.start, Position::new(reads as u32 + 1, 0));
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        assert_eq!(facts["valid"], false);
+        let diagnostics = facts["diagnostics"]
+            .as_array()
+            .expect("diagnostics should be an array");
+        assert_eq!(diagnostics.len(), MAX_PUBLISHED_WARNINGS + 2);
+        assert!(
+            diagnostics[..MAX_PUBLISHED_WARNINGS]
+                .iter()
+                .all(|diagnostic| diagnostic["severity"] == "warning")
+        );
+        let notice = &diagnostics[MAX_PUBLISHED_WARNINGS];
+        assert_eq!(notice["severity"], "info");
+        assert_eq!(notice["code"], "K8003");
+        assert_eq!(
+            notice["message"],
+            "99901 more warnings are not shown; `krit check` reports every warning"
+        );
+        // `let _ = 1;\n` and 100 lines of `_;\n` precede the first omitted read.
+        assert_eq!(
+            notice["span"],
+            serde_json::json!({"start": 311, "end": 312})
+        );
+        assert_eq!(diagnostics[MAX_PUBLISHED_WARNINGS + 1]["severity"], "error");
+        assert_eq!(diagnostics[MAX_PUBLISHED_WARNINGS + 1]["code"], "K2001");
+
+        // At the bound nothing is left out and no notice is published.
+        let bounded = state
+            .change(&uri, 3, discard_reads_program(MAX_PUBLISHED_WARNINGS))
+            .expect("change should succeed");
+        assert_eq!(bounded.diagnostics.len(), MAX_PUBLISHED_WARNINGS);
+        assert!(
+            bounded
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::WARNING))
+        );
+    }
+
+    #[test]
+    fn bounds_the_published_error_message_and_notes() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+
+        // Each record doubles the rendered type of the one before it, so the
+        // call error's message grows to hundreds of kilobytes from a few
+        // hundred bytes of source.
+        let mut source = "let v0 = 1;\n".to_owned();
+        for level in 1..=14 {
+            let previous = level - 1;
+            source.push_str(&format!(
+                "let v{level} = record {{ a: v{previous}, b: v{previous} }};\n"
+            ));
+        }
+        source.push_str("v14();\n");
+        let published = state.open(uri.clone(), 1, source);
+        assert_eq!(published.diagnostics.len(), 1);
+        let error = &published.diagnostics[0];
+        assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(error.code, Some(NumberOrString::String("K3002".to_owned())));
+        assert!(error.message.len() <= MAX_PUBLISHED_ERROR_MESSAGE_BYTES);
+        assert!(error.message.ends_with(TRUNCATION_MARKER));
+
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        let message = facts["diagnostics"][0]["message"]
+            .as_str()
+            .expect("message should be a string");
+        assert_eq!(message, error.message);
+
+        // A note keeps its place and is cut to its own bound; text that fits
+        // is unchanged.
+        let long_name = "é".repeat(MAX_PUBLISHED_ERROR_NOTE_BYTES);
+        let bounded = bounded_error(
+            CompilerDiagnostic::new(
+                "K2001",
+                format!("undefined name `{long_name}x`"),
+                Span::new(0, 1),
+            )
+            .with_note(format!("did you mean `{long_name}`?")),
+        );
+        assert_eq!(bounded.code(), "K2001");
+        assert_eq!(bounded.severity(), Severity::Error);
+        assert_eq!(bounded.span(), Span::new(0, 1));
+        assert_eq!(bounded.message().len(), long_name.len() + 18);
+        assert_eq!(bounded.notes().len(), 1);
+        assert!(bounded.notes()[0].len() <= MAX_PUBLISHED_ERROR_NOTE_BYTES);
+        assert!(bounded.notes()[0].ends_with(TRUNCATION_MARKER));
+        let fitting = CompilerDiagnostic::new("K2001", "undefined name `x`", Span::new(0, 1))
+            .with_note("did you mean `y`?");
+        assert_eq!(bounded_error(fitting.clone()), fitting);
+    }
+
+    #[test]
+    fn bounds_published_warnings_by_count_and_message_bytes() {
+        let warning = |index: usize, message: String| {
+            CompilerDiagnostic::warning("K2003", message, Span::new(index, index + 1))
+        };
+        let short = |count: usize| {
+            (0..count)
+                .map(|index| warning(index, "short".to_owned()))
+                .collect::<Vec<_>>()
+        };
+
+        let (kept, omitted) = bound_warnings(Vec::new());
+        assert!(kept.is_empty());
+        assert_eq!(omitted, None);
+
+        let (kept, omitted) = bound_warnings(short(MAX_PUBLISHED_WARNINGS));
+        assert_eq!(kept.len(), MAX_PUBLISHED_WARNINGS);
+        assert_eq!(omitted, None);
+
+        let (kept, omitted) = bound_warnings(short(8 * MAX_PUBLISHED_WARNINGS));
+        assert_eq!(kept.len(), MAX_PUBLISHED_WARNINGS);
+        assert!(
+            kept.capacity() < 2 * MAX_PUBLISHED_WARNINGS,
+            "the kept prefix must not retain the full allocation"
+        );
+        assert_eq!(
+            omitted.map(|omitted| omitted.count),
+            Some(7 * MAX_PUBLISHED_WARNINGS)
+        );
+
+        let (kept, omitted) = bound_warnings(short(MAX_PUBLISHED_WARNINGS + 1));
+        assert_eq!(kept.len(), MAX_PUBLISHED_WARNINGS);
+        let omitted = omitted.expect("one warning should be left out");
+        assert_eq!(
+            omitted,
+            OmittedWarnings {
+                count: 1,
+                span: Span::new(MAX_PUBLISHED_WARNINGS, MAX_PUBLISHED_WARNINGS + 1),
+            }
+        );
+        assert_eq!(
+            omitted.message(),
+            "1 more warning is not shown; `krit check` reports every warning"
+        );
+
+        // Messages that exactly fill the byte budget are kept. The first
+        // warning past it is left out with every later one, however short, so
+        // the published warnings stay a source-order prefix.
+        let half = MAX_PUBLISHED_WARNING_MESSAGE_BYTES / 2;
+        let (kept, omitted) = bound_warnings(vec![
+            warning(0, "a".repeat(half)),
+            warning(1, "b".repeat(half)),
+            warning(2, "c".to_owned()),
+            warning(3, "d".to_owned()),
+        ]);
+        assert_eq!(
+            kept.iter()
+                .map(|warning| warning.span().start)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            omitted,
+            Some(OmittedWarnings {
+                count: 2,
+                span: Span::new(2, 3),
+            })
+        );
     }
 
     #[test]

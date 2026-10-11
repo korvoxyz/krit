@@ -1,0 +1,22 @@
+let answer = match Some(41) {
+    Some(state_get) => state_get + 1,
+    None => 0,
+};
+
+println(answer);
+
+fn total(items) {
+    match items {
+        [] => 0,
+        [cache_get, ..object_put] => cache_get + total(object_put),
+    }
+}
+
+println(total([1, 2, 3]));
+
+let label = match Ok("bound") {
+    Ok(queue_publish) => queue_publish,
+    Err(db_commit) => db_commit,
+};
+
+println(label);
