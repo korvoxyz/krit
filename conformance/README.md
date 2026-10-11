@@ -82,7 +82,7 @@ network service, or nondeterministic value.
 | `check/type/*` | stable static operator, condition, field, call, annotation, and match errors |
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
-| `check/nesting/*` | syntactic and inferred-type nesting limits (`K1005`) |
+| `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including chains hidden by parentheses and types that grow after they are bound |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |

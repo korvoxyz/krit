@@ -1863,6 +1863,132 @@ fn direct_run_reports_k4010_for_runaway_recursion_and_runs_deep_recursion() {
     assert!(output.stderr.is_empty());
 }
 
+/// Operator chains that each sit inside the parentheses of the next, so the
+/// innermost operand lies below every operator of every level.
+fn parenthesized_spine(levels: usize, operators: usize, operator: &str) -> String {
+    let mut expression = format!("1{}", operator.repeat(operators));
+    for _ in 1..levels {
+        expression = format!("({expression}){}", operator.repeat(operators));
+    }
+    expression
+}
+
+#[test]
+fn parenthesized_operator_spines_report_k1005_from_every_command() {
+    let directory = TestDirectory::new("operator-spine");
+    let source = directory.file(
+        "main.krit",
+        &format!("println({});\n", parenthesized_spine(3, 2_000, " + 1")),
+    );
+    directory.file("krit.pkg", &package_manifest(true));
+    for command in [
+        vec!["check".into(), source.clone().into_os_string()],
+        vec!["run".into(), source.clone().into_os_string()],
+        vec!["fmt".into(), source.clone().into_os_string()],
+        vec!["build".into()],
+    ] {
+        let output = krit_in(&directory)
+            .args(&command)
+            .output()
+            .expect("Krit should start");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_ne!(output.status.code(), Some(134), "{command:?}");
+        assert_eq!(output.status.code(), Some(1), "{command:?}: {stderr}");
+        assert!(stderr.contains("error[K1005]"), "{command:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{command:?}");
+    }
+}
+
+#[test]
+fn language_server_reports_k1005_for_a_parenthesized_operator_spine() {
+    // 125 levels of 3,900 operators: a document just under the language
+    // server's 1 MiB limit whose syntax tree would be almost half a million
+    // operators deep.
+    let directory = TestDirectory::new("lsp-operator-spine");
+    let text = format!("let value = {};\n", parenthesized_spine(125, 3_900, "+1"));
+    assert!(text.len() < 1024 * 1024);
+    let source = directory.file("main.krit", &text);
+    let uri = format!("file://{}", source.display());
+    let messages = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "capabilities": {}, "workspaceFolders": null}
+        }),
+        serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {"uri": uri, "languageId": "krit", "version": 1, "text": text}
+            }
+        }),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": null}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "exit", "params": null}),
+    ];
+    let mut input = Vec::new();
+    for message in &messages {
+        input.extend_from_slice(&lsp_frame(message));
+    }
+
+    let mut child = krit_in(&directory)
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Krit language server should start");
+    child
+        .stdin
+        .take()
+        .expect("language server stdin should be piped")
+        .write_all(&input)
+        .expect("LSP input should be written");
+    let output = child
+        .wait_with_output()
+        .expect("language server should finish");
+
+    assert_ne!(output.status.code(), Some(134));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let frames = parse_lsp_frames(&output.stdout);
+    assert_eq!(frames[1]["method"], "textDocument/publishDiagnostics");
+    assert_eq!(frames[1]["params"]["diagnostics"][0]["code"], "K1005");
+}
+
+#[test]
+fn direct_run_reports_k4010_for_runaway_value_nesting() {
+    // `run` does not consult static checking, so this ill-typed program
+    // reaches the evaluator: 1,000 sequential calls each wrap the value in
+    // 9,000 more lists. Printing it used to overflow the native stack; it now
+    // fails during the second call, when the value would nest more than
+    // 10,000 levels.
+    let directory = TestDirectory::new("value-depth");
+    let mut text = String::from(
+        "fn wrap(x, n) {\n    if n == 0 {\n        x\n    } else {\n        wrap([x], n - 1)\n    }\n}\n\nlet v0 = 0;\n",
+    );
+    for level in 1..=1_000 {
+        text.push_str(&format!("let v{level} = wrap(v{}, 9000);\n", level - 1));
+    }
+    text.push_str("println(v1000);\nprintln(json_encode(v1000));\nprintln(v1000 == v1000);\n");
+    let source = directory.file("main.krit", &text);
+    let output = krit()
+        .args(["run", "--diagnostic-format", "json"])
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+    assert_ne!(output.status.code(), Some(134));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let diagnostics = parse_json_lines(&output.stderr);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "K4010");
+}
+
 #[test]
 fn long_else_if_chains_check_run_format_build_and_execute() {
     let directory = TestDirectory::new("else-if-chain");

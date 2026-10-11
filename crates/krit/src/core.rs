@@ -9,7 +9,7 @@ use crate::{
     Analysis, BinaryOperator, Block, Builtin, EffectSet, Expression, ExpressionKind, FunctionType,
     MatchKind, Parameter, Program, RequirementSet, ResolvedName, Span, Statement, StatementKind,
     SymbolId, SymbolKind, Type, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
-    limits::{MAX_CORE_BLOCK_DEPTH, MAX_STRUCTURAL_DEPTH},
+    limits::{MAX_CORE_BLOCK_DEPTH, MAX_TREE_DEPTH},
 };
 
 macro_rules! id_type {
@@ -615,14 +615,14 @@ impl<'a> Lowerer<'a> {
 
     /// Counts one level of lowering recursion.
     ///
-    /// The parser keeps source programs far below this bound, and analysis
+    /// The parser keeps source programs within this bound, and analysis
     /// applies it to the same tree, so this only rejects a hand-built syntax
     /// tree that differs from the one that was analyzed.
     fn enter(&mut self, span: Option<Span>) -> Result<(), IrError> {
-        if self.depth >= MAX_STRUCTURAL_DEPTH {
+        if self.depth >= MAX_TREE_DEPTH {
             return Err(IrError::new(format!(
                 "nesting depth limit exceeded: the syntax tree nests deeper than \
-                 {MAX_STRUCTURAL_DEPTH} levels at {span:?}"
+                 {MAX_TREE_DEPTH} levels at {span:?}"
             )));
         }
         self.depth += 1;

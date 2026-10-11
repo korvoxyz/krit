@@ -1,4 +1,4 @@
-use std::{fmt, io::Write, rc::Rc};
+use std::{fmt, io::Write, ops::Deref, rc::Rc};
 
 use crate::{
     Diagnostic, Span,
@@ -6,7 +6,7 @@ use crate::{
         BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
         Statement, StatementKind, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
     },
-    limits::{MAX_CALL_DEPTH, MAX_EVALUATION_DEPTH},
+    limits::{MAX_CALL_DEPTH, MAX_EVALUATION_DEPTH, MAX_VALUE_DEPTH},
 };
 
 #[derive(Clone)]
@@ -15,14 +15,64 @@ pub enum Value {
     Boolean(bool),
     String(Rc<str>),
     Unit,
-    List(Rc<[Value]>),
-    Record(Rc<[(String, Value)]>),
+    List(ListValue),
+    Record(RecordValue),
     Variant {
         name: VariantName,
-        payload: Option<Rc<Value>>,
+        payload: Option<VariantPayload>,
     },
     Function(Rc<FunctionValue>),
     Builtin(BuiltinFunction),
+}
+
+/// The elements of a list value.
+///
+/// Lists, records, and variants record how deeply they nest when they are
+/// built, which is how the evaluator bounds value nesting at
+/// [`MAX_VALUE_DEPTH`].
+#[derive(Clone)]
+pub struct ListValue {
+    elements: Rc<[Value]>,
+    depth: usize,
+}
+
+impl Deref for ListValue {
+    type Target = [Value];
+
+    fn deref(&self) -> &[Value] {
+        &self.elements
+    }
+}
+
+/// The fields of a record value, in construction order.
+#[derive(Clone)]
+pub struct RecordValue {
+    fields: Rc<[(String, Value)]>,
+    depth: usize,
+}
+
+impl Deref for RecordValue {
+    type Target = [(String, Value)];
+
+    fn deref(&self) -> &[(String, Value)] {
+        &self.fields
+    }
+}
+
+/// The value carried by `Some`, `Ok`, or `Err`.
+#[derive(Clone)]
+pub struct VariantPayload {
+    value: Rc<Value>,
+    /// The nesting depth of the variant that carries this payload.
+    depth: usize,
+}
+
+impl Deref for VariantPayload {
+    type Target = Value;
+
+    fn deref(&self) -> &Value {
+        &self.value
+    }
 }
 
 #[derive(Clone)]
@@ -161,6 +211,55 @@ impl Value {
         }
     }
 
+    /// Returns how many lists, records, and variants nest in this value:
+    /// zero for scalars and functions, one for an empty list.
+    pub fn depth(&self) -> usize {
+        match self {
+            Self::List(list) => list.depth,
+            Self::Record(record) => record.depth,
+            Self::Variant { payload, .. } => payload.as_ref().map_or(1, |payload| payload.depth),
+            Self::Integer(_)
+            | Self::Boolean(_)
+            | Self::String(_)
+            | Self::Unit
+            | Self::Function(_)
+            | Self::Builtin(_) => 0,
+        }
+    }
+
+    /// Builds a list value; fails with `K4010` at `span` when it would nest
+    /// more than [`MAX_VALUE_DEPTH`] levels.
+    fn list(elements: Vec<Self>, span: Span) -> Result<Self, Diagnostic> {
+        let depth = container_depth(elements.iter(), span)?;
+        Ok(Self::List(ListValue {
+            elements: elements.into(),
+            depth,
+        }))
+    }
+
+    /// Builds a record value; fails with `K4010` at `span` when it would nest
+    /// more than [`MAX_VALUE_DEPTH`] levels.
+    fn record(fields: Vec<(String, Self)>, span: Span) -> Result<Self, Diagnostic> {
+        let depth = container_depth(fields.iter().map(|(_, value)| value), span)?;
+        Ok(Self::Record(RecordValue {
+            fields: fields.into(),
+            depth,
+        }))
+    }
+
+    /// Builds `Some`, `Ok`, or `Err` around `payload`; fails with `K4010` at
+    /// `span` when it would nest more than [`MAX_VALUE_DEPTH`] levels.
+    fn variant(name: VariantName, payload: Self, span: Span) -> Result<Self, Diagnostic> {
+        let depth = container_depth(std::iter::once(&payload), span)?;
+        Ok(Self::Variant {
+            name,
+            payload: Some(VariantPayload {
+                value: Rc::new(payload),
+                depth,
+            }),
+        })
+    }
+
     fn kind(&self) -> &'static str {
         match self {
             Self::Integer(_) => "integer",
@@ -227,14 +326,66 @@ impl Environment {
 impl Drop for Environment {
     fn drop(&mut self) {
         // Release uniquely owned bindings one at a time, so dropping a scope
-        // with many bindings does not recurse once per binding.
-        let mut next = self.0.take();
-        while let Some(binding) = next {
-            next = match Rc::try_unwrap(binding) {
-                Ok(mut binding) => binding.parent.0.take(),
-                Err(_) => None,
-            };
+        // with many bindings does not recurse once per binding. A released
+        // binding hands the captured scopes of the closures it owns
+        // exclusively to the same loop, so a long chain of closures that each
+        // capture the previous one does not recurse once per closure either.
+        let mut pending = vec![self.0.take()];
+        while let Some(mut next) = pending.pop() {
+            while let Some(binding) = next {
+                next = match Rc::try_unwrap(binding) {
+                    Ok(mut binding) => {
+                        detach_captured_scopes(&mut binding.value, &mut pending);
+                        binding.parent.0.take()
+                    }
+                    Err(_) => None,
+                };
+            }
         }
+    }
+}
+
+/// Moves the captured scope of every closure that `value` owns exclusively
+/// into `pending`, so releasing `value` afterwards does not recurse into
+/// those scopes.
+///
+/// This walk follows only lists, records, and variants, which nest at most
+/// [`MAX_VALUE_DEPTH`] levels, so its own recursion is bounded.
+fn detach_captured_scopes(value: &mut Value, pending: &mut Vec<Option<Rc<Binding>>>) {
+    match value {
+        Value::Function(function) => {
+            if let Some(function) = Rc::get_mut(function) {
+                pending.push(function.environment.0.take());
+            }
+        }
+        Value::List(list) => {
+            if let Some(elements) = Rc::get_mut(&mut list.elements) {
+                for element in elements {
+                    detach_captured_scopes(element, pending);
+                }
+            }
+        }
+        Value::Record(record) => {
+            if let Some(fields) = Rc::get_mut(&mut record.fields) {
+                for (_, field) in fields {
+                    detach_captured_scopes(field, pending);
+                }
+            }
+        }
+        Value::Variant {
+            payload: Some(payload),
+            ..
+        } => {
+            if let Some(value) = Rc::get_mut(&mut payload.value) {
+                detach_captured_scopes(value, pending);
+            }
+        }
+        Value::Integer(_)
+        | Value::Boolean(_)
+        | Value::String(_)
+        | Value::Unit
+        | Value::Variant { payload: None, .. }
+        | Value::Builtin(_) => {}
     }
 }
 
@@ -379,7 +530,7 @@ impl Evaluator<'_> {
                 for element in elements {
                     values.push(self.expression(element, environment)?);
                 }
-                Ok(Value::List(values.into()))
+                Value::list(values, expression.span)
             }
             ExpressionKind::Record(fields) => {
                 let mut values = Vec::with_capacity(fields.len());
@@ -389,7 +540,7 @@ impl Evaluator<'_> {
                         self.expression(&field.value, environment)?,
                     ));
                 }
-                Ok(Value::Record(values.into()))
+                Value::record(values, expression.span)
             }
             ExpressionKind::FieldAccess { value, field } => {
                 let value = self.expression(value, environment)?;
@@ -588,18 +739,9 @@ impl Evaluator<'_> {
                 }
                 Ok(Value::Unit)
             }
-            BuiltinFunction::Some => Ok(Value::Variant {
-                name: VariantName::Some,
-                payload: Some(Rc::new(value)),
-            }),
-            BuiltinFunction::Ok => Ok(Value::Variant {
-                name: VariantName::Ok,
-                payload: Some(Rc::new(value)),
-            }),
-            BuiltinFunction::Err => Ok(Value::Variant {
-                name: VariantName::Err,
-                payload: Some(Rc::new(value)),
-            }),
+            BuiltinFunction::Some => Value::variant(VariantName::Some, value, span),
+            BuiltinFunction::Ok => Value::variant(VariantName::Ok, value, span),
+            BuiltinFunction::Err => Value::variant(VariantName::Err, value, span),
             BuiltinFunction::JsonEncode => json_encode(&value, span),
             BuiltinFunction::JsonDecode => json_decode(value, span),
             BuiltinFunction::AiInvoke
@@ -941,6 +1083,26 @@ fn not_callable(value: &Value, span: Span) -> Diagnostic {
     Diagnostic::new("K4002", format!("cannot call {}", value.kind()), span)
 }
 
+/// Returns the nesting depth of a list, record, or variant holding
+/// `children`, or `K4010` at `span` when it exceeds [`MAX_VALUE_DEPTH`].
+fn container_depth<'a>(
+    children: impl Iterator<Item = &'a Value>,
+    span: Span,
+) -> Result<usize, Diagnostic> {
+    let depth = 1 + children.map(Value::depth).max().unwrap_or(0);
+    if depth > MAX_VALUE_DEPTH {
+        return Err(Diagnostic::new(
+            "K4010",
+            format!(
+                "value depth limit exceeded: lists, records, and variants may nest at most \
+                 {MAX_VALUE_DEPTH} levels"
+            ),
+            span,
+        ));
+    }
+    Ok(depth)
+}
+
 /// Selects the match arm for an evaluated subject and returns it with the
 /// environment that binds its pattern names.
 fn select_match_arm<'a>(
@@ -967,8 +1129,9 @@ fn select_match_arm<'a>(
                 Ok((empty_case, environment.clone()))
             } else {
                 let with_head = environment.extend(head_name.clone(), values[0].clone());
-                let with_tail =
-                    with_head.extend(tail_name.clone(), Value::List(values[1..].to_vec().into()));
+                // The tail nests no deeper than the list it came from.
+                let tail = Value::list(values[1..].to_vec(), subject_span)?;
+                let with_tail = with_head.extend(tail_name.clone(), tail);
                 Ok((cons_case, with_tail))
             }
         }
@@ -1000,8 +1163,8 @@ fn select_match_arm<'a>(
                 .find(|arm| arm.variant == name)
                 .expect("parser guarantees exhaustive variant arms");
             let arm_environment = match (&arm.binding, payload) {
-                (Some(binding), Some(value)) => {
-                    environment.extend(binding.clone(), value.as_ref().clone())
+                (Some(binding), Some(payload)) => {
+                    environment.extend(binding.clone(), Value::clone(&payload))
                 }
                 (None, None) => environment.clone(),
                 _ => unreachable!("variant payload shape is fixed"),
@@ -1221,7 +1384,7 @@ fn json_to_value(value: serde_json::Value, span: Span) -> Result<Value, Diagnost
             .into_iter()
             .map(|value| json_to_value(value, span))
             .collect::<Result<Vec<_>, _>>()
-            .map(|values| Value::List(values.into())),
+            .and_then(|values| Value::list(values, span)),
         serde_json::Value::Object(mut fields) => {
             if fields.len() == 1 {
                 for (tag, name) in [
@@ -1244,10 +1407,7 @@ fn json_to_value(value: serde_json::Value, span: Span) -> Result<Value, Diagnost
                                 payload: None,
                             });
                         }
-                        return Ok(Value::Variant {
-                            name,
-                            payload: Some(Rc::new(json_to_value(payload, span)?)),
-                        });
+                        return Value::variant(name, json_to_value(payload, span)?, span);
                     }
                 }
             }
@@ -1256,14 +1416,14 @@ fn json_to_value(value: serde_json::Value, span: Span) -> Result<Value, Diagnost
                 .map(|(name, value)| json_to_value(value, span).map(|value| (name, value)))
                 .collect::<Result<Vec<_>, _>>()?;
             fields.sort_by(|(left, _), (right, _)| left.cmp(right));
-            Ok(Value::Record(fields.into()))
+            Value::record(fields, span)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Diagnostic, MAX_CALL_DEPTH, Source, Value, run_source};
+    use crate::{Diagnostic, MAX_CALL_DEPTH, MAX_VALUE_DEPTH, Source, Value, run_source};
 
     fn run(text: &str) -> Result<(String, Value), Diagnostic> {
         let source = Source::new("test.krit", text);
@@ -1337,6 +1497,111 @@ mod tests {
             "{}",
             error.message()
         );
+    }
+
+    /// A program that wraps `0` in `levels` layers of `wrapper`, `chunk` calls
+    /// at a time so no call chain approaches the call-depth limit, and then
+    /// evaluates `finish` with the result bound to `value`.
+    fn wrapped_value(wrapper: &str, levels: usize, chunk: usize, finish: &str) -> String {
+        let mut text = format!(
+            "fn wrap(x, n) {{ if n == 0 {{ x }} else {{ wrap({wrapper}, n - 1) }} }}\nlet value = 0;\n"
+        );
+        let mut remaining = levels;
+        while remaining > 0 {
+            let step = remaining.min(chunk);
+            text.push_str(&format!("let value = wrap(value, {step});\n"));
+            remaining -= step;
+        }
+        text.push_str(finish);
+        text
+    }
+
+    #[test]
+    fn releases_long_closure_chains_without_recursing() {
+        // Each of 50,000 closures captures the previous one, through a
+        // parameter and through a record. Releasing them recursively would
+        // need far more than this thread's 16 MiB; no call chain is deeper
+        // than 100.
+        for (wrapper, first) in [
+            ("fn() { f() + 1 }", "fn() { 0 }"),
+            (
+                "record { next: fn() { f.next() + 1 } }",
+                "record { next: fn() { 0 } }",
+            ),
+        ] {
+            let mut text = format!(
+                "fn chain(f, n) {{ if n == 0 {{ f }} else {{ chain({wrapper}, n - 1) }} }}\n\
+                 let last = {{\n    let c0 = {first};\n"
+            );
+            for link in 1..=500 {
+                text.push_str(&format!("    let c{link} = chain(c{}, 100);\n", link - 1));
+            }
+            text.push_str("    c500\n};\nprintln(1);\n");
+            let output = crate::run_on_thread("evaluator-test", 16 * 1024 * 1024, move || {
+                run(&text).map(|(output, _)| output)
+            })
+            .expect("evaluator test thread should start")
+            .expect("a long closure chain should run and be released");
+            assert_eq!(output, "1\n", "{wrapper}");
+        }
+    }
+
+    #[test]
+    fn values_at_the_depth_limit_print_compare_and_encode() {
+        let output = run_on_evaluator_stack(wrapped_value(
+            "[x]",
+            MAX_VALUE_DEPTH,
+            5_000,
+            "println(value == value);\nprintln(value);\nprintln(json_encode(value));\n",
+        ))
+        .expect("values at the depth limit should work");
+        let list = format!(
+            "{}0{}",
+            "[".repeat(MAX_VALUE_DEPTH),
+            "]".repeat(MAX_VALUE_DEPTH)
+        );
+        assert_eq!(output, format!("true\n{list}\n{list}\n"));
+    }
+
+    #[test]
+    fn reports_the_value_depth_limit_for_every_container() {
+        for wrapper in ["[x]", "record { inner: x }", "Some(x)", "Ok(x)", "Err(x)"] {
+            // The reviewer's shape, 1,000 sequential calls each nesting the
+            // value 9,000 levels deeper, fails during the second call instead
+            // of building a value nine million levels deep.
+            let error = run_on_evaluator_stack(wrapped_value(
+                wrapper,
+                1_000 * 9_000,
+                9_000,
+                "println(value);\n",
+            ))
+            .expect_err("a nine-million-level value should be rejected");
+            assert_eq!(error.code(), "K4010", "{wrapper}");
+            assert!(
+                error.message().contains("value depth"),
+                "{wrapper}: {}",
+                error.message()
+            );
+
+            let error = run_on_evaluator_stack(wrapped_value(
+                wrapper,
+                MAX_VALUE_DEPTH + 1,
+                5_000,
+                "println(1);\n",
+            ))
+            .expect_err("one level past the limit should be rejected");
+            assert_eq!(error.code(), "K4010", "{wrapper}");
+        }
+
+        // Decoded JSON is bounded by the decoder's own nesting limit, far
+        // below the value limit.
+        let error = run(&format!(
+            "json_decode(\"{}{}\");",
+            "[".repeat(1_000),
+            "]".repeat(1_000)
+        ))
+        .expect_err("deep JSON should be rejected");
+        assert_eq!(error.code(), "K4009");
     }
 
     #[test]

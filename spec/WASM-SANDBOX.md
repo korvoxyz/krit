@@ -298,10 +298,11 @@ Builds fail with `K7001` for residual parametric layouts and `K7002` for
 unsupported semantics. Both code generators walk nested Core blocks
 recursively; source nesting limits (`LANGUAGE.md` section 4.1) bound that
 nesting, and the backend independently refuses Core nested more than 8,192
-blocks deep with `K1005` rather than relying on that bound. Policy 1 rejects strings, lists, records, options,
-results, JSON conversion, lexical captures, matches, unsupported print
-values, and any operation without a correct lowering. It never substitutes a
-trapping placeholder or direct-evaluator fallback.
+blocks deep with `K1005` rather than relying on that bound. Policy 1 rejects
+strings, lists, records, options, results, JSON conversion, lexical captures,
+matches, unsupported print values, and any operation without a correct
+lowering. It never substitutes a trapping placeholder or direct-evaluator
+fallback.
 
 Policy 2 does not generalize these layouts to arbitrary records/lists,
 capturing closures, JSON, or dynamic string operators. Those shapes continue

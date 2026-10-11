@@ -17,18 +17,33 @@ use crate::{Diagnostic, Span};
 /// `match` subjects and arms, and type argument lists each open one level.
 /// An `else if` continuation and a chained binary operator do not.
 ///
-/// Analysis applies the same bound to inferred types, which can otherwise
-/// grow one level per binding (`let next = [previous];`).
+/// Analysis applies the same bound to the resolved type of every type
+/// variable, since inferred types can otherwise grow without limit: one level
+/// per binding (`let next = [previous];`), or many levels at once when a type
+/// variable inside an earlier binding's type is resolved later.
 pub const MAX_NESTING_DEPTH: usize = 256;
 
 /// Maximum structural depth of a source file (`K1005`).
 ///
-/// Structural depth is the syntactic nesting depth plus the number of
-/// enclosing `else if` continuations and chained binary operators. It bounds
-/// the recursion of every later stage, including Core IR and the WebAssembly
-/// compilers, which represent each `else if` continuation as one more nested
-/// block.
+/// The structural depth of a point is its syntactic nesting depth plus the
+/// number of `else if` continuations, binary operators, and call and
+/// field-access links above it in the syntax tree. Operator and postfix
+/// chains nest to the left, so in `(a + b) + c` the operand `a` sits below
+/// both operators; parenthesizing a chain therefore cannot hide its length.
+/// The parser checks this depth for every point of the tree it builds, so it
+/// bounds the height of every accepted syntax tree, and with it the recursion
+/// of every later stage, including Core IR and the WebAssembly compilers,
+/// which represent each `else if` continuation as one more nested block.
 pub const MAX_STRUCTURAL_DEPTH: usize = 4096;
+
+/// Maximum recursion of analysis and Core lowering over a syntax tree.
+///
+/// Both count one level per expression and one per block, so a block used as
+/// an expression, or a function literal's body, counts twice where the
+/// structural depth counts it once. That adds at most one level per syntactic
+/// level, so every tree the parser accepts stays within this bound and only a
+/// hand-built tree that bypassed the parser can exceed it.
+pub(crate) const MAX_TREE_DEPTH: usize = MAX_STRUCTURAL_DEPTH + MAX_NESTING_DEPTH;
 
 /// Maximum nesting of Core IR blocks inside one function body.
 ///
@@ -50,16 +65,30 @@ pub const MAX_CALL_DEPTH: usize = 10_000;
 /// bodies nested unusually deeply reach this bound first instead.
 pub const MAX_EVALUATION_DEPTH: usize = 100_000;
 
+/// Maximum nesting of list, record, and variant values in the direct
+/// evaluator (`K4010`).
+///
+/// Printing, comparing, JSON-encoding, and releasing a value recurse once per
+/// level of its nesting, so constructing a deeper value fails instead. A
+/// value nests no deeper than its static type, which analysis bounds far
+/// below this, so only programs run without analysis can reach it, for
+/// example a function that wraps its argument in one more list on every
+/// call.
+pub const MAX_VALUE_DEPTH: usize = 10_000;
+
 /// Native stack reserved for the thread that runs the direct evaluator: 1 GiB.
 ///
 /// Measured on aarch64 macOS across the recursive shapes the evaluator has
-/// (calls, operators, blocks, lists, records, matches, unary operators, field
-/// access, and built-in calls), the most stack used per counted evaluation is
-/// about 0.85 KiB in optimized builds and 4.4 KiB in unoptimized builds, so
-/// reaching [`MAX_EVALUATION_DEPTH`] needs about 85 MiB and 430 MiB
+/// (calls, short-circuit and strict operators, blocks, lists, records,
+/// matches, unary operators, `if` conditions, field access, closures, and
+/// built-in calls), the most stack used per counted evaluation is about
+/// 1.2 KiB in optimized builds and 5 KiB in unoptimized builds, so reaching
+/// [`MAX_EVALUATION_DEPTH`] needs at most about 120 MiB and 500 MiB
 /// respectively; 10,000 calls of a simple recursive function need about
-/// 31 MiB and 150 MiB. The reservation is virtual address space: pages are
-/// committed only as a program actually recurses.
+/// 40 MiB and 150 MiB, and printing, comparing, and encoding a value at
+/// [`MAX_VALUE_DEPTH`] needs under 15 MiB and 50 MiB. The reservation is
+/// virtual address space: pages are committed only as a program actually
+/// recurses.
 pub const EVALUATOR_STACK_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Native stack reserved for the thread that runs the compiler pipeline
@@ -109,8 +138,9 @@ pub(crate) fn structural_error(span: Span) -> Diagnostic {
     Diagnostic::new(
         "K1005",
         format!(
-            "nesting depth limit exceeded: nesting plus `else if` continuations and chained \
-             operators may reach at most {MAX_STRUCTURAL_DEPTH} levels"
+            "nesting depth limit exceeded: nesting plus the `else if` continuations, operators, \
+             and call or field-access links above any point may reach at most \
+             {MAX_STRUCTURAL_DEPTH} levels"
         ),
         span,
     )
@@ -122,7 +152,7 @@ pub(crate) fn tree_depth_error(span: Span) -> Diagnostic {
     Diagnostic::new(
         "K1005",
         format!(
-            "nesting depth limit exceeded: the syntax tree nests deeper than {MAX_STRUCTURAL_DEPTH} levels"
+            "nesting depth limit exceeded: the syntax tree nests deeper than {MAX_TREE_DEPTH} levels"
         ),
         span,
     )

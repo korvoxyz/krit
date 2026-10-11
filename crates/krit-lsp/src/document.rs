@@ -1304,77 +1304,90 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
     }
 
     fn expression_fields(expression: &Expression, fields: &mut BTreeSet<String>) {
-        match &expression.kind {
-            ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
-            ExpressionKind::List(elements) => {
-                for element in elements {
-                    expression_fields(element, fields);
+        // `else if` continuations and the left spine of an operator chain are
+        // followed by this loop rather than by recursion, so a long chain
+        // never deepens the walk.
+        let mut pending_operands = Vec::new();
+        let mut current = expression;
+        loop {
+            match &current.kind {
+                ExpressionKind::If {
+                    condition,
+                    consequent,
+                    alternative,
+                } => {
+                    expression_fields(condition, fields);
+                    block_fields(consequent, fields);
+                    current = alternative;
+                    continue;
                 }
-            }
-            ExpressionKind::Record(record_fields) => {
-                for field in record_fields {
-                    fields.insert(field.name.clone());
-                    expression_fields(&field.value, fields);
+                ExpressionKind::Binary { left, right, .. } => {
+                    pending_operands.push(right.as_ref());
+                    current = left;
+                    continue;
                 }
-            }
-            ExpressionKind::FieldAccess { value, field } => {
-                fields.insert(field.clone());
-                expression_fields(value, fields);
-            }
-            ExpressionKind::Block(block) => block_fields(block, fields),
-            ExpressionKind::If {
-                condition,
-                consequent,
-                alternative,
-            } => {
-                expression_fields(condition, fields);
-                block_fields(consequent, fields);
-                expression_fields(alternative, fields);
-            }
-            ExpressionKind::Function {
-                parameters,
-                return_type,
-                body,
-            } => {
-                for parameter in parameters {
-                    if let Some(annotation) = &parameter.annotation {
-                        annotation_fields(annotation, fields);
+                ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+                ExpressionKind::List(elements) => {
+                    for element in elements {
+                        expression_fields(element, fields);
                     }
                 }
-                if let Some(return_type) = return_type {
-                    annotation_fields(return_type, fields);
-                }
-                block_fields(body, fields);
-            }
-            ExpressionKind::Call { callee, arguments } => {
-                expression_fields(callee, fields);
-                for argument in arguments {
-                    expression_fields(argument, fields);
-                }
-            }
-            ExpressionKind::Match { subject, kind } => {
-                expression_fields(subject, fields);
-                match kind {
-                    MatchKind::List {
-                        empty_case,
-                        cons_case,
-                        ..
-                    } => {
-                        expression_fields(empty_case, fields);
-                        expression_fields(cons_case, fields);
+                ExpressionKind::Record(record_fields) => {
+                    for field in record_fields {
+                        fields.insert(field.name.clone());
+                        expression_fields(&field.value, fields);
                     }
-                    MatchKind::Variants { arms, .. } => {
-                        for arm in arms {
-                            expression_fields(&arm.value, fields);
+                }
+                ExpressionKind::FieldAccess { value, field } => {
+                    fields.insert(field.clone());
+                    expression_fields(value, fields);
+                }
+                ExpressionKind::Block(block) => block_fields(block, fields),
+                ExpressionKind::Function {
+                    parameters,
+                    return_type,
+                    body,
+                } => {
+                    for parameter in parameters {
+                        if let Some(annotation) = &parameter.annotation {
+                            annotation_fields(annotation, fields);
+                        }
+                    }
+                    if let Some(return_type) = return_type {
+                        annotation_fields(return_type, fields);
+                    }
+                    block_fields(body, fields);
+                }
+                ExpressionKind::Call { callee, arguments } => {
+                    expression_fields(callee, fields);
+                    for argument in arguments {
+                        expression_fields(argument, fields);
+                    }
+                }
+                ExpressionKind::Match { subject, kind } => {
+                    expression_fields(subject, fields);
+                    match kind {
+                        MatchKind::List {
+                            empty_case,
+                            cons_case,
+                            ..
+                        } => {
+                            expression_fields(empty_case, fields);
+                            expression_fields(cons_case, fields);
+                        }
+                        MatchKind::Variants { arms, .. } => {
+                            for arm in arms {
+                                expression_fields(&arm.value, fields);
+                            }
                         }
                     }
                 }
+                ExpressionKind::Unary { operand, .. } => expression_fields(operand, fields),
             }
-            ExpressionKind::Unary { operand, .. } => expression_fields(operand, fields),
-            ExpressionKind::Binary { left, right, .. } => {
-                expression_fields(left, fields);
-                expression_fields(right, fields);
-            }
+            let Some(operand) = pending_operands.pop() else {
+                break;
+            };
+            current = operand;
         }
     }
 
@@ -1852,102 +1865,116 @@ impl<'a> DeclarationCollector<'a> {
     }
 
     fn expression(&mut self, expression: &Expression) {
-        self.syntax_kinds
-            .insert(expression.span, expression_kind(&expression.kind));
-        match &expression.kind {
-            ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
-            ExpressionKind::List(elements) => {
-                for element in elements {
-                    self.expression(element);
+        // `else if` continuations and the left spine of an operator chain are
+        // followed by this loop rather than by recursion, so a long chain
+        // never deepens the walk; expressions are still visited in source
+        // order.
+        let mut pending_operands = Vec::new();
+        let mut current = expression;
+        loop {
+            self.syntax_kinds
+                .insert(current.span, expression_kind(&current.kind));
+            match &current.kind {
+                ExpressionKind::If {
+                    condition,
+                    consequent,
+                    alternative,
+                } => {
+                    self.expression(condition);
+                    self.block(consequent);
+                    current = alternative;
+                    continue;
                 }
-            }
-            ExpressionKind::Record(fields) => {
-                for field in fields {
-                    self.expression(&field.value);
+                ExpressionKind::Binary { left, right, .. } => {
+                    pending_operands.push(right.as_ref());
+                    current = left;
+                    continue;
                 }
-            }
-            ExpressionKind::FieldAccess { value, .. } => self.expression(value),
-            ExpressionKind::Block(block) => self.block(block),
-            ExpressionKind::If {
-                condition,
-                consequent,
-                alternative,
-            } => {
-                self.expression(condition);
-                self.block(consequent);
-                self.expression(alternative);
-            }
-            ExpressionKind::Function {
-                parameters, body, ..
-            } => {
-                for parameter in parameters {
-                    self.add(
-                        &parameter.name,
-                        CompilerSymbolKind::Parameter,
-                        parameter.span,
-                        Some(parameter.span),
-                        body.span,
-                        parameter.annotation.as_ref().map(ToString::to_string),
-                    );
-                }
-                self.block(body);
-            }
-            ExpressionKind::Call { callee, arguments } => {
-                self.expression(callee);
-                for argument in arguments {
-                    self.expression(argument);
-                }
-            }
-            ExpressionKind::Match { subject, kind } => {
-                self.expression(subject);
-                match kind {
-                    MatchKind::List {
-                        empty_case,
-                        head_name,
-                        tail_name,
-                        cons_case,
-                    } => {
-                        self.expression(empty_case);
-                        self.add(
-                            head_name,
-                            CompilerSymbolKind::Match,
-                            expression.span,
-                            None,
-                            cons_case.span,
-                            None,
-                        );
-                        self.add(
-                            tail_name,
-                            CompilerSymbolKind::Match,
-                            expression.span,
-                            None,
-                            cons_case.span,
-                            None,
-                        );
-                        self.expression(cons_case);
+                ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+                ExpressionKind::List(elements) => {
+                    for element in elements {
+                        self.expression(element);
                     }
-                    MatchKind::Variants { arms, .. } => {
-                        for arm in arms {
-                            if let Some(binding) = &arm.binding {
-                                self.add(
-                                    binding,
-                                    CompilerSymbolKind::Match,
-                                    arm.span,
-                                    find_identifier_span(self.text, arm.span, binding),
-                                    arm.value.span,
-                                    None,
-                                );
+                }
+                ExpressionKind::Record(fields) => {
+                    for field in fields {
+                        self.expression(&field.value);
+                    }
+                }
+                ExpressionKind::FieldAccess { value, .. } => self.expression(value),
+                ExpressionKind::Block(block) => self.block(block),
+                ExpressionKind::Function {
+                    parameters, body, ..
+                } => {
+                    for parameter in parameters {
+                        self.add(
+                            &parameter.name,
+                            CompilerSymbolKind::Parameter,
+                            parameter.span,
+                            Some(parameter.span),
+                            body.span,
+                            parameter.annotation.as_ref().map(ToString::to_string),
+                        );
+                    }
+                    self.block(body);
+                }
+                ExpressionKind::Call { callee, arguments } => {
+                    self.expression(callee);
+                    for argument in arguments {
+                        self.expression(argument);
+                    }
+                }
+                ExpressionKind::Match { subject, kind } => {
+                    self.expression(subject);
+                    match kind {
+                        MatchKind::List {
+                            empty_case,
+                            head_name,
+                            tail_name,
+                            cons_case,
+                        } => {
+                            self.expression(empty_case);
+                            self.add(
+                                head_name,
+                                CompilerSymbolKind::Match,
+                                current.span,
+                                None,
+                                cons_case.span,
+                                None,
+                            );
+                            self.add(
+                                tail_name,
+                                CompilerSymbolKind::Match,
+                                current.span,
+                                None,
+                                cons_case.span,
+                                None,
+                            );
+                            self.expression(cons_case);
+                        }
+                        MatchKind::Variants { arms, .. } => {
+                            for arm in arms {
+                                if let Some(binding) = &arm.binding {
+                                    self.add(
+                                        binding,
+                                        CompilerSymbolKind::Match,
+                                        arm.span,
+                                        find_identifier_span(self.text, arm.span, binding),
+                                        arm.value.span,
+                                        None,
+                                    );
+                                }
+                                self.expression(&arm.value);
                             }
-                            self.expression(&arm.value);
                         }
                     }
                 }
+                ExpressionKind::Unary { operand, .. } => self.expression(operand),
             }
-            ExpressionKind::Unary { operand, .. } => self.expression(operand),
-            ExpressionKind::Binary { left, right, .. } => {
-                self.expression(left);
-                self.expression(right);
-            }
+            let Some(operand) = pending_operands.pop() else {
+                break;
+            };
+            current = operand;
         }
     }
 
@@ -2448,6 +2475,58 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// A valid program with a 2,000-branch `else if` chain and a 4,000-term
+    /// operator chain, the longest flat chains the parser accepts.
+    fn long_chain_program() -> String {
+        let mut source = String::from("fn pick(n) {\n    if n == 0 {\n        0\n    }");
+        for branch in 1..2_000 {
+            source.push_str(&format!(
+                " else if n == {branch} {{\n        {branch}\n    }}"
+            ));
+        }
+        source.push_str(" else {\n        -1\n    }\n}\n\nlet total = 0");
+        source.push_str(&" + pick(1)".repeat(4_000));
+        source.push_str(";\n");
+        source
+    }
+
+    #[test]
+    fn walks_long_else_if_and_operator_chains_iteratively() {
+        // Runs on a 1 MiB thread: walking either chain recursively, once per
+        // link, would need several times more.
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let directory = TestDirectory::new();
+                let uri = directory.uri("main.krit");
+                let mut state = ServerState::new(vec![directory.path.clone()]);
+                let source = long_chain_program();
+                let diagnostics = state.open(uri.clone(), 1, source.clone());
+                assert!(diagnostics.diagnostics.is_empty());
+                let hover = state
+                    .hover(&uri, Position::new(0, 4))
+                    .expect("hover should succeed");
+                assert!(hover.is_some());
+
+                // An unknown receiver makes completion collect candidate field
+                // names from the whole program.
+                let source = format!("{source}let probe = unknown.;\n");
+                let line = source.lines().count() - 1;
+                state
+                    .change(&uri, 2, source)
+                    .expect("the document should change");
+                let CompletionResponse::List(_) = state
+                    .completion(&uri, Position::new(line as u32, 20))
+                    .expect("completion should succeed")
+                else {
+                    panic!("completion should return a bounded list")
+                };
+            })
+            .expect("test thread should start")
+            .join()
+            .expect("long chains should be walked on a small stack");
     }
 
     #[test]

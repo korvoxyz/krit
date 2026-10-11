@@ -21,9 +21,17 @@ struct Parser {
     /// Syntactic nesting levels currently open (bounded by
     /// [`MAX_NESTING_DEPTH`]).
     depth: usize,
-    /// Enclosing `else if` continuations and chained binary operators; added
-    /// to `depth`, bounded by [`MAX_STRUCTURAL_DEPTH`].
+    /// Enclosing `else if` continuations; added to `depth` to give the
+    /// structural depth of the current point.
     chain_depth: usize,
+    /// The deepest structural depth reached since the innermost enclosing
+    /// operator or postfix chain started measuring its current operand.
+    ///
+    /// Those chains nest to the left, so an operand's final depth is known
+    /// only once the chain ends; they measure each operand's height with this
+    /// mark and check the depth of the tree they build (bounded by
+    /// [`MAX_STRUCTURAL_DEPTH`]).
+    peak: usize,
 }
 
 impl Parser {
@@ -33,6 +41,7 @@ impl Parser {
             cursor: 0,
             depth: 0,
             chain_depth: 0,
+            peak: 0,
         }
     }
 
@@ -390,22 +399,30 @@ impl Parser {
     /// Parses one left-associative precedence level.
     ///
     /// A chain such as `a + b + c` is flat source, so it does not open
-    /// syntactic levels; each operator counts once toward the structural
-    /// depth because the resulting tree nests to the left.
+    /// syntactic levels, but the resulting tree nests to the left: `a` sits
+    /// below both operators. Every operand is parsed at the chain's own depth
+    /// and measured, and the chain checks the structural depth of the tree it
+    /// builds after each operator, so a deep left operand counts every
+    /// operator that ends up above it.
     fn binary_chain(
         &mut self,
         operand: impl Fn(&mut Self) -> Result<Expression, Diagnostic>,
         operator: impl Fn(&TokenKind) -> Option<BinaryOperator>,
     ) -> Result<Expression, Diagnostic> {
-        let chain_depth = self.chain_depth;
+        let base = self.structural_depth();
+        let outer_peak = std::mem::replace(&mut self.peak, base);
         let mut expression = operand(self)?;
+        // Levels the tree built so far reaches below the chain's own depth.
+        let mut height = self.peak - base;
         while let Some(operator) = operator(&self.current().kind) {
             let operator_span = self.advance().span;
-            self.enter_chain_link(operator_span)?;
+            self.peak = base;
             let right = operand(self)?;
+            height = 1 + height.max(self.peak - base);
+            self.reach(base + height, operator_span)?;
             expression = binary(expression, operator, right);
         }
-        self.chain_depth = chain_depth;
+        self.peak = self.peak.max(outer_peak);
         Ok(expression)
     }
 
@@ -430,14 +447,21 @@ impl Parser {
     }
 
     fn call(&mut self) -> Result<Expression, Diagnostic> {
+        let base = self.structural_depth();
+        let outer_peak = std::mem::replace(&mut self.peak, base);
         let mut expression = self.primary()?;
         // Each call or field-access link opens one level for the rest of the
-        // chain, because the resulting tree nests its callee or record.
+        // chain. The tree nests the other way, with the first callee or record
+        // deepest, so the chain also measures the tree it builds and checks
+        // its structural depth after each link, as operator chains do.
+        let mut height = self.peak - base;
         let depth = self.depth;
         loop {
             if self.check(&TokenKind::LeftParen) {
                 let open = self.advance().span;
                 self.enter(open)?;
+                let arguments_depth = self.structural_depth();
+                let callee_peak = std::mem::replace(&mut self.peak, arguments_depth);
                 let mut arguments = Vec::new();
                 if !self.check(&TokenKind::RightParen) {
                     loop {
@@ -450,6 +474,9 @@ impl Parser {
                         }
                     }
                 }
+                height = 1 + height.max(self.peak - arguments_depth);
+                self.peak = self.peak.max(callee_peak);
+                self.reach(base + height, open)?;
                 let end = self.expect(TokenKind::RightParen)?.span;
                 let span = expression.span.join(end);
                 expression = Expression {
@@ -462,6 +489,8 @@ impl Parser {
             } else if self.check(&TokenKind::Dot) {
                 let dot = self.advance().span;
                 self.enter(dot)?;
+                height += 1;
+                self.reach(base + height, dot)?;
                 let (field, field_span) = self.identifier()?;
                 let span = expression.span.join(field_span);
                 expression = Expression {
@@ -476,6 +505,7 @@ impl Parser {
             }
         }
         self.depth = depth;
+        self.peak = self.peak.max(outer_peak);
         Ok(expression)
     }
 
@@ -995,21 +1025,27 @@ impl Parser {
         if self.depth > MAX_NESTING_DEPTH {
             return Err(nesting_error(span));
         }
-        self.check_structural_depth(span)
+        self.reach(self.structural_depth(), span)
     }
 
-    /// Records one `else if` continuation or chained binary operator.
+    /// Records one `else if` continuation.
     fn enter_chain_link(&mut self, span: Span) -> Result<(), Diagnostic> {
         self.chain_depth += 1;
-        self.check_structural_depth(span)
+        self.reach(self.structural_depth(), span)
     }
 
-    fn check_structural_depth(&self, span: Span) -> Result<(), Diagnostic> {
-        if self.depth + self.chain_depth > MAX_STRUCTURAL_DEPTH {
-            Err(structural_error(span))
-        } else {
-            Ok(())
+    const fn structural_depth(&self) -> usize {
+        self.depth + self.chain_depth
+    }
+
+    /// Records that the tree reaches structural depth `depth` because of the
+    /// construct at `span`.
+    fn reach(&mut self, depth: usize, span: Span) -> Result<(), Diagnostic> {
+        if depth > MAX_STRUCTURAL_DEPTH {
+            return Err(structural_error(span));
         }
+        self.peak = self.peak.max(depth);
+        Ok(())
     }
 
     fn check(&self, kind: &TokenKind) -> bool {
@@ -1315,6 +1351,114 @@ mod tests {
             .expect("a long operator chain should parse");
         let error = parse_on_compiler_stack(sum(MAX_STRUCTURAL_DEPTH + 8))
             .expect_err("an operator chain past the structural limit should fail");
+        assert_eq!(error.code(), "K1005");
+    }
+
+    /// Counts the operator, unary, call, and field-access nodes on the
+    /// leftmost path down from `expression`; parentheses create no node.
+    fn spine_height(expression: &Expression) -> usize {
+        let mut height = 0;
+        let mut current = expression;
+        loop {
+            current = match &current.kind {
+                ExpressionKind::Binary { left, .. } => left,
+                ExpressionKind::Unary { operand, .. } => operand,
+                ExpressionKind::Call { callee, .. } => callee,
+                ExpressionKind::FieldAccess { value, .. } => value,
+                _ => return height,
+            };
+            height += 1;
+        }
+    }
+
+    #[test]
+    fn counts_every_operator_above_a_parenthesized_left_operand() {
+        // Each parenthesized chain becomes the left operand of the next, so the
+        // innermost `1` sits below every operator of every level.
+        let spine = |levels: usize, operators: usize| {
+            let mut expression = format!("1{}", " + 1".repeat(operators));
+            for _ in 1..levels {
+                expression = format!("({expression}){}", " + 1".repeat(operators));
+            }
+            format!("let value = {expression};\n")
+        };
+        let program =
+            parse_on_compiler_stack(spine(2, 2_000)).expect("a 4,000-operator tree should parse");
+        let StatementKind::Let { value, .. } = &program.statements[0].kind else {
+            panic!("expected a let");
+        };
+        assert_eq!(spine_height(value), 4_000);
+
+        let error = parse_on_compiler_stack(spine(3, 2_000))
+            .expect_err("a 6,000-operator tree should fail");
+        assert_eq!(error.code(), "K1005");
+        assert!(error.message().contains("4096"), "{}", error.message());
+        // The error points at the operator that takes the tree past the limit:
+        // the third level's operators sit above the 4,002 levels of its left
+        // operand (4,000 operators and two pairs of parentheses), so its 95th
+        // operator crosses 4,096.
+        let text = spine(3, 2_000);
+        let third_level = text.rfind(") + 1").expect("third level should exist") + 1;
+        assert_eq!(
+            error.span(),
+            Span::new(third_level + 1 + 94 * 4, third_level + 2 + 94 * 4)
+        );
+
+        // The reviewer's shape: 250 parenthesized levels of 3,800 operators.
+        let error = parse_on_compiler_stack(spine(250, 3_800))
+            .expect_err("a million-node operator spine should fail");
+        assert_eq!(error.code(), "K1005");
+    }
+
+    #[test]
+    fn counts_operators_above_a_deep_unary_operand() {
+        // 250 nested negations stay within 256 levels, but every one of the
+        // 3,900 additions sits above them.
+        let text = format!(
+            "let value = {}1{};\n",
+            "-".repeat(250),
+            " + 1".repeat(3_900)
+        );
+        let error = parse_on_compiler_stack(text).expect_err("4,150 levels should fail");
+        assert_eq!(error.code(), "K1005");
+        assert!(error.message().contains("4096"), "{}", error.message());
+
+        let text = format!(
+            "let value = {}1{};\n",
+            "-".repeat(250),
+            " + 1".repeat(3_800)
+        );
+        parse_on_compiler_stack(text).expect("4,050 levels should parse");
+    }
+
+    #[test]
+    fn counts_postfix_links_above_a_parenthesized_callee() {
+        // Parentheses reset nothing: each level's field accesses sit above the
+        // parenthesized chain they apply to.
+        let chain = |levels: usize, links: usize| {
+            let mut expression = String::from("r");
+            for _ in 0..levels {
+                expression = format!("({expression}){}", ".a".repeat(links));
+            }
+            format!("let value = {expression};\n")
+        };
+        let program = parse_on_compiler_stack(chain(40, 50)).expect("2,000 links should parse");
+        let StatementKind::Let { value, .. } = &program.statements[0].kind else {
+            panic!("expected a let");
+        };
+        assert_eq!(spine_height(value), 2_000);
+
+        let error = parse_on_compiler_stack(chain(200, 50)).expect_err("10,000 links should fail");
+        assert_eq!(error.code(), "K1005");
+        assert!(error.message().contains("4096"), "{}", error.message());
+
+        // Calls nest their callee the same way.
+        let calls = format!(
+            "let value = {}f{};\n",
+            "(".repeat(200),
+            ")(1)(2)(3)(4)(5)(6)(7)(8)(9)(10)(11)(12)(13)(14)(15)(16)(17)(18)(19)(20)".repeat(200)
+        );
+        let error = parse_on_compiler_stack(calls).expect_err("4,000 calls should fail");
         assert_eq!(error.code(), "K1005");
     }
 

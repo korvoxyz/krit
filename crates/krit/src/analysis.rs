@@ -14,7 +14,7 @@ use crate::{
         Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral,
         VariantFamily, VariantName,
     },
-    limits::{MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, tree_depth_error},
+    limits::{MAX_NESTING_DEPTH, MAX_TREE_DEPTH, tree_depth_error},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -835,6 +835,14 @@ struct Analyzer {
     allowed_secret_constructor_spans: BTreeSet<Span>,
     /// Nested expression and block analyses currently open.
     depth: usize,
+    /// The resolved height of each root type variable: how many type
+    /// constructors its binding nests with every type variable inside it
+    /// resolved, or 0 while it is unbound. Kept current whenever a binding
+    /// changes and bounded by [`MAX_NESTING_DEPTH`].
+    type_heights: Vec<usize>,
+    /// For each type variable, the type variables whose bindings mention it,
+    /// so a change to its height reaches every type that contains it.
+    type_dependents: Vec<BTreeSet<TypeVariable>>,
     /// A binding that would have nested an inferred type too deeply; it takes
     /// precedence over the generic mismatch reported by the failing
     /// unification.
@@ -865,6 +873,8 @@ impl Analyzer {
             direct_host_builtin_references: BTreeSet::new(),
             allowed_secret_constructor_spans: BTreeSet::new(),
             depth: 0,
+            type_heights: Vec::new(),
+            type_dependents: Vec::new(),
             type_depth_error: None,
         }
     }
@@ -1177,11 +1187,12 @@ impl Analyzer {
 
     /// Counts one level of analyzer recursion.
     ///
-    /// The parser bounds every source program well below this limit, and
-    /// `else if` and binary-operator chains are analyzed iteratively, so this
-    /// only rejects hand-built syntax trees that bypassed the parser.
+    /// The parser's structural limit keeps every source program within
+    /// [`MAX_TREE_DEPTH`], and `else if` and binary-operator chains are
+    /// analyzed iteratively, so this only rejects hand-built syntax trees that
+    /// bypassed the parser.
     fn enter(&mut self, span: Span) -> Result<(), Diagnostic> {
-        if self.depth >= MAX_STRUCTURAL_DEPTH {
+        if self.depth >= MAX_TREE_DEPTH {
             return Err(tree_depth_error(span));
         }
         self.depth += 1;
@@ -2123,17 +2134,18 @@ impl Analyzer {
                 if let Some(existing) = self.substitutions.get(&variable).cloned() {
                     let (field_type, widened) =
                         self.require_field_and_widen(existing, field, span)?;
-                    self.substitutions.insert(variable, widened);
+                    self.set_binding(variable, widened, span)?;
                     Ok(field_type)
                 } else {
                     let field_type = self.fresh_type();
-                    self.substitutions.insert(
+                    self.set_binding(
                         variable,
                         InferType::Record {
                             fields: BTreeMap::from([(field.to_owned(), field_type.clone())]),
                             open: true,
                         },
-                    );
+                        span,
+                    )?;
                     Ok(field_type)
                 }
             }
@@ -2340,21 +2352,21 @@ impl Analyzer {
                 } else {
                     (right, left)
                 };
-                self.type_parents[alias as usize] = root;
+                self.alias_variable(alias, root, span).map_err(|_| ())?;
                 Ok(InferType::Variable(root))
             }
             (Some(binding), None) => {
                 if self.occurs(right, &binding) {
                     return Err(());
                 }
-                self.type_parents[right as usize] = left;
+                self.alias_variable(right, left, span).map_err(|_| ())?;
                 Ok(InferType::Variable(left))
             }
             (None, Some(binding)) => {
                 if self.occurs(left, &binding) {
                     return Err(());
                 }
-                self.type_parents[left as usize] = right;
+                self.alias_variable(left, right, span).map_err(|_| ())?;
                 Ok(InferType::Variable(right))
             }
             (Some(left_binding), Some(right_binding)) => {
@@ -2379,8 +2391,8 @@ impl Analyzer {
                 } else {
                     (right, left)
                 };
-                self.type_parents[alias as usize] = root;
-                self.substitutions.insert(root, unified);
+                self.alias_variable(alias, root, span).map_err(|_| ())?;
+                self.set_binding(root, unified, span).map_err(|_| ())?;
                 Ok(InferType::Variable(root))
             }
         }
@@ -2428,18 +2440,23 @@ impl Analyzer {
         context: &str,
     ) -> Result<InferType, Diagnostic> {
         let variable = self.root_variable(variable);
+        // A depth failure stays recorded in `type_depth_error` (cloned, not
+        // taken) so an enclosing `unify` still reports it instead of a
+        // generic mismatch.
         if let InferType::Variable(other) = ty {
             return self.unify_variables(variable, other, span).map_err(|()| {
-                Diagnostic::new(
-                    "K3001",
-                    format!("{context} would create an infinite type"),
-                    span,
-                )
+                self.type_depth_error.clone().unwrap_or_else(|| {
+                    Diagnostic::new(
+                        "K3001",
+                        format!("{context} would create an infinite type"),
+                        span,
+                    )
+                })
             });
         }
         if let Some(existing) = self.substitutions.get(&variable).cloned() {
             let Ok(unified) = self.unify_inner(existing, ty.clone(), span) else {
-                return Err(self.type_depth_error.take().unwrap_or_else(|| {
+                return Err(self.type_depth_error.clone().unwrap_or_else(|| {
                     Diagnostic::new(
                         "K3001",
                         format!(
@@ -2450,7 +2467,7 @@ impl Analyzer {
                     )
                 }));
             };
-            self.substitutions.insert(variable, unified);
+            self.set_binding(variable, unified, span)?;
             return Ok(InferType::Variable(variable));
         }
         if self.occurs(variable, &ty) {
@@ -2460,69 +2477,124 @@ impl Analyzer {
                 span,
             ));
         }
-        // Every inferred type deeper than its syntax grows through a binding
-        // like this one (for example `let next = [previous];`), so bounding
-        // bindings bounds every later walk over types.
-        if self.type_height(&ty, 0, &mut HashMap::new()) > MAX_NESTING_DEPTH {
-            let error = Diagnostic::new(
-                "K1005",
-                format!(
-                    "nesting depth limit exceeded: inferred types may nest at most \
-                     {MAX_NESTING_DEPTH} levels"
-                ),
-                span,
-            );
-            self.type_depth_error = Some(error.clone());
-            return Err(error);
-        }
-        self.substitutions.insert(variable, ty);
+        self.set_binding(variable, ty, span)?;
         Ok(InferType::Variable(variable))
     }
 
-    /// Returns how many type constructors `ty` nests, with bound variables
-    /// resolved, once `depth` constructors already enclose it.
+    /// Makes `ty` the binding of the root type variable `variable`.
+    ///
+    /// Every inferred type deeper than its syntax grows through bindings, so
+    /// this is where inferred types are bounded. Binding a variable can deepen
+    /// not only its own type but every type already containing it (`top`
+    /// below grows when `next` is bound later), so the resolved heights of
+    /// `variable` and of everything depending on it are refreshed, and the
+    /// binding fails with `K1005` if any of them would nest more than
+    /// [`MAX_NESTING_DEPTH`] type constructors:
+    ///
+    /// ```text
+    /// let next = [];
+    /// let top = [[next]];
+    /// let deeper = next == [[[]]];
+    /// ```
+    fn set_binding(
+        &mut self,
+        variable: TypeVariable,
+        ty: InferType,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        for mentioned in self.mentioned_roots(&ty) {
+            self.type_dependents[mentioned as usize].insert(variable);
+        }
+        self.substitutions.insert(variable, ty);
+        self.refresh_type_heights(vec![variable], span)
+    }
+
+    /// Makes `alias` an alias of the root `root`, so every type mentioning
+    /// `alias` now resolves through `root`'s binding.
+    fn alias_variable(
+        &mut self,
+        alias: TypeVariable,
+        root: TypeVariable,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        self.type_parents[alias as usize] = root;
+        let alias_height = self.type_heights[alias as usize];
+        let root_height = &mut self.type_heights[root as usize];
+        *root_height = (*root_height).max(alias_height);
+        let dependents = std::mem::take(&mut self.type_dependents[alias as usize]);
+        let pending = dependents.iter().copied().collect();
+        self.type_dependents[root as usize].extend(dependents);
+        self.refresh_type_heights(pending, span)
+    }
+
+    /// Recomputes the resolved heights of the `pending` type variables and,
+    /// whenever one grows, of every type variable whose binding mentions it.
+    ///
+    /// Heights only grow and are bounded, so each variable grows at most
+    /// [`MAX_NESTING_DEPTH`] times and the propagation stays linear in the
+    /// size of the bindings. Fails with `K1005` at `span`, the inference step
+    /// being checked, as soon as any height would exceed the bound.
+    fn refresh_type_heights(
+        &mut self,
+        mut pending: Vec<TypeVariable>,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        while let Some(variable) = pending.pop() {
+            let root = self.root_variable(variable);
+            let Some(binding) = self.substitutions.get(&root) else {
+                continue;
+            };
+            let height = self.resolved_height(binding, 0);
+            if height <= self.type_heights[root as usize] {
+                continue;
+            }
+            if height > MAX_NESTING_DEPTH {
+                let error = Diagnostic::new(
+                    "K1005",
+                    format!(
+                        "nesting depth limit exceeded: inferred types may nest at most \
+                         {MAX_NESTING_DEPTH} levels"
+                    ),
+                    span,
+                );
+                self.type_depth_error = Some(error.clone());
+                return Err(error);
+            }
+            self.type_heights[root as usize] = height;
+            pending.extend(self.type_dependents[root as usize].iter().copied());
+        }
+        Ok(())
+    }
+
+    /// Returns how many type constructors `ty` nests, with each type variable
+    /// counted at its cached resolved height, once `depth` constructors
+    /// already enclose it.
     ///
     /// The walk stops below `MAX_NESTING_DEPTH + 1` enclosing constructors and
     /// reports at least that height for anything it cuts off, so its recursion
-    /// is bounded and a result above the limit is exact enough to reject. Each
-    /// variable is measured once, which keeps shared type DAGs linear.
-    fn type_height(
-        &self,
-        ty: &InferType,
-        depth: usize,
-        measured: &mut HashMap<TypeVariable, usize>,
-    ) -> usize {
+    /// is bounded and a result above the limit is exact enough to reject.
+    fn resolved_height(&self, ty: &InferType, depth: usize) -> usize {
         const CUTOFF: usize = MAX_NESTING_DEPTH + 1;
         if depth >= CUTOFF {
             return CUTOFF;
         }
-        let nested = |children: &mut dyn Iterator<Item = &InferType>,
-                      measured: &mut HashMap<TypeVariable, usize>| {
+        let nested = |children: &mut dyn Iterator<Item = &InferType>| {
             1 + children
-                .map(|child| self.type_height(child, depth + 1, measured))
+                .map(|child| self.resolved_height(child, depth + 1))
                 .max()
                 .unwrap_or(0)
         };
         match ty {
             InferType::Variable(variable) => {
-                let root = self.root_variable(*variable);
-                if let Some(height) = measured.get(&root) {
-                    return *height;
-                }
-                let height = self
-                    .substitutions
-                    .get(&root)
-                    .map_or(0, |bound| self.type_height(bound, depth, measured));
-                measured.insert(root, height);
-                height
+                self.type_heights[self.root_variable(*variable) as usize]
             }
             InferType::List(element) | InferType::Option(element) => {
-                nested(&mut std::iter::once(element.as_ref()), measured)
+                nested(&mut std::iter::once(element.as_ref()))
             }
             InferType::Result(value, error) => {
-                nested(&mut [value.as_ref(), error.as_ref()].into_iter(), measured)
+                nested(&mut [value.as_ref(), error.as_ref()].into_iter())
             }
-            InferType::Record { fields, .. } => nested(&mut fields.values(), measured),
+            InferType::Record { fields, .. } => nested(&mut fields.values()),
             InferType::Function {
                 parameters,
                 return_type,
@@ -2531,7 +2603,6 @@ impl Analyzer {
                 &mut parameters
                     .iter()
                     .chain(std::iter::once(return_type.as_ref())),
-                measured,
             ),
             InferType::Int
             | InferType::Bool
@@ -2546,6 +2617,47 @@ impl Analyzer {
             | InferType::DatabaseTransaction
             | InferType::Secret => 0,
         }
+    }
+
+    /// Returns the root of every type variable `ty` mentions directly, without
+    /// following bindings.
+    fn mentioned_roots(&self, ty: &InferType) -> BTreeSet<TypeVariable> {
+        let mut roots = BTreeSet::new();
+        let mut pending = vec![ty];
+        while let Some(ty) = pending.pop() {
+            match ty {
+                InferType::Variable(variable) => {
+                    roots.insert(self.root_variable(*variable));
+                }
+                InferType::List(element) | InferType::Option(element) => pending.push(element),
+                InferType::Result(value, error) => {
+                    pending.push(value);
+                    pending.push(error);
+                }
+                InferType::Record { fields, .. } => pending.extend(fields.values()),
+                InferType::Function {
+                    parameters,
+                    return_type,
+                    ..
+                } => {
+                    pending.extend(parameters);
+                    pending.push(return_type);
+                }
+                InferType::Int
+                | InferType::Bool
+                | InferType::String
+                | InferType::Unit
+                | InferType::HttpHeader
+                | InferType::HttpRequest
+                | InferType::HttpResponse
+                | InferType::LogField
+                | InferType::QueueJob
+                | InferType::ScheduleEvent
+                | InferType::DatabaseTransaction
+                | InferType::Secret => {}
+            }
+        }
+        roots
     }
 
     fn occurs(&self, variable: TypeVariable, ty: &InferType) -> bool {
@@ -3370,6 +3482,8 @@ impl Analyzer {
         let variable = self.next_type_variable;
         self.next_type_variable += 1;
         self.type_parents.push(variable);
+        self.type_heights.push(0);
+        self.type_dependents.push(BTreeSet::new());
         InferType::Variable(variable)
     }
 
@@ -4113,8 +4227,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_hand_built_syntax_trees_beyond_the_structural_limit() {
-        let depth = MAX_STRUCTURAL_DEPTH + 10;
+    fn analyzes_every_tree_the_parser_accepts() {
+        // A block used as a callee counts twice in analysis recursion but
+        // once in the structural depth: 127 levels of `{ ... }` each followed
+        // by 31 calls is 4,064 structural levels and 4,191 levels of analysis
+        // recursion. Analysis reaches the undefined innermost name instead of
+        // reporting the tree as too deep.
+        let mut expression = String::from("g");
+        for _ in 0..127 {
+            expression = format!("{{ {expression} }}{}", "(1)".repeat(31));
+        }
+        let error = check_on_compiler_stack(format!("let value = {expression};\n"))
+            .expect_err("the innermost name is undefined");
+        assert_eq!(error.code(), "K2001");
+    }
+
+    #[test]
+    fn rejects_hand_built_syntax_trees_beyond_the_tree_limit() {
+        let depth = MAX_TREE_DEPTH + 10;
         let error = crate::run_on_thread("analysis-test", crate::COMPILER_STACK_BYTES, move || {
             let mut expression = Expression {
                 kind: ExpressionKind::Literal(ValueLiteral::Boolean(true)),
@@ -4183,6 +4313,101 @@ mod tests {
         // Long chains fail at the same binding instead of slowing analysis.
         let error = check(&chain(5_000)).expect_err("a long chain should be rejected");
         assert_eq!(error.code(), "K1005");
+    }
+
+    fn list_depth(ty: &Type) -> usize {
+        ty.to_string().matches("List<").count()
+    }
+
+    /// Checks on the stack the CLI gives the compiler pipeline; unoptimized
+    /// builds need more than a default test thread to parse 200 levels.
+    fn check_on_compiler_stack(text: String) -> Result<Analysis, Diagnostic> {
+        crate::run_on_thread("analysis-test", crate::COMPILER_STACK_BYTES, move || {
+            check(&text)
+        })
+        .expect("analysis test thread should start")
+    }
+
+    #[test]
+    fn rejects_inferred_types_that_grow_after_they_are_bound() {
+        // `top` is bound first around the still-unknown element type of `e0`;
+        // each later comparison resolves the previous element type to a deeper
+        // list, so `top` grows by `width` levels per step.
+        let program = |steps: usize, width: usize| {
+            let wrap = |inner: &str| format!("{}{inner}{}", "[".repeat(width), "]".repeat(width));
+            let mut text = format!("let e0 = [];\nlet top = {};\n", wrap("e0"));
+            for step in 1..=steps {
+                text.push_str(&format!(
+                    "let e{step} = [];\nlet c{step} = e{} == {};\n",
+                    step - 1,
+                    wrap(&format!("e{step}"))
+                ));
+            }
+            text
+        };
+        let analysis = check(&program(4, 50)).expect("251 levels should analyze");
+        let top = analysis
+            .bindings()
+            .iter()
+            .find(|binding| binding.name() == "top")
+            .expect("top should be bound");
+        assert_eq!(list_depth(top.ty()), 251);
+
+        let text = program(5, 50);
+        let error = check(&text).expect_err("301 levels should be rejected");
+        assert_eq!(error.code(), "K1005");
+        assert!(
+            error.message().contains("inferred types"),
+            "{}",
+            error.message()
+        );
+        // Reported at the step that deepens `top` past the limit.
+        let step = text.find("let c5 =").expect("fifth step should exist");
+        let line_end = step + text[step..].find('\n').expect("step should end");
+        assert!(
+            (step..line_end).contains(&error.span().start),
+            "{:?}",
+            error.span()
+        );
+
+        // The reviewer's shape: 200 levels per step fails at the first step
+        // instead of growing `top` by 200 levels per binding.
+        let error =
+            check_on_compiler_stack(program(100, 200)).expect_err("deep growth should be rejected");
+        assert_eq!(error.code(), "K1005");
+    }
+
+    #[test]
+    fn rejects_inferred_types_that_grow_through_an_alias() {
+        // The list match makes the unknown element type inside `top` the type
+        // of `head`; unifying the arms then aliases it to the type of `deep`,
+        // so `top` resolves through `deep` without being bound again.
+        let program = |deep: usize| {
+            format!(
+                "let e = [];\nlet top = {}e{};\nlet deep = {}0{};\n\
+                 let h = match e {{ [] => deep, [head, ..rest] => head }};\n",
+                "[".repeat(100),
+                "]".repeat(100),
+                "[".repeat(deep),
+                "]".repeat(deep)
+            )
+        };
+        let analysis = check_on_compiler_stack(program(150)).expect("251 levels should analyze");
+        let top = analysis
+            .bindings()
+            .iter()
+            .find(|binding| binding.name() == "top")
+            .expect("top should be bound");
+        assert_eq!(list_depth(top.ty()), 251);
+
+        let error =
+            check_on_compiler_stack(program(200)).expect_err("301 levels should be rejected");
+        assert_eq!(error.code(), "K1005");
+        assert!(
+            error.message().contains("inferred types"),
+            "{}",
+            error.message()
+        );
     }
 
     #[test]

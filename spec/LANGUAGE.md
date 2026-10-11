@@ -195,19 +195,33 @@ following opens one level for what it contains:
 
 An `else if` continuation stays at the level of the `if` it continues, and a
 chain of binary operators such as `a + b + c` stays at the level of its first
-operand, so long flat chains are not nesting. Each continuation and each
-chained operator still nests one step deeper in the program's tree, so they
-count toward a separate **structural depth** limit: the nesting level of any
-point plus the number of `else if` continuations and chained binary operators
-enclosing it may not exceed **4,096**. A 1,000-branch `else if` chain is
-valid.
+operand, so long flat chains are not nesting. They still nest in the
+program's syntax tree, so a separate **structural depth** limit applies: the
+nesting level of any point plus the number of `else if` continuations, binary
+operators, and call or field-access links above it in the tree may not exceed
+**4,096**.
 
-Inferred types are bounded the same way: a binding whose inferred type would
-nest more than 256 type constructors deep, such as the 257th binding of a
-chain of `let next = [previous];` declarations, is rejected.
+Operator and postfix chains nest to the left: their first operand lies below
+every operator or link of the chain. Parentheses group without changing that,
+so in `(a + b) + c` the operand `a` has nesting level 1 and two operators
+above it, a structural depth of 3, and wrapping a chain in parentheses cannot
+hide its length from an enclosing chain. A 1,000-branch `else if` chain and a
+4,000-operator sum are valid; a 2,100-operator sum whose first operand is a
+parenthesized 2,100-operator sum is not.
+
+Inferred types are bounded too. Inference solves for an unknown type at every
+binding, parameter, function result, and list element, and rejects any step
+that would make one of them stand for a type nesting more than 256 type
+constructors deep. That covers a binding deeper than the one before it, such
+as the 257th binding of a chain of `let next = [previous];` declarations, and
+a type inferred earlier that grows later: after `let e = []; let top = [[e]];`,
+the type of `top` deepens whenever a later expression resolves the element
+type of `e` to a deeper list. Types spelled out by nested literals and
+annotations are bounded by the nesting limit, so every static type stays
+within a fixed depth.
 
 Exceeding any of these limits is error `K1005` at the construct, operator, or
-binding that crosses it. Parsing, static checking, Core lowering and
+inference step that crosses it. Parsing, static checking, Core lowering and
 verification, formatting, and component generation all enforce the same
 bounds, so no accepted program can exhaust the compiler's native stack.
 
@@ -648,8 +662,9 @@ The following are errors rather than implementation-defined behavior:
 - unavailable webhook, configuration, secret, HTTP, AI, or logging direct-run
   host contract
 - invalid or unsupported JSON
-- more than 10,000 active function calls, or more than 100,000 nested
-  expression and block evaluations, in direct evaluation (`K4010`)
+- more than 10,000 active function calls, more than 100,000 nested
+  expression and block evaluations, or a list, record, or variant value
+  nesting more than 10,000 levels, in direct evaluation (`K4010`)
 
 Evaluation stops at the first error. Errors follow `DIAGNOSTICS.md`.
 
@@ -657,10 +672,19 @@ The direct-evaluation limits count active frames, not total work: sequential
 calls that each recurse 9,000 levels deep are valid. A typical recursive
 function evaluates three to six nested expressions per call, so it reaches the
 call limit first; a function body nested unusually deeply reaches the
-evaluation limit first. `krit run` evaluates on a dedicated thread with a
-1 GiB stack reservation. The most stack measured at these limits is about
-85 MiB in optimized builds and 430 MiB in unoptimized builds, so `K4010` is
-always reported before the native stack is exhausted.
+evaluation limit first. The value limit applies when a list, record, or
+variant is built: a value nests no deeper than its static type, which section
+4.1 bounds far below 10,000 levels, so only a program that is not statically
+valid, such as a function that wraps its argument in one more list on every
+call, can reach it. Printing, comparing, JSON-encoding, and releasing a value
+therefore recurse at most 10,000 levels, and releasing a long chain of
+closures that each capture the previous one does not recurse once per
+closure.
+
+`krit run` evaluates on a dedicated thread with a 1 GiB stack reservation.
+The most stack measured at these limits is about 120 MiB in optimized builds
+and 500 MiB in unoptimized builds, so `K4010` is reported before the native
+stack is exhausted.
 
 ## 15. Determinism
 

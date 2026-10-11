@@ -213,9 +213,11 @@ Implementation requirements:
 - unification must be deterministic
 - type variable numbering must be stable
 - errors should identify the originating constraints
-- a binding whose inferred type would nest more than 256 type constructors
-  deep is rejected with `K1005` (`LANGUAGE.md` section 4.1), which bounds every
-  later walk over types
+- no inference variable may stand for a type nesting more than 256 type
+  constructors deep (`K1005`, `LANGUAGE.md` section 4.1); solving a variable
+  rechecks every type that contains it, so a type bound earlier cannot grow
+  past the limit when a variable inside it is solved later, and every later
+  walk over types stays bounded
 - checking one changed module should not require unrelated modules (draft)
 - exported signatures form module cache boundaries (draft)
 

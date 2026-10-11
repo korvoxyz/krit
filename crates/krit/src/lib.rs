@@ -31,11 +31,13 @@ pub use core::{
 };
 pub use diagnostic::Diagnostic;
 pub use durable::{DurableOperationFact, DurableOperationKind, durable_operations};
-pub use evaluator::{BuiltinFunction, FunctionValue, Value, execute};
+pub use evaluator::{
+    BuiltinFunction, FunctionValue, ListValue, RecordValue, Value, VariantPayload, execute,
+};
 pub use formatter::{FORMAT_LINE_WIDTH, format_source};
 pub use limits::{
     COMPILER_STACK_BYTES, EVALUATOR_STACK_BYTES, MAX_CALL_DEPTH, MAX_CORE_BLOCK_DEPTH,
-    MAX_EVALUATION_DEPTH, MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, run_on_thread,
+    MAX_EVALUATION_DEPTH, MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, MAX_VALUE_DEPTH, run_on_thread,
 };
 pub use parser::parse;
 pub use source::{Position, Source, Span};
