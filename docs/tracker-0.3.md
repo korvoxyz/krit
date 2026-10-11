@@ -14,21 +14,21 @@ documentation, examples, and the release gate.
 
 | ID | Item | Req | Status | Acceptance check | Notes |
 |---|---|---|---|---|---|
-| P1 | Wasmtime 47.0.4 → 48.0.5 LTS, MSRV 1.94 → 1.95, CI toolchain | R1.9 | doing | workspace green; docs name 48 LTS | wasm-tools crates only if required |
-| P2 | Artifact compatibility window (supported sets; golden 0.2.0 artifact) | R1.4 | doing | 0.2.0 artifact runs on 0.3 | `validation.rs:503-548` |
-| P3 | Secret→origin binding, K5006, permissions UNBOUND label | R1.5 | doing | swapped-token probe refused | `network.rs`, manifest, host config |
-| P4 | `[dependencies]` fail closed, K6003 | R1.3 | doing | package case | `krit-package/src/lib.rs:160` |
+| P1 | Wasmtime 47.0.4 → 48.0.5 LTS, MSRV 1.94 → 1.95, CI toolchain | R1.9 | review | workspace green; docs name 48 LTS | wasm-tools crates only if required |
+| P2 | Artifact compatibility window (supported sets; golden 0.2.0 artifact) | R1.4 | done | 0.2.0 artifact runs on 0.3 | `validation.rs:503-548` |
+| P3 | Secret→origin binding, K5006, permissions UNBOUND label | R1.5 | review | swapped-token probe refused | `network.rs`, manifest, host config |
+| P4 | `[dependencies]` fail closed, K6003 | R1.3 | done | package case | `krit-package/src/lib.rs:160` |
 | P5 | Host path hardening, `CURLOPT_PATH_AS_IS` | R1.6 | doing | dot/encoded-segment cases refused | `webhook.rs:115-140` |
-| P6 | Papercuts: config `_`, prompt-pack version, User-Agent, SECURITY.md | R1.7 | doing | tests/docs | |
-| P7 | CI on Linux/macOS/Windows; Windows host-mode refusal | R1.8 | doing | refusal test; ci.yml matrix | `host_config.rs:1668` |
+| P6 | Papercuts: config `_`, prompt-pack version, User-Agent, SECURITY.md | R1.7 | done | tests/docs | |
+| P7 | CI on Linux/macOS/Windows; Windows host-mode refusal | R1.8 | done | refusal test; ci.yml matrix | `host_config.rs:1668` |
 
 ### Track W: Wasm honesty and strings
 
 | ID | Item | Req | Status | Acceptance check | Notes |
 |---|---|---|---|---|---|
-| W1 | `check --target component\|module`, all K7002 at spans, `build --diagnostic-format json`, policy-name fix | R2.1, R1.7 | doing | check == build on every file | `support.rs`, `agent_compiler.rs` |
-| W2 | Guest string runtime: `==`, `!=`, ordering, `+` | R2.2 | doing | POST-routing webhook builds and invokes | |
-| W3 | JSON unescape in Wasm `json_decode` to String | R2.3 | doing | escaped model output case | `agent_compiler.rs:1200-1287` |
+| W1 | `check --target component\|module`, all K7002 at spans, `build --diagnostic-format json`, policy-name fix | R2.1, R1.7 | done | check == build on every file | `support.rs`, `agent_compiler.rs` |
+| W2 | Guest string runtime: `==`, `!=`, ordering, `+` | R2.2 | done | POST-routing webhook builds and invokes | |
+| W3 | JSON unescape in Wasm `json_decode` to String | R2.3 | done | escaped model output case | `agent_compiler.rs:1200-1287` |
 
 ### Track F: front end
 
@@ -70,3 +70,9 @@ documentation, examples, and the release gate.
 - 2026-10-11 — Wave 1 started in four parallel worktrees: runtime (P1, P3,
   P5, P6 User-Agent), package (P4, P2, P6 papercuts, P7), wasm (W1–W3),
   frontend (F1–F4). Each item: implement → adversarial review → fix.
+- 2026-10-11 — Wave 1 results: 13 of 15 items implemented, 11 approved by
+  adversarial review. Package track (P4, P2, P6 papercuts, P7) and wasm
+  track (W1–W3) merged into `release/0.3`: fmt and clippy clean, 701 tests
+  pass. Runtime track (P1, P3, P6 User-Agent approved; P5 closing one
+  traversal finding) and frontend track (F1 closing two findings, F3 in
+  review, F4 pending) resumed after a session-limit interruption.
