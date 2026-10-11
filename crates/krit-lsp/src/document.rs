@@ -47,6 +47,16 @@ const MAX_PUBLISHED_WARNING_MESSAGE_BYTES: usize = 64 * 1024;
 /// The code of the notice that stands in for the warnings a document leaves
 /// out of its published diagnostics.
 const OMITTED_WARNINGS_CODE: &str = "K8003";
+/// The most message bytes the error rejecting a document publishes. Analysis
+/// messages render inferred types, and a type can grow far past the source
+/// that spells it, so an unbounded message could need a `publishDiagnostics`
+/// notification above the protocol frame limit.
+const MAX_PUBLISHED_ERROR_MESSAGE_BYTES: usize = 64 * 1024;
+/// The most bytes of each note the rejecting error publishes. Notes are fixed
+/// text, but a did-you-mean note quotes a source name.
+const MAX_PUBLISHED_ERROR_NOTE_BYTES: usize = 4 * 1024;
+/// Ends published error text cut to its bound.
+const TRUNCATION_MARKER: &str = " [truncated; `krit check` reports it in full]";
 
 pub(crate) struct ServerState {
     workspace_roots: Vec<PathBuf>,
@@ -214,8 +224,9 @@ struct Document {
     warnings: Vec<CompilerDiagnostic>,
     /// The analysis warnings left out of `warnings`, if any.
     omitted_warnings: Option<OmittedWarnings>,
-    /// The parse or analysis error that rejected the document, if any. It is
-    /// always published, after the warnings and any omission notice.
+    /// The parse or analysis error that rejected the document, if any, with
+    /// its text bounded by [`bounded_error`]. It is always published, after
+    /// the warnings and any omission notice.
     error: Option<CompilerDiagnostic>,
     formatted: Result<String, CompilerDiagnostic>,
     declarations: Vec<DeclarationFact>,
@@ -279,7 +290,48 @@ fn bound_warnings(
         span: first.span(),
     });
     warnings.truncate(kept);
+    // An open document holds only the published prefix, not an allocation
+    // sized for every warning analysis found.
+    warnings.shrink_to_fit();
     (warnings, omitted)
+}
+
+/// `text` unchanged when it fits in `limit` bytes, and otherwise cut at a
+/// character boundary and ended with [`TRUNCATION_MARKER`], within `limit`.
+fn bounded_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit.saturating_sub(TRUNCATION_MARKER.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(end + TRUNCATION_MARKER.len());
+    bounded.push_str(&text[..end]);
+    bounded.push_str(TRUNCATION_MARKER);
+    bounded
+}
+
+/// The error rejecting a document as the document publishes it: its message
+/// cut to `MAX_PUBLISHED_ERROR_MESSAGE_BYTES` and each note to
+/// `MAX_PUBLISHED_ERROR_NOTE_BYTES`. Code, span, and every note are kept.
+fn bounded_error(error: CompilerDiagnostic) -> CompilerDiagnostic {
+    if error.message().len() <= MAX_PUBLISHED_ERROR_MESSAGE_BYTES
+        && error
+            .notes()
+            .iter()
+            .all(|note| note.len() <= MAX_PUBLISHED_ERROR_NOTE_BYTES)
+    {
+        return error;
+    }
+    let message = bounded_text(error.message(), MAX_PUBLISHED_ERROR_MESSAGE_BYTES);
+    let bounded = match error.severity() {
+        Severity::Error => CompilerDiagnostic::new(error.code(), message, error.span()),
+        Severity::Warning => CompilerDiagnostic::warning(error.code(), message, error.span()),
+    };
+    error.notes().iter().fold(bounded, |bounded, note| {
+        bounded.with_note(bounded_text(note, MAX_PUBLISHED_ERROR_NOTE_BYTES))
+    })
 }
 
 impl Document {
@@ -330,6 +382,7 @@ impl Document {
             Err(diagnostic) => (None, None, Vec::new(), Some(diagnostic)),
         };
         let (warnings, omitted_warnings) = bound_warnings(all_warnings);
+        let error = error.map(bounded_error);
         let (declarations, syntax_kinds) = match (&program, &analysis) {
             (Some(program), Some(analysis)) => {
                 DeclarationCollector::collect(source.text(), program, analysis, source.text().len())
@@ -2900,6 +2953,65 @@ mod tests {
     }
 
     #[test]
+    fn bounds_the_published_error_message_and_notes() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+
+        // Each record doubles the rendered type of the one before it, so the
+        // call error's message grows to hundreds of kilobytes from a few
+        // hundred bytes of source.
+        let mut source = "let v0 = 1;\n".to_owned();
+        for level in 1..=14 {
+            let previous = level - 1;
+            source.push_str(&format!(
+                "let v{level} = record {{ a: v{previous}, b: v{previous} }};\n"
+            ));
+        }
+        source.push_str("v14();\n");
+        let published = state.open(uri.clone(), 1, source);
+        assert_eq!(published.diagnostics.len(), 1);
+        let error = &published.diagnostics[0];
+        assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(error.code, Some(NumberOrString::String("K3002".to_owned())));
+        assert!(error.message.len() <= MAX_PUBLISHED_ERROR_MESSAGE_BYTES);
+        assert!(error.message.ends_with(TRUNCATION_MARKER));
+
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        let message = facts["diagnostics"][0]["message"]
+            .as_str()
+            .expect("message should be a string");
+        assert_eq!(message, error.message);
+
+        // A note keeps its place and is cut to its own bound; text that fits
+        // is unchanged.
+        let long_name = "é".repeat(MAX_PUBLISHED_ERROR_NOTE_BYTES);
+        let bounded = bounded_error(
+            CompilerDiagnostic::new(
+                "K2001",
+                format!("undefined name `{long_name}x`"),
+                Span::new(0, 1),
+            )
+            .with_note(format!("did you mean `{long_name}`?")),
+        );
+        assert_eq!(bounded.code(), "K2001");
+        assert_eq!(bounded.severity(), Severity::Error);
+        assert_eq!(bounded.span(), Span::new(0, 1));
+        assert_eq!(bounded.message().len(), long_name.len() + 18);
+        assert_eq!(bounded.notes().len(), 1);
+        assert!(bounded.notes()[0].len() <= MAX_PUBLISHED_ERROR_NOTE_BYTES);
+        assert!(bounded.notes()[0].ends_with(TRUNCATION_MARKER));
+        let fitting = CompilerDiagnostic::new("K2001", "undefined name `x`", Span::new(0, 1))
+            .with_note("did you mean `y`?");
+        assert_eq!(bounded_error(fitting.clone()), fitting);
+    }
+
+    #[test]
     fn bounds_published_warnings_by_count_and_message_bytes() {
         let warning = |index: usize, message: String| {
             CompilerDiagnostic::warning("K2003", message, Span::new(index, index + 1))
@@ -2917,6 +3029,17 @@ mod tests {
         let (kept, omitted) = bound_warnings(short(MAX_PUBLISHED_WARNINGS));
         assert_eq!(kept.len(), MAX_PUBLISHED_WARNINGS);
         assert_eq!(omitted, None);
+
+        let (kept, omitted) = bound_warnings(short(8 * MAX_PUBLISHED_WARNINGS));
+        assert_eq!(kept.len(), MAX_PUBLISHED_WARNINGS);
+        assert!(
+            kept.capacity() < 2 * MAX_PUBLISHED_WARNINGS,
+            "the kept prefix must not retain the full allocation"
+        );
+        assert_eq!(
+            omitted.map(|omitted| omitted.count),
+            Some(7 * MAX_PUBLISHED_WARNINGS)
+        );
 
         let (kept, omitted) = bound_warnings(short(MAX_PUBLISHED_WARNINGS + 1));
         assert_eq!(kept.len(), MAX_PUBLISHED_WARNINGS);

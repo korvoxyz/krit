@@ -9,7 +9,7 @@ breaking compatibility.
 
 ## Severity
 
-Every diagnostic has a severity:
+Every diagnostic a command reports has a severity:
 
 | Severity | Meaning |
 |---|---|
@@ -28,19 +28,23 @@ and `krit/compilerFacts` diagnostics carry the same `severity` strings as the
 JSON Lines format. A published LSP diagnostic's message is the diagnostic's
 message followed by each of its notes on its own line as `help: <note>`, as in
 the human format; `krit/compilerFacts` diagnostics carry the message and a
-`notes` array exactly as the JSON Lines format does.
+`notes` array as the JSON Lines format does. Both are bounded as described
+next.
 
-The language server bounds the warnings it publishes for one document, so that
-a document within its size limit always fits in a protocol frame. It keeps the
-first 100 warnings in the order above, and stops before the first warning that
-would take their combined published message text, notes included, past
-64 KiB. When it leaves warnings
-out, it publishes one `K8003` notice after the warnings it kept: the notice
-sits at the span of the first warning left out, has LSP
-`DiagnosticSeverity.Information`, and states how many warnings were left out.
-The error that rejects the document, if any, is always published, last.
+The language server bounds what it publishes for one document, so that the
+diagnostics of a document within its size limit fit in a protocol frame. It
+keeps the first 100 warnings in the order above, and stops before the first
+warning that would take their combined published message text, notes
+included, past 64 KiB. When it leaves warnings out, it publishes one `K8003`
+notice after the warnings it kept: the notice sits at the span of the first
+warning left out, has LSP `DiagnosticSeverity.Information`, and states how
+many warnings were left out. The error that rejects the document, if any, is
+always published, last; its message is cut to 64 KiB and each of its notes to
+4 KiB, at character boundaries, ending with a marker saying the text was cut.
 `krit/compilerFacts` returns the same list, with severity `info` for the
-notice. The commands above do not bound warnings.
+notice. Should a document's diagnostics still not fit in a protocol frame, the
+server publishes a single `K8002` error for the document in their place and
+keeps running. The commands above bound neither warnings nor messages.
 
 The schema reserves `info` for informational diagnostics. Only the language
 server's `K8003` notice uses it; commands never report an `info` diagnostic on
@@ -193,7 +197,7 @@ Initial required codes:
 | `K7003` | WebAssembly emission, validation, metadata attachment, artifact loading, or output failed |
 | `K7004` | Artifact metadata, byte size, or content digest mismatch |
 | `K8001` | Source is not canonically formatted in formatter check mode |
-| `K8002` | Language-server input or open-document state exceeds a bounded limit |
+| `K8002` | Language-server input, open-document state, or a document's published diagnostics exceed a bounded limit |
 | `K8003` | Info: the language server left a document's remaining warnings out of its published diagnostics at the bounded limit |
 | `K8101` | Authoring assistance is disabled or provider configuration is invalid |
 | `K8102` | Authoring context, range, path, ignore, redaction, or privacy validation failed |

@@ -6,10 +6,11 @@ use std::{
 };
 
 use krit_assist::{
-    AUTHORING_PROTOCOL_VERSION, AssistRequest, AssistResponse, ContextSelection, PermissionKey,
-    ProposedTextEdit, ProviderDescriptor, RequestOptions, RequestedRange, ResponseDocument,
-    SuggestionKind, SuggestionProvider, TextPosition, TextRange, accept_reviewed, build_proposal,
-    decode_response, prepare_request, render_proposal_human, review_loaded_proposal,
+    AUTHORING_PROTOCOL_VERSION, AssistRequest, AssistResponse, ContextSelection,
+    DiagnosticSeverity, PermissionKey, ProposedTextEdit, ProviderDescriptor, RequestOptions,
+    RequestedRange, ResponseDocument, SuggestionKind, SuggestionProvider, TextPosition, TextRange,
+    accept_reviewed, build_proposal, decode_response, prepare_request, render_proposal_human,
+    review_loaded_proposal,
 };
 
 static DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
@@ -825,6 +826,80 @@ fn diagnostic_repair_is_formatted_checked_reviewed_and_atomically_accepted() {
             0o640
         );
     }
+}
+
+/// A warning never changes an outcome (`spec/DIAGNOSTICS.md`): a candidate
+/// that checks with only warnings is a valid candidate, and the review keeps
+/// each warning with its severity.
+#[test]
+fn repair_that_keeps_a_warning_is_accepted_and_reviews_the_warning() {
+    let directory = TestDirectory::new("repair-warning");
+    let manifest_path = directory.file("krit.pkg", &manifest(""));
+    let source_path = directory.file(
+        "main.krit",
+        "let _ = 1;\nlet copy = _;\nlet answer = 6 * seven;\n",
+    );
+
+    let prepared = prepare_request(
+        provider(),
+        options(
+            &directory,
+            SuggestionKind::DiagnosticRepair,
+            RequestedRange::WholeDocument,
+        ),
+    )
+    .expect("invalid source should still produce compiler context");
+    let request = prepared.request().clone();
+    let proposal = build_proposal(
+        prepared,
+        response(
+            &request,
+            vec![ProposedTextEdit {
+                range: request.target.selection.clone(),
+                new_text: "let _ = 1;\nlet copy = _;\nlet answer=6*7;\n".to_owned(),
+            }],
+        ),
+    )
+    .expect("a candidate with only warnings should create a proposal");
+
+    let severities = |snapshot: &krit_assist::CompilerSnapshot| {
+        snapshot
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.severity, diagnostic.code.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert!(!proposal.review.before.valid);
+    assert_eq!(
+        severities(&proposal.review.before),
+        vec![
+            (DiagnosticSeverity::Warning, "K2003".to_owned()),
+            (DiagnosticSeverity::Error, "K2001".to_owned()),
+        ]
+    );
+    assert!(proposal.review.after.valid);
+    assert_eq!(
+        severities(&proposal.review.after),
+        vec![(DiagnosticSeverity::Warning, "K2003".to_owned())]
+    );
+    assert!(
+        proposal
+            .review
+            .explanation
+            .contains("(errors 1 -> 0, warnings 1 -> 1)"),
+        "{}",
+        proposal.review.explanation
+    );
+    let rendered = render_proposal_human(&proposal).expect("proposal should render");
+    assert!(rendered.contains("\"severity\": \"warning\""), "{rendered}");
+
+    let reviewed =
+        review_loaded_proposal(&manifest_path, proposal).expect("proposal should revalidate");
+    accept_reviewed(reviewed, &BTreeSet::new()).expect("reviewed repair should be accepted");
+    assert_eq!(
+        fs::read_to_string(&source_path).unwrap(),
+        "let _ = 1;\nlet copy = _;\nlet answer = 6 * 7;\n"
+    );
 }
 
 #[test]

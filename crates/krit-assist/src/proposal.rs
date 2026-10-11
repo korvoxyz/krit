@@ -96,9 +96,24 @@ impl FromStr for PermissionKey {
     }
 }
 
+/// A compiler diagnostic's severity, spelled as `krit/compilerFacts` and the
+/// JSON Lines diagnostic format spell it (`spec/DIAGNOSTICS.md`).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticSeverity {
+    /// The document is rejected.
+    Error,
+    /// The document is accepted; the diagnostic reports something the author
+    /// should change.
+    Warning,
+    /// A language-server notice, such as `K8003` for warnings left out.
+    Info,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DiagnosticSnapshot {
+    pub severity: DiagnosticSeverity,
     pub code: String,
     pub message: String,
     pub start_byte: usize,
@@ -723,7 +738,15 @@ fn proposal_from_candidate(
     .map_err(|_| AssistError::candidate("could not derive candidate compiler facts"))?;
     let before = compiler_snapshot(&before_facts, &package.manifest)?;
     let after = compiler_snapshot(&after_facts, &package.manifest)?;
-    if !after.valid || !after.diagnostics.is_empty() {
+    // A warning, or a notice standing in for warnings left out, never changes
+    // an outcome, so only an error rejects the candidate. Both stay in the
+    // review report with their severity.
+    if !after.valid
+        || after
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+    {
         return Err(AssistError::candidate(
             "candidate did not pass deterministic compiler checks",
         ));
@@ -913,10 +936,21 @@ fn review_explanation(
     effects: &SetDelta,
     permissions: &PermissionReview,
 ) -> String {
+    let count = |snapshot: &CompilerSnapshot, severity: DiagnosticSeverity| {
+        snapshot
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == severity)
+            .count()
+    };
     format!(
-        "Canonical candidate changes diagnostics {} -> {}, top-level type facts {} -> {}, adds {} effect(s), removes {} effect(s), adds {} required permission(s), and removes {} required permission(s).",
+        "Canonical candidate changes diagnostics {} -> {} (errors {} -> {}, warnings {} -> {}), top-level type facts {} -> {}, adds {} effect(s), removes {} effect(s), adds {} required permission(s), and removes {} required permission(s).",
         before.diagnostics.len(),
         after.diagnostics.len(),
+        count(before, DiagnosticSeverity::Error),
+        count(after, DiagnosticSeverity::Error),
+        count(before, DiagnosticSeverity::Warning),
+        count(after, DiagnosticSeverity::Warning),
         before.top_level_types.len(),
         after.top_level_types.len(),
         effects.added.len(),
@@ -937,6 +971,9 @@ struct RawCompilerFacts {
 
 #[derive(Deserialize)]
 struct RawDiagnostic {
+    /// An unknown severity fails decoding, so it is never mistaken for a
+    /// warning.
+    severity: DiagnosticSeverity,
     code: String,
     message: String,
     span: RawSpan,
@@ -982,6 +1019,7 @@ fn compiler_snapshot(
         .diagnostics
         .into_iter()
         .map(|diagnostic| DiagnosticSnapshot {
+            severity: diagnostic.severity,
             code: diagnostic.code,
             message: diagnostic.message,
             start_byte: diagnostic.span.start,
@@ -993,6 +1031,7 @@ fn compiler_snapshot(
             .cmp(&right.start_byte)
             .then_with(|| left.end_byte.cmp(&right.end_byte))
             .then_with(|| left.code.cmp(&right.code))
+            .then_with(|| left.severity.cmp(&right.severity))
     });
     let mut top_level_types = facts
         .symbols

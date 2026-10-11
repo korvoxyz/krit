@@ -289,15 +289,18 @@ provider summary, 4 MiB proposal, 256 KiB manifest, and 64 KiB
 Provider edits are applied only in memory. Krit then canonicalizes the complete
 candidate, parses and analyzes it, and verifies Core IR without evaluating,
 building, installing, invoking runtime code, or performing provider/network
-work. Invalid candidates are `K8105`.
+work. Invalid candidates are `K8105`. A candidate is invalid when checking
+reports an error; a warning, or the `K8003` notice for warnings left out,
+never makes a candidate invalid, as no warning changes a command's outcome
+(`DIAGNOSTICS.md`).
 
 The proposal records no timestamp or reviewed claim. It contains deterministic
 request/response identities, host-local full-source/context digests that were
 never sent to the provider, the canonical candidate digest, a unified diff,
-before/after diagnostics and top-level types, effect deltas,
-manifest-requested permission usage, exact required/granted/missing permission
-facts, and added or removed authority. The provider summary is labeled
-untrusted.
+before/after diagnostics (each with its `error`, `warning`, or `info`
+severity) and top-level types, effect deltas, manifest-requested permission
+usage, exact required/granted/missing permission facts, and added or removed
+authority. The provider summary is labeled untrusted.
 
 Review recomputes every source/context/manifest digest, redaction, filtered
 compiler fact, response range, candidate, diff, and report. `accept` requires
