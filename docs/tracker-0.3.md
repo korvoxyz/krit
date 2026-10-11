@@ -14,11 +14,11 @@ documentation, examples, and the release gate.
 
 | ID | Item | Req | Status | Acceptance check | Notes |
 |---|---|---|---|---|---|
-| P1 | Wasmtime 47.0.4 → 48.0.5 LTS, MSRV 1.94 → 1.95, CI toolchain | R1.9 | review | workspace green; docs name 48 LTS | wasm-tools crates only if required |
+| P1 | Wasmtime 47.0.4 → 48.0.5 LTS, MSRV 1.94 → 1.95, CI toolchain | R1.9 | done | workspace green; docs name 48 LTS | wasm-tools crates only if required |
 | P2 | Artifact compatibility window (supported sets; golden 0.2.0 artifact) | R1.4 | done | 0.2.0 artifact runs on 0.3 | `validation.rs:503-548` |
-| P3 | Secret→origin binding, K5006, permissions UNBOUND label | R1.5 | review | swapped-token probe refused | `network.rs`, manifest, host config |
+| P3 | Secret→origin binding, K5006, permissions UNBOUND label | R1.5 | done | swapped-token probe refused | `network.rs`, manifest, host config |
 | P4 | `[dependencies]` fail closed, K6003 | R1.3 | done | package case | `krit-package/src/lib.rs:160` |
-| P5 | Host path hardening, `CURLOPT_PATH_AS_IS` | R1.6 | doing | dot/encoded-segment cases refused | `webhook.rs:115-140` |
+| P5 | Host path hardening, `CURLOPT_PATH_AS_IS` | R1.6 | done | dot/encoded-segment cases refused | `webhook.rs:115-140` |
 | P6 | Papercuts: config `_`, prompt-pack version, User-Agent, SECURITY.md | R1.7 | done | tests/docs | |
 | P7 | CI on Linux/macOS/Windows; Windows host-mode refusal | R1.8 | done | refusal test; ci.yml matrix | `host_config.rs:1668` |
 
@@ -76,3 +76,6 @@ documentation, examples, and the release gate.
   pass. Runtime track (P1, P3, P6 User-Agent approved; P5 closing one
   traversal finding) and frontend track (F1 closing two findings, F3 in
   review, F4 pending) resumed after a session-limit interruption.
+- 2026-10-12 — Runtime track merged (Wasmtime 48.0.5 LTS + Rust 1.95,
+  secret→origin binding K5006, path hardening incl. query-cut/control-byte/
+  overlong forms, default User-Agent): clippy clean, 741 tests pass.
