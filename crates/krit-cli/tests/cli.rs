@@ -2415,6 +2415,46 @@ fn long_else_if_chains_check_run_format_build_and_execute() {
 }
 
 #[test]
+fn unifying_solved_types_reports_limits_without_aborting() {
+    // Unifying `shallow` with `deep` deepens `top` to 260 levels; unifying
+    // `e` with a type containing it would be infinite.
+    let directory = TestDirectory::new("solved-type-unification");
+    let cases = [
+        (
+            format!(
+                "let shallow = [[[]]];\nlet top = {}shallow{};\n\
+                 let deep = [[[[[[[[[[1]]]]]]]]]];\nlet grows = shallow == deep;\n",
+                "[".repeat(250),
+                "]".repeat(250)
+            ),
+            "K1005",
+        ),
+        (
+            "let e = [];\nlet wrapped = [[e]];\nlet same = e == wrapped;\n".to_owned(),
+            "K3001",
+        ),
+    ];
+    for (index, (text, code)) in cases.iter().enumerate() {
+        let source = directory.file(&format!("case{index}.krit"), text);
+        for command in ["check", "explain", "run"] {
+            let output = krit()
+                .arg(command)
+                .arg(&source)
+                .output()
+                .expect("Krit should start");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_ne!(output.status.code(), Some(134), "{code} {command}");
+            assert_eq!(output.status.code(), Some(1), "{code} {command}: {stderr}");
+            assert!(
+                stderr.contains(&format!("error[{code}]")),
+                "{code} {command}: {stderr}"
+            );
+            assert!(output.stdout.is_empty(), "{code} {command}");
+        }
+    }
+}
+
+#[test]
 fn sandbox_reports_missing_component_and_sidecar_actionably() {
     let directory = TestDirectory::new("sandbox-missing");
     directory.file("main.krit", "println(1);\n");

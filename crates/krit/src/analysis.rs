@@ -2423,6 +2423,18 @@ impl Analyzer {
                 Ok(InferType::Variable(right))
             }
             (Some(left_binding), Some(right_binding)) => {
+                // Both bindings are detached while they are unified, so the
+                // occurs checks made meanwhile cannot see through `left` or
+                // `right`. A binding that mentions the other variable would
+                // make the merged type infinite, and unifying it could bind a
+                // variable inside one binding to a type containing the other,
+                // leaving a cycle that every later walk over types would
+                // follow forever (`let e = []; let w = [[e]]; e == w;`).
+                // Reject it first; otherwise neither variable is reachable
+                // from either binding, and the checks below stay exact.
+                if self.occurs(left, &right_binding) || self.occurs(right, &left_binding) {
+                    return Err(());
+                }
                 self.substitutions.remove(&left);
                 self.substitutions.remove(&right);
                 let unified =
@@ -2564,6 +2576,22 @@ impl Analyzer {
 
     /// Makes `alias` an alias of the root `root`, so every type mentioning
     /// `alias` now resolves through `root`'s binding.
+    ///
+    /// `root` keeps the larger of the two cached heights, and the types that
+    /// mention either variable are rechecked against it. Rechecking the types
+    /// that mention `root` matters when both variables were solved:
+    /// `unify_variables` detaches both bindings while it unifies them, so
+    /// refreshes during that unification stop at both variables, and their
+    /// merged binding may be no taller than `alias` already was. Those types
+    /// would otherwise keep a stale height and could grow past
+    /// [`MAX_NESTING_DEPTH`] unnoticed (`top` below gains seven levels):
+    ///
+    /// ```text
+    /// let shallow = [[[]]];
+    /// let top = [[[[shallow]]]];
+    /// let deep = [[[[[[[[[[1]]]]]]]]]];
+    /// let grows = shallow == deep;
+    /// ```
     fn alias_variable(
         &mut self,
         alias: TypeVariable,
@@ -2572,10 +2600,13 @@ impl Analyzer {
     ) -> Result<(), Diagnostic> {
         self.type_parents[alias as usize] = root;
         let alias_height = self.type_heights[alias as usize];
-        let root_height = &mut self.type_heights[root as usize];
-        *root_height = (*root_height).max(alias_height);
+        let mut pending = Vec::new();
+        if alias_height > self.type_heights[root as usize] {
+            self.type_heights[root as usize] = alias_height;
+            pending.extend(self.type_dependents[root as usize].iter().copied());
+        }
         let dependents = std::mem::take(&mut self.type_dependents[alias as usize]);
-        let pending = dependents.iter().copied().collect();
+        pending.extend(dependents.iter().copied());
         self.type_dependents[root as usize].extend(dependents);
         self.refresh_type_heights(pending, span)
     }
@@ -4577,6 +4608,234 @@ mod tests {
             "{}",
             error.message()
         );
+    }
+
+    /// Asserts that `error` is the inferred-type `K1005` reported on the line
+    /// of `text` that starts with `line`.
+    fn assert_inferred_type_limit_at(text: &str, error: &Diagnostic, line: &str) {
+        assert_eq!(error.code(), "K1005", "{}", error.message());
+        assert!(
+            error.message().contains("inferred types"),
+            "{}",
+            error.message()
+        );
+        let start = text.find(line).expect("the crossing line should exist");
+        let end = start + text[start..].find('\n').expect("the line should end");
+        assert!(
+            (start..end).contains(&error.span().start),
+            "expected the error on `{line}`, found {:?}",
+            error.span()
+        );
+    }
+
+    #[test]
+    fn rejects_inferred_types_that_grow_when_two_solved_types_unify() {
+        // `shallow` and `deep` both have solved types. Unifying them solves
+        // the element type inside `shallow` to a seven-level list, which
+        // deepens `top` although the merged type of `shallow` and `deep` is no
+        // deeper than `deep` already was.
+        let program = |width: usize| {
+            format!(
+                "let shallow = [[[]]];\nlet top = {}shallow{};\n\
+                 let deep = [[[[[[[[[[1]]]]]]]]]];\nlet grows = shallow == deep;\n",
+                "[".repeat(width),
+                "]".repeat(width)
+            )
+        };
+        let analysis = check_on_compiler_stack(program(246)).expect("256 levels should analyze");
+        let top = analysis
+            .bindings()
+            .iter()
+            .find(|binding| binding.name() == "top")
+            .expect("top should be bound");
+        assert_eq!(list_depth(top.ty()), 256);
+
+        let text = program(247);
+        let error = check_on_compiler_stack(text.clone()).expect_err("257 levels should fail");
+        assert_inferred_type_limit_at(&text, &error, "let grows =");
+
+        // Repeating the step would stack about 252 levels per step; it fails
+        // at the second step instead of accepting ever deeper types.
+        let mut text = String::from("let s0 = 1;\n");
+        for step in 1..=100 {
+            text.push_str(&format!(
+                "let r{step} = [[]];\nlet top{step} = {}r{step}{};\n\
+                 let a{step} = [[s{}]];\nlet c{step} = r{step} == a{step};\n\
+                 let s{step} = top{step};\n",
+                "[".repeat(250),
+                "]".repeat(250),
+                step - 1
+            ));
+        }
+        let error = check_on_compiler_stack(text.clone()).expect_err("stacked steps should fail");
+        assert_inferred_type_limit_at(&text, &error, "let c2 =");
+    }
+
+    #[test]
+    fn rejects_infinite_types_between_two_solved_types_without_cycles() {
+        // `w` contains `e`, so unifying their solved types would make the
+        // element type of `e` contain itself. Rejecting it must not leave a
+        // cyclic binding for the error message to render forever.
+        for unify in [
+            "e == w",
+            "w == e",
+            "match [e] { [] => w, [head, ..rest] => head }",
+        ] {
+            let text = format!("let e = [];\nlet w = [[e]];\nlet c = {unify};\n");
+            let error = check_on_compiler_stack(text).expect_err("the type would be infinite");
+            assert_eq!(error.code(), "K3001", "{unify}: {}", error.message());
+        }
+    }
+
+    /// Recomputes the resolved height of `ty` from the solved bindings alone,
+    /// without the analyzer's cached heights.
+    fn exact_height(
+        analyzer: &Analyzer,
+        ty: &InferType,
+        memo: &mut BTreeMap<TypeVariable, usize>,
+    ) -> usize {
+        let children: Vec<&InferType> = match ty {
+            InferType::Variable(variable) => {
+                let root = analyzer.root_variable(*variable);
+                if let Some(height) = memo.get(&root) {
+                    return *height;
+                }
+                let height = analyzer
+                    .substitutions
+                    .get(&root)
+                    .map_or(0, |binding| exact_height(analyzer, binding, memo));
+                memo.insert(root, height);
+                return height;
+            }
+            InferType::List(element) | InferType::Option(element) => vec![element],
+            InferType::Result(value, error) => vec![value, error],
+            InferType::Record { fields, .. } => fields.values().collect(),
+            InferType::Function {
+                parameters,
+                return_type,
+                ..
+            } => parameters
+                .iter()
+                .chain(std::iter::once(return_type.as_ref()))
+                .collect(),
+            _ => return 0,
+        };
+        1 + children
+            .into_iter()
+            .map(|child| exact_height(analyzer, child, memo))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Generates a short program of list bindings, comparisons, and list
+    /// matches whose inferred types sometimes grow past the limit: either
+    /// random statements over earlier bindings, or steps that each unify a
+    /// shallow solved type, already wrapped by another binding, with a deeper
+    /// one built from the previous step.
+    fn random_unification_program(state: &mut u64) -> String {
+        let mut next = |bound: u64| {
+            // xorshift64: deterministic, so failures reproduce.
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state % bound
+        };
+        let wrap = |width: u64, inner: &str| {
+            let width = width as usize;
+            format!("{}{inner}{}", "[".repeat(width), "]".repeat(width))
+        };
+        if next(2) == 0 {
+            let mut text = format!("let s0 = {};\n", wrap(next(4), "1"));
+            for step in 1..=1 + next(4) {
+                let unify = match next(3) {
+                    0 => format!("r{step} == d{step}"),
+                    1 => format!("d{step} == r{step}"),
+                    _ => format!("match [r{step}] {{ [] => d{step}, [head, ..rest] => head }}"),
+                };
+                text.push_str(&format!(
+                    "let r{step} = {};\nlet top{step} = {};\nlet d{step} = {};\n\
+                     let u{step} = {unify};\nlet s{step} = top{step};\n",
+                    wrap(next(4), "[]"),
+                    wrap(next(120), &format!("r{step}")),
+                    wrap(next(4), &format!("s{}", step - 1)),
+                ));
+            }
+            return text;
+        }
+        let mut text = String::from("let v0 = [];\n");
+        let mut values = 1;
+        for statement in 0..4 + next(12) {
+            let width = if next(4) == 0 { 30 + next(90) } else { next(5) };
+            let value = match next(20) {
+                0..=5 => wrap(width, "[]"),
+                6 => wrap(width, "1"),
+                7..=11 => wrap(width, &format!("v{}", next(values))),
+                12..=16 => {
+                    let (left, right) = (next(values), next(values));
+                    text.push_str(&format!("let c{statement} = v{left} == v{right};\n"));
+                    continue;
+                }
+                _ => {
+                    let (list, other) = (next(values), next(values));
+                    format!("match v{list} {{ [] => v{other}, [head, ..rest] => head }}")
+                }
+            };
+            text.push_str(&format!("let v{values} = {value};\n"));
+            values += 1;
+        }
+        text
+    }
+
+    #[test]
+    fn cached_type_heights_stay_exact_through_every_unification() {
+        // Every accepted program must leave each type variable's cached
+        // height equal to the height of its solved type; a stale, too-low
+        // height is how an inferred type escapes the limit. A cyclic binding
+        // left behind by a rejected program would instead overflow the stack.
+        let (accepted, too_deep) = crate::run_on_thread(
+            "analysis-test",
+            crate::COMPILER_STACK_BYTES,
+            check_type_heights,
+        )
+        .expect("analysis test thread should start");
+        // The generator is deterministic; these guard its coverage.
+        assert!(accepted >= 200, "only {accepted} programs were accepted");
+        assert!(too_deep >= 20, "only {too_deep} programs were too deep");
+    }
+
+    /// Analyzes generated programs, checks the cached heights of each one
+    /// that is accepted, and returns how many were accepted and how many
+    /// failed with `K1005`.
+    fn check_type_heights() -> (usize, usize) {
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        let (mut accepted, mut too_deep) = (0, 0);
+        for _ in 0..500 {
+            let text = random_unification_program(&mut state);
+            let source = Source::new("heights.krit", text.as_str());
+            let program = parse_source(&source).expect("generated programs should parse");
+            let mut analyzer = Analyzer::new();
+            match analyzer.program(&program) {
+                Ok(_) => {
+                    accepted += 1;
+                    let mut memo = BTreeMap::new();
+                    for variable in 0..analyzer.next_type_variable {
+                        if analyzer.root_variable(variable) != variable {
+                            continue;
+                        }
+                        let exact =
+                            exact_height(&analyzer, &InferType::Variable(variable), &mut memo);
+                        assert_eq!(
+                            analyzer.type_heights[variable as usize], exact,
+                            "type variable {variable} of:\n{text}"
+                        );
+                        assert!(exact <= MAX_NESTING_DEPTH, "{text}");
+                    }
+                }
+                Err(error) if error.code() == "K1005" => too_deep += 1,
+                Err(_) => {}
+            }
+        }
+        (accepted, too_deep)
     }
 
     #[test]

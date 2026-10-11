@@ -87,11 +87,11 @@ network service, or nondeterministic value.
 | `check/syntax/missing-semicolon` | missing required syntax |
 | `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
 | `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, and an unbound `_` is undefined |
-| `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors |
+| `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings |
 | `check/match/*` | unique, exhaustive, single-family Option and Result arms (`K1003`) |
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
-| `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, and types that grow after they are bound |
+| `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, types that grow after they are bound, and types that grow when two solved types unify |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |

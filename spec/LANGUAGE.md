@@ -216,8 +216,9 @@ constructors deep. That covers a binding deeper than the one before it, such
 as the 257th binding of a chain of `let next = [previous];` declarations, and
 a type inferred earlier that grows later: after `let e = []; let top = [[e]];`,
 the type of `top` deepens whenever a later expression resolves the element
-type of `e` to a deeper list. Types spelled out by nested literals and
-annotations are bounded by the nesting limit, so every static type stays
+type of `e` to a deeper list, including by comparing `e` with another binding
+whose type is already known to be deeper. Types spelled out by nested literals
+and annotations are bounded by the nesting limit, so every static type stays
 within a fixed depth.
 
 Exceeding any of these limits is error `K1005` at the construct, operator, or

@@ -216,9 +216,13 @@ Implementation requirements:
 - errors should identify the originating constraints
 - no inference variable may stand for a type nesting more than 256 type
   constructors deep (`K1005`, `LANGUAGE.md` section 4.1); solving a variable
-  rechecks every type that contains it, so a type bound earlier cannot grow
-  past the limit when a variable inside it is solved later, and every later
-  walk over types stays bounded
+  rechecks every type that contains it, and unifying two solved variables
+  rechecks every type that contains either, so a type bound earlier cannot
+  grow past the limit when a variable inside it is solved later, and every
+  later walk over types stays bounded
+- unifying two solved variables fails as an infinite type (`K3001`) before
+  either solution changes when one solution mentions the other variable, so
+  a rejected unification never leaves a type that contains itself
 - checking one changed module should not require unrelated modules (draft)
 - exported signatures form module cache boundaries (draft)
 
