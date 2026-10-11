@@ -3,14 +3,15 @@ use std::{fs, path::Path};
 use krit::{Source, analyze, lower, parse_source};
 use krit_wasm::{
     AI_INTERFACE, ArtifactMetadata, BuildErrorKind, BuildOptions, EMBEDDED_METADATA_SECTION,
-    HTTP_ANONYMOUS_INTERFACE, LOGGING_INTERFACE, MAX_EMBEDDED_METADATA_BYTES, PROGRAM_WORLD,
-    PURE_PROGRAM_WORLD, STATE_ARTIFACT_POLICY_VERSION, STATE_INTERFACE, STDOUT_INTERFACE,
-    WEBHOOK_PROGRAM_WORLD, build_component, digest_bytes, validate_artifact, validate_component,
+    HTTP_ANONYMOUS_INTERFACE, JSON_DECODE_FUNCTION_NAME, LOGGING_INTERFACE,
+    MAX_EMBEDDED_METADATA_BYTES, PROGRAM_WORLD, PURE_PROGRAM_WORLD, STATE_ARTIFACT_POLICY_VERSION,
+    STATE_INTERFACE, STDOUT_INTERFACE, WEBHOOK_PROGRAM_WORLD, build_component, digest_bytes,
+    validate_artifact, validate_component,
 };
 use wasm_encoder::{
     Component, CustomSection, MemorySection, MemoryType, Module, ModuleSection, RawSection,
 };
-use wasmparser::{Parser, Payload};
+use wasmparser::{KnownCustom, Name, Parser, Payload};
 
 fn compile(
     name: &str,
@@ -595,6 +596,54 @@ fn string_operators_build_with_runtime_helpers_emitted_once_when_used() {
 }
 
 #[test]
+fn json_string_decoding_emits_one_named_decoder_only_when_used() {
+    let webhook = |prelude: &str, body: &str| {
+        format!(
+            "webhook fn handle(request: HttpRequest) -> HttpResponse {{\n    {prelude}\n    \
+             record {{ status: 200, headers: [], body: {body} }}\n}}\n"
+        )
+    };
+    let baseline = compile("plain.krit", &webhook("", "request.body"), false)
+        .expect("a webhook without JSON decoding should build");
+    let decoding = webhook(
+        "let once: String = json_decode(request.body);\n    \
+         let twice: String = json_decode(once);",
+        "twice",
+    );
+    let first = compile("decode.krit", &decoding, false).expect("JSON decoding should build");
+    let second = compile("decode.krit", &decoding, false).expect("JSON decoding should rebuild");
+    assert_eq!(
+        first.bytes, second.bytes,
+        "decoder emission must be deterministic"
+    );
+    validate_artifact(&first.bytes, &first.metadata).expect("decoding artifact should validate");
+    assert_eq!(first.metadata.world, baseline.metadata.world);
+    assert!(first.metadata.imports.is_empty() && first.metadata.effects.is_empty());
+
+    // Two call sites share one decoder, the only function the core module
+    // names; a module without `json_decode` has no decoder and no names.
+    let functions = count_core_functions(&baseline.bytes);
+    assert_eq!(count_core_functions(&first.bytes), functions + 1);
+    assert_eq!(
+        core_function_names(&first.bytes),
+        [JSON_DECODE_FUNCTION_NAME]
+    );
+    assert!(core_function_names(&baseline.bytes).is_empty());
+
+    let with_operators = webhook(
+        "let decoded: String = json_decode(request.body);",
+        "if decoded == \"\" { \"empty\" } else { decoded + \"!\" }",
+    );
+    let combined = compile("combined.krit", &with_operators, false)
+        .expect("JSON decoding with String operators should build");
+    assert_eq!(count_core_functions(&combined.bytes), functions + 3);
+    assert_eq!(
+        core_function_names(&combined.bytes),
+        [JSON_DECODE_FUNCTION_NAME]
+    );
+}
+
+#[test]
 fn policy_one_rejects_string_operators_where_the_string_is_produced() {
     for (operator, source) in [
         ("==", "println(\"a\" == \"b\");\n"),
@@ -645,6 +694,27 @@ fn count_core_functions(bytes: &[u8]) -> u32 {
             _ => None,
         })
         .sum()
+}
+
+/// The function names in every core module's name section, in order.
+fn core_function_names(bytes: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        let Payload::CustomSection(section) = payload.expect("component should parse") else {
+            continue;
+        };
+        let KnownCustom::Name(reader) = section.as_known() else {
+            continue;
+        };
+        for subsection in reader {
+            if let Name::Function(map) = subsection.expect("name section should parse") {
+                for naming in map {
+                    names.push(naming.expect("function name should parse").name.to_owned());
+                }
+            }
+        }
+    }
+    names
 }
 
 fn replace_embedded_metadata(bytes: &[u8], world: &str, effects: &[&str]) -> Vec<u8> {

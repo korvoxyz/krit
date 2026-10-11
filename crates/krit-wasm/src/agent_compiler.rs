@@ -12,8 +12,8 @@ use krit::{
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
     ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
-    Instruction, MemArg, MemorySection, MemoryType, Module, RefType, TableSection, TableType,
-    TypeSection,
+    Instruction, MemArg, MemorySection, MemoryType, Module, NameMap, NameSection, RefType,
+    TableSection, TableType, TypeSection,
 };
 
 use crate::{
@@ -139,9 +139,7 @@ pub(crate) fn encode_webhook_core(
         results: vec![Scalar::I32],
     };
     signatures.insert(realloc_signature.clone());
-    if !string_helpers.is_empty() {
-        signatures.insert(StringHelper::signature());
-    }
+    signatures.extend(string_helpers.iter().map(|helper| helper.signature()));
 
     let signature_indices = signatures
         .into_iter()
@@ -203,8 +201,8 @@ pub(crate) fn encode_webhook_core(
     functions.function(signature_indices[&contract.entry_signature]);
     functions.function(signature_indices[&realloc_signature]);
     functions.function(signature_indices[&contract.post_entry_signature]);
-    for _ in &string_helpers {
-        functions.function(signature_indices[&StringHelper::signature()]);
+    for helper in &string_helpers {
+        functions.function(signature_indices[&helper.signature()]);
     }
 
     let table_size = core_count
@@ -314,6 +312,15 @@ pub(crate) fn encode_webhook_core(
         literals.data().iter().copied(),
     );
 
+    // Only helpers whose traps the host attributes are named, so a module
+    // without them has no name section.
+    let mut helper_names = NameMap::new();
+    for (helper, index) in &string_helper_indices {
+        if let Some(name) = helper.name() {
+            helper_names.append(*index, name);
+        }
+    }
+
     let mut wasm = Module::new();
     wasm.section(&types)
         .section(&imports)
@@ -325,6 +332,11 @@ pub(crate) fn encode_webhook_core(
         .section(&elements)
         .section(&code)
         .section(&data);
+    if !helper_names.is_empty() {
+        let mut names = NameSection::new();
+        names.functions(&helper_names);
+        wasm.section(&names);
+    }
 
     Ok(EncodedCore {
         bytes: wasm.finish(),
@@ -465,8 +477,6 @@ struct FunctionContext<'a> {
     locals: BTreeMap<ValueId, u32>,
     value_types: BTreeMap<ValueId, Arc<Type>>,
     scratch_i32: u32,
-    scratch_i32_2: u32,
-    scratch_i32_3: u32,
 }
 
 fn encode_function(
@@ -519,13 +529,7 @@ fn encode_function(
                 .map_err(|_| BuildError::artifact("too many WebAssembly locals"))?,
         )
         .ok_or_else(|| BuildError::artifact("too many WebAssembly locals"))?;
-    let scratch_i32_2 = scratch_i32
-        .checked_add(1)
-        .ok_or_else(|| BuildError::artifact("too many WebAssembly locals"))?;
-    let scratch_i32_3 = scratch_i32
-        .checked_add(2)
-        .ok_or_else(|| BuildError::artifact("too many WebAssembly locals"))?;
-    local_declarations.extend([Scalar::I32; 3]);
+    local_declarations.push(Scalar::I32);
 
     let mut function = Function::new(
         local_declarations
@@ -538,8 +542,6 @@ fn encode_function(
         locals,
         value_types,
         scratch_i32,
-        scratch_i32_2,
-        scratch_i32_3,
     };
 
     for capture in &core.captures {
@@ -1269,99 +1271,23 @@ fn encode_builtin_call(
     Ok(())
 }
 
+/// Lowers `json_decode` into `String` to the guest JSON string decoder,
+/// which returns a fresh pair or traps on anything but one JSON string.
 fn encode_json_string_decode(
     function: &mut Function,
     context: &FunctionContext<'_>,
     result: ValueId,
     input: ValueId,
 ) -> Result<(), BuildError> {
+    let decoder = context
+        .shared
+        .string_helpers
+        .get(&StringHelper::JsonDecode)
+        .copied()
+        .ok_or_else(|| BuildError::invalid_core("JSON string decoder was not emitted"))?;
     load_value(function, context, input)?;
-    function.instruction(&Instruction::I32Load(memarg(0, 2)));
-    function.instruction(&Instruction::LocalSet(context.scratch_i32));
-    load_value(function, context, input)?;
-    function.instruction(&Instruction::I32Load(memarg(4, 2)));
-    function.instruction(&Instruction::LocalSet(context.scratch_i32_2));
-
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
-    function.instruction(&Instruction::I32Const(2));
-    function.instruction(&Instruction::I32LtU);
-    trap_unreachable_if(function);
-
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
-    function.instruction(&Instruction::I32Const(34));
-    function.instruction(&Instruction::I32Ne);
-    trap_unreachable_if(function);
-
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
-    function.instruction(&Instruction::I32Const(34));
-    function.instruction(&Instruction::I32Ne);
-    trap_unreachable_if(function);
-
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::LocalSet(context.scratch_i32_3));
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
-    function.instruction(&Instruction::I32Const(32));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
-    function.instruction(&Instruction::I32Const(34));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::I32Or);
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
-    function.instruction(&Instruction::I32Const(92));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::I32Or);
-    trap_unreachable_if(function);
-
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_3));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(context.scratch_i32_3));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::End);
-
-    allocate_result(function, context, result, 8, 4)?;
-    load_value(function, context, result)?;
-    function.instruction(&Instruction::LocalGet(context.scratch_i32));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store(memarg(0, 2)));
-    load_value(function, context, result)?;
-    function.instruction(&Instruction::LocalGet(context.scratch_i32_2));
-    function.instruction(&Instruction::I32Const(2));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Store(memarg(4, 2)));
-    Ok(())
-}
-
-fn trap_unreachable_if(function: &mut Function) {
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::Unreachable);
-    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::Call(decoder));
+    store_value(function, context, result)
 }
 
 fn encode_variant(

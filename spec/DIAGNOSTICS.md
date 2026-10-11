@@ -96,7 +96,7 @@ Initial required codes:
 | `K4006` | Function comparison |
 | `K4007` | Output operation failed |
 | `K4008` | Value cannot be encoded as JSON |
-| `K4009` | Invalid or unsupported JSON input |
+| `K4009` | Invalid or unsupported JSON input, in direct evaluation or a component's `json_decode` into `String` |
 | `K5001` | Required capability not granted |
 | `K5002` | Artifact import/world does not match the authorized host interface |
 | `K5003` | Required host contract is unavailable in direct source execution |

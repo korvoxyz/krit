@@ -21,6 +21,7 @@ pub use metadata::{
     LanguageMetadata, PackageMetadata, ResourceRequirementMetadata, STATE_ARTIFACT_POLICY_VERSION,
     VersionedTool,
 };
+pub use strings::JSON_DECODE_FUNCTION_NAME;
 pub use support::SUPPORTED_BACKEND_SEMANTICS;
 pub use validation::{
     ComponentInspection, EMBEDDED_METADATA_SECTION, MAX_EMBEDDED_METADATA_BYTES, digest_bytes,

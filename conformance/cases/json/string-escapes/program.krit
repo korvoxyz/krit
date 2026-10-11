@@ -1,0 +1,10 @@
+let short: String = json_decode("\"q\\\" b\\\\ s\\/ t[\\t]\"");
+let controls: String = json_decode("\"\\b\\f\\n\\r\"");
+let unicode: String = json_decode("\"caf\\u00e9 \\u20AC \\ud83d\\ude00\"");
+let padded: String = json_decode(" \t\"two\\nlines\"\r\n");
+
+println(short);
+println(controls == "\u{8}\u{c}\n\r");
+println(unicode);
+println(unicode == "café € 😀");
+println(padded);

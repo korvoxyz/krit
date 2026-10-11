@@ -1,0 +1,12 @@
+fn parse(text: String) -> String {
+    json_decode(text)
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let summary = parse(request.body);
+    if summary == "" {
+        record { status: 422, headers: [], body: "empty summary" }
+    } else {
+        record { status: 200, headers: [], body: "summary: " + summary }
+    }
+}

@@ -21,10 +21,10 @@ and print/println of Int, Bool, or Unit. Webhook policy 2 additionally supports 
 String values with concatenation, equality, and byte-lexicographic ordering, \
 the closed HttpHeader/HttpRequest/HttpResponse records, header lists, \
 LogField records and field lists, Result/Option matching, exact config/secret/http/AI \
-host calls, structured logging, unescaped JSON string decoding, and static \
-non-capturing helper references. Helpers unreachable from the selected entrypoint \
-are eliminated before layout checks. Other composites, general JSON, data captures, \
-residual types, and list matching fail closed.";
+host calls, structured logging, json_decode into String (every RFC 8259 escape), \
+and static non-capturing helper references. Helpers unreachable from the selected \
+entrypoint are eliminated before layout checks. Other composites, general JSON, data \
+captures, residual types, and list matching fail closed.";
 
 pub(crate) struct CheckedModule {
     pub kind: ProgramKind,

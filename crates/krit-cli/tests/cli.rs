@@ -2379,6 +2379,117 @@ license = "Apache-2.0"
     }
 }
 
+#[test]
+fn invoke_decodes_escaped_json_strings_and_reports_invalid_json() {
+    let directory = TestDirectory::new("invoke-json-escapes");
+    let program = directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let summary: String = json_decode(request.body);
+    record { status: 200, headers: [], body: "summary: " + summary }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/json-escapes"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+"#,
+    );
+    let checked = krit()
+        .args(["check", "--target", "component"])
+        .arg(&program)
+        .output()
+        .expect("Krit should check");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let invoke = |name: &str, body: &str| {
+        let request = directory.file(
+            &format!("{name}.json"),
+            &serde_json::json!({
+                "method": "POST",
+                "path": "/summary",
+                "query": "",
+                "headers": [],
+                "body": body,
+            })
+            .to_string(),
+        );
+        krit_in(&directory)
+            .args(["invoke", "--manifest"])
+            .arg(&manifest)
+            .arg("--request")
+            .arg(&request)
+            .output()
+            .expect("Krit should invoke")
+    };
+
+    // Model output: a JSON string with every escape kind and a trailing
+    // newline outside the string.
+    let escaped = invoke(
+        "escaped",
+        "\"line one\\nsaid \\\"hi\\\"\\t\\\\ \\/ \\u00e9 \\ud83d\\ude00\\r\\b\\f\"\n",
+    );
+    assert!(
+        escaped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&escaped.stderr)
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&escaped.stdout).expect("response should be JSON");
+    assert_eq!(response["status"], 200);
+    assert_eq!(
+        response["body"],
+        "summary: line one\nsaid \"hi\"\t\\ / \u{e9} \u{1f600}\r\u{8}\u{c}"
+    );
+
+    // A lone surrogate is invalid JSON, reported like the evaluator reports
+    // it (K4009), with no response and without echoing the input.
+    let lone = invoke("lone", "\"secret \\ud800 text\"");
+    assert_eq!(lone.status.code(), Some(1));
+    assert!(lone.stdout.is_empty());
+    let stderr = String::from_utf8(lone.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("error[K4009]: invalid JSON"), "{stderr}");
+    assert!(!stderr.contains("secret"), "{stderr}");
+
+    let source = directory.file(
+        "evaluate.krit",
+        "let summary: String = json_decode(\"\\\"secret \\\\ud800 text\\\"\");\n",
+    );
+    let evaluated = krit()
+        .args(["run", "--diagnostic-format", "json"])
+        .arg(&source)
+        .output()
+        .expect("Krit should run");
+    assert_eq!(evaluated.status.code(), Some(1));
+    let diagnostic: serde_json::Value = serde_json::from_slice(&evaluated.stderr)
+        .expect("the evaluator should report one JSON diagnostic");
+    assert_eq!(diagnostic["code"], "K4009");
+}
+
 #[cfg(unix)]
 #[test]
 fn invoke_loads_owner_only_secret_files_without_disclosure() {

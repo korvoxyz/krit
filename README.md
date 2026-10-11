@@ -319,8 +319,8 @@ operators, primitive comparisons, and scalar `print`/`println`. The bounded
 webhook policy-2 path additionally supports strings, the fixed HTTP records,
 header lists, Result/Option matching, static non-capturing helper references,
 config, opaque secrets, outbound HTTP, neutral AI calls, ordered log fields,
-and unescaped JSON-string decoding used to validate the reference model
-output. Other composites, general JSON shapes, escaped JSON strings, data
+and `json_decode` into `String` (every JSON escape) used to validate the
+reference model output. Other composites, general JSON shapes, data
 captures, and unresolved parametric layouts fail closed with stable
 `K7001`/`K7002` diagnostics or a bounded guest trap; helpers the entrypoint
 never reaches are eliminated first, so an unused generic helper does not fail

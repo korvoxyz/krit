@@ -70,10 +70,11 @@ evaluate, interpolate, deserialize into a trusted object, or otherwise grant
 authority to that text. Source must explicitly validate or parse the returned
 text before using it as structured data. The bounded policy-2 backend supports
 only the documented concrete shapes. For the reference flow it validates and
-decodes an unescaped JSON string when `json_decode` is inferred as
-`String -> String`; escaped strings and unsupported JSON result shapes
-continue to fail closed with `K7001`, `K7002`, or a bounded guest validation
-trap.
+decodes a JSON string, with every escape and surrogate pair, when
+`json_decode` is inferred as `String -> String`; model output that is not
+exactly one JSON string fails the invocation with `K4009` and publishes no
+response, and unsupported JSON result shapes fail the build with `K7001` or
+`K7002`.
 
 Direct source execution has no AI or logging host and reports `K5003`.
 

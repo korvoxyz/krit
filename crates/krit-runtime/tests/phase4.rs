@@ -142,7 +142,8 @@ fn reference_webhook_runs_github_ai_and_messaging_with_exact_audit_facts() {
         let (mut stream, _) = ai.accept().expect("AI mock should accept");
         let request = read_request(&mut stream);
         ai_order.lock().expect("order lock").push("ai".to_owned());
-        let body = r#"{"output":"\"summary ready\""}"#;
+        // The model answers with JSON string text that uses escapes.
+        let body = r#"{"output":"\"summary ready:\\n\\\"ok\\\" \\u2705\""}"#;
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -341,7 +342,7 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
         .expect("reference flow should run");
 
     assert_eq!(result.response.status, 200);
-    assert_eq!(result.response.body, "summary ready");
+    assert_eq!(result.response.body, "summary ready:\n\"ok\" \u{2705}");
     assert_eq!(result.stats.http_calls, 2);
     assert_eq!(result.stats.ai_calls, 1);
     assert_eq!(result.stats.network_attempts, 4);
@@ -387,7 +388,7 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
     assert!(message_request.starts_with("POST /messages HTTP/1.1\r\n"));
     assert!(message_lower.contains("authorization: bearer message-private\r\n"));
     assert!(message_lower.contains("idempotency-key: reference-delivery\r\n"));
-    assert!(message_request.ends_with("summary ready"));
+    assert!(message_request.ends_with("summary ready:\n\"ok\" \u{2705}"));
 }
 
 #[test]
@@ -1659,8 +1660,8 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
             &host,
             request("private prompt"),
         )
-        .expect_err("malformed model JSON string must trap");
-    assert_eq!(error.code(), "K4001");
+        .expect_err("malformed model JSON string must fail");
+    assert_eq!(error.code(), "K4009");
     assert_eq!(error.events().len(), 1);
     assert!(!format!("{error:?}").contains("private prompt"));
     assert!(!format!("{error:?}").contains("not-json"));

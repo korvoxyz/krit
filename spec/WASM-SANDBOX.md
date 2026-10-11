@@ -285,6 +285,7 @@ Policy 2 adds a deliberately bounded webhook ABI:
 - canonical UTF-8 strings and checked linear-memory allocation/reallocation
 - String concatenation (`+`), equality (`==`, `!=`), and byte-lexicographic
   ordering (`<`, `<=`, `>`, `>=`) through the guest string runtime below
+- `json_decode` into `String` through the guest JSON string decoder below
 - fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` records
 - ordered lists of headers
 - the Result/Option shapes returned by config, secrets, and HTTP
@@ -330,6 +331,59 @@ before any byte of the result is written; copies only ever target the fresh
 allocation, and a trapping invocation publishes no response. Fuel bounds the
 copy and compare loops like any other guest code.
 
+### Guest JSON string decoding
+
+`json_decode` whose inferred result is `String` lowers to a call of one more
+generated core function, `json-decode-string(text) -> pair`, emitted under the
+same rules as the string helpers (at most once per module, only when a live
+function calls it, after every other definition). It accepts exactly the
+texts for which the direct evaluator yields a string:
+
+- The text is one JSON string, optionally preceded and followed by JSON
+  whitespace: space, tab, line feed, and carriage return (RFC 8259 section
+  2). Any other byte outside the string, including a byte-order mark or a
+  form feed, is rejected.
+- Inside the quotes every byte below 0x20 and every unescaped `"` is
+  rejected. Every other byte, including DEL and multibyte UTF-8, is kept
+  unchanged.
+- The escapes are `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and
+  `\uXXXX` with hex digits in either case (RFC 8259 section 7). A high
+  surrogate escape (`\uD800`-`\uDBFF`) must be followed immediately by a low
+  surrogate escape (`\uDC00`-`\uDFFF`), and the pair decodes to the one
+  supplementary scalar value it encodes, as four UTF-8 bytes. A lone or
+  reversed surrogate is rejected, as is any other escape.
+- Valid JSON that is not a string (a number, `true`, `null`, an object, an
+  array) is rejected. The direct evaluator returns such a value unchecked,
+  because `json_decode` is not yet schema-directed; a component decoding into
+  `String` has no layout for it and fails closed.
+
+Every String is valid UTF-8 and escapes produce only scalar values, so the
+result is valid UTF-8. RFC 8259 lets a parser accept lone surrogates and
+ignore a byte-order mark; Krit rejects both, exactly as the evaluator does,
+because a Krit string holds only Unicode scalar values.
+
+The decoder first validates the whole text and measures its decoded length
+without allocating, so a rejected text never allocates and is rejected the
+same way at any size. A text without escapes decodes to a pair that shares
+the input's content bytes (bytes are never mutated). Otherwise the exact
+decoded length is allocated through the module's bounded `realloc`, which
+traps with `K5103` when guest memory is exhausted, and a second pass writes
+the decoded bytes into that fresh allocation only. Both passes consume runs
+of plain bytes eight at a time with MVP integer instructions. Fuel bounds
+them like any other guest code; a text with escapes is scanned twice and so
+costs more than twice the fuel of plain text of the same length.
+
+Rejection executes `unreachable` inside the decoder. The decoder is the only
+function the core module names in its standard `name` custom section, as
+`krit:json-decode-string` (no Krit identifier can contain `:`), and the
+runtime reports an `unreachable` trap whose innermost frame is that function
+as `K4009`, the code the direct evaluator uses for invalid JSON, with a fixed
+message that never contains the input. The trap aborts the invocation and
+publishes no response. Like every guest trap it is reported at the artifact
+(`artifact.wasm:1:1`) rather than at the `json_decode` call, because
+artifacts carry no source map. A module that never decodes JSON into `String`
+has neither the decoder nor a `name` section.
+
 ### Support checking
 
 Builds fail with `K7001` for residual parametric layouts and `K7002` for
@@ -342,9 +396,9 @@ String value is produced (the literal, parameter, or field), with the
 "String has no concrete guest layout in WebAssembly policy 1" message.
 
 Policy 2 does not generalize these layouts to arbitrary records/lists,
-capturing closures, JSON, or composite equality (`==` over options, results,
-records, or lists). Those shapes continue to fail closed rather than
-receiving fake values.
+capturing closures, JSON other than `json_decode` into `String`, or
+composite equality (`==` over options, results, records, or lists). Those
+shapes continue to fail closed rather than receiving fake values.
 
 Before any layout is chosen, dead-function elimination keeps only the
 functions reachable from module initialization and the selected entrypoint.
