@@ -14,7 +14,7 @@ pub const FORMAT_LINE_WIDTH: usize = 100;
 /// Formats one parseable edition-2026 source file into canonical Krit source.
 pub fn format_source(source: &Source) -> Result<String, Diagnostic> {
     let lexed = lex_with_comments(source)?;
-    let program = parser::parse(lexed.tokens.clone())?;
+    let program = parser::parse(source, lexed.tokens.clone())?;
     Ok(Formatter::new(lexed.tokens, lexed.comments, &program).format())
 }
 

@@ -45,7 +45,7 @@ pub use source::{Position, Source, Span};
 
 pub fn parse_source(source: &Source) -> Result<Program, Diagnostic> {
     let tokens = lexer::lex(source)?;
-    parser::parse(tokens)
+    parser::parse(source, tokens)
 }
 
 /// Parses and analyzes `source`, then evaluates it directly.

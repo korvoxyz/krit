@@ -261,12 +261,15 @@ A **habit word** is one of these identifiers:
 
 A habit word reports its construct's code when:
 
-- it is an operand followed by a token that can only start an operand, which
-  never follows a complete expression: an identifier, integer, string,
-  `true`, `false`, `record`, `if`, `match`, `fn`, `!`, or a `[` with
-  whitespace between it and the word (`return value`, `for item in items`,
-  `const limit = 3`, `class Point`, `async fn`, `throw "empty"`,
-  `return [a, b]`);
+- it is an operand followed, on the same line, by a token that can only start
+  an operand, which never follows a complete expression: an identifier,
+  integer, string, `true`, `false`, `record`, `if`, `match`, `fn`, `!`, or a
+  `[` with whitespace between it and the word (`return value`,
+  `for item in items`, `const limit = 3`, `class Point`, `async fn`,
+  `throw "empty"`, `return [a, b]`). When a line break comes between them,
+  the word stays an ordinary name and the program reports the generic error
+  of the `;` or `,` that is missing (`let x = from` followed by `println(x);`
+  on the next line is `K1002`);
 - it is an operand followed by a parenthesized group and then `=>`
   (`async (x) => e`);
 - it starts a statement and is followed by `{`, by `:`, or by a parenthesized
@@ -290,9 +293,13 @@ These constructs are reported wherever they occur:
   (`x => e`, `(x, y) => e`, `(x: Int) => e`, `() => e`). No expression is
   ever followed by `=>`; only match patterns are.
 - `K1110`: a `?` after an operand, followed by an expression and then `:`
-  (`ready ? 1 : 2`). The parser examines the tokens after the `?` without
-  consuming them. A `?` in any other position is an unexpected token
-  (`K1001`).
+  (`ready ? 1 : 2`). When the tokens after the `?` start an expression that
+  does not parse, the `?` is still `K1110` if a `:` follows it at the same
+  bracket depth before the end of the file, a closing bracket opened before
+  the `?`, or the first `;`, `,`, or `let` at that depth
+  (`ready ? items[0] : None`, `ok ? { status: 200 } : { status: 500 }`). The
+  parser examines the tokens after the `?` without consuming them. A `?` in
+  any other position is an unexpected token (`K1001`).
 - `K1112`: `else` followed by `return` and a token that can only start an
   operand, as above, either as the first tokens of its block or directly
   (`else { return 0; }`, `else return 0;`).
@@ -304,7 +311,11 @@ the first `{` or `}` when it expects `{`.
 Where a habit word could still be an ordinary name (`return;`,
 `return -1;`, `await(job)`), the program parses, and if the name is not bound
 checking reports `K2001` with the construct's fix. Parsing stops at the first
-error, so the first construct reached in source order is the one reported.
+error, so the first construct reached in source order is the one reported,
+with two exceptions inside the first branch of a conditional operator: a
+conditional operator there is reported in place of the outer one
+(`a ? b ? c : d : e` reports `? c :`), and so is a nesting limit (`K1005`)
+crossed there.
 
 ## 5. Program and block values
 

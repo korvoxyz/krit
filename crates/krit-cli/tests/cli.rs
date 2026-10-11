@@ -1843,9 +1843,11 @@ fn diagnostic_codes(diagnostics: &[serde_json::Value], severity: &str) -> Vec<St
         .collect()
 }
 
-/// Habit codes (`K1101`-`K1112`) and method calls (`K3011`) carry a one-line
-/// fix in their JSON `notes`; every note is a one-line string.
-fn assert_fix_hints(diagnostics: &[serde_json::Value], case: &Path) {
+/// An error carries the number of JSON `notes` in `expect.notes`, which
+/// defaults to exactly one fix for habit codes (`K1101`-`K1112`) and method
+/// calls (`K3011`) and to none otherwise; every note is a one-line string.
+fn assert_notes(diagnostics: &[serde_json::Value], case: &Path) {
+    let expected = conformance_expectation(case, "expect.notes");
     for diagnostic in diagnostics {
         let code = diagnostic["code"]
             .as_str()
@@ -1853,12 +1855,25 @@ fn assert_fix_hints(diagnostics: &[serde_json::Value], case: &Path) {
         let notes = diagnostic["notes"]
             .as_array()
             .expect("notes should be an array");
-        let habit = code
-            .strip_prefix("K11")
-            .and_then(|number| number.parse::<u8>().ok())
-            .is_some_and(|number| (1..=12).contains(&number));
-        if habit || code == "K3011" {
-            assert!(!notes.is_empty(), "{}: {code} has no fix", case.display());
+        if diagnostic["severity"] == "error" {
+            let habit = code
+                .strip_prefix("K11")
+                .and_then(|number| number.parse::<u8>().ok())
+                .is_some_and(|number| (1..=12).contains(&number));
+            let expected = if expected.is_empty() {
+                usize::from(habit || code == "K3011")
+            } else {
+                expected
+                    .trim()
+                    .parse::<usize>()
+                    .expect("expect.notes should contain a number")
+            };
+            assert_eq!(
+                notes.len(),
+                expected,
+                "{}: note count of {code}",
+                case.display()
+            );
         }
         assert!(
             notes.iter().all(|note| note
@@ -1908,7 +1923,7 @@ fn run_refuses_every_check_failure_with_checks_diagnostic_and_status() {
                     "{}: every diagnostic is an error or a warning",
                     case.display()
                 );
-                assert_fix_hints(&diagnostics, &case);
+                assert_notes(&diagnostics, &case);
             }
             let run = krit()
                 .args(["run", "--diagnostic-format", format])

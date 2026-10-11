@@ -15,6 +15,9 @@ Each directory contains:
   means no errors
 - `expect.warnings` — optional ordered warning codes, one per line; absent
   means no warnings
+- `expect.notes` — optional decimal number of notes (fix hints) the error
+  carries, plus line feed, for `conformance/check` cases; absent means one
+  for a habit code (`K1101`-`K1112`) or `K3011` and none for any other error
 
 `conformance/cases` contains runtime cases. The harness invokes the
 equivalent of:
@@ -46,9 +49,9 @@ krit check --diagnostic-format json program.krit
 
 It compares status, error codes, and warning codes as the runtime harness does,
 and requires that checking never execute program effects or emit program
-output. An error with a habit code (`K1101`-`K1112`) or `K3011` must carry at
-least one note, and every note must be one line (`spec/DIAGNOSTICS.md`, Fix
-hints); the wording of notes is not compared. Because `krit run` checks
+output. The error must carry exactly the number of notes that `expect.notes`
+gives, and every note must be one line (`spec/DIAGNOSTICS.md`, Fix hints);
+the wording of notes is not compared. Because `krit run` checks
 first, the harness also requires that `krit run` refuse every failing check
 case with the same diagnostics and status and no program output.
 
@@ -87,10 +90,11 @@ network service, or nondeterministic value.
 | `errors/call-depth` | runaway recursion fails with `K4010` instead of aborting |
 | `check/valid/inference` | recursion, closures, empty lists, None, and effects infer together |
 | `check/syntax/missing-semicolon` | missing required syntax |
+| `check/syntax/habit-word-line-break` | a bound habit word ending a line before a missing `;` stays an ordinary name (`K1002`) |
 | `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
 | `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, and an unbound `_` is undefined |
 | `check/name/did-you-mean`, `check/name/null` | undefined names (`K2001`) that carry a did-you-mean or `None` note |
-| `check/habit/*` | one case per construct from another language (`K1101`-`K1112`): `return`, loops, assignment, `struct`, `import`, `await`, `throw`, indexing, arrow functions, the conditional operator, `switch`, and `else { return ... }` |
+| `check/habit/*` | one case per construct from another language (`K1101`-`K1112`): `return`, loops, assignment, `struct`, `import`, `await`, `throw`, indexing, arrow functions, the conditional operator, `switch`, and `else { return ... }`; plus a conditional operator whose first branch does not parse |
 | `check/valid/habit-words-as-names` | habit words stay ordinary identifiers outside foreign constructs |
 | `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings and a method call on a string (`K3011`) |
 | `check/match/*` | unique, exhaustive, single-family Option and Result arms (`K1003`) |

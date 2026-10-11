@@ -112,7 +112,7 @@ fn run_case(case: &Path, root: &Path) {
         .display()
         .to_string();
     if let Err(diagnostic) = &result {
-        assert_fix_hint(diagnostic, &case_name);
+        assert_notes(diagnostic, case, &case_name);
     }
     let (actual_status, actual_codes) = match result {
         Ok(_) => (0, Vec::new()),
@@ -139,21 +139,31 @@ fn run_case(case: &Path, root: &Path) {
     );
 }
 
-/// Habit codes (`K1101`-`K1112`) and method calls (`K3011`) always carry a
-/// one-line fix in their notes (`spec/DIAGNOSTICS.md`); its wording may vary.
-fn assert_fix_hint(diagnostic: &Diagnostic, case_name: &str) {
+/// The error carries the number of notes in `expect.notes`, which defaults to
+/// exactly one fix for habit codes (`K1101`-`K1112`) and method calls
+/// (`K3011`) and to none otherwise (`spec/DIAGNOSTICS.md`). Every note is one
+/// line; its wording may vary.
+fn assert_notes(diagnostic: &Diagnostic, case: &Path, case_name: &str) {
     let code = diagnostic.code();
     let requires_hint = code == "K3011"
         || code
             .strip_prefix("K11")
             .and_then(|number| number.parse::<u8>().ok())
             .is_some_and(|number| (1..=12).contains(&number));
-    if requires_hint {
-        assert!(
-            !diagnostic.notes().is_empty(),
-            "{code} in {case_name} has no fix hint"
-        );
-    }
+    let expected = read_optional(case.join("expect.notes"));
+    let expected = if expected.is_empty() {
+        usize::from(requires_hint)
+    } else {
+        expected
+            .trim()
+            .parse::<usize>()
+            .expect("expect.notes should contain a number")
+    };
+    assert_eq!(
+        diagnostic.notes().len(),
+        expected,
+        "note count of {code} in {case_name}"
+    );
     assert!(
         diagnostic
             .notes()

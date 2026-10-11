@@ -1,0 +1,5 @@
+let ready = true;
+let items = [1, 2];
+let first = ready ? items[0] : 0;
+
+println(first);

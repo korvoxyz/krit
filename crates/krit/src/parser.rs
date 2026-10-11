@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    Diagnostic, Span,
+    Diagnostic, Source, Span,
     ast::{
         BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
         RecordField, RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind,
@@ -12,11 +12,17 @@ use crate::{
     token::{Token, TokenKind},
 };
 
-pub fn parse(tokens: Vec<Token>) -> Result<Program, Diagnostic> {
-    Parser::new(tokens).program()
+/// Parses `tokens`, which the lexer produced from `source`.
+///
+/// The source text tells the parser where lines break between tokens, which
+/// decides whether a word from another language starts a foreign construct.
+pub fn parse(source: &Source, tokens: Vec<Token>) -> Result<Program, Diagnostic> {
+    Parser::new(source.text(), tokens).program()
 }
 
-struct Parser {
+struct Parser<'source> {
+    /// The text the tokens' spans index.
+    text: &'source str,
     tokens: Vec<Token>,
     cursor: usize,
     /// Syntactic nesting levels currently open (bounded by
@@ -33,16 +39,21 @@ struct Parser {
     /// mark and check the depth of the tree they build (bounded by
     /// [`MAX_STRUCTURAL_DEPTH`]).
     peak: usize,
+    /// Conditional-operator checks currently parsing a first branch
+    /// speculatively ([`Self::ternary_after`]).
+    speculations: usize,
 }
 
-impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
+impl<'source> Parser<'source> {
+    fn new(text: &'source str, tokens: Vec<Token>) -> Self {
         Self {
+            text,
             tokens,
             cursor: 0,
             depth: 0,
             chain_depth: 0,
             peak: 0,
+            speculations: 0,
         }
     }
 
@@ -635,7 +646,7 @@ impl Parser {
     fn word_habit(&self, word: &str, span: Span) -> Option<Diagnostic> {
         let habit = Habit::of_word(word)?;
         let next = self.current();
-        let foreign = follows_as_operand(span, next)
+        let foreign = self.follows_as_operand(span, next)
             || (next.kind == TokenKind::LeftParen && self.arrow_after_group(self.cursor).is_some());
         foreign.then(|| habit.word_diagnostic(word, span))
     }
@@ -721,9 +732,9 @@ impl Parser {
 
     /// Diagnoses a `?` that follows an expression.
     ///
-    /// `c ? a : b`, a `?` followed by an expression and then `:`, is another
-    /// language's conditional operator (`K1110`). Any other `?` there is a
-    /// postfix operator that Krit does not have yet.
+    /// `c ? a : b` is another language's conditional operator (`K1110`, see
+    /// [`Self::ternary_after`]). Any other `?` there is a postfix operator that
+    /// Krit does not have yet.
     fn question_mark(&mut self) -> Diagnostic {
         let question = self.advance().span;
         self.ternary_after(question).unwrap_or_else(|| {
@@ -734,33 +745,72 @@ impl Parser {
         })
     }
 
-    /// Returns `K1110` when the tokens after the `?` at `question` are an
-    /// expression followed by `:`.
+    /// Returns `K1110` when the `?` at `question` starts another language's
+    /// conditional operator: the tokens after it are an expression and then
+    /// `:`, or they start an expression that does not parse and a `:` follows
+    /// at the `?`'s bracket depth ([`Self::ternary_colon`]), as in
+    /// `ready ? items[0] : None`.
     ///
     /// The first branch is parsed speculatively, one nesting level deeper, and
     /// the parser is restored either way, so the check never consumes input.
-    /// A conditional operator inside the first branch is reported in place of
-    /// the outer one. The parser never backtracks over a `?`, so each `?` is
-    /// examined once and the speculation adds at most one parse of the tokens
-    /// after it.
+    /// A nesting limit (`K1005`) or a conditional operator reached inside the
+    /// first branch is reported in place of the outer one.
+    ///
+    /// Every `?` ends the parse with an error, and only this speculation
+    /// recovers from one, so only the outermost `?` is examined outside a
+    /// speculation. The speculations add at most one parse of the tokens after
+    /// it, and only the outermost `?` scans for a `:`.
     fn ternary_after(&mut self, question: Span) -> Option<Diagnostic> {
         if !starts_expression(&self.current().kind) {
             return None;
         }
+        let question_index = self.cursor - 1;
         let saved = (self.cursor, self.depth, self.chain_depth, self.peak);
+        self.speculations += 1;
         let branch = self.nested(question, Self::expression);
+        self.speculations -= 1;
         let colon = self.check(&TokenKind::Colon).then(|| self.current().span);
         (self.cursor, self.depth, self.chain_depth, self.peak) = saved;
-        match branch {
-            Ok(_) => colon.map(|colon| {
-                Habit::Ternary.diagnostic(
-                    "the conditional operator `? :` is not Krit syntax",
-                    question.join(colon),
-                )
-            }),
-            Err(error) if error.code() == Habit::Ternary.code() => Some(error),
+        let colon = match branch {
+            Ok(_) => colon,
+            Err(error) if error.code() == "K1005" || error.code() == Habit::Ternary.code() => {
+                return Some(error);
+            }
+            Err(_) if self.speculations == 0 => self.ternary_colon(question_index),
             Err(_) => None,
+        };
+        colon.map(|colon| {
+            Habit::Ternary.diagnostic(
+                "the conditional operator `? :` is not Krit syntax",
+                question.join(colon),
+            )
+        })
+    }
+
+    /// The `:` that would end a conditional operator's first branch after the
+    /// `?` at token `question`: the first `:` at the `?`'s bracket depth,
+    /// looking no further than the end of the file, a closing bracket opened
+    /// before the `?`, or the first `;`, `,`, or `let` at that depth, none of
+    /// which a first branch contains outside brackets.
+    fn ternary_colon(&self, question: usize) -> Option<Span> {
+        let mut depth = 0_usize;
+        for token in &self.tokens[question + 1..] {
+            match &token.kind {
+                TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace => {
+                    depth += 1;
+                }
+                TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
+                    depth = depth.checked_sub(1)?;
+                }
+                TokenKind::Colon if depth == 0 => return Some(token.span),
+                TokenKind::Semicolon | TokenKind::Comma | TokenKind::Let if depth == 0 => {
+                    return None;
+                }
+                TokenKind::Eof => return None,
+                _ => {}
+            }
         }
+        None
     }
 
     /// Reports `else { return value }` or `else return value` (`K1112`): an
@@ -769,12 +819,34 @@ impl Parser {
         let word = self.cursor + usize::from(self.check(&TokenKind::LeftBrace));
         let (word, next) = (self.tokens.get(word)?, self.tokens.get(word + 1)?);
         let is_return = matches!(&word.kind, TokenKind::Identifier(name) if name == "return");
-        (is_return && follows_as_operand(word.span, next)).then(|| {
+        (is_return && self.follows_as_operand(word.span, next)).then(|| {
             Habit::ElseReturn.diagnostic(
                 "`return` in an `else` block is not Krit syntax",
                 else_span.join(word.span),
             )
         })
+    }
+
+    /// Whether `next` starts an operand right after the word ending at `word`,
+    /// on the same line, which no expression is ever followed by:
+    /// `return value`, `throw "boom"`, `await fetch()`, `return [a, b]`. A `[`
+    /// touching the word is indexing (`K1108`) instead.
+    ///
+    /// An operand on a later line more likely starts the next statement or
+    /// element after a missing `;` or `,` (`let x = from` and then
+    /// `println(x);`), so the word is left to be an ordinary name.
+    fn follows_as_operand(&self, word: Span, next: &Token) -> bool {
+        self.same_line(word, next.span)
+            && (starts_operand_only(&next.kind)
+                || (next.kind == TokenKind::LeftBracket && next.span.start > word.end))
+    }
+
+    /// Whether no line break separates the end of `before` from the start of
+    /// `after`.
+    fn same_line(&self, before: Span, after: Span) -> bool {
+        self.text
+            .get(before.end..after.start)
+            .is_some_and(|between| !between.contains(['\n', '\r']))
     }
 
     /// Reports `K1109` when the parenthesized group opening at token `open` is
@@ -1363,15 +1435,6 @@ fn is_settled(error: &Diagnostic) -> bool {
     error.code() == "K1005" || error.code().starts_with("K11")
 }
 
-/// Whether `next` starts an operand right after the word ending at `word`,
-/// which no expression is ever followed by: `return value`, `throw "boom"`,
-/// `await fetch()`, `return [a, b]`. A `[` touching the word is indexing
-/// (`K1108`) instead.
-fn follows_as_operand(word: Span, next: &Token) -> bool {
-    starts_operand_only(&next.kind)
-        || (next.kind == TokenKind::LeftBracket && next.span.start > word.end)
-}
-
 /// Whether a token of `kind` can start an operand but never continue an
 /// expression.
 fn starts_operand_only(kind: &TokenKind) -> bool {
@@ -1419,7 +1482,7 @@ mod tests {
 
     fn parse_text(text: &str) -> Result<Program, Diagnostic> {
         let source = Source::new("test.krit", text);
-        parse(lex(&source)?)
+        parse(&source, lex(&source)?)
     }
 
     #[test]
@@ -1948,13 +2011,87 @@ mod tests {
     #[test]
     fn ternary_speculation_is_bounded_by_the_nesting_limit() {
         // Each `?` examines its first branch one level deeper, so a long run of
-        // unterminated conditionals stops at the nesting limit.
+        // unterminated conditionals stops at the nesting limit, which is
+        // reported as such.
         let text = format!("let y = {}1;\n", "a ? ".repeat(2_000));
         let error = parse_on_compiler_stack(text).expect_err("should not parse");
-        assert_eq!(error.code(), "K1001");
+        assert_eq!(error.code(), "K1005");
         let text = format!("let y = {}1{};\n", "a ? ".repeat(200), " : b".repeat(200));
         let error = parse_on_compiler_stack(text).expect_err("should not parse");
         assert_eq!(error.code(), "K1110");
+        // A first branch that crosses the nesting limit reports the limit, as
+        // the same branch does without the `?`.
+        let nested = format!("{}1{}", "(".repeat(300), ")".repeat(300));
+        let error =
+            parse_on_compiler_stack(format!("let y = x ? {nested} : 2;\n")).expect_err("deep");
+        assert_eq!(error.code(), "K1005");
+        let error = parse_on_compiler_stack(format!("let y = {nested};\n")).expect_err("deep");
+        assert_eq!(error.code(), "K1005");
+    }
+
+    #[test]
+    fn a_conditional_operator_whose_first_branch_does_not_parse_is_still_reported() {
+        for (text, spanned) in [
+            ("fn f(xs) { len(xs) > 0 ? xs[0] : None }", "? xs[0] :"),
+            (
+                "fn f(ok) { ok ? { status: 200 } : { status: 500 } }",
+                "? { status: 200 } :",
+            ),
+            ("fn f(x) { x > 0 ? return 1 : 2 }", "? return 1 :"),
+            ("fn f(c, x) { c ? x++ : x }", "? x++ :"),
+            ("let y = c ? xs[0] : 0;", "? xs[0] :"),
+            ("let y = c ? f(xs[0], 1) : 0;", "? f(xs[0], 1) :"),
+            // The outer `?` comes first in source order.
+            ("let y = a ? (b ? c[0] : d) : e;", "? (b ? c[0] : d) :"),
+        ] {
+            let (code, actual_span, notes) = habit(text);
+            assert_eq!(code, "K1110", "{text}");
+            assert_eq!(actual_span, spanned, "{text}");
+            assert_eq!(notes.len(), 1, "{text}");
+        }
+        // Without a `:` at the `?`'s bracket depth before the first branch
+        // could end, the `?` is an unexpected token.
+        for text in [
+            "let y = c ? xs[0];",
+            "let y = c ? xs[0], 1;",
+            "let y = c ? xs[0]\nlet z: Int = 1;",
+            "fn f(c, xs) { c ? g(xs[0]) }\nlet z: Int = 1;",
+            "let y = [c ? xs[0]]\nlet z: Int = 1;",
+        ] {
+            let error = parse_text(text).expect_err("should not parse");
+            assert_eq!(error.code(), "K1001", "{text}");
+            assert_eq!(&text[error.span().start..error.span().end], "?", "{text}");
+            assert_eq!(error.notes().len(), 1, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_habit_word_before_a_line_break_keeps_the_generic_error() {
+        // A bound habit word ending a line, followed by an operand on the
+        // next, is a missing `;` or `,`, not a foreign construct.
+        for (text, code) in [
+            ("let from = 1;\nlet x = from\nprintln(x);", "K1002"),
+            ("let default = 1;\nlet y = default\nfn g() { 1 }", "K1002"),
+            ("let case = 1;\nlet y = [case\ncase];", "K1002"),
+            (
+                "let from = 1;\nlet x = from // the source\n\"json\";",
+                "K1002",
+            ),
+        ] {
+            let error = parse_text(text).expect_err("should not parse");
+            assert_eq!(error.code(), code, "{text}");
+            assert!(error.notes().is_empty(), "{text}");
+        }
+        // On one line, the same words still start foreign constructs.
+        for (text, code) in [
+            ("let x = from json;", "K1105"),
+            ("let y = [case 1];", "K1111"),
+            ("fn f(x) {\n    return x\n}", "K1101"),
+            ("fn f(x) { if x { 1 } else {\n    return 0\n} }", "K1112"),
+        ] {
+            let error = parse_text(text).expect_err("should not parse");
+            assert_eq!(error.code(), code, "{text}");
+        }
     }
 
     #[test]
