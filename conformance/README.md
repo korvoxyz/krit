@@ -34,6 +34,18 @@ krit check --diagnostic-format json program.krit
 It compares status and diagnostic codes and requires that checking never
 execute program effects or emit program output.
 
+`conformance/package` contains manifest-validation cases. Each case
+directory holds `krit.pkg`, the entry it names, `expect.status`, and optional
+`expect.diagnostics`. That harness runs from the case directory and invokes the
+equivalent of:
+
+```text
+krit package check krit.pkg
+```
+
+It compares status and the ordered codes from the normative human diagnostic
+lines (`file:line:column: severity[CODE]: message`) on standard error.
+
 `conformance/format` contains formatter input/output pairs. Each
 `input.krit` must parse, and formatting must exactly equal
 `formatted.krit`. Formatting the expected output again must produce identical
@@ -82,6 +94,9 @@ network service, or nondeterministic value.
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |
 | `check/valid/schedule-handler` | typed `ScheduleEvent` trigger facts and outcome |
+| `package/dependencies/declared` | a declared version dependency fails closed with `K6003` |
+| `package/dependencies/path-source` | a declared source-table dependency fails closed with `K6003` |
+| `package/dependencies/empty-table` | an empty `[dependencies]` table is accepted |
 | `format/comments` | exact standalone and end-of-line comment preservation |
 | `format/edition-2026` | canonical layout for all currently implemented syntax families |
 | `format/webhook` | canonical typed webhook and ordered duplicate-header layout |

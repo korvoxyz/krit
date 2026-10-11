@@ -120,6 +120,7 @@ Initial required codes:
 | `K5404` | Search connector is missing, misconfigured, or returned invalid output |
 | `K6001` | Invalid package manifest |
 | `K6002` | Lockfile is stale or invalid |
+| `K6003` | Manifest declares dependencies, but dependency resolution is not supported |
 | `K7001` | Residual or unresolved type requires specialization before layout |
 | `K7002` | Core semantics or concrete layout is unsupported by the artifact target |
 | `K7003` | WebAssembly emission, validation, metadata attachment, artifact loading, or output failed |

@@ -1663,13 +1663,15 @@ impl PackageContext {
                 .to_string_lossy()
                 .replace('\\', "/"),
             target: self.manifest.package.target.clone(),
+            // Validation rejects any declared dependency with `K6003`, so this
+            // schema-1 field stays empty until dependency resolution exists.
             dependencies: self
                 .manifest
                 .dependencies
                 .iter()
                 .map(|(name, requirement)| PackageDependencyFact {
                     name: name.clone(),
-                    requirement: requirement.clone(),
+                    requirement: requirement.to_string(),
                 })
                 .collect(),
             requested_permissions,
@@ -3148,6 +3150,37 @@ license = "Apache-2.0"
         )
         .expect("facts should serialize");
         assert!(facts.get("package").is_none());
+    }
+
+    #[test]
+    fn package_discovery_rejects_declared_dependencies() {
+        let directory = TestDirectory::new();
+        fs::write(directory.path.join("main.krit"), "let value = 1;\n")
+            .expect("entry should be written");
+        let manifest = "schema = 1\n\n[package]\nname = \"example/deps\"\nversion = \"0.2.0\"\nedition = \"2026\"\nentry = \"main.krit\"\nlicense = \"Apache-2.0\"\n\n[dependencies]\n";
+        let uri = directory.uri("main.krit");
+
+        for (dependencies, attached) in [("\"krit/json\" = \"1.2.3\"\n", false), ("", true)] {
+            fs::write(
+                directory.path.join("krit.pkg"),
+                format!("{manifest}{dependencies}"),
+            )
+            .expect("manifest should be written");
+            let mut state = ServerState::new(vec![directory.path.clone()]);
+            state.open(uri.clone(), 1, "let value = 1;\n".to_owned());
+
+            let facts = serde_json::to_value(
+                state
+                    .compiler_facts(&uri)
+                    .expect("source facts should remain available"),
+            )
+            .expect("facts should serialize");
+            if attached {
+                assert_eq!(facts["package"]["dependencies"], serde_json::json!([]));
+            } else {
+                assert!(facts.get("package").is_none());
+            }
+        }
     }
 
     #[test]

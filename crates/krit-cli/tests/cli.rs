@@ -2068,6 +2068,80 @@ fn sandbox_and_artifact_permissions_use_documented_usage_and_manifest_exits() {
 }
 
 #[test]
+fn every_manifest_command_refuses_declared_dependencies() {
+    let directory = TestDirectory::new("dependencies-fail-closed");
+    directory.file("main.krit", "println(1);\n");
+    let without_dependencies = r#"
+schema = 1
+
+[package]
+name = "test/program"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[dependencies]
+
+[capabilities]
+stdout = true
+"#;
+    let manifest = directory.file(
+        "krit.pkg",
+        &without_dependencies.replace(
+            "[dependencies]\n",
+            "[dependencies]\n\"krit/json\" = \"1.2.3\"\n",
+        ),
+    );
+    let manifest_arg = manifest.to_string_lossy().into_owned();
+    let request = directory
+        .path
+        .join("request.json")
+        .to_string_lossy()
+        .into_owned();
+    for arguments in [
+        vec!["package", "check", &manifest_arg],
+        vec!["build", "--manifest", &manifest_arg],
+        vec!["sandbox", "--manifest", &manifest_arg],
+        vec!["permissions", &manifest_arg],
+        vec!["permissions", "--json", &manifest_arg],
+        vec!["invoke", "--manifest", &manifest_arg, "--request", &request],
+        vec!["worker", "--manifest", &manifest_arg, "--queue", "jobs"],
+        vec![
+            "schedule",
+            "--manifest",
+            &manifest_arg,
+            "--schedule",
+            "hourly",
+        ],
+        vec!["serve", "--manifest", &manifest_arg, "--once"],
+    ] {
+        let output = krit_in(&directory)
+            .args(&arguments)
+            .output()
+            .expect("Krit should start");
+        assert_eq!(output.status.code(), Some(3), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("diagnostic should be UTF-8"),
+            format!(
+                "{manifest_arg}:1:1: error[K6003]: dependency resolution is not supported; remove [dependencies]\n"
+            ),
+            "{arguments:?}"
+        );
+    }
+    assert!(!directory.path.join("target").exists());
+
+    fs::write(&manifest, without_dependencies).expect("manifest should be rewritten");
+    let output = krit_in(&directory)
+        .args(["package", "check", &manifest_arg])
+        .output()
+        .expect("Krit should start");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn build_fails_closed_for_capabilities_and_unsupported_layouts() {
     let directory = TestDirectory::new("build-fail-closed");
     directory.file("main.krit", "println(1);\n");

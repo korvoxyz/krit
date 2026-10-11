@@ -40,9 +40,6 @@ entry = "src/main.krit"
 license = "Apache-2.0"
 target = "wasm-component"
 
-[dependencies]
-"krit/json" = "1.2.3"
-
 [capabilities]
 stdout = true
 config = ["agent.model", "agent.timeout-ms"]
@@ -66,8 +63,23 @@ The target selects an artifact contract, not additional ambient capabilities.
 
 ## Dependency sources
 
-Dependency resolution is deferred until the single-package WebAssembly MVP is
-working end to end. Its accepted design is:
+Dependency resolution is not implemented, so dependencies fail closed rather
+than being silently ignored. A manifest whose `[dependencies]` table has one
+or more entries, whatever their value shape (version requirement string or
+source table), is rejected with `K6003` ("dependency resolution is not
+supported; remove [dependencies]"). Every command that loads a manifest
+applies the same validation: `krit package check`, `build`, `sandbox`,
+`permissions`, `invoke`, `worker`, `schedule`, and `serve` all exit with
+status 3 before reading source, artifacts, host configuration, or requests.
+An absent or empty `[dependencies]` table is accepted; a `dependencies` value
+that is not a table is `K6001`. Validation reports one error
+deterministically: TOML, unknown-field, schema, and `[package]` errors
+(`K6001`) precede `K6003`, which precedes capability-list errors (`K6001`).
+The language server attaches no package facts for such a manifest, and
+`krit assist` refuses it as an invalid package context (`K8102`).
+
+Resolution is deferred until the single-package WebAssembly MVP is working end
+to end. Its accepted design is:
 
 Supported source kinds:
 
