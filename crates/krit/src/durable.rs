@@ -163,6 +163,9 @@ fn collect_expression<'a>(
         ExpressionKind::Record(fields) => {
             pending.extend(fields.iter().map(|field| Pending::Expression(&field.value)));
         }
+        ExpressionKind::Construct { fields, .. } => {
+            pending.extend(fields.iter().map(|field| Pending::Expression(&field.value)));
+        }
         ExpressionKind::FieldAccess { value, .. } => pending.push(Pending::Expression(value)),
         ExpressionKind::Block(block) => pending.push(Pending::Block(block)),
         ExpressionKind::If {

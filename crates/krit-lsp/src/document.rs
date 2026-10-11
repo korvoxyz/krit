@@ -1517,6 +1517,14 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
                         expression_fields(&field.value, fields);
                     }
                 }
+                ExpressionKind::Construct {
+                    fields: written, ..
+                } => {
+                    for field in written {
+                        fields.insert(field.name.clone());
+                        expression_fields(&field.value, fields);
+                    }
+                }
                 ExpressionKind::FieldAccess { value, field } => {
                     fields.insert(field.clone());
                     expression_fields(value, fields);
@@ -2082,6 +2090,11 @@ impl<'a> DeclarationCollector<'a> {
                         self.expression(&field.value);
                     }
                 }
+                ExpressionKind::Construct { fields, .. } => {
+                    for field in fields {
+                        self.expression(&field.value);
+                    }
+                }
                 ExpressionKind::FieldAccess { value, .. } => self.expression(value),
                 ExpressionKind::Block(block) => self.block(block),
                 ExpressionKind::Function {
@@ -2233,6 +2246,7 @@ fn expression_kind(kind: &ExpressionKind) -> &'static str {
         ExpressionKind::Variable(_) => "name",
         ExpressionKind::List(_) => "list",
         ExpressionKind::Record(_) => "record",
+        ExpressionKind::Construct { .. } => "construction",
         ExpressionKind::FieldAccess { .. } => "field-access",
         ExpressionKind::Block(_) => "block",
         ExpressionKind::If { .. } => "if",
@@ -3611,6 +3625,79 @@ fn unused() -> Result<String, String> {{
         for ty in ["HttpRequest", "HttpResponse", "QueueJob", "ScheduleEvent"] {
             assert!(type_completions().iter().any(|item| item.label == ty));
         }
+    }
+
+    #[test]
+    fn reports_named_construction_facts_hover_and_punned_formatting() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let source =
+            "let body = \"x\";\nlet response = HttpResponse { status: 200, body: body };\n";
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let published = state.open(uri.clone(), 1, source.to_owned());
+        assert!(published.diagnostics.is_empty());
+
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        let expressions = facts["expressions"]
+            .as_array()
+            .expect("expression facts should be a list");
+        let construction = expressions
+            .iter()
+            .find(|fact| fact["syntaxKind"] == "construction")
+            .expect("the construction should have an expression fact");
+        assert_eq!(
+            construction["inferredType"],
+            "Record { body: String, headers: List<HttpHeader>, status: Int }"
+        );
+        assert!(
+            expressions
+                .iter()
+                .any(|fact| fact["syntaxKind"] == "name" && fact["resolved"]["name"] == "body"),
+            "the field value should resolve: {expressions:?}"
+        );
+
+        let hover = state
+            .hover(&uri, Position::new(1, 17))
+            .expect("hover should succeed")
+            .expect("the construction should have hover facts");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("hover should use markdown")
+        };
+        assert!(
+            markup.value.contains("headers: List<HttpHeader>"),
+            "{}",
+            markup.value
+        );
+
+        let edits = state.formatting(&uri).expect("formatting should succeed");
+        assert_eq!(
+            edits[0].new_text,
+            "let body = \"x\";\nlet response = HttpResponse { status: 200, body };\n"
+        );
+
+        let published = state
+            .change(
+                &uri,
+                2,
+                "let response = HttpResponse { stauts: 200 };\n".to_owned(),
+            )
+            .expect("the document should change");
+        assert_eq!(published.diagnostics.len(), 1);
+        let diagnostic = &published.diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("K3016".to_owned()))
+        );
+        assert!(
+            diagnostic.message.contains("help: did you mean `status`?"),
+            "{}",
+            diagnostic.message
+        );
     }
 
     #[test]

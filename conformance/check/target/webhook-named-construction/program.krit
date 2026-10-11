@@ -1,0 +1,17 @@
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let fetch = HttpRequest {
+        method: "GET",
+        path: "/x",
+        headers: [HttpHeader { name: "accept", value: "text/plain" }],
+    };
+    match http_request("https://api.example.com", fetch, None) {
+        Ok(response) => {
+            let logged = log_info(
+                "fetch.done",
+                [LogField { name: "status", value: response.body }],
+            );
+            HttpResponse { status: 200, body: request.path }
+        },
+        Err(error) => HttpResponse { status: 502, body: error },
+    }
+}

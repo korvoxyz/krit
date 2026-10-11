@@ -10,11 +10,11 @@ use krit_capability::{HttpOrigin, is_valid_config_key, is_valid_resource_name};
 use crate::{
     Builtin, Diagnostic, Span,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
-        Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral,
-        VariantFamily, VariantName,
+        BinaryOperator, Block, ConstructField, ContractRecord, Expression, ExpressionKind,
+        MatchKind, Parameter, Program, Statement, StatementKind, TypeAnnotation, TypeKind,
+        UnaryOperator, ValueLiteral, VariantFamily, VariantName,
     },
-    habits::{MethodReceiver, method_hint, undefined_name_note},
+    habits::{MethodReceiver, closest_name, method_hint, undefined_name_note},
     limits::{MAX_NESTING_DEPTH, MAX_TREE_DEPTH, tree_depth_error},
 };
 
@@ -469,6 +469,10 @@ impl RecordType {
 
     pub fn ty(&self) -> &Type {
         self.ty.as_ref()
+    }
+
+    pub(crate) fn shared_type(&self) -> Arc<Type> {
+        Arc::clone(&self.ty)
     }
 }
 
@@ -1376,6 +1380,11 @@ impl Analyzer {
                     effects,
                 })
             }
+            ExpressionKind::Construct {
+                contract,
+                contract_span,
+                fields,
+            } => self.construction(*contract, *contract_span, fields),
             ExpressionKind::FieldAccess { value, field } => {
                 let called = self.method_callee.take() == Some(expression.span);
                 let receiver = value;
@@ -1437,6 +1446,57 @@ impl Analyzer {
             effects: info.effects.clone(),
             resolved_name,
         });
+    }
+
+    /// Analyzes a named construction such as `HttpResponse { status: 200 }`.
+    ///
+    /// The field set is checked first (`K3016`). Each written value is then
+    /// analyzed in source order and must have its contract field's type. The
+    /// construction has exactly the closed structural record type that
+    /// `record { ... }` with every contract field would have; the omitted
+    /// fields take their spec-fixed defaults, whose types are the contract
+    /// field types, so they need no syntax node and no expression fact.
+    fn construction(
+        &mut self,
+        contract: ContractRecord,
+        contract_span: Span,
+        fields: &[ConstructField],
+    ) -> Result<ExpressionInfo, Diagnostic> {
+        check_construction_fields(contract, contract_span, fields)?;
+        let InferType::Record {
+            fields: contract_fields,
+            ..
+        } = contract_record(&contract_nominal(contract))
+        else {
+            unreachable!("built-in record contracts normalize to records")
+        };
+        let mut effects = InferEffects::default();
+        for field in fields {
+            let value = self.expression(&field.value)?;
+            self.constraints.push(TypeConstraint {
+                ty: value.ty.clone(),
+                span: field.value.span,
+                kind: ConstraintKind::StructuralValue,
+            });
+            let expected = contract_fields
+                .get(&field.name)
+                .cloned()
+                .expect("checked construction fields belong to their contract");
+            self.unify(
+                expected,
+                value.ty,
+                field.value.span,
+                &format!("`{}` field `{}`", contract.name(), field.name),
+            )?;
+            effects.union(value.effects);
+        }
+        Ok(ExpressionInfo {
+            ty: InferType::Record {
+                fields: contract_fields,
+                open: false,
+            },
+            effects,
+        })
     }
 
     /// Analyzes an `if` expression and its whole `else if` chain.
@@ -3932,6 +3992,128 @@ fn contract_record(nominal: &InferType) -> InferType {
     }
 }
 
+/// The built-in nominal type that `contract` constructs a record of.
+const fn contract_nominal(contract: ContractRecord) -> InferType {
+    match contract {
+        ContractRecord::HttpRequest => InferType::HttpRequest,
+        ContractRecord::HttpResponse => InferType::HttpResponse,
+        ContractRecord::HttpHeader => InferType::HttpHeader,
+        ContractRecord::LogField => InferType::LogField,
+    }
+}
+
+/// Checks the written field names of a named construction (`K3016`): each
+/// must belong to the contract and be written once, and every required field
+/// must be written. Fields are checked in source order, and a missing field
+/// is reported at the type name after every written field has been checked.
+pub(crate) fn check_construction_fields(
+    contract: ContractRecord,
+    contract_span: Span,
+    fields: &[ConstructField],
+) -> Result<(), Diagnostic> {
+    let name = contract.name();
+    let all_fields = || {
+        format!(
+            "`{name}` has the fields {}",
+            code_list(contract.fields().iter().map(|field| field.name))
+        )
+    };
+    let mut written = BTreeSet::new();
+    for field in fields {
+        if contract.field(&field.name).is_none() {
+            let note = match closest_name(
+                &field.name,
+                contract.fields().iter().map(|field| field.name),
+            ) {
+                Some(candidate) => format!("did you mean `{candidate}`? {}", all_fields()),
+                None => all_fields(),
+            };
+            return Err(Diagnostic::new(
+                "K3016",
+                format!("`{name}` has no field `{}`", field.name),
+                field.name_span,
+            )
+            .with_note(note));
+        }
+        if !written.insert(field.name.as_str()) {
+            return Err(Diagnostic::new(
+                "K3016",
+                format!(
+                    "field `{}` is written more than once in `{name} {{ ... }}`",
+                    field.name
+                ),
+                field.name_span,
+            )
+            .with_note(format!("write each field once; {}", all_fields())));
+        }
+    }
+    let missing = contract
+        .fields()
+        .iter()
+        .filter(|field| field.default.is_none() && !written.contains(field.name))
+        .map(|field| field.name)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let required = contract
+        .fields()
+        .iter()
+        .filter(|field| field.default.is_none())
+        .map(|field| field.name);
+    let defaults = contract
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            field
+                .default
+                .map(|default| format!("`{}` defaults to `{}`", field.name, default.as_source()))
+        })
+        .collect::<Vec<_>>();
+    let note = if defaults.is_empty() {
+        format!(
+            "`{name}` requires {} and has no defaults",
+            code_list(required)
+        )
+    } else {
+        format!(
+            "`{name}` requires {}; {}",
+            code_list(required),
+            prose_list(defaults)
+        )
+    };
+    Err(Diagnostic::new(
+        "K3016",
+        format!(
+            "`{name} {{ ... }}` is missing required {} {}",
+            if missing.len() == 1 {
+                "field"
+            } else {
+                "fields"
+            },
+            code_list(missing.iter().copied())
+        ),
+        contract_span,
+    )
+    .with_note(note))
+}
+
+/// Joins names as code spans in an English list: "`a`", "`a` and `b`", or
+/// "`a`, `b`, and `c`".
+fn code_list<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    prose_list(names.into_iter().map(|name| format!("`{name}`")).collect())
+}
+
+/// Joins phrases in an English list with a serial comma.
+fn prose_list(items: Vec<String>) -> String {
+    match items.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
 fn public_contract_fields(nominal: &InferType) -> Vec<RecordType> {
     let InferType::Record { fields, .. } = contract_record(nominal) else {
         unreachable!("built-in record contracts normalize to records")
@@ -5200,5 +5382,160 @@ mod tests {
         // A field that exists but does not hold a function is a call error.
         let (code, _, _) = error_notes("let item = record { a: 1 };\nitem.a();");
         assert_eq!(code, "K3002");
+    }
+
+    #[test]
+    fn named_construction_has_the_structural_type_of_the_full_record() {
+        let analysis = check(
+            r#"
+            let body = "ready";
+            let response = HttpResponse { status: 200, body };
+            let explicit = record { status: 200, headers: [], body: "ready" };
+            let same = response == explicit;
+            let request = HttpRequest { method: "GET", path: "/x" };
+            let header = HttpHeader { name: "accept", value: "text/plain" };
+            let field = LogField { name: "k", value: "v" };
+            let full = HttpRequest {
+                body,
+                headers: [HttpHeader { name: "a", value: "b" }],
+                query: "",
+                path: "/",
+                method: "POST",
+            };
+            fn status(value: HttpResponse) -> Int { value.status }
+            let code = status(HttpResponse { status: 204 });
+            let accepted: List<HttpHeader> = [LogField { name: "k", value: "v" }];
+            "#,
+        )
+        .expect("constructions should check");
+        let types = analysis
+            .bindings()
+            .iter()
+            .map(|binding| (binding.name().to_owned(), binding.ty().to_string()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            types["response"],
+            "Record { body: String, headers: List<HttpHeader>, status: Int }"
+        );
+        assert_eq!(
+            types["request"],
+            "Record { body: String, headers: List<HttpHeader>, method: String, path: String, query: String }"
+        );
+        assert_eq!(types["full"], types["request"]);
+        assert_eq!(types["header"], "Record { name: String, value: String }");
+        assert_eq!(types["field"], types["header"]);
+        assert_eq!(types["same"], "Bool");
+
+        // The punned field's value is a resolved reference to the binding.
+        let text = "let body = \"x\";\nlet r = HttpResponse { status: 1, body };";
+        let analysis = check(text).expect("punning should check");
+        let start = text.rfind("body").expect("punned field");
+        let fact = analysis
+            .expression(Span::new(start, start + 4))
+            .expect("the punned value has an expression fact");
+        assert_eq!(
+            fact.resolved_name(),
+            Some(ResolvedName::Symbol(analysis.bindings()[0].id()))
+        );
+    }
+
+    #[test]
+    fn named_construction_values_carry_effects_and_requirements() {
+        let analysis = check(
+            r#"
+            fn respond() -> HttpResponse {
+                HttpResponse {
+                    status: 200,
+                    body: match config_string("agent.greeting") {
+                        Ok(text) => text,
+                        Err(error) => error,
+                    },
+                }
+            }
+            "#,
+        )
+        .expect("an effectful field value should check");
+        let Type::Function(function) = analysis.bindings()[0].ty() else {
+            panic!("respond should be a function");
+        };
+        assert!(function.effects().contains(&Effect::ConfigRead));
+        assert!(
+            function
+                .requirements()
+                .contains(&CapabilityRequirement::new(
+                    Effect::ConfigRead,
+                    "agent.greeting"
+                ))
+        );
+    }
+
+    #[test]
+    fn reports_unknown_duplicate_and_missing_construction_fields() {
+        for (text, message, note) in [
+            (
+                "let r = HttpResponse { stauts: 200 };",
+                "`HttpResponse` has no field `stauts`",
+                "did you mean `status`? `HttpResponse` has the fields `status`, `headers`, and `body`",
+            ),
+            (
+                "let r = HttpHeader { name: \"a\", value: \"b\", extra: 1 };",
+                "`HttpHeader` has no field `extra`",
+                "`HttpHeader` has the fields `name` and `value`",
+            ),
+            (
+                "let r = HttpResponse { status: 1, body: \"a\", body: \"b\" };",
+                "field `body` is written more than once in `HttpResponse { ... }`",
+                "write each field once; `HttpResponse` has the fields `status`, `headers`, and `body`",
+            ),
+            (
+                "let r = HttpRequest { method: \"GET\" };",
+                "`HttpRequest { ... }` is missing required field `path`",
+                "`HttpRequest` requires `method` and `path`; `query` defaults to `\"\"`, \
+                 `headers` defaults to `[]`, and `body` defaults to `\"\"`",
+            ),
+            (
+                "let r = HttpResponse { body: \"x\" };",
+                "`HttpResponse { ... }` is missing required field `status`",
+                "`HttpResponse` requires `status`; `headers` defaults to `[]` and `body` \
+                 defaults to `\"\"`",
+            ),
+            (
+                "let r = LogField {};",
+                "`LogField { ... }` is missing required fields `name` and `value`",
+                "`LogField` requires `name` and `value` and has no defaults",
+            ),
+        ] {
+            let (code, actual, notes) = error_notes(text);
+            assert_eq!(code, "K3016", "{text}");
+            assert_eq!(actual, message, "{text}");
+            assert_eq!(notes, [note], "{text}");
+        }
+
+        // The unknown field is reported at its name, a missing field at the
+        // type name, and the field set before any value is analyzed.
+        let error = check("let r = HttpResponse { status: missing, stauts: 1 };")
+            .expect_err("unknown field");
+        assert_eq!(error.code(), "K3016");
+        assert_eq!(error.span(), Span::new(40, 46));
+        let error = check("let r = HttpRequest {\n    method: \"GET\",\n};").expect_err("missing");
+        assert_eq!(error.span(), Span::new(8, 19));
+    }
+
+    #[test]
+    fn construction_values_must_have_their_contract_field_types() {
+        let error = check("let r = HttpResponse { status: \"200\" };").expect_err("mismatch");
+        assert_eq!(error.code(), "K3001");
+        assert_eq!(error.span(), Span::new(31, 36));
+        assert_eq!(
+            error.message(),
+            "`HttpResponse` field `status` type mismatch: expected `Int`, found `String`"
+        );
+        let error = check("let r = HttpRequest { method: \"GET\", path: \"/\", headers: [1] };")
+            .expect_err("mismatch");
+        assert_eq!(error.code(), "K3001");
+        let error =
+            check("let s = secret(\"token\");\nlet r = HttpResponse { status: 1, body: s };")
+                .expect_err("a secret result is not a body");
+        assert_eq!(error.code(), "K3001");
     }
 }

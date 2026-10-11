@@ -213,6 +213,36 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
 }
 
 #[test]
+fn named_constructions_build_in_webhooks_and_fail_at_their_span_in_modules() {
+    let webhook = lower_source(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let fetch = HttpRequest { method: "GET", path: request.path };
+    let logged = log_info("seen", [LogField { name: "path", value: fetch.path }]);
+    HttpResponse { status: 200, headers: [HttpHeader { name: "x", value: "y" }], body: fetch.path }
+}
+"#,
+    );
+    let effects = options(&["observe.log"]);
+    assert!(check_target(&webhook, &effects, CheckTarget::Component).is_empty());
+    let artifact =
+        build_component(&webhook, &effects).expect("a webhook of named constructions builds");
+    validate_artifact(&artifact.bytes, &artifact.metadata)
+        .expect("a webhook of named constructions validates");
+
+    // Policy 1 has no record layout; the construction, including its
+    // defaults, is reported at the construction, never at `1:1`.
+    let text = "let status = HttpResponse { status: 1 }.status;\nprintln(status);\n";
+    let errors = check_target(&lower_source(text), &options(&[]), CheckTarget::Module);
+    assert_sorted_unique_and_located(&errors);
+    assert!(
+        errors.iter().all(|error| error.code() == "K7002"),
+        "{errors:#?}"
+    );
+    assert_eq!(starts(&errors), [span_of(text, "HttpResponse").start]);
+}
+
+#[test]
 fn target_checks_ignore_package_grants_that_builds_enforce() {
     let module = lower_source("println(1);\n");
     assert!(check_target(&module, &options(&[]), CheckTarget::Component).is_empty());

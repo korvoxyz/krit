@@ -128,7 +128,7 @@ Initial required codes:
 | `K0001` | Invalid source character or token |
 | `K0002` | Unterminated string |
 | `K0003` | Invalid string escape |
-| `K1001` | Unexpected token, including a `?` that is not a conditional operator (`K1110`) |
+| `K1001` | Unexpected token, including a `?` that is not a conditional operator (`K1110`) and a named construction written directly as an `if` condition or `match` subject |
 | `K1002` | Expected token not found |
 | `K1003` | Invalid match pattern |
 | `K1004` | Webhook declaration is nested or otherwise misplaced |
@@ -159,6 +159,7 @@ Initial required codes:
 | `K3009` | Opaque secret is used by a revealing or structural operation |
 | `K3010` | Opaque database transaction handle is used outside a database operation |
 | `K3011` | Method call `value.name(...)` on a value that has no field `name`: Krit values have no methods |
+| `K3016` | Named construction of a contract record writes a field the contract does not have, writes a field more than once, or omits a required field |
 | `K4001` | Generic guest trap, wrong runtime value kind, or HTTP request/response the host refuses (including a request path that breaks the rule in `WEBHOOK-CONTRACTS.md`, "Request paths and queries") |
 | `K4002` | Calling a non-function |
 | `K4003` | Function argument count mismatch |
@@ -242,6 +243,18 @@ may improve, but which diagnostics carry one is part of each code's contract:
   without parentheses.
 - `K1001` for a `?` after an operand carries one note: postfix `?` is not
   available yet.
+- `K1001` for a named construction written directly as an `if` condition or
+  a `match` subject carries one note: wrap the construction in parentheses.
+- `K3016` always carries exactly one note. For an unknown field it lists the
+  contract's fields, preceded by `did you mean `name`?` when one of them is
+  close by the rule for undefined names below; for a repeated field it lists
+  the contract's fields; for missing fields it names the contract's required
+  fields and the default of each other field:
+
+```text
+main.krit:1:15: error[K3016]: `HttpRequest { ... }` is missing required field `path`
+help: `HttpRequest` requires `method` and `path`; `query` defaults to `""`, `headers` defaults to `[]`, and `body` defaults to `""`
+```
 
 ### Constructs from other languages
 

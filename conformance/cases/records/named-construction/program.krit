@@ -1,0 +1,37 @@
+fn note(label: String, value: Int) -> Int {
+    print(label);
+    value
+}
+
+fn respond(body: String) -> HttpResponse {
+    HttpResponse { status: 200, body }
+}
+
+let header = HttpHeader { name: "accept", value: "text/plain" };
+let request = HttpRequest { method: "GET", path: "/x" };
+let full = HttpRequest {
+    method: "POST",
+    path: "/items",
+    query: "limit=1",
+    headers: [header, record { name: "x-trace", value: "1" }],
+    body: "{}",
+};
+
+println(respond("ready"));
+println(request);
+println(full.headers);
+println(LogField { name: "attempt", value: "1" });
+println(respond("ready") == record { status: 200, headers: [], body: "ready" });
+println(json_encode(HttpResponse { status: 204 }));
+println((HttpResponse { status: 404 }).status);
+
+let ordered = HttpResponse {
+    body: {
+        print("body ");
+        "late"
+    },
+    status: note("status ", 201),
+};
+
+println("");
+println(ordered);

@@ -122,6 +122,7 @@ primary         = integer
                 | identifier
                 | list
                 | record
+                | construction
                 | block
                 | if-expression
                 | match-expression
@@ -132,6 +133,13 @@ list            = "[", arguments?, "]" ;
 record          = "record", "{", record-fields?, "}" ;
 record-fields   = record-field, (",", record-field)*, ","? ;
 record-field    = identifier, ":", expression ;
+
+construction    = contract-name, "{", construction-fields?, "}" ;
+contract-name   = "HttpRequest" | "HttpResponse" | "HttpHeader" | "LogField" ;
+construction-fields
+                = construction-field, (",", construction-field)*, ","? ;
+construction-field
+                = identifier, (":", expression)? ;
 
 if-expression   = "if", expression, block, "else",
                   (block | if-expression) ;
@@ -167,6 +175,18 @@ record-type-field
                 = identifier, ":", type ;
 ```
 
+A `contract-name` is an ordinary identifier, not a keyword; only these four
+names followed by `{` start a `construction` (section 8.2), and any other
+identifier followed by `{` keeps its meaning. In the condition of an `if` or
+`else if` and in the subject of a `match`, a contract name followed by `{` is
+not a construction either: the `{` opens the `if` block or the match arms, as
+it does after any other name. A construction there must be written inside
+parentheses, a list, a call's argument list, a block, a record or construction
+field, or a match arm: `if (HttpResponse { status: 200 }).status == 200 { ... }`.
+When the tokens after that `{` are a name followed by `:` or `,`, which never
+start a block, the parser reports `K1001` with a note to add the parentheses;
+`if HttpResponse { x } else { y }` remains a condition named `HttpResponse`.
+
 Assignments and mutable bindings do not exist in edition 2026. Neither do
 `return`, loops, classes, modules, `async`, exceptions, indexing, arrow
 functions, the conditional operator, or `switch`; section 4.2 specifies how
@@ -192,7 +212,8 @@ operation; the name does not create an ambient network listener.
 A source file may nest syntax at most **256 levels** deep. Each of the
 following opens one level for what it contains:
 
-- a parenthesized expression, a block, a list literal, and a record literal
+- a parenthesized expression, a block, a list literal, a record literal, and
+  a named construction
 - the argument list of a call, and each call or field-access link of a
   postfix chain (`a.b(c).d` opens three levels for what follows `a`)
 - the operand of a unary operator
@@ -473,6 +494,48 @@ type error. Status-range validation belongs to the component HTTP host, not the
 static type checker. These built-ins do not add general user-defined type
 alias syntax.
 
+## 8.2 Named construction
+
+The contract records `HttpRequest`, `HttpResponse`, `HttpHeader`, and
+`LogField` (section 13.1) can be built by name:
+
+```krit
+let fetch = HttpRequest { method: "GET", path: "/issues/1" };
+let response = HttpResponse { status: 200, body };
+```
+
+A field written as its name alone is punned: `body` means `body: body`, a
+reference to the binding named `body`. Fields may be written in any order, and
+a trailing comma is allowed. A construction may omit a field that has a
+spec-fixed default:
+
+| Contract | Required fields | Defaults of the other fields |
+|---|---|---|
+| `HttpRequest` | `method`, `path` | `query: ""`, `headers: []`, `body: ""` |
+| `HttpResponse` | `status` | `headers: []`, `body: ""` |
+| `HttpHeader` | `name`, `value` | none |
+| `LogField` | `name`, `value` | none |
+
+Writing a field the contract does not have, writing a field more than once, or
+omitting a required field is error `K3016`. The field names are checked before
+any field value: an unknown or repeated field is reported at its name, and
+missing required fields at the type name. Each written value must have its
+contract field's type (`K3001` otherwise; `TYPES-AND-EFFECTS.md`).
+
+The value is exactly the record that `record { ... }` with every contract
+field would build. Its static type is the contract's closed structural record
+type (section 8.1), so it flows anywhere such a record does, including
+`http_request`, webhook results, and log field lists, and it is equal to that
+record. Because the type is structural, `HttpHeader { ... }` and
+`LogField { ... }` have the same type. The written values evaluate from left
+to right in source order. The record lists its fields in the contract's
+declared order (sections 8.1 and 13.1, and the table above), whatever order
+they are written in, and renders in that order
+(`record { status: 200, headers: [], body: "ready" }`). Defaults have no
+source text and perform no evaluation or effect; the compiler supplies them
+directly, without any syntax node. `record { ... }` remains valid for every
+record, including these four.
+
 ## 9. Operators
 
 Operators evaluate left to right.
@@ -534,7 +597,8 @@ let response = record { status: 200, body: "ready" };
 println(response.status);
 ```
 
-The `record` prefix distinguishes a record literal from a block. Fields
+The `record` prefix distinguishes a record literal from a block; a named
+construction (section 8.2) starts with a contract name instead. Fields
 evaluate from left to right. Accessing a field requires a record containing
 that field.
 
@@ -880,6 +944,14 @@ grammar-permitted trailing commas, not expression order or program semantics.
 - Multiline lists, records, parameter lists, argument lists, record types,
   and matches have one item per line and a trailing comma. Single-line forms
   omit a trailing comma.
+- A named construction is laid out like a record literal: on one line when it
+  fits (`HttpResponse { status: 200, body }`), otherwise one field per line
+  with a trailing comma. A field whose value is exactly the identifier with
+  the field's own name is written punned (`body`, from `body` or
+  `body: body`); every other field is written `field: value`, including
+  `body: (body)`. A field keeps its `name: name` spelling when a comment
+  stands between the name and the value, so no comment moves. Record literals
+  are never punned.
 - Top-level declarations are separated from executable expression statements
   by one blank line.
 - Integer separators are removed. Strings use direct printable Unicode plus

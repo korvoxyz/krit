@@ -871,6 +871,11 @@ fn ast_sensitive_literal_spans(
                             collect(source, &field.value, scopes, visited, targets);
                         }
                     }
+                    ExpressionKind::Construct { fields, .. } => {
+                        for field in fields {
+                            collect(source, &field.value, scopes, visited, targets);
+                        }
+                    }
                     ExpressionKind::FieldAccess { value, .. } => {
                         collect(source, value, scopes, visited, targets);
                     }
@@ -988,6 +993,11 @@ fn ast_sensitive_literal_spans(
                     }
                 }
                 ExpressionKind::Record(fields) => {
+                    for field in fields {
+                        expression_spans(source, &field.value, scopes, spans);
+                    }
+                }
+                ExpressionKind::Construct { fields, .. } => {
                     for field in fields {
                         expression_spans(source, &field.value, scopes, spans);
                     }
@@ -1544,8 +1554,19 @@ fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static
                 });
                 let kind = if bytes[cursor] == b'[' {
                     GroupKind::Bracket
-                } else if matches!(tokens.last(), Some(TolerantToken::Identifier("record"))) {
-                    // `record { ... }` is a literal, not a lexical scope.
+                } else if matches!(tokens.last(), Some(TolerantToken::Identifier("record")))
+                    || (!saw_function_keyword
+                        && matches!(
+                            tokens.last(),
+                            Some(TolerantToken::Identifier(
+                                "HttpRequest" | "HttpResponse" | "HttpHeader" | "LogField"
+                            ))
+                        ))
+                {
+                    // `record { ... }` and a named construction such as
+                    // `HttpResponse { ... }` are literals, not lexical scopes.
+                    // After `fn`, the same name is the return type and the
+                    // brace opens the function body.
                     GroupKind::Record
                 } else {
                     GroupKind::Block
@@ -2692,6 +2713,56 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
                 .any(|(content, _)| content == "record-question"),
             "a record literal must not drop an outer binding: {spans:?}"
         );
+    }
+
+    #[test]
+    fn a_named_construction_does_not_open_a_binding_scope() {
+        let source = "let q = \"construction-question\";\nlet shape = HttpResponse { status: 1 };\nsearch_query(\"docs\", q, 3";
+        let spans = redacted_tolerant(source);
+
+        assert!(
+            spans
+                .iter()
+                .any(|(content, _)| content == "construction-question"),
+            "a named construction must not drop an outer binding: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn named_construction_values_inside_a_sensitive_argument_are_redacted() {
+        // `-> HttpResponse {` opens the webhook body, not a construction, so
+        // the fallback still scopes the body and resolves `payload`; the
+        // equivalent `record { ... }` program redacts the same literal.
+        let source = r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let payload = json_encode(LogField { name: "kind", value: "private-payload" });
+    match cache_put("lookups", "k", payload, 60) {
+        Ok(stored) => HttpResponse { status: 200, body: "ok" },
+        Err(problem) => HttpResponse { status: 500, body: problem },
+    }
+}
+"#;
+
+        for (path, spans) in [
+            ("parsed", redacted(source)),
+            ("tolerant", redacted_tolerant(source)),
+            (
+                "parsed-record",
+                redacted(&source.replace("LogField {", "record {")),
+            ),
+            (
+                "tolerant-record",
+                redacted_tolerant(&source.replace("LogField {", "record {")),
+            ),
+        ] {
+            assert!(
+                spans
+                    .iter()
+                    .any(|(content, category)| content == "private-payload"
+                        && *category == "cache-value"),
+                "{path}: a constructed payload leaked: {spans:?}"
+            );
+        }
     }
 
     #[test]

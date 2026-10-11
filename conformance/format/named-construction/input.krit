@@ -1,0 +1,12 @@
+fn respond(status:Int,body:String)->HttpResponse{
+HttpResponse{status:status,body:body,}
+}
+fn fetch(path:String)->HttpRequest{
+    HttpRequest {method:"POST",path:path,query:"page=2",headers:[HttpHeader{name:"accept",value:"application/json"},HttpHeader{name:"x-trace",value:"on"}],body:"{}"}
+}
+let empty=HttpResponse{status:204};
+let commented = HttpResponse { status: // why this code
+200, body: (fetch("/x").path) };
+let field=LogField{name:"path",
+    value:fetch("/x").path};
+let code=if(HttpResponse{status:200}).status==200{1}else{2};

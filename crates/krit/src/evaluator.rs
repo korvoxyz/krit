@@ -2,9 +2,11 @@ use std::{fmt, io::Write, ops::Deref, rc::Rc};
 
 use crate::{
     Diagnostic, Span,
+    analysis::check_construction_fields,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
-        Statement, StatementKind, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+        BinaryOperator, Block, ConstructField, ContractRecord, Expression, ExpressionKind,
+        FieldDefault, MatchKind, Parameter, Program, Statement, StatementKind, UnaryOperator,
+        ValueLiteral, VariantFamily, VariantName,
     },
     limits::{MAX_CALL_DEPTH, MAX_EVALUATION_DEPTH, MAX_VALUE_DEPTH},
 };
@@ -546,6 +548,17 @@ impl Evaluator<'_> {
                 }
                 Value::record(values, expression.span)
             }
+            ExpressionKind::Construct {
+                contract,
+                contract_span,
+                fields,
+            } => self.construction(
+                *contract,
+                *contract_span,
+                fields,
+                environment,
+                expression.span,
+            ),
             ExpressionKind::FieldAccess { value, field } => {
                 let value = self.expression(value, environment)?;
                 field_value(value, field, expression.span)
@@ -566,6 +579,45 @@ impl Evaluator<'_> {
             }
             ExpressionKind::Binary { .. } => self.binary_chain(expression, environment),
         }
+    }
+
+    /// Evaluates a named construction: the written values in source order,
+    /// then the record in the contract's field order, with every omitted
+    /// field set to its spec-fixed default.
+    ///
+    /// A checked program always writes a valid field set; a program
+    /// evaluated without checking reports the checker's `K3016` instead.
+    fn construction(
+        &mut self,
+        contract: ContractRecord,
+        contract_span: Span,
+        fields: &[ConstructField],
+        environment: &Environment,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        check_construction_fields(contract, contract_span, fields)?;
+        let mut written = Vec::with_capacity(fields.len());
+        for field in fields {
+            written.push((
+                field.name.as_str(),
+                Some(self.expression(&field.value, environment)?),
+            ));
+        }
+        let mut values = Vec::with_capacity(contract.fields().len());
+        for field in contract.fields() {
+            let value = written
+                .iter_mut()
+                .find(|(name, _)| *name == field.name)
+                .and_then(|(_, value)| value.take());
+            let value = match (value, field.default) {
+                (Some(value), _) => value,
+                (None, Some(FieldDefault::EmptyString)) => Value::String(Rc::from("")),
+                (None, Some(FieldDefault::EmptyList)) => Value::list(Vec::new(), span)?,
+                (None, None) => unreachable!("checked constructions write every required field"),
+            };
+            values.push((field.name.to_owned(), value));
+        }
+        Value::record(values, span)
     }
 
     fn match_expression(
@@ -1916,5 +1968,39 @@ mod tests {
 
         let decode_error = run(r#"json_decode("{");"#).expect_err("invalid JSON should not decode");
         assert_eq!(decode_error.code(), "K4009");
+    }
+
+    #[test]
+    fn named_construction_evaluates_in_source_order_and_fills_defaults() {
+        let (output, _) = run(r#"
+            fn note(text: String, value: Int) -> Int {
+                print(text);
+                value
+            }
+            let response = HttpResponse { body: { print("b"); "x" }, status: note("s", 201) };
+            println("");
+            println(response);
+            println(HttpRequest { method: "GET", path: "/" });
+            println(HttpResponse { status: 1 } == record { status: 1, headers: [], body: "" });
+            "#)
+        .expect("constructions should run");
+        assert_eq!(
+            output,
+            "bs\nrecord { status: 201, headers: [], body: \"x\" }\n\
+             record { method: \"GET\", path: \"/\", query: \"\", headers: [], body: \"\" }\n\
+             true\n"
+        );
+    }
+
+    #[test]
+    fn unchecked_named_construction_reports_the_checkers_field_error() {
+        for text in [
+            "HttpResponse { body: \"x\" };",
+            "HttpResponse { status: 1, extra: 2 };",
+            "HttpResponse { status: 1, status: 2 };",
+        ] {
+            let error = run_unchecked(text).expect_err("an invalid field set should fail");
+            assert_eq!(error.code(), "K3016", "{text}");
+        }
     }
 }

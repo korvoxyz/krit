@@ -62,6 +62,9 @@ struct ActiveGroup {
 
 struct Formatter {
     tokens: Vec<Token>,
+    /// Tokens the canonical form leaves out: the `: name` of a construction
+    /// field whose value is its own name, which is written punned.
+    omitted: Vec<bool>,
     token_text: Vec<String>,
     comments: Vec<Comment>,
     comment_cursor: usize,
@@ -81,14 +84,17 @@ impl Formatter {
     fn new(tokens: Vec<Token>, comments: Vec<Comment>, program: &Program) -> Self {
         let token_text = tokens.iter().map(canonical_token_text).collect::<Vec<_>>();
         let syntax = SyntaxMap::new(program, &tokens);
+        let omitted = punned_tokens(&tokens, &comments, &syntax.pun_values);
         let (groups, close_to_open) = build_groups(
             &tokens,
             &token_text,
             &comments,
             &syntax.block_spans,
             &syntax.call_group_spans,
+            &omitted,
         );
         Self {
+            omitted,
             type_tokens: syntax.type_tokens,
             generic_commas: syntax.generic_commas,
             breaks_after: syntax.breaks_after,
@@ -118,7 +124,7 @@ impl Formatter {
             }
             self.emit_comments_before(self.tokens[index].span.start);
 
-            if self.should_skip_trailing_comma(index) {
+            if self.omitted[index] || self.should_skip_trailing_comma(index) {
                 continue;
             }
 
@@ -394,6 +400,17 @@ struct SyntaxMap {
     type_tokens: Vec<bool>,
     generic_commas: Vec<bool>,
     breaks_after: HashMap<usize, usize>,
+    pun_values: Vec<PunCandidate>,
+}
+
+/// A construction field written `name: name`, which the canonical form
+/// writes punned as `name`.
+#[derive(Clone, Copy, Debug)]
+struct PunCandidate {
+    /// The end of the field name.
+    name_end: usize,
+    /// The span of the value, a single identifier token.
+    value: Span,
 }
 
 impl SyntaxMap {
@@ -476,8 +493,40 @@ impl SyntaxMap {
             type_tokens,
             generic_commas,
             breaks_after,
+            pun_values: collector.pun_values,
         }
     }
+}
+
+/// Marks the `:` and value tokens of every pun candidate, so the field is
+/// written punned. A field with a comment between its name and the end of
+/// its value keeps its `name: name` spelling, so no comment moves.
+fn punned_tokens(tokens: &[Token], comments: &[Comment], candidates: &[PunCandidate]) -> Vec<bool> {
+    let mut omitted = vec![false; tokens.len()];
+    for candidate in candidates {
+        let commented = {
+            let first = comments.partition_point(|comment| comment.span.end <= candidate.name_end);
+            comments
+                .get(first)
+                .is_some_and(|comment| comment.span.start < candidate.value.end)
+        };
+        if commented {
+            continue;
+        }
+        let value = tokens.partition_point(|token| token.span.start < candidate.value.start);
+        let is_value = tokens
+            .get(value)
+            .is_some_and(|token| token.span == candidate.value);
+        let colon = value.checked_sub(1).filter(|colon| {
+            tokens[*colon].kind == TokenKind::Colon
+                && tokens[*colon].span.start >= candidate.name_end
+        });
+        if let (true, Some(colon)) = (is_value, colon) {
+            omitted[colon] = true;
+            omitted[value] = true;
+        }
+    }
+    omitted
 }
 
 #[derive(Default)]
@@ -487,6 +536,7 @@ struct SyntaxCollector {
     type_spans: Vec<Span>,
     result_separator_spans: Vec<Span>,
     breaks_after: HashMap<usize, usize>,
+    pun_values: Vec<PunCandidate>,
 }
 
 /// One syntax-tree node awaiting collection.
@@ -590,6 +640,23 @@ impl SyntaxCollector {
                         .iter()
                         .map(|field| SyntaxNode::Expression(&field.value)),
                 );
+            }
+            ExpressionKind::Construct { fields, .. } => {
+                for field in fields {
+                    // Exactly the identifier `name`, not `(name)`.
+                    let is_own_name = matches!(
+                        &field.value.kind,
+                        ExpressionKind::Variable(name) if *name == field.name
+                    ) && field.value.span.end - field.value.span.start
+                        == field.name.len();
+                    if is_own_name && !field.is_punned() {
+                        self.pun_values.push(PunCandidate {
+                            name_end: field.name_span.end,
+                            value: field.value.span,
+                        });
+                    }
+                    pending.push(SyntaxNode::Expression(&field.value));
+                }
             }
             ExpressionKind::FieldAccess { value, .. } => {
                 pending.push(SyntaxNode::Expression(value));
@@ -696,6 +763,7 @@ fn build_groups(
     comments: &[Comment],
     block_spans: &HashSet<(usize, usize)>,
     call_group_spans: &HashSet<(usize, usize)>,
+    omitted: &[bool],
 ) -> (Vec<Option<GroupInfo>>, Vec<Option<usize>>) {
     let mut pairs = vec![None; tokens.len()];
     let mut close_to_open = vec![None; tokens.len()];
@@ -738,13 +806,15 @@ fn build_groups(
         });
     }
 
-    let mut optional_trailing_commas = vec![false; tokens.len()];
+    // Tokens the flat width leaves out: omitted pun tokens, and trailing
+    // commas, which a single-line group drops.
+    let mut unrendered = omitted.to_vec();
     for info in groups.iter().flatten() {
         if info.kind.allows_trailing_comma()
             && info.close > 0
             && matches!(tokens[info.close - 1].kind, TokenKind::Comma)
         {
-            optional_trailing_commas[info.close - 1] = true;
+            unrendered[info.close - 1] = true;
         }
     }
 
@@ -752,8 +822,7 @@ fn build_groups(
         let Some(info) = groups[open] else {
             continue;
         };
-        let flat_width =
-            canonical_flat_width(open, info.close, token_text, &optional_trailing_commas);
+        let flat_width = canonical_flat_width(open, info.close, token_text, &unrendered);
         groups[open]
             .as_mut()
             .expect("opening delimiter should have group information")
@@ -908,10 +977,10 @@ fn canonical_flat_width(
     open: usize,
     close: usize,
     token_text: &[String],
-    optional_trailing_commas: &[bool],
+    unrendered: &[bool],
 ) -> usize {
     (open..=close)
-        .filter(|index| !optional_trailing_commas[*index])
+        .filter(|index| !unrendered[*index])
         .map(|index| token_text[index].chars().count() + 1)
         .sum()
 }
@@ -1300,5 +1369,53 @@ mod tests {
             ),
             "let r = f(3, (1 + 2));\nlet wrapped = record { value: (1 + 2) };\n\nif [129] {\n    1\n} else {\n    2\n};\nmatch [129] {\n    [] => 0,\n    [head, ..tail] => head,\n};\n"
         );
+    }
+
+    #[test]
+    fn writes_construction_fields_punned_exactly_when_the_value_is_the_name() {
+        assert_eq!(
+            format(
+                "let status=1;let body=\"x\";\nlet r=HttpResponse{status:status,body:body,};\nlet s = HttpResponse { status: (status), body: body2 };\n"
+            ),
+            "let status = 1;\nlet body = \"x\";\nlet r = HttpResponse { status, body };\nlet s = HttpResponse { status: (status), body: body2 };\n"
+        );
+        // `record { ... }` has no punning.
+        assert_eq!(
+            format("let r = record { body: body };\n"),
+            "let r = record { body: body };\n"
+        );
+        // A comment between the name and the value keeps both.
+        let commented = format("let r = HttpResponse { status: // why\nstatus };\n");
+        assert_eq!(
+            commented,
+            "let r = HttpResponse {\n    status: // why\n    status,\n};\n"
+        );
+        assert_eq!(format(&commented), commented);
+    }
+
+    #[test]
+    fn breaks_long_constructions_one_field_per_line() {
+        let source = "let r = HttpRequest { method: \"POST\", path: \"/repos/example/issues/1/comments\", headers: [HttpHeader { name: \"accept\", value: \"application/json\" }], body: body };\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "let r = HttpRequest {\n    method: \"POST\",\n    path: \"/repos/example/issues/1/comments\",\n    headers: [HttpHeader { name: \"accept\", value: \"application/json\" }],\n    body,\n};\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+        // The punned spelling is what decides the width: this fits once
+        // `body: body` becomes `body`, and a value that cannot be punned
+        // does not.
+        let method = "m".repeat(48);
+        let fits = format(&format!(
+            "let r = HttpRequest {{ method: \"{method}\", path, body: body }};\n"
+        ));
+        assert_eq!(
+            fits,
+            format!("let r = HttpRequest {{ method: \"{method}\", path, body }};\n")
+        );
+        let breaks = format(&format!(
+            "let r = HttpRequest {{ method: \"{method}\", path, body: body2 }};\n"
+        ));
+        assert_eq!(breaks.lines().count(), 5, "{breaks}");
     }
 }

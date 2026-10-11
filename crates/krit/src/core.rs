@@ -6,9 +6,10 @@ use std::{
 };
 
 use crate::{
-    Analysis, BinaryOperator, Block, Builtin, EffectSet, Expression, ExpressionKind, FunctionType,
-    MatchKind, Parameter, Program, RequirementSet, ResolvedName, Span, Statement, StatementKind,
-    SymbolId, SymbolKind, Type, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+    Analysis, BinaryOperator, Block, Builtin, ConstructField, ContractRecord, EffectSet,
+    Expression, ExpressionKind, FieldDefault, FunctionType, MatchKind, Parameter, Program,
+    RequirementSet, ResolvedName, Span, Statement, StatementKind, SymbolId, SymbolKind, Type,
+    UnaryOperator, ValueLiteral, VariantFamily, VariantName,
     limits::{MAX_CORE_BLOCK_DEPTH, MAX_TREE_DEPTH},
 };
 
@@ -934,6 +935,11 @@ impl<'a> Lowerer<'a> {
                     OperationKind::Record(fields),
                 ))
             }
+            ExpressionKind::Construct {
+                contract,
+                contract_span,
+                fields,
+            } => self.lower_construction(*contract, *contract_span, fields, ty, source, operations),
             ExpressionKind::FieldAccess { value, field } => {
                 let value = self.lower_expression(value, operations)?;
                 Ok(self.emit(
@@ -1081,6 +1087,98 @@ impl<'a> Lowerer<'a> {
             }
             ExpressionKind::Binary { .. } => self.lower_binary_chain(expression, operations),
         }
+    }
+
+    /// Lowers a named construction to the same record operation that
+    /// `record { ... }` with every contract field would produce.
+    ///
+    /// The written values are lowered in source order, so their effects
+    /// happen in the order they are written. Each omitted field becomes one
+    /// pure literal operation for its spec-fixed default (`""` or `[]`), at
+    /// the type name's span, typed with the field's type from the
+    /// construction's analyzed record type.
+    fn lower_construction(
+        &mut self,
+        contract: ContractRecord,
+        contract_span: Span,
+        fields: &[ConstructField],
+        ty: Arc<Type>,
+        source: Option<Span>,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<ValueId, IrError> {
+        let Type::Record(record_types) = ty.as_ref() else {
+            return Err(IrError::new(format!(
+                "`{}` construction has non-record type `{ty}`",
+                contract.name()
+            )));
+        };
+        let mut written = BTreeMap::new();
+        for field in fields {
+            let value = self.lower_expression(&field.value, operations)?;
+            if written.insert(field.name.as_str(), value).is_some() {
+                return Err(IrError::new(format!(
+                    "`{}` construction writes field `{}` twice",
+                    contract.name(),
+                    field.name
+                )));
+            }
+        }
+        let mut operands = Vec::with_capacity(contract.fields().len());
+        for field in contract.fields() {
+            let value = match (written.remove(field.name), field.default) {
+                (Some(value), _) => value,
+                (None, Some(default)) => {
+                    let field_type = record_types
+                        .iter()
+                        .find(|record_type| record_type.name() == field.name)
+                        .map(crate::RecordType::shared_type)
+                        .ok_or_else(|| {
+                            IrError::new(format!(
+                                "`{}` construction type has no field `{}`",
+                                contract.name(),
+                                field.name
+                            ))
+                        })?;
+                    let kind = match default {
+                        FieldDefault::EmptyString => {
+                            OperationKind::Literal(ValueLiteral::String(String::new()))
+                        }
+                        FieldDefault::EmptyList => OperationKind::List(Vec::new()),
+                    };
+                    self.emit(
+                        operations,
+                        field_type,
+                        EffectSet::default(),
+                        Some(contract_span),
+                        kind,
+                    )
+                }
+                (None, None) => {
+                    return Err(IrError::new(format!(
+                        "`{}` construction omits required field `{}`",
+                        contract.name(),
+                        field.name
+                    )));
+                }
+            };
+            operands.push(RecordOperand {
+                name: field.name.to_owned(),
+                value,
+            });
+        }
+        if let Some(name) = written.keys().next() {
+            return Err(IrError::new(format!(
+                "`{}` construction writes unknown field `{name}`",
+                contract.name()
+            )));
+        }
+        Ok(self.emit(
+            operations,
+            ty,
+            EffectSet::default(),
+            source,
+            OperationKind::Record(operands),
+        ))
     }
 
     /// Lowers an `if` expression and its whole `else if` chain.
@@ -2867,7 +2965,9 @@ impl<'a> Verifier<'a> {
                 }
             }
             BinaryOperator::Equal | BinaryOperator::NotEqual => {
-                if left_type != right_type
+                // A built-in contract type and its structural record are the
+                // same type, so `response == record { ... }` compares them.
+                if !type_equivalent(left_type, right_type)
                     || !type_contains_no_function(left_type)
                     || operation.ty.as_ref() != &Type::Bool
                 {
@@ -4124,6 +4224,52 @@ mod tests {
                 .expect_err("bad capture should fail")
                 .to_string()
                 .contains("capture count")
+        );
+    }
+
+    #[test]
+    fn lowers_named_construction_to_a_full_record_with_default_literals() {
+        let text = "let body = \"x\";\nlet response = HttpResponse { body, status: 200 };\n";
+        let module = lowered(text);
+        assert!(!module.has_residual_types());
+        let rendered = module.render_text();
+        // The written value is lowered in source order, the omitted field
+        // becomes a typed `[]`, and the record lists the contract's order.
+        assert!(
+            rendered.contains(
+                "    v2: Int = int 200\n    v3: List<HttpHeader> = list []\n    \
+                 v4: Record { body: String, headers: List<HttpHeader>, status: Int } = \
+                 record {status: v2, headers: v3, body: v0}\n"
+            ),
+            "{rendered}"
+        );
+        let block = &module.functions()[0].body;
+        let default = block
+            .operations
+            .iter()
+            .find(|operation| matches!(operation.kind, OperationKind::List(_)))
+            .expect("the omitted headers become a list operation");
+        let type_name = text.find("HttpResponse").expect("type name");
+        assert_eq!(
+            default.source,
+            Some(Span::new(type_name, type_name + "HttpResponse".len()))
+        );
+
+        // A contract-typed value and a construction or record compare.
+        let compared = lowered(
+            "fn respond(body: String) -> HttpResponse {\n    HttpResponse { status: 200, body }\n}\n\
+             let same = respond(\"a\") == record { status: 200, headers: [], body: \"a\" };\n\
+             let also = HttpResponse { status: 1 } != respond(\"b\");\n",
+        );
+        compared.verify().expect("contract equality should verify");
+
+        let request = lowered("let r = HttpRequest { path: \"/x\", method: \"GET\" };");
+        assert!(
+            request
+                .render_text()
+                .contains("record {method: v1, path: v0, query: v2, headers: v3, body: v4}"),
+            "{}",
+            request.render_text()
         );
     }
 }

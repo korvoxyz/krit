@@ -3308,6 +3308,146 @@ license = "Apache-2.0"
 }
 
 #[test]
+fn named_construction_formats_checks_builds_and_invokes() {
+    let directory = TestDirectory::new("named-construction");
+    let program = directory.file(
+        "main.krit",
+        r#"webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let body = request.path;
+    if request.method == "POST" {
+        HttpResponse { status: 201, body: body, headers: [HttpHeader { name: "x-made", value: "yes" }] }
+    } else {
+        HttpResponse { status: 200, body }
+    }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/construction"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+"#,
+    );
+
+    let unformatted = krit()
+        .args(["fmt", "--check"])
+        .arg(&program)
+        .output()
+        .expect("Krit should check formatting");
+    assert_eq!(unformatted.status.code(), Some(1));
+    let formatted = krit()
+        .arg("fmt")
+        .arg(&program)
+        .output()
+        .expect("Krit should format");
+    assert!(formatted.status.success());
+    let text = fs::read_to_string(&program).expect("formatted source should be readable");
+    assert!(
+        text.contains(
+            "        HttpResponse {\n            status: 201,\n            body,\n            headers: [HttpHeader { name: \"x-made\", value: \"yes\" }],\n        }\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("        HttpResponse { status: 200, body }\n"),
+        "{text}"
+    );
+
+    let checked = krit()
+        .arg("check")
+        .arg(&program)
+        .output()
+        .expect("Krit should check");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    for (name, method, expected) in [
+        (
+            "created",
+            "POST",
+            r#"{"status":201,"headers":[{"name":"x-made","value":"yes"}],"body":"/hello"}"#,
+        ),
+        (
+            "read",
+            "GET",
+            r#"{"status":200,"headers":[],"body":"/hello"}"#,
+        ),
+    ] {
+        let request = directory.file(
+            &format!("{name}.json"),
+            &format!(
+                r#"{{"method":"{method}","path":"/hello","query":"","headers":[],"body":""}}"#
+            ),
+        );
+        let invoked = krit_in(&directory)
+            .args(["invoke", "--manifest"])
+            .arg(&manifest)
+            .arg("--request")
+            .arg(&request)
+            .output()
+            .expect("Krit should invoke");
+        assert!(
+            invoked.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&invoked.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(invoked.stdout).expect("response should be UTF-8"),
+            format!("{expected}\n"),
+            "{name}"
+        );
+    }
+
+    let invalid = directory.file(
+        "invalid.krit",
+        "let request = HttpRequest { method: \"GET\" };\n",
+    );
+    for command in ["check", "run"] {
+        let output = krit()
+            .args([command, "--diagnostic-format", "json"])
+            .arg(&invalid)
+            .output()
+            .expect("Krit should start");
+        assert_eq!(output.status.code(), Some(1), "{command}");
+        assert!(output.stdout.is_empty(), "{command}");
+        let diagnostics = parse_json_lines(&output.stderr);
+        assert_eq!(diagnostics.len(), 1, "{command}");
+        assert_eq!(diagnostics[0]["code"], "K3016", "{command}");
+        assert_eq!(
+            diagnostics[0]["message"], "`HttpRequest { ... }` is missing required field `path`",
+            "{command}"
+        );
+        assert_eq!(diagnostics[0]["span"]["start"]["column"], 15, "{command}");
+        assert_eq!(
+            diagnostics[0]["notes"].as_array().map(Vec::len),
+            Some(1),
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn invoke_decodes_escaped_json_strings_and_reports_invalid_json() {
     let directory = TestDirectory::new("invoke-json-escapes");
     let program = directory.file(

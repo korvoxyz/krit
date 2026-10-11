@@ -12,10 +12,11 @@ use crate::{Diagnostic, Span};
 
 /// Maximum syntactic nesting depth of a source file (`K1005`).
 ///
-/// Parenthesized expressions, blocks, list and record literals, call argument
-/// lists, field-access and call links, unary operands, `if` conditions,
-/// `match` subjects and arms, and type argument lists each open one level.
-/// An `else if` continuation and a chained binary operator do not.
+/// Parenthesized expressions, blocks, list and record literals, named
+/// constructions, call argument lists, field-access and call links, unary
+/// operands, `if` conditions, `match` subjects and arms, and type argument
+/// lists each open one level. An `else if` continuation and a chained binary
+/// operator do not.
 ///
 /// Analysis applies the same bound to the resolved type of every type
 /// variable, since inferred types can otherwise grow without limit: one level

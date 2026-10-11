@@ -125,6 +125,7 @@ network service, or nondeterministic value.
 | `functions/deep-recursion` | 9,000 nested calls stay within the call-depth limit |
 | `lists/match` | list construction and exhaustive decomposition |
 | `records/fields` | ordered record rendering and field access |
+| `records/named-construction` | named construction of the four contract records: punning, spec-fixed defaults, contract field order, source-order evaluation, and equality with the full `record { ... }` |
 | `variants/option-match` | exhaustive Option matching |
 | `variants/result-match` | exhaustive Result matching |
 | `json/round-trip` | deterministic JSON conversion |
@@ -139,18 +140,21 @@ network service, or nondeterministic value.
 | `check/valid/inference` | recursion, closures, empty lists, None, and effects infer together |
 | `check/syntax/missing-semicolon` | missing required syntax |
 | `check/syntax/habit-word-line-break` | a bound habit word ending a line before a missing `;` stays an ordinary name (`K1002`) |
+| `check/syntax/construction-in-condition` | a named construction written directly as an `if` condition is `K1001` with a note to add parentheses |
 | `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
 | `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, and an unbound `_` is undefined |
 | `check/name/did-you-mean`, `check/name/null` | undefined names (`K2001`) that carry a did-you-mean or `None` note |
 | `check/habit/*` | one case per construct from another language (`K1101`-`K1112`): `return`, loops, assignment, `struct`, `import`, `await`, `throw`, indexing, arrow functions, the conditional operator, `switch`, and `else { return ... }`; plus a conditional operator whose first branch does not parse |
 | `check/valid/habit-words-as-names` | habit words stay ordinary identifiers outside foreign constructs |
 | `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings and a method call on a string (`K3011`) |
+| `check/type/construction-*` | named construction with an unknown, repeated, or missing required field (`K3016`, one note) or a value of the wrong type (`K3001`) |
+| `check/valid/named-construction` | named constructions flow wherever contract records do: helper results, list annotations, parenthesized conditions, and equality with records |
 | `check/match/*` | unique, exhaustive, single-family Option and Result arms (`K1003`) |
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
 | `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, types that grow after they are bound, and types that grow when two solved types unify |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
-| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook built from named constructions builds |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |
@@ -163,6 +167,7 @@ network service, or nondeterministic value.
 | `format/comments` | exact standalone and end-of-line comment preservation |
 | `format/edition-2026` | canonical layout for all currently implemented syntax families |
 | `format/webhook` | canonical typed webhook and ordered duplicate-header layout |
+| `format/named-construction` | canonical named construction: one line when it fits, one field per line otherwise, and punning exactly when a value is the field's own name |
 
 ## Adding a case
 

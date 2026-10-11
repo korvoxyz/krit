@@ -463,6 +463,11 @@ fn assert_expression_names_resolved(expression: &Expression, analysis: &Analysis
                 assert_expression_names_resolved(&field.value, analysis);
             }
         }
+        ExpressionKind::Construct { fields, .. } => {
+            for field in fields {
+                assert_expression_names_resolved(&field.value, analysis);
+            }
+        }
         ExpressionKind::FieldAccess { value, .. } => {
             assert_expression_names_resolved(value, analysis);
         }

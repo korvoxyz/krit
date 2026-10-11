@@ -19,9 +19,10 @@ pub use analysis::{
     SymbolAnalysis, SymbolId, SymbolKind, Type, analyze, analyze_with_warnings,
 };
 pub use ast::{
-    BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program, RecordField,
-    RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator,
-    ValueLiteral, VariantArm, VariantFamily, VariantName,
+    BinaryOperator, Block, ConstructField, ContractField, ContractRecord, Expression,
+    ExpressionKind, FieldDefault, MatchKind, Parameter, Program, RecordField, RecordTypeField,
+    Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral, VariantArm,
+    VariantFamily, VariantName,
 };
 pub use builtin::{Builtin, BuiltinCategory};
 pub use core::{

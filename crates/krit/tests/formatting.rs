@@ -48,7 +48,7 @@ fn analysis_code(source: &Source) -> Result<(), &'static str> {
 #[test]
 fn formatting_fixtures_are_canonical_and_idempotent() {
     let root = repository_root().join("conformance/format");
-    for fixture in ["comments", "edition-2026", "webhook"] {
+    for fixture in ["comments", "edition-2026", "named-construction", "webhook"] {
         let directory = root.join(fixture);
         let input = fs::read_to_string(directory.join("input.krit"))
             .expect("formatter input should be readable");
@@ -200,6 +200,11 @@ fn deterministic_generated_corpus_preserves_formatting_properties() {
                 .to_owned(),
         ),
         (
+            "named-construction-punning".to_owned(),
+            "let status = 1;\nlet body = \"x\";\nlet r = HttpResponse{status:status,body:body,};\nlet c = HttpResponse { status: // pinned\nstatus };\n"
+                .to_owned(),
+        ),
+        (
             "webhook-contract".to_owned(),
             "webhook fn handle(request:HttpRequest)->HttpResponse{record{status:200,headers:[],body:request.path}}\n"
                 .to_owned(),
@@ -220,6 +225,8 @@ fn deterministic_generated_corpus_preserves_formatting_properties() {
         "if true { 1 } else { 2 }",
         "{ let inner = 1; inner + 1 }",
         "fn(value: Int) -> Int { value }",
+        "HttpResponse { status: 200, }",
+        "HttpHeader { name: \"a\", value: \"b\" }",
     ];
     for (index, atom) in atoms.iter().enumerate() {
         corpus.push((

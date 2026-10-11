@@ -39,10 +39,24 @@ fn(A, B) -> C
 The public Rust analysis API represents unresolved inference variables as
 `Type::Variable` and renders them as stable lowercase names such as `'a`.
 Source-level generic declaration syntax is not yet accepted. `HttpHeader`,
-`HttpRequest`, and `HttpResponse` are stable built-in aliases for the closed
-record structures in `LANGUAGE.md`; they retain their nominal names at public
-entrypoint and Core boundaries while participating in structural record
-checking. `Secret` is a distinct opaque type, never a `String` alias.
+`HttpRequest`, `HttpResponse`, and `LogField` are stable built-in aliases for
+the closed record structures in `LANGUAGE.md`; they retain their nominal names
+at public entrypoint and Core boundaries while participating in structural
+record checking. `Secret` is a distinct opaque type, never a `String` alias.
+
+A named construction such as `HttpResponse { status: 200, body }`
+(`LANGUAGE.md` section 8.2) has its contract's closed structural record type,
+`Record { body: String, headers: List<HttpHeader>, status: Int }` here, which
+is the type `record { ... }` with every contract field has once it meets the
+contract. The checker first checks the written field names (`K3016`), then
+analyzes each written value in source order and unifies it with its contract
+field's type, reporting a mismatch as `K3001` at the value (`` `HttpResponse`
+field `status` type mismatch ``). An omitted field contributes its contract
+field's concrete type (`String` or `List<HttpHeader>`) and no inference
+variable, effect, or requirement. The construction's effects and literal
+requirements are the union of its written values'. Core lowering emits the
+same record operation the full `record { ... }` would, with one pure literal
+operation per omitted field at the type name's span.
 
 There are no implicit numeric, string, boolean, or collection conversions.
 Union types, subtyping, null, exceptions, and user-defined mutable objects are

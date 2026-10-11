@@ -286,7 +286,10 @@ Policy 2 adds a deliberately bounded webhook ABI:
 - String concatenation (`+`), equality (`==`, `!=`), and byte-lexicographic
   ordering (`<`, `<=`, `>`, `>=`) through the guest string runtime below
 - `json_decode` into `String` through the guest JSON string decoder below
-- fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` records
+- fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` records, written as
+  `record { ... }` or by named construction (`HttpResponse { status: 200 }`,
+  `LANGUAGE.md` section 8.2), whose omitted fields lower to the same `""` and
+  `[]` literals the full record would write
 - ordered lists of headers
 - the Result/Option shapes returned by config, secrets, and HTTP
 - Result/Option matching and static references to non-capturing helpers
@@ -392,9 +395,9 @@ recursively; source nesting limits (`LANGUAGE.md` section 4.1) bound that
 nesting, and the backend independently refuses Core nested more than 8,192
 blocks deep with `K1005`, before support checking and equally in a
 `krit check` target check, rather than relying on that bound. Policy 1 rejects
-strings, lists, records, options, results, JSON conversion, lexical captures,
-matches, unsupported print values, and any operation without a correct
-lowering. It never substitutes a trapping placeholder or direct-evaluator
+strings, lists, records (named constructions included), options, results,
+JSON conversion, lexical captures, matches, unsupported print values, and any
+operation without a correct lowering. It never substitutes a trapping placeholder or direct-evaluator
 fallback. Policy 1 has no linear memory, so a String operator in a module
 program is reported where the String value is produced (the literal,
 parameter, or field), with the "String has no concrete guest layout in

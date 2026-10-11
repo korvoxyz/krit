@@ -3,9 +3,10 @@ use std::collections::HashSet;
 use crate::{
     Diagnostic, Source, Span,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
-        RecordField, RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind,
-        UnaryOperator, ValueLiteral, VariantArm, VariantFamily, VariantName,
+        BinaryOperator, Block, ConstructField, ContractRecord, Expression, ExpressionKind,
+        MatchKind, Parameter, Program, RecordField, RecordTypeField, Statement, StatementKind,
+        TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral, VariantArm, VariantFamily,
+        VariantName,
     },
     habits::Habit,
     limits::{MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, nesting_error, structural_error},
@@ -42,6 +43,12 @@ struct Parser<'source> {
     /// Conditional-operator checks currently parsing a first branch
     /// speculatively ([`Self::ternary_after`]).
     speculations: usize,
+    /// Whether a contract type name followed by `{` starts a named
+    /// construction here. It does not directly in an `if` condition or a
+    /// `match` subject, where the `{` opens the block or the arms, until a
+    /// bracketed group or block inside them allows it again
+    /// ([`Self::with_construction`]).
+    construction_allowed: bool,
 }
 
 impl<'source> Parser<'source> {
@@ -54,6 +61,7 @@ impl<'source> Parser<'source> {
             chain_depth: 0,
             peak: 0,
             speculations: 0,
+            construction_allowed: true,
         }
     }
 
@@ -312,7 +320,9 @@ impl<'source> Parser<'source> {
 
     fn block(&mut self) -> Result<Block, Diagnostic> {
         let start = self.expect(TokenKind::LeftBrace)?.span;
-        self.nested(start, |parser| parser.block_contents(start))
+        self.nested(start, |parser| {
+            parser.with_construction(true, |parser| parser.block_contents(start))
+        })
     }
 
     fn block_contents(&mut self, start: Span) -> Result<Block, Diagnostic> {
@@ -490,18 +500,7 @@ impl<'source> Parser<'source> {
                 self.enter(open)?;
                 let arguments_depth = self.structural_depth();
                 let callee_peak = std::mem::replace(&mut self.peak, arguments_depth);
-                let mut arguments = Vec::new();
-                if !self.check(&TokenKind::RightParen) {
-                    loop {
-                        arguments.push(self.expression()?);
-                        if !self.consume(&TokenKind::Comma) {
-                            break;
-                        }
-                        if self.check(&TokenKind::RightParen) {
-                            break;
-                        }
-                    }
-                }
+                let arguments = self.with_construction(true, Self::arguments)?;
                 height = 1 + height.max(self.peak - arguments_depth);
                 self.peak = self.peak.max(callee_peak);
                 self.reach(base + height, open)?;
@@ -546,6 +545,23 @@ impl<'source> Parser<'source> {
         Ok(expression)
     }
 
+    /// Parses a call's arguments up to, but not including, its `)`.
+    fn arguments(&mut self) -> Result<Vec<Expression>, Diagnostic> {
+        let mut arguments = Vec::new();
+        if !self.check(&TokenKind::RightParen) {
+            loop {
+                arguments.push(self.expression()?);
+                if !self.consume(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightParen) {
+                    break;
+                }
+            }
+        }
+        Ok(arguments)
+    }
+
     fn primary(&mut self) -> Result<Expression, Diagnostic> {
         let token = self.advance().clone();
         match token.kind {
@@ -576,6 +592,16 @@ impl<'source> Parser<'source> {
                 }
                 if let Some(habit) = self.word_habit(&name, token.span) {
                     return Err(habit);
+                }
+                if let Some(contract) = ContractRecord::from_name(&name)
+                    && self.check(&TokenKind::LeftBrace)
+                {
+                    if self.construction_allowed {
+                        return self.construction(contract, token.span);
+                    }
+                    if let Some(error) = self.restricted_construction(contract, token.span) {
+                        return Err(error);
+                    }
                 }
                 Ok(Expression {
                     kind: ExpressionKind::Variable(name),
@@ -611,7 +637,9 @@ impl<'source> Parser<'source> {
     /// `(x, y) => e`, `() => e`.
     fn parenthesized(&mut self, open: Span) -> Result<Expression, Diagnostic> {
         let open_index = self.cursor - 1;
-        let expression = match self.nested(open, Self::expression) {
+        let expression = match self.nested(open, |parser| {
+            parser.with_construction(true, Self::expression)
+        }) {
             Ok(expression) => expression,
             // `()` and parameters such as `(...rest)` are not expressions.
             Err(error) if !is_settled(&error) => {
@@ -882,7 +910,9 @@ impl<'source> Parser<'source> {
     }
 
     fn list(&mut self, start: Span) -> Result<Expression, Diagnostic> {
-        self.nested(start, |parser| parser.list_elements(start))
+        self.nested(start, |parser| {
+            parser.with_construction(true, |parser| parser.list_elements(start))
+        })
     }
 
     fn list_elements(&mut self, start: Span) -> Result<Expression, Diagnostic> {
@@ -906,7 +936,9 @@ impl<'source> Parser<'source> {
     }
 
     fn record(&mut self, start: Span) -> Result<Expression, Diagnostic> {
-        self.nested(start, |parser| parser.record_fields(start))
+        self.nested(start, |parser| {
+            parser.with_construction(true, |parser| parser.record_fields(start))
+        })
     }
 
     fn record_fields(&mut self, start: Span) -> Result<Expression, Diagnostic> {
@@ -945,6 +977,96 @@ impl<'source> Parser<'source> {
         })
     }
 
+    /// Parses a named construction `TypeName { field: value, punned, ... }`
+    /// after its type name at `start`; the current token is its `{`.
+    ///
+    /// The parser accepts any field names. Which fields a contract has,
+    /// requires, and defaults is checked by analysis (`K3016`).
+    fn construction(
+        &mut self,
+        contract: ContractRecord,
+        start: Span,
+    ) -> Result<Expression, Diagnostic> {
+        self.expect(TokenKind::LeftBrace)?;
+        self.nested(start, |parser| {
+            parser.with_construction(true, |parser| parser.construction_fields(contract, start))
+        })
+    }
+
+    fn construction_fields(
+        &mut self,
+        contract: ContractRecord,
+        start: Span,
+    ) -> Result<Expression, Diagnostic> {
+        let mut fields = Vec::new();
+        if !self.check(&TokenKind::RightBrace) {
+            loop {
+                let (name, name_span) = self.identifier()?;
+                let value = if self.consume(&TokenKind::Colon) {
+                    self.expression()?
+                } else if self.check(&TokenKind::Comma) || self.check(&TokenKind::RightBrace) {
+                    // A punned field `body` means `body: body`.
+                    Expression {
+                        kind: ExpressionKind::Variable(name.clone()),
+                        span: name_span,
+                    }
+                } else {
+                    return Err(self.expected("`:`, `,`, or `}`"));
+                };
+                fields.push(ConstructField {
+                    span: name_span.join(value.span),
+                    name,
+                    name_span,
+                    value,
+                });
+                if !self.consume(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightBrace) {
+                    break;
+                }
+            }
+        }
+        let end = self.expect(TokenKind::RightBrace)?.span;
+        Ok(Expression {
+            kind: ExpressionKind::Construct {
+                contract,
+                contract_span: start,
+                fields,
+            },
+            span: start.join(end),
+        })
+    }
+
+    /// Reports a named construction written directly as an `if` condition or
+    /// a `match` subject, where its `{` would open the block or the arms
+    /// instead: the type name at `name` is followed by `{` and then a field
+    /// name with `:` or `,`, which never start a block.
+    ///
+    /// `if HttpResponse { x } else { y }` stays a condition named
+    /// `HttpResponse`, since `{ x }` is a valid block.
+    fn restricted_construction(&self, contract: ContractRecord, name: Span) -> Option<Diagnostic> {
+        let field = self.tokens.get(self.cursor + 1)?;
+        let after = self.tokens.get(self.cursor + 2)?;
+        let starts_field = matches!(field.kind, TokenKind::Identifier(_))
+            && matches!(after.kind, TokenKind::Colon | TokenKind::Comma);
+        starts_field.then(|| {
+            Diagnostic::new(
+                "K1001",
+                format!(
+                    "`{} {{ ... }}` cannot be written directly as an `if` condition or a \
+                     `match` subject",
+                    contract.name()
+                ),
+                name.join(self.current().span),
+            )
+            .with_note(format!(
+                "wrap the construction in parentheses: `({} {{ ... }})`",
+                contract.name()
+            ))
+        })
+    }
+
     /// Parses an `if` expression and its whole `else if` chain.
     ///
     /// An `else if` continuation stays at the nesting level of the `if` it
@@ -955,7 +1077,9 @@ impl<'source> Parser<'source> {
         let mut links = Vec::new();
         let mut link_start = start;
         let alternative = loop {
-            let condition = self.nested(link_start, Self::expression)?;
+            let condition = self.nested(link_start, |parser| {
+                parser.with_construction(false, Self::expression)
+            })?;
             let consequent = self.block()?;
             let else_span = self.expect(TokenKind::Else)?.span;
             if let Some(habit) = self.else_return(else_span) {
@@ -1015,14 +1139,18 @@ impl<'source> Parser<'source> {
     }
 
     fn match_expression(&mut self, start: Span) -> Result<Expression, Diagnostic> {
-        let subject = self.nested(start, Self::expression)?;
+        let subject = self.nested(start, |parser| {
+            parser.with_construction(false, Self::expression)
+        })?;
         let open = self.expect(TokenKind::LeftBrace)?.span;
         self.nested(open, |parser| {
-            if parser.check(&TokenKind::LeftBracket) {
-                parser.list_match(start, subject)
-            } else {
-                parser.variant_match(start, subject)
-            }
+            parser.with_construction(true, |parser| {
+                if parser.check(&TokenKind::LeftBracket) {
+                    parser.list_match(start, subject)
+                } else {
+                    parser.variant_match(start, subject)
+                }
+            })
         })
     }
 
@@ -1334,6 +1462,17 @@ impl<'source> Parser<'source> {
         Ok((name, token.span))
     }
 
+    /// Runs `parse` with named construction allowed or not
+    /// ([`Self::construction_allowed`]), and restores the enclosing setting
+    /// whether `parse` succeeds or not, so a failed speculative parse leaves
+    /// it unchanged too.
+    fn with_construction<T>(&mut self, allowed: bool, parse: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = std::mem::replace(&mut self.construction_allowed, allowed);
+        let result = parse(self);
+        self.construction_allowed = outer;
+        result
+    }
+
     /// Parses one syntactic nesting level opened by the construct at `span`.
     fn nested<T>(
         &mut self,
@@ -1591,6 +1730,7 @@ mod tests {
             "blocks" => ("{ ", "1", " }", ""),
             "lists" => ("[", "1", "]", ""),
             "records" => ("record { a: ", "1", " }", ""),
+            "constructions" => ("HttpResponse { status: ", "1", " }", ""),
             "ifs" => ("if true { ", "1", " } else { 0 }", ""),
             "matches" => ("match Some(1) { None => 0, Some(x) => ", "1", " }", ""),
             "calls" => ("f(", "1", ")", "fn f(x) { x }\n"),
@@ -1620,6 +1760,7 @@ mod tests {
             "blocks",
             "lists",
             "records",
+            "constructions",
             "ifs",
             "matches",
             "calls",
@@ -2091,6 +2232,163 @@ mod tests {
         ] {
             let error = parse_text(text).expect_err("should not parse");
             assert_eq!(error.code(), code, "{text}");
+        }
+    }
+
+    /// The written fields of the named construction `text` is the value of,
+    /// as `(name, punned)` pairs.
+    fn construction_fields(text: &str) -> (ContractRecord, Vec<(String, bool)>) {
+        let program = parse_text(text).expect("construction should parse");
+        let StatementKind::Let { value, .. } = &program.statements.last().unwrap().kind else {
+            panic!("the last statement should be a let");
+        };
+        let ExpressionKind::Construct {
+            contract, fields, ..
+        } = &value.kind
+        else {
+            panic!("the value should be a named construction: {value:?}");
+        };
+        let fields = fields
+            .iter()
+            .map(|field| (field.name.clone(), field.is_punned()))
+            .collect();
+        (*contract, fields)
+    }
+
+    #[test]
+    fn parses_named_construction_with_punning_and_trailing_commas() {
+        let (contract, fields) =
+            construction_fields("let body = \"x\";\nlet r = HttpResponse { status: 200, body, };");
+        assert_eq!(contract, ContractRecord::HttpResponse);
+        assert_eq!(
+            fields,
+            [("status".to_owned(), false), ("body".to_owned(), true)]
+        );
+
+        let (contract, fields) = construction_fields("let r = HttpRequest {};");
+        assert_eq!(contract, ContractRecord::HttpRequest);
+        assert!(fields.is_empty());
+
+        for (name, contract) in [
+            ("HttpHeader", ContractRecord::HttpHeader),
+            ("LogField", ContractRecord::LogField),
+        ] {
+            let (parsed, fields) =
+                construction_fields(&format!("let r = {name} {{ name: \"a\", value }};"));
+            assert_eq!(parsed, contract);
+            assert_eq!(
+                fields,
+                [("name".to_owned(), false), ("value".to_owned(), true)]
+            );
+        }
+
+        // A punned field's value is the variable at the field name's span.
+        let program = parse_text("let r = HttpResponse { status };").expect("should parse");
+        let StatementKind::Let { value, .. } = &program.statements[0].kind else {
+            panic!("let expected");
+        };
+        let ExpressionKind::Construct {
+            contract_span,
+            fields,
+            ..
+        } = &value.kind
+        else {
+            panic!("construction expected");
+        };
+        assert_eq!(*contract_span, Span::new(8, 20));
+        assert_eq!(value.span, Span::new(8, 31));
+        assert_eq!(fields[0].name_span, Span::new(23, 29));
+        assert_eq!(fields[0].value.span, fields[0].name_span);
+        assert!(
+            matches!(&fields[0].value.kind, ExpressionKind::Variable(name) if name == "status")
+        );
+    }
+
+    #[test]
+    fn only_the_four_contract_names_start_a_named_construction() {
+        for text in [
+            "let r = QueueJob { id: \"x\" };",
+            "let r = Response { status: 200 };",
+            "let r = httpResponse { status: 200 };",
+        ] {
+            let error = parse_text(text).expect_err("other names are not constructions");
+            assert_eq!(error.code(), "K1002", "{text}");
+        }
+        let error = parse_text("let r = HttpResponse { status 200 };")
+            .expect_err("a field needs `:`, `,`, or `}` after its name");
+        assert_eq!(error.code(), "K1002");
+        assert!(error.message().contains("`:`, `,`, or `}`"));
+    }
+
+    #[test]
+    fn named_construction_needs_parentheses_as_a_condition_or_subject() {
+        for (text, span) in [
+            (
+                "if HttpResponse { status: 1 }.status == 1 { 1 } else { 2 };",
+                Span::new(3, 17),
+            ),
+            (
+                "let x = 1;\nif x == 1 { 1 } else if HttpHeader { name, value: \"\" }.name == \"\" { 2 } else { 3 };",
+                Span::new(35, 47),
+            ),
+            (
+                "match HttpRequest { method: \"GET\", path: \"/\" }.method { _ => 1 };",
+                Span::new(6, 19),
+            ),
+            (
+                "if !LogField { name: \"a\", value: \"b\" }.name { 1 } else { 2 };",
+                Span::new(4, 14),
+            ),
+        ] {
+            let error = parse_text(text).expect_err("a bare construction condition should fail");
+            assert_eq!(error.code(), "K1001", "{text}");
+            assert_eq!(error.span(), span, "{text}");
+            assert_eq!(error.notes().len(), 1, "{text}");
+        }
+
+        // Parentheses, brackets, call arguments, blocks, and match arms
+        // inside a condition or subject allow it again.
+        for text in [
+            "if (HttpResponse { status: 1 }).status == 1 { 1 } else { 2 };",
+            "fn f(r) { r.status == 1 }\nif f(HttpResponse { status: 1 }) { 1 } else { 2 };",
+            "if [HttpHeader { name: \"a\", value: \"b\" }] == [] { 1 } else { 2 };",
+            "if { HttpResponse { status: 1 } }.status == 1 { 1 } else { 2 };",
+            "if match Some(1) { Some(x) => HttpResponse { status: x }, None => HttpResponse { status: 0 } }.status == 1 { 1 } else { 2 };",
+            "match (HttpRequest { method: \"GET\", path: \"/\" }).headers { [] => 0, [h, ..t] => 1 };",
+            "if true { HttpResponse { status: 1 } } else { HttpResponse { status: 2 } };",
+        ] {
+            parse_text(text).unwrap_or_else(|error| panic!("{text}: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn contract_names_before_a_block_keep_their_meaning_in_conditions() {
+        // `{ x }` is a valid block, so the condition is the name itself.
+        let program = parse_text(
+            "let HttpResponse = true;\nlet x = 1;\nlet y = if HttpResponse { x } else { 2 };",
+        )
+        .expect("a bound contract name is an ordinary condition");
+        let StatementKind::Let { value, .. } = &program.statements[2].kind else {
+            panic!("let expected");
+        };
+        let ExpressionKind::If { condition, .. } = &value.kind else {
+            panic!("if expected");
+        };
+        assert!(
+            matches!(&condition.kind, ExpressionKind::Variable(name) if name == "HttpResponse")
+        );
+        parse_text("let HttpRequest = [];\nmatch HttpRequest { [] => 0, [h, ..t] => 1 };")
+            .expect("a bound contract name is an ordinary match subject");
+    }
+
+    #[test]
+    fn a_conditional_operator_around_a_construction_is_still_reported() {
+        for text in [
+            "if ready ? HttpResponse { status: 1 } : other { 1 } else { 2 };",
+            "let r = ready ? HttpResponse { status: 1 } : HttpResponse { status: 2 };",
+        ] {
+            let error = parse_text(text).expect_err("should not parse");
+            assert_eq!(error.code(), "K1110", "{text}");
         }
     }
 
