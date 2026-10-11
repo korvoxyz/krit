@@ -8,8 +8,8 @@ use std::{
 use crate::{
     Analysis, BinaryOperator, Block, Builtin, ConstructField, ContractRecord, EffectSet,
     Expression, ExpressionKind, FieldDefault, FunctionType, ListEntry, MatchKind, Parameter,
-    Program, RequirementSet, ResolvedName, Span, Statement, StatementKind, SymbolId, SymbolKind,
-    Type, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+    Program, RequirementSet, ResolvedName, Span, Statement, StatementKind, StringPart, SymbolId,
+    SymbolKind, Type, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
     limits::{MAX_CORE_BLOCK_DEPTH, MAX_TREE_DEPTH},
 };
 
@@ -872,6 +872,9 @@ impl<'a> Lowerer<'a> {
                 source,
                 OperationKind::Literal(literal.clone()),
             )),
+            ExpressionKind::Interpolation(parts) => {
+                self.lower_interpolation(parts, ty, expression.span, operations)
+            }
             ExpressionKind::Variable(_) => {
                 let resolution = fact.resolved_name().ok_or_else(|| {
                     IrError::new(format!(
@@ -1097,6 +1100,67 @@ impl<'a> Lowerer<'a> {
             }
             ExpressionKind::Binary { .. } => self.lower_binary_chain(expression, operations),
         }
+    }
+
+    /// Lowers an interpolated string or text block at `span` to left-to-right
+    /// concatenation: each text part is a string literal operation at its
+    /// span, each hole is its lowered value, and every part after the first
+    /// is appended with one `add` operation spanning the string up to that
+    /// part. A string with no parts is the empty string literal, and a
+    /// string that is one hole is that hole's value.
+    fn lower_interpolation(
+        &mut self,
+        parts: &[StringPart],
+        ty: Arc<Type>,
+        span: Span,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<ValueId, IrError> {
+        if ty.as_ref() != &Type::String {
+            return Err(IrError::new(format!(
+                "interpolated string has non-string type `{ty}`"
+            )));
+        }
+        let mut result = None;
+        for part in parts {
+            let (value, part_end) = match part {
+                StringPart::Text { value, span } => (
+                    self.emit(
+                        operations,
+                        Arc::clone(&ty),
+                        EffectSet::default(),
+                        Some(*span),
+                        OperationKind::Literal(ValueLiteral::String(value.clone())),
+                    ),
+                    span.end,
+                ),
+                StringPart::Hole { value, span } => {
+                    (self.lower_expression(value, operations)?, span.end)
+                }
+            };
+            result = Some(match result {
+                None => value,
+                Some(left) => self.emit(
+                    operations,
+                    Arc::clone(&ty),
+                    EffectSet::default(),
+                    Some(Span::new(span.start, part_end)),
+                    OperationKind::Binary {
+                        left,
+                        operator: BinaryOperator::Add,
+                        right: value,
+                    },
+                ),
+            });
+        }
+        Ok(result.unwrap_or_else(|| {
+            self.emit(
+                operations,
+                ty,
+                EffectSet::default(),
+                Some(span),
+                OperationKind::Literal(ValueLiteral::String(String::new())),
+            )
+        }))
     }
 
     /// Lowers an entry list to the operations `[record { name: k, value: v },
@@ -4324,6 +4388,62 @@ mod tests {
                 .contains("record {method: v1, path: v0, query: v2, headers: v3, body: v4}"),
             "{}",
             request.render_text()
+        );
+    }
+
+    #[test]
+    fn lowers_interpolation_to_left_to_right_concatenation() {
+        let text = "let user = record { name: \"Ada\" };\nlet id = \"7\";\n\
+                    let line = \"<\\(user.name)|\\(id)>\";\n";
+        let module = lowered(text);
+        let rendered = module.render_text();
+        assert!(
+            rendered.contains(
+                "    v5: String = string \"<\"\n    v6: String = field v1.name\n    \
+                 v7: String = add v5 v6\n    v8: String = string \"|\"\n    \
+                 v9: String = add v7 v8\n    v10: String = add v9 v3\n    \
+                 v11: String = string \">\"\n    v12: String = add v10 v11\n    \
+                 v13: Unit = bind b2 = v12\n"
+            ),
+            "{rendered}"
+        );
+        // Each text part is a literal at its own span, and each appended part
+        // spans the string up to that part.
+        let string = text.find("\"<").expect("string");
+        let mut sources = Vec::new();
+        visit_operations(&module.functions()[0].body, &mut |operation| {
+            if matches!(
+                operation.kind,
+                OperationKind::Literal(ValueLiteral::String(_)) | OperationKind::Binary { .. }
+            ) && operation.source.is_some_and(|span| span.start >= string)
+            {
+                let span = operation.source.expect("checked above");
+                sources.push(&text[span.start..span.end]);
+            }
+        });
+        assert_eq!(
+            sources,
+            [
+                "<",
+                "\"<\\(user.name)",
+                "|",
+                "\"<\\(user.name)|",
+                "\"<\\(user.name)|\\(id)",
+                ">",
+                "\"<\\(user.name)|\\(id)>",
+            ]
+        );
+
+        // A lone hole is its value, and an empty text block the empty string.
+        let rendered = lowered("let id = \"7\";\nlet same = \"\\(id)\";\n").render_text();
+        assert!(
+            rendered.contains("    v2: Unit = bind b1 = v0\n"),
+            "{rendered}"
+        );
+        let rendered = lowered("let empty = \"\"\"\n\"\"\";\n").render_text();
+        assert!(
+            rendered.contains("    v0: String = string \"\"\n    v1: Unit = bind b0 = v0\n"),
+            "{rendered}"
         );
     }
 }

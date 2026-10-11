@@ -72,6 +72,22 @@ operation per entry at the entry's span (from the key to the value), and the
 list operation. Doc comments (`LANGUAGE.md` section 2.1) take no part in
 checking.
 
+An interpolated string or text block (`LANGUAGE.md` section 9.1) has type
+`String`. The checker analyzes each hole's value in source order, a name with
+optional field accesses, records a fact for it at its own span inside the
+string, and unifies its type with `String`; a mismatch is `K3015` at the hole
+(`` interpolation hole `count` has type `Int`, but a hole must be a `String` ``)
+with one note, never `K3001`. So a hole fixes an unannotated parameter or an
+open record field to `String`, as `+` with a `String` operand would, and a
+later use at another type is the ordinary `K3001` there. Holes add no effect
+and no requirement. Core lowering is left-to-right concatenation with the
+existing operations: one string literal operation per text part at that
+text's span, each hole's value, and one `add` per part after the first,
+spanning the string up to that part; a string with no parts is the empty
+string literal, and one that is a single hole is that hole's value. No
+operation or Core form is specific to interpolation, so every backend that
+lowers string literals and string `+` lowers it.
+
 There are no implicit numeric, string, boolean, or collection conversions.
 Union types, subtyping, null, exceptions, and user-defined mutable objects are
 out of scope for the first static checker.
@@ -210,6 +226,11 @@ Effects and capabilities answer different questions:
 
 - **Effect:** what an expression may attempt.
 - **Capability:** what the host permits this execution to do.
+
+Literal requirements come only from direct string literals, which are
+one-line strings without holes. An interpolated string or text block in a
+resource position is `K3008`, even when it has no holes, so every resource is
+spelled out where it is used.
 
 A program can type-check while lacking a runtime grant. The analyzer reports
 the inferred effect and requirement sets to compiler clients. Source-only

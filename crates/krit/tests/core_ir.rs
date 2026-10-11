@@ -4,8 +4,8 @@ use std::{
 };
 
 use krit::{
-    Analysis, Block, Expression, ExpressionKind, MatchKind, Source, StatementKind, analyze, lower,
-    parse_source,
+    Analysis, Block, Expression, ExpressionKind, MatchKind, Source, StatementKind, StringPart,
+    analyze, lower, parse_source,
 };
 
 fn lower_source(name: impl Into<String>, text: impl Into<String>) -> String {
@@ -474,6 +474,13 @@ fn assert_expression_names_resolved(expression: &Expression, analysis: &Analysis
     }
     match &expression.kind {
         ExpressionKind::Literal(_) | ExpressionKind::Unit | ExpressionKind::Variable(_) => {}
+        ExpressionKind::Interpolation(parts) => {
+            for part in parts {
+                if let StringPart::Hole { value, .. } = part {
+                    assert_expression_names_resolved(value, analysis);
+                }
+            }
+        }
         ExpressionKind::List(elements) => {
             for element in elements {
                 assert_expression_names_resolved(element, analysis);

@@ -53,7 +53,9 @@ fn formatting_fixtures_are_canonical_and_idempotent() {
         "doc-comments",
         "edition-2026",
         "entry-lists",
+        "interpolation",
         "named-construction",
+        "text-blocks",
         "unit-literal",
         "webhook",
     ] {
@@ -223,6 +225,16 @@ fn deterministic_generated_corpus_preserves_formatting_properties() {
                 .to_owned(),
         ),
         (
+            "interpolation".to_owned(),
+            "let who=record{name:\"Ada\"};\nlet id = \"7\";\nprintln(\"\\u{48}i \\(who.name)\\(id)\\\\(x)\"+\"\\(id)\");\n"
+                .to_owned(),
+        ),
+        (
+            "text-blocks".to_owned(),
+            "fn p(t:String)->String{\n\"\"\"\n\t\tTitle: \\(t)\n\t\t  \"quoted\"\n\n\t\t\"\"\"}\nlet a = p(\"\"\"\r\n  x\r\n  \"\"\");\nlet b = [\"\"\"\n\"\"\", \"\"\"\n\n  \"\"\"];\n"
+                .to_owned(),
+        ),
+        (
             "webhook-contract".to_owned(),
             "webhook fn handle(request:HttpRequest)->HttpResponse{record{status:200,headers:[],body:request.path}}\n"
                 .to_owned(),
@@ -247,6 +259,8 @@ fn deterministic_generated_corpus_preserves_formatting_properties() {
         "HttpHeader { name: \"a\", value: \"b\" }",
         "[\"k\": \"v\",]",
         "Ok(( ))",
+        "\"\\(generated_0)-\\(generated_2)\"",
+        "\"\"\"\n  text \\(generated_2)\n  \"\"\"",
     ];
     for (index, atom) in atoms.iter().enumerate() {
         corpus.push((

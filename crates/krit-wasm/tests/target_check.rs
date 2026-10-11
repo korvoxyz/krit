@@ -290,6 +290,53 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
 }
 
 #[test]
+fn interpolation_and_text_blocks_build_in_webhooks_and_fail_at_their_span_in_modules() {
+    let webhook = lower_source(
+        r#"
+/// Composes the reviewer's prompt.
+fn prompt(request: HttpRequest) -> String {
+    """
+    Review "\(request.path)" (\(request.method)):
+
+    \(request.body)
+    """
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match ai_invoke("reviewer", prompt(request)) {
+        Ok(answer) => HttpResponse { status: 200, body: "verdict: \(answer)" },
+        Err(reason) => HttpResponse { status: 502, body: "\(reason)" },
+    }
+}
+"#,
+    );
+    let effects = options(&["ai.invoke"]);
+    assert!(check_target(&webhook, &effects, CheckTarget::Component).is_empty());
+    let artifact = build_component(&webhook, &effects).expect("a webhook composing strings builds");
+    validate_artifact(&artifact.bytes, &artifact.metadata)
+        .expect("a webhook composing strings validates");
+
+    // Policy 1 has no string layout: the text parts and the concatenation
+    // are reported inside the interpolated string, never at `1:1`.
+    let text = "let name = \"Ada\";\nlet greeting = \"hey \\(name)!\";\nprintln(1);\n";
+    let errors = check_target(&lower_source(text), &options(&[]), CheckTarget::Module);
+    assert_sorted_unique_and_located(&errors);
+    assert!(
+        errors.iter().all(|error| error.code() == "K7002"),
+        "{errors:#?}"
+    );
+    let string = span_of(text, "\"hey \\(name)!\"");
+    let inside = errors
+        .iter()
+        .filter_map(BuildError::span)
+        .filter(|span| span.start >= string.start && span.end <= string.end)
+        .map(|span| span.start)
+        .collect::<Vec<_>>();
+    assert!(inside.contains(&span_of(text, "hey ").start), "{errors:#?}");
+    assert!(inside.contains(&span_of(text, "!\"").start), "{errors:#?}");
+}
+
+#[test]
 fn target_checks_ignore_package_grants_that_builds_enforce() {
     let module = lower_source("println(1);\n");
     assert!(check_target(&module, &options(&[]), CheckTarget::Component).is_empty());

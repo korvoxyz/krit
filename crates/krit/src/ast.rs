@@ -103,6 +103,15 @@ pub struct Expression {
 #[derive(Clone, Debug)]
 pub enum ExpressionKind {
     Literal(ValueLiteral),
+    /// A string written with interpolation holes (`"Hi \(name)!"`), or a
+    /// `"""` text block, with or without holes: the concatenation of its
+    /// parts from left to right, of type `String`.
+    ///
+    /// It is never a [`ValueLiteral`], so it never counts as a capability
+    /// resource literal. Its parts have no syntax nodes apart from each
+    /// hole's value, whose spans lie inside the string, so every node keeps a
+    /// span of its own.
+    Interpolation(Vec<StringPart>),
     /// The unit value `()`.
     Unit,
     Variable(String),
@@ -169,6 +178,19 @@ pub struct RecordField {
     pub name: String,
     pub value: Expression,
     pub span: Span,
+}
+
+/// One part of an interpolated string or text block.
+#[derive(Clone, Debug)]
+pub enum StringPart {
+    /// Literal text with its escapes decoded; in a text block, with each
+    /// line's indentation removed and line breaks normalized to `\n`. The
+    /// parser never produces an empty text part or two adjacent ones.
+    Text { value: String, span: Span },
+    /// A hole `\(name.field)`. `value` is the variable named in it, followed
+    /// by its field accesses, at the spans of those names inside the hole;
+    /// `span` covers the hole from its `\` to its `)`.
+    Hole { value: Expression, span: Span },
 }
 
 /// One `key: value` entry of an entry list.

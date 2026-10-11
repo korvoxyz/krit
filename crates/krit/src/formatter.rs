@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     Block, Diagnostic, Expression, ExpressionKind, MatchKind, Program, Source, Span, Statement,
-    StatementKind, TypeAnnotation, TypeKind,
+    StatementKind, StringPart, TypeAnnotation, TypeKind,
     lexer::{Comment, lex_with_comments},
     parser,
-    token::{Token, TokenKind},
+    token::{TemplatePart, Token, TokenKind},
 };
 
 /// The formatter's soft line-width target.
@@ -184,7 +184,13 @@ impl Formatter {
         if self.needs_space(index) {
             self.writer.space();
         }
-        self.writer.write(&self.token_text[index]);
+        if let TokenKind::Template(template) = &self.tokens[index].kind
+            && let Some(lines) = &template.text_block
+        {
+            self.writer.write_text_block(lines);
+        } else {
+            self.writer.write(&self.token_text[index]);
+        }
         self.previous_rendered = Some(index);
         self.closing_group = None;
     }
@@ -330,6 +336,8 @@ struct Writer {
     indent: usize,
     column: usize,
     line_start: bool,
+    /// The indentation level the current line started at.
+    line_indent: usize,
 }
 
 impl Default for Writer {
@@ -339,6 +347,7 @@ impl Default for Writer {
             indent: 0,
             column: 0,
             line_start: true,
+            line_indent: 0,
         }
     }
 }
@@ -351,9 +360,39 @@ impl Writer {
             }
             self.column = self.indent * 4;
             self.line_start = false;
+            self.line_indent = self.indent;
         }
         self.output.push_str(text);
         self.column += text.chars().count();
+    }
+
+    /// Writes a text block whose content lines, without indentation, are
+    /// `lines`: the opening `"""` here, then each line and the closing
+    /// `"""` at the opening delimiter's indentation when it starts its
+    /// line, or one level deeper than the line it opens on otherwise. An
+    /// empty content line stays empty, so no trailing whitespace is added;
+    /// every other line is written exactly as it was, after the new
+    /// indentation.
+    fn write_text_block(&mut self, lines: &[String]) {
+        let starts_line = self.line_start;
+        self.write("\"\"\"");
+        let level = if starts_line {
+            self.line_indent
+        } else {
+            self.line_indent + 1
+        };
+        let indentation = " ".repeat(level * 4);
+        for line in lines {
+            self.output.push('\n');
+            if !line.is_empty() {
+                self.output.push_str(&indentation);
+                self.output.push_str(line);
+            }
+        }
+        self.output.push('\n');
+        self.output.push_str(&indentation);
+        self.output.push_str("\"\"\"");
+        self.column = indentation.len() + 3;
     }
 
     fn space(&mut self) {
@@ -675,6 +714,12 @@ impl SyntaxCollector {
     fn expression<'a>(&mut self, expression: &'a Expression, pending: &mut Vec<SyntaxNode<'a>>) {
         match &expression.kind {
             ExpressionKind::Literal(_) | ExpressionKind::Unit | ExpressionKind::Variable(_) => {}
+            ExpressionKind::Interpolation(parts) => {
+                pending.extend(parts.iter().filter_map(|part| match part {
+                    StringPart::Hole { value, .. } => Some(SyntaxNode::Expression(value)),
+                    StringPart::Text { .. } => None,
+                }));
+            }
             ExpressionKind::List(elements) => {
                 pending.extend(elements.iter().map(SyntaxNode::Expression));
             }
@@ -958,6 +1003,10 @@ fn canonical_token_text(token: &Token) -> String {
     match &token.kind {
         TokenKind::Identifier(value) | TokenKind::Integer(value) => value.clone(),
         TokenKind::String(value) => canonical_string(value),
+        // A text block is laid out by `Writer::write_text_block`; within a
+        // line it is as wide as its opening delimiter.
+        TokenKind::Template(template) if template.text_block.is_some() => "\"\"\"".to_owned(),
+        TokenKind::Template(template) => canonical_template(&template.parts),
         TokenKind::Let => "let".to_owned(),
         TokenKind::Fn => "fn".to_owned(),
         TokenKind::Webhook => "webhook".to_owned(),
@@ -1003,6 +1052,36 @@ fn canonical_token_text(token: &Token) -> String {
 fn canonical_string(value: &str) -> String {
     let mut output = String::with_capacity(value.len() + 2);
     output.push('"');
+    push_canonical_text(&mut output, value);
+    output.push('"');
+    output
+}
+
+/// A one-line interpolated string: its text written as in any string, and
+/// each hole exactly as written, `\(name.field)`.
+fn canonical_template(parts: &[TemplatePart]) -> String {
+    let mut output = String::from("\"");
+    for part in parts {
+        match part {
+            TemplatePart::Text { value, .. } => push_canonical_text(&mut output, value),
+            TemplatePart::Hole { path, .. } => {
+                output.push_str("\\(");
+                for (index, (name, _)) in path.iter().enumerate() {
+                    if index > 0 {
+                        output.push('.');
+                    }
+                    output.push_str(name);
+                }
+                output.push(')');
+            }
+        }
+    }
+    output.push('"');
+    output
+}
+
+/// Appends `value` as the inside of a canonical string literal.
+fn push_canonical_text(output: &mut String, value: &str) {
     for character in value.chars() {
         match character {
             '"' => output.push_str("\\\""),
@@ -1019,8 +1098,6 @@ fn canonical_string(value: &str) -> String {
             character => output.push(character),
         }
     }
-    output.push('"');
-    output
 }
 
 fn canonical_flat_width(
@@ -1152,6 +1229,7 @@ fn is_word(kind: &TokenKind) -> bool {
         TokenKind::Identifier(_)
             | TokenKind::Integer(_)
             | TokenKind::String(_)
+            | TokenKind::Template(_)
             | TokenKind::Let
             | TokenKind::Fn
             | TokenKind::Webhook
@@ -1193,6 +1271,7 @@ fn can_end_expression(kind: &TokenKind) -> bool {
         TokenKind::Identifier(_)
             | TokenKind::Integer(_)
             | TokenKind::String(_)
+            | TokenKind::Template(_)
             | TokenKind::True
             | TokenKind::False
             | TokenKind::RightParen
@@ -1526,5 +1605,75 @@ mod tests {
             "let r = HttpRequest {{ method: \"{method}\", path, body: body2 }};\n"
         ));
         assert_eq!(breaks.lines().count(), 5, "{breaks}");
+    }
+
+    /// The output of running `text`, which must check.
+    fn output(text: &str) -> String {
+        let mut output = Vec::new();
+        crate::run_source(&Source::new("test.krit", text), &mut output).expect("source should run");
+        String::from_utf8(output).expect("output should be UTF-8")
+    }
+
+    #[test]
+    fn keeps_holes_and_canonicalizes_the_text_of_interpolated_strings() {
+        let source = "let user=record{name:\"Ada\"};\nprintln(\"\\u{48}i,\\t\\(user.name)\\\\(x)\\u{21}\"  );\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "let user = record { name: \"Ada\" };\n\nprintln(\"Hi,\\t\\(user.name)\\\\(x)!\");\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+        assert_eq!(output(&formatted), output(source));
+    }
+
+    #[test]
+    fn re_indents_text_blocks_and_preserves_their_content() {
+        let source = "fn p(t: String) -> String {\n\"\"\"\n\t\tTitle: \\(t)\n\t\t  deeper \"quoted\"   \n\n\t\t\"\"\"\n}\n\
+                      let a = p(\"\"\"\n  x\n  \"\"\");\nprintln(json_encode(a));\n\
+                      println(json_encode(HttpResponse{status:1,body:\"\"\"\n                  far\n                  \"\"\"}.body));\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "fn p(t: String) -> String {\n    \"\"\"\n    Title: \\(t)\n      deeper \"quoted\"   \n\n    \"\"\"\n}\n\n\
+             let a = p(\"\"\"\n    x\n    \"\"\");\n\n\
+             println(json_encode(a));\n\
+             println(json_encode(HttpResponse { status: 1, body: \"\"\"\n    far\n    \"\"\" }.body));\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+        assert_eq!(output(&formatted), output(source));
+        assert_eq!(
+            output(source),
+            "\"Title: x\\n  deeper \\\"quoted\\\"   \\n\"\n\"far\"\n"
+        );
+    }
+
+    #[test]
+    fn text_blocks_in_crlf_sources_format_to_line_feeds() {
+        let source =
+            "let t = \"\"\"\r\n      a\r\n\r\n        b\r\n      \"\"\";\r\nprintln(t);\r\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "let t = \"\"\"\n    a\n\n      b\n    \"\"\";\n\nprintln(t);\n"
+        );
+        assert_eq!(output(&formatted), output(source));
+        assert_eq!(output(source), "a\n\n  b\n");
+    }
+
+    #[test]
+    fn a_text_block_in_a_broken_group_indents_from_its_own_line() {
+        let long = "x".repeat(60);
+        let source = format!(
+            "fn f(a: String, b: String, c: String) -> String {{ a }}\n\
+             let v = f(\"{long}\", \"{long}\", \"\"\"\n  tail\n  \"\"\");\n"
+        );
+        let formatted = format(&source);
+        assert!(
+            formatted.ends_with(&format!(
+                "let v = f(\n    \"{long}\",\n    \"{long}\",\n    \"\"\"\n    tail\n    \"\"\",\n);\n"
+            )),
+            "{formatted}"
+        );
+        assert_eq!(format(&formatted), formatted);
     }
 }

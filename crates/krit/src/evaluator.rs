@@ -5,8 +5,8 @@ use crate::{
     analysis::check_construction_fields,
     ast::{
         BinaryOperator, Block, ConstructField, ContractRecord, Expression, ExpressionKind,
-        FieldDefault, MatchKind, Parameter, Program, Statement, StatementKind, UnaryOperator,
-        ValueLiteral, VariantFamily, VariantName,
+        FieldDefault, MatchKind, Parameter, Program, Statement, StatementKind, StringPart,
+        UnaryOperator, ValueLiteral, VariantFamily, VariantName,
     },
     limits::{MAX_CALL_DEPTH, MAX_EVALUATION_DEPTH, MAX_VALUE_DEPTH},
 };
@@ -527,6 +527,7 @@ impl Evaluator<'_> {
     ) -> Result<Value, Diagnostic> {
         match &expression.kind {
             ExpressionKind::Literal(literal) => self.literal(literal, expression.span),
+            ExpressionKind::Interpolation(parts) => self.interpolation(parts, environment),
             ExpressionKind::Unit => Ok(Value::Unit),
             ExpressionKind::Variable(name) => variable(name, environment, expression.span),
             // Operands on the recursive evaluation path are collected with
@@ -593,6 +594,37 @@ impl Evaluator<'_> {
             }
             ExpressionKind::Binary { .. } => self.binary_chain(expression, environment),
         }
+    }
+
+    /// Evaluates an interpolated string or text block: its parts from left
+    /// to right, concatenated. A hole whose value is not a string is a
+    /// `K4001` error, which only a program evaluated without analysis can
+    /// reach.
+    fn interpolation(
+        &mut self,
+        parts: &[StringPart],
+        environment: &Environment,
+    ) -> Result<Value, Diagnostic> {
+        let mut text = String::new();
+        for part in parts {
+            match part {
+                StringPart::Text { value, .. } => text.push_str(value),
+                StringPart::Hole { value, span } => match self.expression(value, environment)? {
+                    Value::String(value) => text.push_str(&value),
+                    other => {
+                        return Err(Diagnostic::new(
+                            "K4001",
+                            format!(
+                                "an interpolation hole must be a string, found {}",
+                                other.kind()
+                            ),
+                            *span,
+                        ));
+                    }
+                },
+            }
+        }
+        Ok(Value::String(Rc::from(text)))
     }
 
     /// Evaluates a named construction: the written values in source order,
@@ -2016,5 +2048,23 @@ mod tests {
             let error = run_unchecked(text).expect_err("an invalid field set should fail");
             assert_eq!(error.code(), "K3016", "{text}");
         }
+    }
+
+    #[test]
+    fn interpolation_concatenates_parts_and_checks_holes_without_analysis() {
+        let (output, _) = run("let user = record { name: \"Ada\" };\nlet id = \"7\";\n\
+             print(\"<\\(user.name)|\\(id)\\(id)>\" + \"\"\"\n    !\n    \"\"\");")
+        .expect("interpolation should run");
+        assert_eq!(output, "<Ada|77>!");
+
+        let error = run_unchecked("let count = 3;\nprint(\"n=\\(count)\");")
+            .expect_err("an integer hole should fail without analysis");
+        assert_eq!(error.code(), "K4001");
+        assert!(
+            error.message().contains("found integer"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(error.span().start, "let count = 3;\nprint(\"n=".len());
     }
 }

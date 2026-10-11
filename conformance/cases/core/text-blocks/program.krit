@@ -1,0 +1,34 @@
+// The closing delimiter's indentation is removed from every line; deeper
+// indentation, quotes, escapes, and holes are kept; the line break before
+// the closing delimiter is not part of the text.
+fn prompt(title: String, body: String) -> String {
+    """
+    Classify this issue as "bug" or "feature".
+      Title: \(title)
+
+      Body: \(body)
+    Answer with one word.\t(no reasons)
+    """
+}
+
+let issue = record { title: "Crash on save", body: "It fails." };
+let single = """
+    one line
+    """;
+let empty = """
+    """;
+let blank = """
+
+    """;
+
+println(prompt(issue.title, issue.body));
+println(json_encode(prompt(issue.title, issue.body)));
+println(json_encode(single));
+println(json_encode(empty));
+println(json_encode(blank));
+println(single == "one line");
+println(json_encode("""
+    a \"""quoted\""" word
+    \(issue.title)\(issue.body)
+        \u{2705} done
+    """));

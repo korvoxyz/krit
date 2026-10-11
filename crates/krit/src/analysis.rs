@@ -11,8 +11,8 @@ use crate::{
     Builtin, Diagnostic, Span,
     ast::{
         BinaryOperator, Block, ConstructField, ContractRecord, Expression, ExpressionKind,
-        ListEntry, MatchKind, Parameter, Program, Statement, StatementKind, TypeAnnotation,
-        TypeKind, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+        ListEntry, MatchKind, Parameter, Program, Statement, StatementKind, StringPart,
+        TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
     },
     habits::{MethodReceiver, closest_name, method_hint, undefined_name_note},
     limits::{MAX_NESTING_DEPTH, MAX_TREE_DEPTH, tree_depth_error},
@@ -1300,6 +1300,7 @@ impl Analyzer {
                 },
                 effects: InferEffects::default(),
             }),
+            ExpressionKind::Interpolation(parts) => self.interpolation(parts),
             ExpressionKind::Variable(name) => {
                 let (ty, resolution) = self.lookup(name, expression.span)?;
                 if name == DISCARD && matches!(resolution, ResolvedName::Symbol(_)) {
@@ -1596,6 +1597,73 @@ impl Analyzer {
             ty: InferType::List(Box::new(element_type)),
             effects,
         })
+    }
+
+    /// Analyzes an interpolated string or text block.
+    ///
+    /// Each hole's value is analyzed in source order and must be a `String`
+    /// (`K3015` at the hole otherwise). The string has type `String`, and its
+    /// effects and literal requirements are its holes', which are names and
+    /// field accesses and so have none.
+    fn interpolation(&mut self, parts: &[StringPart]) -> Result<ExpressionInfo, Diagnostic> {
+        let mut effects = InferEffects::default();
+        for part in parts {
+            let StringPart::Hole { value, span } = part else {
+                continue;
+            };
+            let info = self.expression(value)?;
+            if self
+                .unify_inner(InferType::String, info.ty.clone(), *span)
+                .is_err()
+            {
+                return Err(self
+                    .type_depth_error
+                    .take()
+                    .unwrap_or_else(|| self.hole_type_error(value, &info.ty, *span)));
+            }
+            effects.union(info.effects);
+        }
+        Ok(ExpressionInfo {
+            ty: InferType::String,
+            effects,
+        })
+    }
+
+    /// The error for the interpolation hole at `span` whose value `value` has
+    /// type `ty`, which is not `String` (`K3015`, always with one note).
+    fn hole_type_error(&self, value: &Expression, ty: &InferType, span: Span) -> Diagnostic {
+        let path = receiver_path(value);
+        let message = format!(
+            "{} has type `{}`, but a hole must be a `String`",
+            path.as_ref().map_or_else(
+                || "this interpolation hole".to_owned(),
+                |path| format!("interpolation hole `{path}`")
+            ),
+            self.render_type(ty)
+        );
+        let note = match self.resolve_head(ty) {
+            InferType::Int => {
+                let path = path.as_deref().unwrap_or("value");
+                let name = path.rsplit('.').next().unwrap_or(path);
+                if int_to_string_available() {
+                    format!(
+                        "convert it first, as in `let {name}_text = int_to_string({path});`, \
+                         then write `\\({name}_text)`"
+                    )
+                } else {
+                    "an `Int` never converts to text implicitly: bind a `String` to a name \
+                     and interpolate that name"
+                        .to_owned()
+                }
+            }
+            InferType::Secret => "a `Secret` is opaque and never becomes text".to_owned(),
+            InferType::Option(_) | InferType::Result(_, _) => {
+                "match the value first and interpolate the `String` it holds".to_owned()
+            }
+            _ => "a hole inserts text: bind a `String` to a name and interpolate that name"
+                .to_owned(),
+        };
+        Diagnostic::new("K3015", message, span).with_note(note)
     }
 
     /// Analyzes an entry list `["k": v, ...]`.
@@ -3956,6 +4024,12 @@ impl<'a> TypeNormalizer<'a> {
     }
 }
 
+/// Whether the standard library provides `int_to_string`, which the
+/// `K3015` note for an `Int` hole then names.
+fn int_to_string_available() -> bool {
+    Builtin::from_name("int_to_string").is_some()
+}
+
 /// The source spelling of a method call's receiver when it is a name or a
 /// short field path (`s`, `request.body`), for use in a fix; `None` for any
 /// other expression.
@@ -5576,5 +5650,146 @@ mod tests {
             check("let s = secret(\"token\");\nlet r = HttpResponse { status: 1, body: s };")
                 .expect_err("a secret result is not a body");
         assert_eq!(error.code(), "K3001");
+    }
+
+    #[test]
+    fn interpolation_is_a_string_and_records_each_hole_at_its_own_span() {
+        let text = "fn line(user, id: String) {\n    \"\\(user.name) #\\(id)\"\n}\n\
+                    let shown = line(record { name: \"Ada\" }, \"7\");\n";
+        let analysis = check(text).expect("interpolation should analyze");
+        let line = &analysis.bindings()[0];
+        assert_eq!(
+            line.ty().to_string(),
+            "fn(Record { name: String }, String) -> String effects {}"
+        );
+        let span_of = |needle: &str| {
+            let start = text.find(needle).expect("needle should occur");
+            Span::new(start, start + needle.len())
+        };
+        let string = span_of("\"\\(user.name) #\\(id)\"");
+        assert_eq!(
+            analysis.expression(string).map(|fact| fact.ty()),
+            Some(&Type::String)
+        );
+        for (needle, ty) in [("user.name", "String"), ("id", "String")] {
+            let start = text[string.start..].find(needle).expect("hole") + string.start;
+            let fact = analysis
+                .expression(Span::new(start, start + needle.len()))
+                .expect("each hole value has a fact");
+            assert_eq!(fact.ty().to_string(), ty);
+        }
+        assert!(
+            analysis
+                .expressions()
+                .windows(2)
+                .all(|window| window[0].span() < window[1].span())
+        );
+    }
+
+    #[test]
+    fn a_hole_that_is_not_a_string_is_k3015_with_one_note() {
+        let int_note = if int_to_string_available() {
+            "int_to_string(count)"
+        } else {
+            "never converts to text implicitly"
+        };
+        for (text, message, note, hole) in [
+            (
+                "let count = 3;\nlet s = \"n=\\(count)\";",
+                "interpolation hole `count` has type `Int`",
+                int_note,
+                "\\(count)",
+            ),
+            (
+                "let issue = record { number: 7 };\nlet s = \"\\(issue.number)\";",
+                "interpolation hole `issue.number` has type `Int`",
+                if int_to_string_available() {
+                    "let number_text = int_to_string(issue.number);"
+                } else {
+                    "never converts to text implicitly"
+                },
+                "\\(issue.number)",
+            ),
+            (
+                "let title = Some(\"a\");\nlet s = \"\\(title)\";",
+                "has type `Option<String>`",
+                "match the value first",
+                "\\(title)",
+            ),
+            (
+                "let s = secret(\"token\");\nlet t = \"\\(s)\";",
+                "has type `Result<Secret, String>`",
+                "match the value first",
+                "\\(s)",
+            ),
+            (
+                "fn f(token: Secret) -> String { \"\\(token)\" }",
+                "has type `Secret`",
+                "opaque",
+                "\\(token)",
+            ),
+            (
+                "let flag = true;\nlet s = \"\\(flag)\";",
+                "has type `Bool`",
+                "bind a `String` to a name",
+                "\\(flag)",
+            ),
+            (
+                "let s = \"\\(println)\";",
+                "has type `fn(",
+                "bind a `String` to a name",
+                "\\(println)",
+            ),
+            (
+                "fn f(n) { let a = n + 1; \"\\(n)\" }",
+                "interpolation hole `n` has type `Int`",
+                int_note,
+                "\\(n)",
+            ),
+        ] {
+            let error = check(text).expect_err("a non-String hole should fail");
+            assert_eq!(error.code(), "K3015", "{text}");
+            assert!(
+                error.message().contains(message),
+                "{text}: {}",
+                error.message()
+            );
+            assert_eq!(error.notes().len(), 1, "{text}");
+            assert!(
+                error.notes()[0].contains(note),
+                "{text}: {:?}",
+                error.notes()
+            );
+            assert_eq!(&text[error.span().start..error.span().end], hole, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_hole_fixes_an_inferred_type_to_string() {
+        let error = check("fn f(n) { \"\\(n)\" }\nlet x = f(1);")
+            .expect_err("calling with an Int should fail");
+        assert_eq!(error.code(), "K3001");
+        let error = check("fn f(r) { let a = r.count + 1; \"\\(r.count)\" }")
+            .expect_err("an Int field should fail");
+        assert_eq!(error.code(), "K3015");
+    }
+
+    #[test]
+    fn interpolated_strings_and_text_blocks_are_never_resource_literals() {
+        for text in [
+            "let key = \"model\";\nlet v = config_string(\"agent.\\(key)\");",
+            "let v = config_string(\"\"\"\n    agent.model\n    \"\"\");",
+            "let id = \"reviewer\";\nfn f(x: String) { ai_invoke(\"\\(id)\", x) }",
+            "fn f() { log_info(\"\"\"\n    review.started\n    \"\"\", []) }",
+            "fn f() { state_get(\"\"\"\n    agent-work\n    \"\"\", \"k\") }",
+            "let o = \"https://example.com\";\n\
+             fn f(r: HttpRequest) { http_request(\"\\(o)\", r, None) }",
+        ] {
+            let error = check(text).expect_err("a template resource should fail");
+            assert_eq!(error.code(), "K3008", "{text}");
+            let template = text.rfind("(\"").map(|index| index + 1).expect("call");
+            assert_eq!(error.span().start, template, "{text}");
+        }
+        check("let v = config_string(\"agent.model\");").expect("a literal resource is valid");
     }
 }

@@ -9,7 +9,7 @@ use std::{
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use krit::{
     Block, Expression, ExpressionKind, MatchKind, Program, Source, Statement, StatementKind,
-    ValueLiteral,
+    StringPart, ValueLiteral,
 };
 use krit_package::Manifest;
 use serde::Serialize;
@@ -855,6 +855,20 @@ fn ast_sensitive_literal_spans(
                             targets.add_span(span);
                         }
                     }
+                    // The whole text between the delimiters, holes included,
+                    // contributes to the value.
+                    ExpressionKind::Interpolation(parts) => {
+                        if let Some(span) =
+                            template_content_span(source, current.span.start, current.span.end)
+                        {
+                            targets.add_span(span);
+                        }
+                        for part in parts {
+                            if let StringPart::Hole { value, .. } = part {
+                                collect(source, value, scopes, visited, targets);
+                            }
+                        }
+                    }
                     ExpressionKind::Literal(_) | ExpressionKind::Unit => {}
                     ExpressionKind::Variable(name) => {
                         if let Some(bound) = resolve(scopes, name) {
@@ -976,6 +990,15 @@ fn ast_sensitive_literal_spans(
                 // A more specific category, if one is found later, replaces this.
                 spans.entry((start, end)).or_insert("secret-like");
             }
+            if let ExpressionKind::Interpolation(parts) = &current.kind
+                && parts.iter().any(|part| {
+                    matches!(part, StringPart::Text { value, .. } if looks_secret_like(value))
+                })
+                && let Some((start, end)) =
+                    template_content_span(source, current.span.start, current.span.end)
+            {
+                spans.entry((start, end)).or_insert("secret-like");
+            }
             match &current.kind {
                 ExpressionKind::If {
                     condition,
@@ -994,6 +1017,13 @@ fn ast_sensitive_literal_spans(
                 }
                 ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
                 ExpressionKind::Unit => {}
+                ExpressionKind::Interpolation(parts) => {
+                    for part in parts {
+                        if let StringPart::Hole { value, .. } = part {
+                            expression_spans(source, value, scopes, spans);
+                        }
+                    }
+                }
                 ExpressionKind::List(elements) => {
                     for element in elements {
                         expression_spans(source, element, scopes, spans);
@@ -1095,6 +1125,18 @@ fn literal_content_span(source: &str, start: usize, end: usize) -> Option<(usize
         && source.as_bytes().get(start) == Some(&b'"')
         && source.as_bytes().get(end - 1) == Some(&b'"'))
     .then_some((start + 1, end - 1))
+}
+
+/// The text between the delimiters of an interpolated string or text block
+/// spanning `start..end`: after a text block's `"""` and before its closing
+/// one, or inside a one-line string's quotes.
+fn template_content_span(source: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    let text = source.get(start..end)?;
+    if text.len() >= 6 && text.starts_with("\"\"\"") && text.ends_with("\"\"\"") {
+        Some((start + 3, end - 3))
+    } else {
+        literal_content_span(source, start, end)
+    }
 }
 
 /// Argument positions whose literal content must be redacted, by built-in name.
@@ -1393,6 +1435,73 @@ fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static
         };
     }
 
+    /// Records a use of the name `$identifier` outside a declaration: in a
+    /// binding's value it passes on what contributed to the named binding,
+    /// and in a sensitive position it redacts that.
+    macro_rules! reference {
+        ($identifier:expr) => {{
+            let identifier: &str = $identifier;
+            // Under sequential `let` semantics a declaration is not
+            // visible from its own initializer, so the real contributor is
+            // always the nearest *finalized* lexical binding. That is
+            // resolved independently here: letting a pending declaration
+            // short-circuit the lookup would hide the finalized outer
+            // value whenever two same-named declarations are open at once.
+            //
+            // Every same-named pending declaration is then unioned in as a
+            // conservative safety net, because in truncated source the
+            // reference may sit inside an initializer whose text is
+            // already written.
+            let barrier = scopes
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, frame)| frame.get(identifier).map(|value| (index, value)));
+            // A parameter shadows everything further out. The barrier
+            // applies to pending declarations too, so one from outside the
+            // parameter's scope can never slip past it.
+            let (mut inherited, floor) = match barrier {
+                Some((index, value)) if value.opaque => (None, Some(index)),
+                Some((_, value)) => (Some(value.clone()), None),
+                None => (None, None),
+            };
+            for binding in pending
+                .iter()
+                .rev()
+                .filter(|binding| binding.name == identifier)
+            {
+                if floor.is_some_and(|floor| binding.scope < floor) {
+                    continue;
+                }
+                let candidate = binding.in_progress(source);
+                match inherited.as_mut() {
+                    Some(existing) => existing.merge(&candidate),
+                    None => inherited = Some(candidate),
+                }
+            }
+            // An alias inside a binding's value inherits the referenced
+            // binding's contributions, so a chain of aliases stays
+            // protected. Every enclosing binding inherits, including a
+            // rebind of the same name: `let token = token;` really does
+            // take the outer value. Merging is idempotent and
+            // deduplicated, so a self-reference cannot grow or loop.
+            if let Some(inherited) = inherited.as_ref() {
+                for binding in &mut pending {
+                    binding.inherit(inherited);
+                }
+            }
+            // A bare name in a sensitive position redacts everything that
+            // contributed to its value.
+            if let Some(category) = frame_category(&frames)
+                && let Some(inherited) = inherited.as_ref()
+            {
+                for (start, end) in inherited.targets() {
+                    spans.push((start, end, category));
+                }
+            }
+        }};
+    }
+
     while cursor < bytes.len() {
         if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'/') {
             cursor += 2;
@@ -1428,63 +1537,7 @@ fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static
                 expect_parameter_name = false;
                 parameters.push(identifier);
             } else {
-                // Under sequential `let` semantics a declaration is not
-                // visible from its own initializer, so the real contributor is
-                // always the nearest *finalized* lexical binding. That is
-                // resolved independently here: letting a pending declaration
-                // short-circuit the lookup would hide the finalized outer
-                // value whenever two same-named declarations are open at once.
-                //
-                // Every same-named pending declaration is then unioned in as a
-                // conservative safety net, because in truncated source the
-                // reference may sit inside an initializer whose text is
-                // already written.
-                let barrier =
-                    scopes.iter().enumerate().rev().find_map(|(index, frame)| {
-                        frame.get(identifier).map(|value| (index, value))
-                    });
-                // A parameter shadows everything further out. The barrier
-                // applies to pending declarations too, so one from outside the
-                // parameter's scope can never slip past it.
-                let (mut inherited, floor) = match barrier {
-                    Some((index, value)) if value.opaque => (None, Some(index)),
-                    Some((_, value)) => (Some(value.clone()), None),
-                    None => (None, None),
-                };
-                for binding in pending
-                    .iter()
-                    .rev()
-                    .filter(|binding| binding.name == identifier)
-                {
-                    if floor.is_some_and(|floor| binding.scope < floor) {
-                        continue;
-                    }
-                    let candidate = binding.in_progress(source);
-                    match inherited.as_mut() {
-                        Some(existing) => existing.merge(&candidate),
-                        None => inherited = Some(candidate),
-                    }
-                }
-                // An alias inside a binding's value inherits the referenced
-                // binding's contributions, so a chain of aliases stays
-                // protected. Every enclosing binding inherits, including a
-                // rebind of the same name: `let token = token;` really does
-                // take the outer value. Merging is idempotent and
-                // deduplicated, so a self-reference cannot grow or loop.
-                if let Some(inherited) = inherited.as_ref() {
-                    for binding in &mut pending {
-                        binding.inherit(inherited);
-                    }
-                }
-                // A bare name in a sensitive position redacts everything that
-                // contributed to its value.
-                if let Some(category) = frame_category(&frames)
-                    && let Some(inherited) = inherited.as_ref()
-                {
-                    for (start, end) in inherited.targets() {
-                        spans.push((start, end, category));
-                    }
-                }
+                reference!(identifier);
             }
             tokens.push(TolerantToken::Identifier(identifier));
             continue;
@@ -1643,29 +1696,50 @@ fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static
                 continue;
             }
         }
-        cursor += 1;
-        let content_start = cursor;
-        let mut escaped = false;
-        while cursor < bytes.len() {
-            if escaped {
-                escaped = false;
-            } else if bytes[cursor] == b'\\' {
-                escaped = true;
-            } else if bytes[cursor] == b'"' {
-                break;
-            }
+        let opening = cursor;
+        let (content_start, content_end, after) = if bytes[cursor..].starts_with(b"\"\"\"") {
+            // A text block's content is everything up to its closing
+            // delimiter, quotes and holes included.
+            let content_start = cursor + 3;
+            let content_end = tolerant_text_block_end(source, content_start);
+            (
+                content_start,
+                content_end,
+                (content_end + 3).min(bytes.len()),
+            )
+        } else {
             cursor += 1;
-        }
-        let content_end = cursor.min(bytes.len());
+            let content_start = cursor;
+            let mut escaped = false;
+            while cursor < bytes.len() {
+                if escaped {
+                    escaped = false;
+                } else if bytes[cursor] == b'\\' {
+                    escaped = true;
+                } else if bytes[cursor] == b'"' {
+                    break;
+                }
+                cursor += 1;
+            }
+            let content_end = cursor.min(bytes.len());
+            (
+                content_start,
+                content_end,
+                (content_end + 1).min(bytes.len()),
+            )
+        };
         let content = &source[content_start..content_end];
         // A literal inside a binding's value is remembered, so a later
         // sensitive use of that name can redact it retroactively.
         for binding in &mut pending {
-            binding
-                .value_start
-                .get_or_insert(content_start.saturating_sub(1));
-            binding.value_end = (content_end + 1).min(source.len());
+            binding.value_start.get_or_insert(opening);
+            binding.value_end = after;
             binding.record_literal((content_start, content_end));
+        }
+        // Each interpolation hole uses the binding it names, whose value
+        // becomes part of this literal's.
+        for root in tolerant_hole_roots(content) {
+            reference!(root);
         }
         let category = if matches!(
             tokens.last(),
@@ -1678,15 +1752,56 @@ fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static
         if let Some(category) = category {
             spans.push((content_start, content_end, category));
         }
-        if cursor < bytes.len() {
-            cursor += 1;
-        }
+        cursor = after;
         tokens.push(TolerantToken::Other);
     }
     while !pending.is_empty() {
         finish_top!();
     }
     spans
+}
+
+/// The names that start the interpolation holes in the string content
+/// `content`: the identifier after each `\(` that is not itself escaped.
+fn tolerant_hole_roots(content: &str) -> Vec<&str> {
+    let bytes = content.as_bytes();
+    let mut roots = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+        if bytes.get(index + 1) == Some(&b'(') {
+            let start = index + 2;
+            let mut end = start;
+            while end < bytes.len() && is_identifier_continue(bytes[end]) {
+                end += 1;
+            }
+            if end > start && !bytes[start].is_ascii_digit() {
+                roots.push(&content[start..end]);
+            }
+        }
+        // The escaped character is never the start of another escape.
+        index += 2;
+    }
+    roots
+}
+
+/// Where the content of a text block that starts at byte `start` of
+/// `source` ends: at the first `"""` that begins a line after spaces and
+/// tabs, or at the end of the source when no line closes it.
+fn tolerant_text_block_end(source: &str, start: usize) -> usize {
+    let mut line_start = start;
+    while let Some(offset) = source[line_start..].find(['\n', '\r']) {
+        line_start += offset + 1;
+        let line = &source[line_start..];
+        let content = line.trim_start_matches([' ', '\t']);
+        if content.starts_with("\"\"\"") {
+            return line_start + (line.len() - content.len());
+        }
+    }
+    source.len()
 }
 
 #[derive(Clone, Copy)]
@@ -2805,6 +2920,73 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
     }
 
     #[test]
+    fn interpolated_and_text_block_values_inside_a_sensitive_argument_are_redacted() {
+        let source = r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let account = "private-account";
+    let key = "user/\(account)/profile";
+    let payload = """
+        private "payload" \(request.path)
+        """;
+    match cache_put("lookups", key, payload, 60) {
+        Ok(stored) => HttpResponse { status: 200, body: "visible-body" },
+        Err(problem) => HttpResponse { status: 500, body: problem },
+    }
+}
+"#;
+        for (path, spans) in [
+            ("parsed", redacted(source)),
+            ("tolerant", redacted_tolerant(source)),
+        ] {
+            for (content, category) in [
+                ("private-account", "cache-key"),
+                ("user/\\(account)/profile", "cache-key"),
+                (
+                    "\n        private \"payload\" \\(request.path)\n        ",
+                    "cache-value",
+                ),
+            ] {
+                assert!(
+                    spans
+                        .iter()
+                        .any(|(redacted, kind)| redacted == content && *kind == category),
+                    "{path}: `{content}` leaked: {spans:?}"
+                );
+            }
+            assert!(
+                spans.iter().all(|(redacted, _)| redacted != "visible-body"),
+                "{path}: over-redacted: {spans:?}"
+            );
+        }
+
+        // A secret-like text part marks the whole string, wherever it is.
+        let source = "let user = \"me\";\nlet header = \"Bearer \\(user)\";\n";
+        for (path, spans) in [
+            ("parsed", redacted(source)),
+            ("tolerant", redacted_tolerant(source)),
+        ] {
+            assert!(
+                spans
+                    .iter()
+                    .any(|(redacted, kind)| redacted == "Bearer \\(user)" && *kind == "secret-like"),
+                "{path}: {spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unclosed_text_block_is_redacted_to_the_end_of_the_source() {
+        let source = "fn f(x: String) { cache_put(\"lookups\", \"k\", \"\"\"\n    private-tail\n";
+        let spans = redacted(source);
+        assert!(
+            spans
+                .iter()
+                .any(|(redacted, _)| redacted.contains("private-tail")),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
     fn the_fallback_never_redacts_less_than_the_parsed_path() {
         // A corpus of well-formed fixtures: every literal the parsed path
         // redacts must also be redacted by the fallback.
@@ -2842,6 +3024,19 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
     match cache_delete("lookups", key) {
         Ok(gone) => record { status: 200, headers: [], body: "ok" },
         Err(problem) => record { status: 500, headers: [], body: problem },
+    }
+}
+"#,
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let id = "corpus-id";
+    let key = "item/\(id)";
+    let value = """
+        "corpus-quoted" \(key)
+        """;
+    match cache_put("lookups", key, value, 60) {
+        Ok(stored) => HttpResponse { status: 200, body: "ok" },
+        Err(problem) => HttpResponse { status: 500, body: problem },
     }
 }
 "#,

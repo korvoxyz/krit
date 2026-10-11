@@ -1,0 +1,16 @@
+/// Composes the reviewer's prompt from the request.
+fn prompt(request: HttpRequest) -> String {
+    """
+    Review the change below and answer "approve" or "reject".
+    Route: \(request.method) \(request.path)
+
+    \(request.body)
+    """
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match ai_invoke("reviewer", prompt(request)) {
+        Ok(answer) => HttpResponse { status: 200, body: "verdict: \(answer)" },
+        Err(reason) => HttpResponse { status: 502, body: "review failed: \(reason)" },
+    }
+}

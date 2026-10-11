@@ -86,13 +86,69 @@ text is literal.
 ```text
 identifier  = (letter | "_"), (letter | digit | "_")* ;
 integer     = digit, (digit | "_")* ;
-string      = '"', string-character*, '"' ;
+string      = '"', (string-character | hole)*, '"' ;
+hole        = "\(", identifier, (".", identifier)*, ")" ;
+text-block  = '"""', line-break,
+              (text-block-line, line-break)*,
+              indentation, '"""' ;
+text-block-line
+            = (text-block-character | hole)* ;
+indentation = (" " | "\t")* ;
+line-break  = "\n" | "\r\n" | "\r" ;
 comment     = "//", non-line-break* ;
 doc-comment = "///", (non-slash-non-line-break, non-line-break*)? ;
 ```
 
 A `doc-comment` is a `comment` too: both are trivia, which the syntactic grammar
 does not mention.
+
+A `hole` inside a string or text block is written without whitespace, and its
+identifiers are not keywords. A string that contains at least one hole is an
+**interpolated string**; section 9.1 gives its meaning. `\(` followed by
+anything other than an identifier path and `)` is `K3015` at the hole, which
+the lexer reports while it reads the source, with one note:
+`\(f(x))`, `\(a + b)`, `\("x")`, `\(1)`, `\(true)`, `\( name )`, `\()`, and
+a hole whose line ends before its `)`. A quoted string inside a hole is
+skipped while looking for the hole's `)`, so `\(f("x"))` is one invalid hole.
+A string without holes is an ordinary string literal, and `\\(` is a
+backslash followed by `(`, never a hole.
+
+A **text block** starts with `"""` followed immediately by a line break; any
+other text after the opening `"""`, even a space, is `K0004`. It ends at the
+first line whose first characters other than spaces and tabs are `"""`; that
+line's spaces and tabs are the block's **indentation**, and the closing
+`"""` may be followed by more tokens on its line (`""")`). The lines between
+the two delimiters are its content lines:
+
+- Every content line must begin with the indentation, character for
+  character, which is removed from it. A line that does not is `K0004` at its
+  start, unless it holds only spaces and tabs, which makes it an empty line.
+  Spaces and tabs after the indentation are kept.
+- The content lines are joined by `\n`, whatever line breaks the source
+  uses, so a file with CRLF line endings means exactly what it means with LF
+  line endings. The line break before the closing delimiter is not part of
+  the text, so a block with no content lines is the empty string.
+- Escapes and holes work in content lines as in strings, within one line: a
+  line cannot end with `\` (`K0003`). A `"` or `""` needs no escape, but
+  `"""` anywhere in a content line is `K0004` (write `\"""` for three quote
+  characters).
+- A text block that no line closes is `K0002`, or `K0004` at the first
+  `"""` inside one of its lines when there is one, since that `"""` was most
+  likely meant to close it.
+
+```krit
+fn prompt(title: String, body: String) -> String {
+    """
+    Classify this issue as "bug" or "feature".
+      Title: \(title)
+
+    \(body)
+    """
+}
+```
+
+The value of `prompt("Crash", "It fails.")` is
+`Classify this issue as "bug" or "feature".\n  Title: Crash\n\nIt fails.`.
 
 Integer separators cannot be leading, trailing, or repeated. Integers are
 signed through unary `-`; the sign is not part of the token.
@@ -101,13 +157,14 @@ signed through unary `-`; the sign is not part of the token.
 no valid program; the parser uses it only to recognize another language's
 conditional operator (section 4.2).
 
-Strings support these escapes:
+Strings and text blocks support these escapes:
 
 ```text
 \"  \\  \n  \r  \t  \0  \u{hex-scalar}
 ```
 
-Other escapes and invalid Unicode scalar values are lexical errors.
+`\(` starts a hole instead. Other escapes and invalid Unicode scalar values
+are lexical errors (`K0003`).
 
 ## 4. Syntactic grammar
 
@@ -155,6 +212,7 @@ arguments       = expression, (",", expression)*, ","? ;
 
 primary         = integer
                 | string
+                | text-block
                 | "true"
                 | "false"
                 | identifier
@@ -262,9 +320,12 @@ A source file may nest syntax at most **256 levels** deep. Each of the
 following opens one level for what it contains:
 
 - a parenthesized expression, a block, a list literal (an entry list
-  included), a record literal, and a named construction
+  included), a record literal, a named construction, and an interpolated
+  string or text block, for its holes
 - the argument list of a call, and each call or field-access link of a
-  postfix chain (`a.b(c).d` opens three levels for what follows `a`)
+  postfix chain (`a.b(c).d` opens three levels for what follows `a`),
+  including the field accesses in a hole (`"\(a.b.c)"` opens three levels
+  for `a`: the string and two links)
 - the operand of a unary operator
 - the condition of an `if`, and the subject and the arm list of a `match`
 - the argument list of `List<…>`, `Option<…>`, or `Result<…, …>`, and the
@@ -624,6 +685,27 @@ so `a == b` exactly when neither `a < b` nor `b < a`.
 No implicit conversions occur. In particular, integers and strings are not
 automatically converted for `+`, and non-booleans are not truthy.
 
+## 9.1 Interpolated strings and text blocks
+
+An interpolated string or a text block (section 3) is an expression of type
+`String`: the concatenation of its text and its holes from left to right.
+`"\(method) \(request.path)"` means `method + " " + request.path`, and a
+text block with holes means the same concatenation of its dedented lines.
+
+- Each hole names a value in scope, optionally followed by field accesses,
+  and that value must be a `String`. Any other type is `K3015` at the hole,
+  with one note; for an `Int`, the note shows how to convert it into a name
+  first when the standard library provides `int_to_string`. There are no
+  implicit conversions (section 9).
+- A hole that names an undefined value is `K2001` at the name, and reading
+  `_` in a hole is the `K2003` warning, as anywhere else.
+- Holes are names, so evaluating one has no effect and the parts' order is
+  never observable.
+- An interpolated string or text block is never a direct string literal, so
+  it is never a capability resource (section 13.1): `config_string("agent.\(key)")`
+  and an adapter name written as a text block are both `K3008`. A text block
+  without holes is not a literal either.
+
 ## 10. Conditionals
 
 ```krit
@@ -830,8 +912,11 @@ db_commit(transaction) // Result<Unit, String>
 db_rollback(transaction) // Result<Unit, String>
 ```
 
-Config and secret operations require exactly one direct string-literal
-resource argument in canonical-name form (see `CAPABILITIES.md`); a
+A direct string literal is a one-line string without holes (section 3);
+interpolated strings and text blocks never count as one, so a resource must
+be written out in full. Config and secret operations require exactly one
+direct string-literal resource argument in canonical-name form (see
+`CAPABILITIES.md`); a
 configuration key may additionally contain `_`, as in `"agent.timeout_ms"`,
 while a secret name may not. A malformed name is `K3008`. `http_request`
 requires a direct normalized exact-origin literal, an `HttpRequest`, and
@@ -898,7 +983,9 @@ schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String
 `queue` and `schedule` are contextual keywords: they introduce an entrypoint
 only when directly followed by a canonical name literal and `fn`, so ordinary
 bindings, parameters, and record fields may still be spelled `queue` or
-`schedule`. The declared name is the exact resource of the
+`schedule`. An interpolated string or text block followed by `fn` in the
+name's place is read as a declaration too, and is `K1002` because the name is
+not a direct literal. The declared name is the exact resource of the
 `queue.consume("queue")` or `schedule.trigger("schedule")` requirement.
 
 `QueueJob` is the closed contract
@@ -1004,7 +1091,8 @@ syntax. Formatting changes trivia, equivalent literal spellings, and
 grammar-permitted trailing commas, not expression order or program semantics.
 
 - Indentation is four ASCII spaces. Formatter-produced structural whitespace
-  contains no tabs or trailing spaces.
+  contains no tabs or trailing spaces; the content of a text block, which the
+  formatter keeps, may.
 - Output uses LF line endings and exactly one final line feed.
 - Binary operators, `=`, `=>`, `->`, and type/value colons use stable spacing.
   Calls, field access, unary operators, and generic type brackets remain
@@ -1040,7 +1128,22 @@ grammar-permitted trailing commas, not expression order or program semantics.
   by one blank line.
 - Integer separators are removed. Strings use direct printable Unicode plus
   `\"`, `\\`, `\n`, `\r`, `\t`, `\0`, or lowercase `\u{...}` escapes for
-  required control characters.
+  required control characters. The text of an interpolated string is written
+  the same way, and each hole exactly as written (`\(request.path)`).
+- A text block keeps its delimiters and its content lines exactly as written
+  after their indentation, holes, escapes, quotes, tabs, and trailing
+  whitespace included; only the indentation changes. The content lines and
+  the closing `"""` are indented one level deeper than the line the block
+  opens on, or at the opening `"""`'s own indentation when it starts its
+  line, and an empty content line stays empty. Within its line a text block
+  is as wide as its opening `"""`, so an argument list or construction that
+  holds one can stay on one line around it:
+
+  ```krit
+  let reply = ai_invoke("reviewer", """
+      Classify: \(request.path)
+      """);
+  ```
 - Parentheses from the input are retained, including every pair needed to
   preserve evaluation order.
 - Every `//` comment and its text is retained in source order. Standalone

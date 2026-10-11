@@ -126,8 +126,9 @@ Initial required codes:
 | Code | Meaning |
 |---|---|
 | `K0001` | Invalid source character or token |
-| `K0002` | Unterminated string |
-| `K0003` | Invalid string escape |
+| `K0002` | Unterminated string or text block |
+| `K0003` | Invalid string escape, including `\` at the end of a text-block line |
+| `K0004` | Text block layout is invalid: text after the opening `"""` on its line, a content line that does not begin with the closing delimiter's indentation, or `"""` inside a content line |
 | `K1001` | Unexpected token, including a `?` that is not a conditional operator (`K1110`), a named construction written directly as an `if` condition or `match` subject, a list literal that mixes `key: value` entries with plain elements, and `[:]` |
 | `K1002` | Expected token not found |
 | `K1003` | Invalid match pattern |
@@ -159,6 +160,7 @@ Initial required codes:
 | `K3009` | Opaque secret is used by a revealing or structural operation |
 | `K3010` | Opaque database transaction handle is used outside a database operation |
 | `K3011` | Method call `value.name(...)` on a value that has no field `name`: Krit values have no methods |
+| `K3015` | Invalid interpolation hole: its content is not a name followed by field accesses (reported while the source is read), or its value is not a `String` |
 | `K3016` | Named construction of a contract record writes a field the contract does not have, writes a field more than once, or omits a required field |
 | `K4001` | Generic guest trap, wrong runtime value kind, or HTTP request/response the host refuses (including a request path that breaks the rule in `WEBHOOK-CONTRACTS.md`, "Request paths and queries") |
 | `K4002` | Calling a non-function |
@@ -253,6 +255,28 @@ may improve, but which diagnostics carry one is part of each code's contract:
   too.
 - `K1002` for `()` written as a type (`fn f() -> () { ... }`) carries one
   note: the unit type is spelled `Unit`, and `()` is the unit value.
+- `K0004` always carries exactly one note: put the text on the next line,
+  indent the line at least as far as the closing `"""`, or move the `"""` to
+  a line of its own (or escape it as `\"""`).
+- `K0002` for an unterminated text block carries one note: close it with
+  `"""` on a line of its own. An unterminated one-line string carries none.
+  A text block that no line closes but that has `"""` inside a content line
+  is reported as `K0004` at that `"""`, which most likely meant to close it.
+- `K3015` always carries exactly one note. It is reported at the hole, from
+  its `\` to its `)` (at the `\(` alone for a hole whose line ends before its
+  `)`). A hole that is not a name path is reported while the source is read,
+  before any syntax error later in the file, with a note to bind the value to
+  a name first (or to remove the whitespace, or to name a value); a hole whose
+  value is not a `String` names the hole's path and type, and its note says
+  how to obtain a `String`: for an `Int`, a `let` that converts it with
+  `int_to_string` when the standard library provides it, and otherwise that
+  integers never convert to text implicitly.
+
+```text
+main.krit:2:16: error[K3015]: interpolation hole `count` has type `Int`, but a hole must be a `String`
+help: an `Int` never converts to text implicitly: bind a `String` to a name and interpolate that name
+```
+
 - `K3016` always carries exactly one note. For an unknown field it lists the
   contract's fields, preceded by `did you mean `name`?` when one of them is
   close by the rule for undefined names below; for a repeated field it lists

@@ -286,6 +286,9 @@ Policy 2 adds a deliberately bounded webhook ABI:
 - canonical UTF-8 strings and checked linear-memory allocation/reallocation
 - String concatenation (`+`), equality (`==`, `!=`), and byte-lexicographic
   ordering (`<`, `<=`, `>`, `>=`) through the guest string runtime below
+- interpolated strings and text blocks (`LANGUAGE.md` section 9.1), which
+  lower to static string literals and left-to-right concatenation, so a
+  prompt or path composed with holes builds wherever the same `+` chain does
 - `json_decode` into `String` through the guest JSON string decoder below
 - fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` records, written as
   `record { ... }` or by named construction (`HttpResponse { status: 200 }`,
@@ -400,14 +403,15 @@ recursively; source nesting limits (`LANGUAGE.md` section 4.1) bound that
 nesting, and the backend independently refuses Core nested more than 8,192
 blocks deep with `K1005`, before support checking and equally in a
 `krit check` target check, rather than relying on that bound. Policy 1 rejects
-strings, lists (entry lists included), records (named constructions
-included), options, results,
+strings (interpolated strings and text blocks included), lists (entry lists
+included), records (named constructions included), options, results,
 JSON conversion, lexical captures, matches, unsupported print values, and any
 operation without a correct lowering. It never substitutes a trapping placeholder or direct-evaluator
 fallback. Policy 1 has no linear memory, so a String operator in a module
 program is reported where the String value is produced (the literal,
-parameter, or field), with the "String has no concrete guest layout in
-WebAssembly policy 1" message.
+parameter, or field; for an interpolated string, its text parts and
+concatenations, inside the string), with the "String has no concrete guest
+layout in WebAssembly policy 1" message.
 
 Policy 2 does not generalize these layouts to arbitrary records/lists,
 capturing closures, JSON other than `json_decode` into `String`, or

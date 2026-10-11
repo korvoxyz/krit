@@ -1,0 +1,2 @@
+let issue = record { number: 7, title: "Crash" };
+let path = "/issues/\(issue.number)";

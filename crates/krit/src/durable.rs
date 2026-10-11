@@ -1,6 +1,6 @@
 use crate::{
     Block, Expression, ExpressionKind, MatchKind, Program, Span, Statement, StatementKind,
-    ValueLiteral,
+    StringPart, ValueLiteral,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -157,6 +157,12 @@ fn collect_expression<'a>(
 ) {
     match &expression.kind {
         ExpressionKind::Literal(_) | ExpressionKind::Unit | ExpressionKind::Variable(_) => {}
+        ExpressionKind::Interpolation(parts) => {
+            pending.extend(parts.iter().filter_map(|part| match part {
+                StringPart::Hole { value, .. } => Some(Pending::Expression(value)),
+                StringPart::Text { .. } => None,
+            }));
+        }
         ExpressionKind::List(elements) => {
             pending.extend(elements.iter().map(Pending::Expression));
         }

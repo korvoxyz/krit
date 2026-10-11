@@ -8,7 +8,7 @@ use std::{
 use krit::{
     Analysis, Block, Builtin, Diagnostic as CompilerDiagnostic, Effect, EntrypointKind, Expression,
     ExpressionKind, MatchKind, Program, RequirementSet, ResolvedName, Severity, Source, Span,
-    Statement, StatementKind, SymbolKind as CompilerSymbolKind, Type, TypeAnnotation,
+    Statement, StatementKind, StringPart, SymbolKind as CompilerSymbolKind, Type, TypeAnnotation,
 };
 use krit_package::Manifest;
 use lsp_server::ErrorCode;
@@ -1522,6 +1522,13 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
                 }
                 ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
                 ExpressionKind::Unit => {}
+                ExpressionKind::Interpolation(parts) => {
+                    for part in parts {
+                        if let StringPart::Hole { value, .. } = part {
+                            expression_fields(value, fields);
+                        }
+                    }
+                }
                 ExpressionKind::List(elements) => {
                     for element in elements {
                         expression_fields(element, fields);
@@ -2115,6 +2122,13 @@ impl<'a> DeclarationCollector<'a> {
                 }
                 ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
                 ExpressionKind::Unit => {}
+                ExpressionKind::Interpolation(parts) => {
+                    for part in parts {
+                        if let StringPart::Hole { value, .. } = part {
+                            self.expression(value);
+                        }
+                    }
+                }
                 ExpressionKind::List(elements) => {
                     for element in elements {
                         self.expression(element);
@@ -2286,6 +2300,7 @@ fn find_identifier_span(text: &str, span: Span, name: &str) -> Option<Span> {
 fn expression_kind(kind: &ExpressionKind) -> &'static str {
     match kind {
         ExpressionKind::Literal(_) => "literal",
+        ExpressionKind::Interpolation(_) => "interpolation",
         ExpressionKind::Unit => "unit",
         ExpressionKind::Variable(_) => "name",
         ExpressionKind::List(_) => "list",
@@ -3854,6 +3869,88 @@ fn unused() -> Result<String, String> {{
             "{}",
             diagnostic.message
         );
+    }
+
+    #[test]
+    fn reports_interpolation_facts_hover_and_text_block_formatting() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let source = "let user = record { name: \"Ada\" };\n\
+                      let line = \"Hi \\(user.name)!\";\n\
+                      let prompt = \"\"\"\n  Name: \\(user.name)\n  \"\"\";\n";
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let published = state.open(uri.clone(), 1, source.to_owned());
+        assert!(published.diagnostics.is_empty(), "{published:?}");
+
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        let expressions = facts["expressions"]
+            .as_array()
+            .expect("expression facts should be a list");
+        let interpolations = expressions
+            .iter()
+            .filter(|fact| fact["syntaxKind"] == "interpolation")
+            .collect::<Vec<_>>();
+        assert_eq!(interpolations.len(), 2, "{expressions:?}");
+        assert!(
+            interpolations
+                .iter()
+                .all(|fact| fact["inferredType"] == "String")
+        );
+        assert_eq!(
+            expressions
+                .iter()
+                .filter(|fact| fact["syntaxKind"] == "name" && fact["resolved"]["name"] == "user")
+                .count(),
+            2,
+            "both holes should resolve: {expressions:?}"
+        );
+        // Every expression fact keeps a span of its own.
+        let mut spans = expressions
+            .iter()
+            .map(|fact| fact["span"].to_string())
+            .collect::<Vec<_>>();
+        let count = spans.len();
+        spans.sort();
+        spans.dedup();
+        assert_eq!(spans.len(), count);
+
+        // Hovering over the field name inside the hole shows its type.
+        let hover = state
+            .hover(&uri, Position::new(1, 22))
+            .expect("hover should succeed")
+            .expect("the hole should have hover facts");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("hover should use markdown")
+        };
+        assert!(markup.value.contains("String"), "{}", markup.value);
+
+        let edits = state.formatting(&uri).expect("formatting should succeed");
+        assert_eq!(
+            edits[0].new_text,
+            "let user = record { name: \"Ada\" };\nlet line = \"Hi \\(user.name)!\";\n\
+             let prompt = \"\"\"\n    Name: \\(user.name)\n    \"\"\";\n"
+        );
+
+        for (version, (text, code)) in (2..).zip([
+            ("let n = 1;\nlet s = \"\\(n)\";\n", "K3015"),
+            ("let s = \"\\(f(1))\";\n", "K3015"),
+            ("let s = \"\"\"\n    a\n  b\n    \"\"\";\n", "K0004"),
+        ]) {
+            let published = state
+                .change(&uri, version, text.to_owned())
+                .expect("the document should change");
+            assert_eq!(published.diagnostics.len(), 1, "{text}");
+            assert_eq!(
+                published.diagnostics[0].code,
+                Some(NumberOrString::String(code.to_owned())),
+                "{text}"
+            );
+        }
     }
 
     #[test]

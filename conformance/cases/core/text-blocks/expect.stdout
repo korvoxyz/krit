@@ -1,0 +1,11 @@
+Classify this issue as "bug" or "feature".
+  Title: Crash on save
+
+  Body: It fails.
+Answer with one word.	(no reasons)
+"Classify this issue as \"bug\" or \"feature\".\n  Title: Crash on save\n\n  Body: It fails.\nAnswer with one word.\t(no reasons)"
+"one line"
+""
+""
+true
+"a \"\"\"quoted\"\"\" word\nCrash on saveIt fails.\n    ✅ done"

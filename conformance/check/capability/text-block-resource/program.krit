@@ -1,0 +1,5 @@
+fn review(issue: String) -> Result<String, String> {
+    ai_invoke("""
+        reviewer
+        """, issue)
+}

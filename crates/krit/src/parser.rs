@@ -5,12 +5,12 @@ use crate::{
     ast::{
         BinaryOperator, Block, ConstructField, ContractRecord, DocComment, Expression,
         ExpressionKind, ListEntry, MatchKind, Parameter, Program, RecordField, RecordTypeField,
-        Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral,
-        VariantArm, VariantFamily, VariantName,
+        Statement, StatementKind, StringPart, TypeAnnotation, TypeKind, UnaryOperator,
+        ValueLiteral, VariantArm, VariantFamily, VariantName,
     },
     habits::Habit,
     limits::{MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, nesting_error, structural_error},
-    token::{Token, TokenKind},
+    token::{Template, TemplatePart, Token, TokenKind},
 };
 
 /// Parses `tokens`, which the lexer produced from `source`.
@@ -282,9 +282,12 @@ impl<'source> Parser<'source> {
             "schedule" => "schedule",
             _ => return None,
         };
+        // An interpolated string or text block in the name's place is read
+        // as an entrypoint too, so its declaration reports that the name
+        // must be a direct literal.
         let follows_literal = matches!(
             self.tokens.get(self.cursor + 1).map(|token| &token.kind),
-            Some(TokenKind::String(_))
+            Some(TokenKind::String(_) | TokenKind::Template(_))
         );
         let follows_fn = matches!(
             self.tokens.get(self.cursor + 2).map(|token| &token.kind),
@@ -600,6 +603,7 @@ impl<'source> Parser<'source> {
                 kind: ExpressionKind::Literal(ValueLiteral::String(value)),
                 span: token.span,
             }),
+            TokenKind::Template(template) => self.interpolation(template, token.span),
             TokenKind::True => Ok(Expression {
                 kind: ExpressionKind::Literal(ValueLiteral::Boolean(true)),
                 span: token.span,
@@ -693,6 +697,70 @@ impl<'source> Parser<'source> {
             span: open.join(end),
             ..expression
         })
+    }
+
+    /// Builds the interpolated string or text block at `span` from its
+    /// lexed `template`.
+    ///
+    /// The string opens one nesting level for its holes, and each field
+    /// access in a hole is one link of a postfix chain, measured as
+    /// [`Self::call`] measures field-access links.
+    fn interpolation(&mut self, template: Template, span: Span) -> Result<Expression, Diagnostic> {
+        let parts = self.nested(span, |parser| {
+            template
+                .parts
+                .into_iter()
+                .map(|part| match part {
+                    TemplatePart::Text { value, span } => Ok(StringPart::Text { value, span }),
+                    TemplatePart::Hole { path, span } => Ok(StringPart::Hole {
+                        value: parser.hole_path(path, span)?,
+                        span,
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        Ok(Expression {
+            kind: ExpressionKind::Interpolation(parts),
+            span,
+        })
+    }
+
+    /// Builds the value of the hole at `hole`: the variable named by the
+    /// first entry of `path`, followed by a field access for each later
+    /// entry, at the spans of the names inside the hole.
+    fn hole_path(
+        &mut self,
+        path: Vec<(String, Span)>,
+        hole: Span,
+    ) -> Result<Expression, Diagnostic> {
+        let base = self.structural_depth();
+        let depth = self.depth;
+        let mut segments = path.into_iter();
+        // The lexer never produces an empty path.
+        let (name, name_span) = segments.next().ok_or_else(|| {
+            Diagnostic::new("K3015", "interpolation hole is empty", hole)
+                .with_note("write the name of a `String` value between `\\(` and `)`")
+        })?;
+        let mut expression = Expression {
+            kind: ExpressionKind::Variable(name),
+            span: name_span,
+        };
+        for (height, (field, field_span)) in segments.enumerate() {
+            // The `.` directly precedes the field name.
+            let dot = Span::new(field_span.start.saturating_sub(1), field_span.start);
+            self.enter(dot)?;
+            self.reach(base + height + 1, dot)?;
+            let span = expression.span.join(field_span);
+            expression = Expression {
+                kind: ExpressionKind::FieldAccess {
+                    value: Box::new(expression),
+                    field,
+                },
+                span,
+            };
+        }
+        self.depth = depth;
+        Ok(expression)
     }
 
     /// Reports a habit word used as another language's keyword: `word` at
@@ -1743,6 +1811,7 @@ fn starts_operand_only(kind: &TokenKind) -> bool {
         TokenKind::Identifier(_)
             | TokenKind::Integer(_)
             | TokenKind::String(_)
+            | TokenKind::Template(_)
             | TokenKind::True
             | TokenKind::False
             | TokenKind::Record
@@ -2735,5 +2804,94 @@ mod tests {
         let mixed = parse_text("match Some(1) { Some(value) => value, Err(error) => error };")
             .expect_err("mixed variant families should fail");
         assert_eq!(mixed.code(), "K1003");
+    }
+
+    fn interpolation_parts(text: &str) -> Vec<StringPart> {
+        let program = parse_text(text).expect("source should parse");
+        let StatementKind::Let { value, .. } = &program.statements[0].kind else {
+            panic!("a let declaration expected");
+        };
+        let ExpressionKind::Interpolation(parts) = &value.kind else {
+            panic!("an interpolation expected, found {:?}", value.kind);
+        };
+        parts.clone()
+    }
+
+    #[test]
+    fn parses_holes_as_names_and_field_accesses_inside_the_string() {
+        let text = r#"let s = "a\(user.team.name)b\(id)";"#;
+        let parts = interpolation_parts(text);
+        assert_eq!(parts.len(), 4);
+        let StringPart::Hole { value, span } = &parts[1] else {
+            panic!("a hole expected");
+        };
+        assert_eq!(&text[span.start..span.end], r"\(user.team.name)");
+        assert_eq!(&text[value.span.start..value.span.end], "user.team.name");
+        let ExpressionKind::FieldAccess {
+            value: inner,
+            field,
+        } = &value.kind
+        else {
+            panic!("a field access expected");
+        };
+        assert_eq!(field, "name");
+        assert_eq!(&text[inner.span.start..inner.span.end], "user.team");
+        let ExpressionKind::FieldAccess { value: root, field } = &inner.kind else {
+            panic!("a field access expected");
+        };
+        assert_eq!(field, "team");
+        assert!(matches!(&root.kind, ExpressionKind::Variable(name) if name == "user"));
+        assert_eq!(&text[root.span.start..root.span.end], "user");
+        let StringPart::Hole { value, .. } = &parts[3] else {
+            panic!("a hole expected");
+        };
+        assert!(matches!(&value.kind, ExpressionKind::Variable(name) if name == "id"));
+        assert!(matches!(&parts[0], StringPart::Text { value, .. } if value == "a"));
+        assert!(matches!(&parts[2], StringPart::Text { value, .. } if value == "b"));
+    }
+
+    #[test]
+    fn every_text_block_is_an_interpolation_never_a_literal() {
+        let parts = interpolation_parts("let s = \"\"\"\n    reviewer\n    \"\"\";");
+        assert!(matches!(&parts[..], [StringPart::Text { value, .. }] if value == "reviewer"));
+        assert!(interpolation_parts("let s = \"\"\"\n\"\"\";").is_empty());
+
+        let program = parse_text("let s = \"plain\";").expect("source should parse");
+        let StatementKind::Let { value, .. } = &program.statements[0].kind else {
+            panic!("a let declaration expected");
+        };
+        assert!(matches!(
+            value.kind,
+            ExpressionKind::Literal(ValueLiteral::String(_))
+        ));
+    }
+
+    #[test]
+    fn hole_field_paths_count_toward_the_nesting_limit() {
+        // The string opens one level and each field access one more.
+        let hole = |fields: usize| format!("let s = \"\\(r{})\";\n", ".a".repeat(fields));
+        parse_on_compiler_stack(hole(MAX_NESTING_DEPTH - 1))
+            .expect("a hole at the nesting limit should parse");
+        let text = hole(MAX_NESTING_DEPTH);
+        let error = parse_on_compiler_stack(text.clone()).expect_err("a deeper hole should fail");
+        assert_eq!(error.code(), "K1005");
+        assert_eq!(error.span().start, text.rfind('.').expect("a dot"));
+
+        let error = parse_on_compiler_stack(hole(2_000)).expect_err("a deep hole should fail");
+        assert_eq!(error.code(), "K1005");
+    }
+
+    #[test]
+    fn an_interpolated_queue_name_is_not_a_literal() {
+        let error = parse_text(
+            "queue \"jobs-\\(x)\" fn handle(job: QueueJob) -> Result<String, String> { Ok(job.id) }",
+        )
+        .expect_err("an interpolated queue name should fail");
+        assert_eq!(error.code(), "K1002");
+        assert!(
+            error
+                .message()
+                .contains("direct canonical `queue` name literal")
+        );
     }
 }
