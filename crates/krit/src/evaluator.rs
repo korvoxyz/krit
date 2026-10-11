@@ -1126,6 +1126,7 @@ fn select_match_arm<'a>(
             head_name,
             tail_name,
             cons_case,
+            ..
         } => {
             let Value::List(values) = subject_value else {
                 return Err(Diagnostic::new(
@@ -1783,6 +1784,28 @@ mod tests {
                 .code(),
             "K3001"
         );
+    }
+
+    #[test]
+    fn reading_a_repeated_discard_evaluates_its_most_recent_binding() {
+        // Analysis accepts repeated `_` bindings in one scope and resolves a
+        // read to the most recent one (with warning K2003); evaluation must
+        // agree, with and without analysis.
+        let source = r#"
+            let _ = 1;
+            let _ = 2;
+            println(_);
+            fn second(_, _) { _ }
+            println(second(3, 4));
+            println(match [5, 6, 7] {
+                [] => [],
+                [_, .._] => _,
+            });
+            "#;
+        for run in [run as Run, run_unchecked] {
+            let (output, _) = run(source).expect("repeated discards should run");
+            assert_eq!(output, "2\n4\n[6, 7]\n");
+        }
     }
 
     #[test]

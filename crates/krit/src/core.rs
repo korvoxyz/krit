@@ -996,20 +996,16 @@ impl<'a> Lowerer<'a> {
                     MatchKind::List {
                         empty_case,
                         head_name,
+                        head_span,
                         tail_name,
+                        tail_span,
                         cons_case,
                     } => {
                         let empty = self.lower_expression_block(empty_case, Vec::new())?;
-                        let head_binding = self.declaration_binding(
-                            expression.span,
-                            head_name,
-                            SymbolKind::Match,
-                        )?;
-                        let tail_binding = self.declaration_binding(
-                            expression.span,
-                            tail_name,
-                            SymbolKind::Match,
-                        )?;
+                        let head_binding =
+                            self.declaration_binding(*head_span, head_name, SymbolKind::Match)?;
+                        let tail_binding =
+                            self.declaration_binding(*tail_span, tail_name, SymbolKind::Match)?;
                         let head = self.block_parameter(head_binding)?;
                         let tail = self.block_parameter(tail_binding)?;
                         let head_id = head.match_binding;

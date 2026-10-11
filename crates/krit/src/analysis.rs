@@ -716,9 +716,44 @@ impl fmt::Display for RequirementSet {
     }
 }
 
+/// Analyzes `program` and returns its analysis or the first error.
+///
+/// Warnings are discarded; [`analyze_with_warnings`] performs the same
+/// analysis and also returns them.
 pub fn analyze(program: &Program) -> Result<Analysis, Diagnostic> {
-    Analyzer::new().program(program)
+    analyze_with_warnings(program).result
 }
+
+/// The outcome of analyzing a program together with its warnings.
+///
+/// Warnings never decide the outcome: a program that analysis accepts still
+/// produces an [`Analysis`] when it has warnings, and a program that analysis
+/// rejects still reports every warning found before its error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalysisReport {
+    /// The analysis, or the first error that rejected the program.
+    pub result: Result<Analysis, Diagnostic>,
+    /// Every warning analysis found, ordered by source span and then code.
+    pub warnings: Vec<Diagnostic>,
+}
+
+/// Analyzes `program` exactly as [`analyze`] does and also returns the
+/// warnings found, whether analysis succeeds or fails.
+pub fn analyze_with_warnings(program: &Program) -> AnalysisReport {
+    let mut analyzer = Analyzer::new();
+    let result = analyzer.program(program);
+    let mut warnings = analyzer.warnings;
+    warnings.sort_by(|left, right| {
+        left.span()
+            .cmp(&right.span())
+            .then_with(|| left.code().cmp(right.code()))
+    });
+    AnalysisReport { result, warnings }
+}
+
+/// The discard name. Any number of bindings in one scope may use it, and
+/// reading it is warning K2003 in edition 2026.
+const DISCARD: &str = "_";
 
 #[derive(Clone, Debug)]
 enum InferType {
@@ -847,6 +882,8 @@ struct Analyzer {
     /// precedence over the generic mismatch reported by the failing
     /// unification.
     type_depth_error: Option<Diagnostic>,
+    /// Warnings found so far, in analysis order. They never stop analysis.
+    warnings: Vec<Diagnostic>,
 }
 
 #[derive(Clone)]
@@ -876,10 +913,11 @@ impl Analyzer {
             type_heights: Vec::new(),
             type_dependents: Vec::new(),
             type_depth_error: None,
+            warnings: Vec::new(),
         }
     }
 
-    fn program(mut self, program: &Program) -> Result<Analysis, Diagnostic> {
+    fn program(&mut self, program: &Program) -> Result<Analysis, Diagnostic> {
         let mut effects = InferEffects::default();
         for statement in &program.statements {
             effects.union(self.statement(statement)?);
@@ -889,7 +927,7 @@ impl Analyzer {
 
         let expanded_effects = self.expanded_effects();
         let expanded_requirements = self.expanded_requirements();
-        let mut normalizer = TypeNormalizer::new(&self, &expanded_effects, &expanded_requirements);
+        let mut normalizer = TypeNormalizer::new(self, &expanded_effects, &expanded_requirements);
         let bindings = self
             .bindings
             .iter()
@@ -1252,6 +1290,13 @@ impl Analyzer {
             }),
             ExpressionKind::Variable(name) => {
                 let (ty, resolution) = self.lookup(name, expression.span)?;
+                if name == DISCARD && matches!(resolution, ResolvedName::Symbol(_)) {
+                    self.warnings.push(Diagnostic::warning(
+                        "K2003",
+                        "`_` is a discard; reading it will be an error in edition 2027",
+                        expression.span,
+                    ));
+                }
                 if matches!(
                     resolution,
                     ResolvedName::Builtin(
@@ -1849,10 +1894,12 @@ impl Analyzer {
             MatchKind::List {
                 empty_case,
                 head_name,
+                head_span,
                 tail_name,
+                tail_span,
                 cons_case,
             } => {
-                if head_name == tail_name {
+                if head_name == tail_name && head_name != DISCARD {
                     return Err(Diagnostic::new(
                         "K2002",
                         format!("duplicate match binding `{tail_name}`"),
@@ -1868,11 +1915,17 @@ impl Analyzer {
                 )?;
                 let empty = self.expression(empty_case)?;
                 self.push_scope();
-                self.define_symbol(head_name, element.clone(), span, SymbolKind::Match, false);
+                self.define_symbol(
+                    head_name,
+                    element.clone(),
+                    *head_span,
+                    SymbolKind::Match,
+                    false,
+                );
                 self.define_symbol(
                     tail_name,
                     InferType::List(Box::new(element)),
-                    span,
+                    *tail_span,
                     SymbolKind::Match,
                     false,
                 );
@@ -3428,12 +3481,16 @@ impl Analyzer {
         Some((ty, ResolvedName::Builtin(builtin)))
     }
 
+    /// Rejects a declaration that reuses a built-in name or a name already
+    /// declared in the current scope. The discard name `_` may be declared any
+    /// number of times; reading it refers to the most recent declaration.
     fn ensure_name_available(&self, name: &str, span: Span) -> Result<(), Diagnostic> {
         if Builtin::from_name(name).is_some()
-            || self
-                .scopes
-                .last()
-                .is_some_and(|scope| scope.contains_key(name))
+            || (name != DISCARD
+                && self
+                    .scopes
+                    .last()
+                    .is_some_and(|scope| scope.contains_key(name)))
         {
             Err(Diagnostic::new(
                 "K2002",
@@ -3959,6 +4016,118 @@ mod tests {
         let duplicate_nested =
             check("{ let value = 1; let value = 2; };").expect_err("same block should fail");
         assert_eq!(duplicate_nested.code(), "K2002");
+    }
+
+    fn check_with_warnings(text: &str) -> AnalysisReport {
+        let source = Source::new("test.krit", text);
+        analyze_with_warnings(&parse_source(&source).expect("source should parse"))
+    }
+
+    fn warning_codes(warnings: &[Diagnostic]) -> Vec<&'static str> {
+        warnings.iter().map(Diagnostic::code).collect()
+    }
+
+    #[test]
+    fn reading_a_discard_warns_without_rejecting_the_program() {
+        let text = "let _ = 1;\nprintln(_);";
+        let report = check_with_warnings(text);
+
+        assert_eq!(report.warnings.len(), 1);
+        let warning = &report.warnings[0];
+        assert_eq!(warning.severity(), crate::Severity::Warning);
+        assert_eq!(warning.code(), "K2003");
+        assert_eq!(
+            warning.message(),
+            "`_` is a discard; reading it will be an error in edition 2027"
+        );
+        assert_eq!(warning.span(), Span::new(19, 20));
+        let analysis = report.result.expect("reading `_` should still check");
+        assert_eq!(
+            check(text).expect("analyze should accept the same program"),
+            analysis
+        );
+
+        let unbound = check_with_warnings("println(_);");
+        assert_eq!(
+            unbound
+                .result
+                .expect_err("an unbound `_` is undefined")
+                .code(),
+            "K2001"
+        );
+        assert!(unbound.warnings.is_empty());
+
+        let unread =
+            check_with_warnings("let _ = 1; let _ = 2; fn ignore(_, _) { 0 } ignore(1, 2);");
+        unread
+            .result
+            .expect("binding `_` without reading it should check");
+        assert!(unread.warnings.is_empty());
+    }
+
+    #[test]
+    fn discard_may_be_bound_repeatedly_and_reads_the_most_recent_binding() {
+        // Each annotation holds only if `_` refers to the most recent binding.
+        let report = check_with_warnings(
+            r#"
+            let _ = 1;
+            let _ = "two";
+            let text: String = _;
+            fn pick(_, _: Bool) { _ }
+            let flag: Bool = pick(1, true);
+            let rest: List<Int> = match [1, 2] {
+                [] => [],
+                [_, .._] => _,
+            };
+            let ignore = fn(_, _) { 0 };
+            fn _() { 3 }
+            fn _() { 4 }
+            "#,
+        );
+
+        report.result.expect("repeated discards should check");
+        assert_eq!(warning_codes(&report.warnings), ["K2003", "K2003", "K2003"]);
+        assert!(
+            report
+                .warnings
+                .windows(2)
+                .all(|pair| pair[0].span() < pair[1].span()),
+            "warnings should be in source order"
+        );
+
+        for (text, message) in [
+            (
+                "let value = 1; let value = 2;",
+                "duplicate declaration `value`",
+            ),
+            (
+                "fn pair(value, value) { value }",
+                "duplicate parameter `value`",
+            ),
+            (
+                "match [1] { [] => 0, [value, ..value] => 1 };",
+                "duplicate match binding `value`",
+            ),
+        ] {
+            let error = check(text).expect_err("non-discard duplicates should still fail");
+            assert_eq!(error.code(), "K2002", "{text}");
+            assert_eq!(error.message(), message, "{text}");
+        }
+    }
+
+    #[test]
+    fn reports_warnings_found_before_an_error() {
+        let report = check_with_warnings("let _ = 1;\nlet text = _ + \"a\";");
+
+        assert_eq!(
+            report
+                .result
+                .expect_err("the type error should still reject the program")
+                .code(),
+            "K3001"
+        );
+        assert_eq!(warning_codes(&report.warnings), ["K2003"]);
+        assert_eq!(report.warnings[0].span(), Span::new(22, 23));
     }
 
     #[test]

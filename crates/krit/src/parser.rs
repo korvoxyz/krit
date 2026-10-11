@@ -257,7 +257,8 @@ impl Parser {
         if !self.check(&TokenKind::RightParen) {
             loop {
                 let (name, span) = self.binding_name()?;
-                if !seen.insert(name.clone()) {
+                // The discard name `_` may name any number of parameters.
+                if name != "_" && !seen.insert(name.clone()) {
                     return Err(Diagnostic::new(
                         "K2002",
                         format!("duplicate parameter `{name}`"),
@@ -739,7 +740,8 @@ impl Parser {
             ));
         }
         let (tail_name, tail_span) = self.binding_name()?;
-        if head_name == tail_name {
+        // The discard name `_` may be bound more than once.
+        if head_name == tail_name && head_name != "_" {
             return Err(Diagnostic::new(
                 "K2002",
                 format!("duplicate match binding `{tail_name}`"),
@@ -758,7 +760,9 @@ impl Parser {
                 kind: MatchKind::List {
                     empty_case: Box::new(empty_case),
                     head_name,
+                    head_span,
                     tail_name,
+                    tail_span,
                     cons_case: Box::new(cons_case),
                 },
             },

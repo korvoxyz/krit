@@ -75,6 +75,8 @@ fn handles_protocol_errors_deterministically_and_shuts_down_gracefully() {
     };
     assert_eq!(diagnostics.method, "textDocument/publishDiagnostics");
     assert_eq!(diagnostics.params["diagnostics"][0]["code"], "K2001");
+    // DiagnosticSeverity::ERROR
+    assert_eq!(diagnostics.params["diagnostics"][0]["severity"], 1);
 
     send(
         &client,
@@ -146,6 +148,27 @@ fn handles_protocol_errors_deterministically_and_shuts_down_gracefully() {
     let second = response_result(receive(&client), 5).expect("facts should succeed");
     assert_eq!(first, second);
     assert_eq!(first["module"]["effects"], json!(["io.stdout"]));
+
+    send(
+        &client,
+        Message::Notification(Notification::new(
+            "textDocument/didChange".to_owned(),
+            json!({
+                "textDocument": {"uri": uri, "version": 3},
+                "contentChanges": [{"text": "let _ = 42;\nprintln(_);\n"}]
+            }),
+        )),
+    );
+    let Message::Notification(diagnostics) = receive(&client) else {
+        panic!("didChange with a warning should publish diagnostics")
+    };
+    assert_eq!(
+        diagnostics.params["diagnostics"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(diagnostics.params["diagnostics"][0]["code"], "K2003");
+    // DiagnosticSeverity::WARNING
+    assert_eq!(diagnostics.params["diagnostics"][0]["severity"], 2);
 
     send(
         &client,

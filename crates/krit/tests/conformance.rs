@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use krit::{Source, analyze, lower, parse_source, run_source};
+use krit::{Source, analyze_with_warnings, lower, parse_source, run_source};
 
 #[test]
 fn normative_conformance_cases() {
@@ -76,7 +76,12 @@ fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) {
 fn run_case(case: &Path, root: &Path) {
     let case_name = case_name(case, root);
     let source = read_program(case);
-    assert_passes_check(&source, &case_name);
+    let warnings = assert_passes_check(&source, &case_name);
+    assert_eq!(
+        warnings,
+        read_lines(case.join("expect.warnings")),
+        "warning mismatch in {case_name}"
+    );
 
     let mut output = Vec::new();
     let result = run_source(&source, &mut output);
@@ -107,11 +112,14 @@ fn run_case(case: &Path, root: &Path) {
 
 /// Runtime cases define evaluation behavior, so each must pass `krit check`
 /// (parsing, analysis, and Core lowering). A program that check rejects never
-/// reaches the evaluator and belongs in `conformance/check` instead.
-fn assert_passes_check(source: &Source, case_name: &str) {
+/// reaches the evaluator and belongs in `conformance/check` instead. Returns
+/// the codes of the warnings check reports.
+fn assert_passes_check(source: &Source, case_name: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
     let program = parse_source(source).and_then(|program| {
-        let analysis = analyze(&program)?;
-        Ok((program, analysis))
+        let report = analyze_with_warnings(&program);
+        warnings = report.warnings;
+        Ok((program, report.result?))
     });
     let (program, analysis) = program.unwrap_or_else(|diagnostic| {
         panic!(
@@ -122,6 +130,10 @@ fn assert_passes_check(source: &Source, case_name: &str) {
     if let Err(error) = lower(&program, &analysis) {
         panic!("runtime case {case_name} should lower to Core IR: {error}");
     }
+    warnings
+        .iter()
+        .map(|warning| warning.code().to_owned())
+        .collect()
 }
 
 fn case_name(case: &Path, root: &Path) -> String {
@@ -145,10 +157,11 @@ fn read_status(case: &Path) -> u8 {
 }
 
 fn read_codes(case: &Path) -> Vec<String> {
-    read_optional(case.join("expect.diagnostics"))
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    read_lines(case.join("expect.diagnostics"))
+}
+
+fn read_lines(path: PathBuf) -> Vec<String> {
+    read_optional(path).lines().map(str::to_owned).collect()
 }
 
 fn read_optional(path: PathBuf) -> String {

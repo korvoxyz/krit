@@ -11,8 +11,10 @@ Each directory contains:
 - `program.krit` — UTF-8 source
 - `expect.status` — required decimal process status plus line feed
 - `expect.stdout` — optional exact standard-output bytes; absent means empty
-- `expect.diagnostics` — optional ordered diagnostic codes, one per line;
-  absent means no diagnostics
+- `expect.diagnostics` — optional ordered error codes, one per line; absent
+  means no errors
+- `expect.warnings` — optional ordered warning codes, one per line; absent
+  means no warnings
 
 `conformance/cases` contains runtime cases. The harness invokes the
 equivalent of:
@@ -22,8 +24,11 @@ krit run --diagnostic-format json program.krit
 ```
 
 It compares status and standard output exactly. It decodes JSON Lines from
-standard error and compares the ordered `code` fields. Additional diagnostic
-prose and labels may vary within `spec/DIAGNOSTICS.md`.
+standard error and compares the ordered `code` fields of the diagnostics whose
+`severity` is `error` with `expect.diagnostics` and of those whose `severity`
+is `warning` with `expect.warnings`. Every diagnostic must be one or the
+other. Additional diagnostic prose and labels may vary within
+`spec/DIAGNOSTICS.md`.
 
 `krit run` checks a program exactly as `krit check` does before evaluating it
 (`spec/LANGUAGE.md` section 14), so every runtime case must pass `krit check`,
@@ -39,8 +44,9 @@ That harness invokes the equivalent of:
 krit check --diagnostic-format json program.krit
 ```
 
-It compares status and diagnostic codes and requires that checking never
-execute program effects or emit program output. Because `krit run` checks
+It compares status, error codes, and warning codes as the runtime harness does,
+and requires that checking never execute program effects or emit program
+output. Because `krit run` checks
 first, the harness also requires that `krit run` refuse every failing check
 case with the same diagnostics and status and no program output.
 
@@ -64,6 +70,7 @@ network service, or nondeterministic value.
 | `core/else-if-chain` | a 300-branch `else if` chain adds no nesting levels |
 | `scope/closures` | immutable lexical capture and shadowing |
 | `scope/builtin-shadowing` | match binders shadow unreserved built-in names, as in checking |
+| `scope/discard` | repeated `_` bindings in one scope; reading `_` evaluates the most recent one and warns (`K2003`) |
 | `functions/recursion` | recursive declaration and calls |
 | `functions/deep-recursion` | 9,000 nested calls stay within the call-depth limit |
 | `lists/match` | list construction and exhaustive decomposition |
@@ -79,6 +86,7 @@ network service, or nondeterministic value.
 | `check/valid/inference` | recursion, closures, empty lists, None, and effects infer together |
 | `check/syntax/missing-semicolon` | missing required syntax |
 | `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
+| `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, and an unbound `_` is undefined |
 | `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors |
 | `check/match/*` | unique, exhaustive, single-family Option and Result arms (`K1003`) |
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |

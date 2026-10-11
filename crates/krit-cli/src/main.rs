@@ -13,7 +13,7 @@ use std::{
 
 use krit::{
     Analysis, CoreModule, Diagnostic, EntrypointKind, Program, RequirementSet, Source, Span,
-    analyze, execute, format_source, lower, parse_source, run_on_thread,
+    analyze_with_warnings, execute, format_source, lower, parse_source, run_on_thread,
 };
 use krit_package::Manifest;
 use krit_runtime::{
@@ -125,9 +125,9 @@ fn build_command(arguments: &[String]) -> u8 {
         Ok(program) => program,
         Err(diagnostic) => return report(&diagnostic, &source, DiagnosticFormat::Human),
     };
-    let analysis = match analyze(&program) {
+    let analysis = match analyze_reported(&program, &source, DiagnosticFormat::Human) {
         Ok(analysis) => analysis,
-        Err(diagnostic) => return report(&diagnostic, &source, DiagnosticFormat::Human),
+        Err(status) => return status,
     };
     let module = match lower(&program, &analysis) {
         Ok(module) => module,
@@ -613,33 +613,18 @@ fn explain_command(arguments: &[String]) -> u8 {
         }
     };
     let source = Source::new(path.to_string_lossy().into_owned(), text);
+    let format = if json {
+        DiagnosticFormat::Json
+    } else {
+        DiagnosticFormat::Human
+    };
     let program = match parse_source(&source) {
         Ok(program) => program,
-        Err(diagnostic) => {
-            return report(
-                &diagnostic,
-                &source,
-                if json {
-                    DiagnosticFormat::Json
-                } else {
-                    DiagnosticFormat::Human
-                },
-            );
-        }
+        Err(diagnostic) => return report(&diagnostic, &source, format),
     };
-    let analysis = match analyze(&program) {
+    let analysis = match analyze_reported(&program, &source, format) {
         Ok(analysis) => analysis,
-        Err(diagnostic) => {
-            return report(
-                &diagnostic,
-                &source,
-                if json {
-                    DiagnosticFormat::Json
-                } else {
-                    DiagnosticFormat::Human
-                },
-            );
-        }
+        Err(status) => return status,
     };
     let module = match lower(&program, &analysis) {
         Ok(module) => module,
@@ -1180,12 +1165,12 @@ fn source_command(arguments: &[String], action: SourceAction) -> u8 {
     }
 }
 
-/// Parses, analyzes, and lowers `source` the way `krit check` does. On failure
-/// the diagnostic has already been reported and the command's exit status is
-/// returned.
+/// Parses, analyzes, and lowers `source` the way `krit check` does, reporting
+/// analysis warnings as it goes. On failure the diagnostic has already been
+/// reported and the command's exit status is returned.
 fn check_source(source: &Source, format: DiagnosticFormat) -> Result<(Program, Analysis), u8> {
     let program = parse_source(source).map_err(|diagnostic| report(&diagnostic, source, format))?;
-    let analysis = analyze(&program).map_err(|diagnostic| report(&diagnostic, source, format))?;
+    let analysis = analyze_reported(&program, source, format)?;
     if let Err(error) = lower(&program, &analysis) {
         return Err(internal_error("KICE0001", "lowering Core IR", &error));
     }
@@ -1335,12 +1320,35 @@ fn parse_diagnostic_format(value: &str) -> Result<DiagnosticFormat, String> {
     }
 }
 
+/// Analyzes `program` and reports every analysis warning, followed by the
+/// error when analysis fails. Warnings never change the exit status; on
+/// failure the returned status is the error's.
+fn analyze_reported(
+    program: &Program,
+    source: &Source,
+    format: DiagnosticFormat,
+) -> Result<Analysis, u8> {
+    let analysis = analyze_with_warnings(program);
+    for warning in &analysis.warnings {
+        emit(warning, source, format);
+    }
+    analysis
+        .result
+        .map_err(|diagnostic| report(&diagnostic, source, format))
+}
+
+/// Reports an error diagnostic and returns the source-failure exit status.
 fn report(diagnostic: &Diagnostic, source: &Source, format: DiagnosticFormat) -> u8 {
+    emit(diagnostic, source, format);
+    1
+}
+
+/// Writes one diagnostic of any severity to standard error.
+fn emit(diagnostic: &Diagnostic, source: &Source, format: DiagnosticFormat) {
     match format {
         DiagnosticFormat::Human => eprintln!("{}", diagnostic.render_human(source)),
         DiagnosticFormat::Json => eprintln!("{}", diagnostic.render_json(source)),
     }
-    1
 }
 
 fn package_command(arguments: &[String]) -> u8 {
@@ -2645,7 +2653,14 @@ mod tests {
             let end = code.find("\n```").expect("Krit code fence should close");
             let source = Source::new(format!("<prompt-example-{count}>"), &code[..end]);
             let program = parse_source(&source).expect("prompt example should parse");
-            analyze(&program).expect("prompt example should pass semantic analysis");
+            let analysis = analyze_with_warnings(&program);
+            analysis
+                .result
+                .expect("prompt example should pass semantic analysis");
+            assert!(
+                analysis.warnings.is_empty(),
+                "prompt example should have no warnings"
+            );
             let formatted = format_source(&source).expect("prompt example should format");
             assert_eq!(
                 formatted,
@@ -2658,7 +2673,9 @@ mod tests {
             );
             let program =
                 parse_source(&formatted_source).expect("formatted prompt example should parse");
-            analyze(&program).expect("formatted prompt example should pass semantic analysis");
+            analyze_with_warnings(&program)
+                .result
+                .expect("formatted prompt example should pass semantic analysis");
             assert_eq!(
                 format_source(&formatted_source).expect("formatting should be idempotent"),
                 formatted

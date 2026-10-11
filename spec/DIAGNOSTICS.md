@@ -7,16 +7,41 @@ Diagnostics are part of Krit's human and AI tooling interface. Their codes and
 structured fields are stable within an edition; prose may improve without
 breaking compatibility.
 
+## Severity
+
+Every diagnostic has a severity:
+
+| Severity | Meaning |
+|---|---|
+| `error` | The program or input is rejected and the command fails |
+| `warning` | The program is accepted; the diagnostic reports something the author should change |
+
+A warning never changes a command's outcome or exit status: a program whose
+only diagnostics are warnings checks, runs, builds, and is explained exactly as
+it would without them. `krit check`, `krit run`, `krit build`, and
+`krit explain` report every warning that analysis finds, ordered by source
+span and then code, on standard error in the selected diagnostic format. When
+analysis also rejects the program, the warnings found before the error are
+reported first and the error last. The language server publishes warnings with
+LSP `DiagnosticSeverity.Warning` and errors with `DiagnosticSeverity.Error`,
+and `krit/compilerFacts` diagnostics carry the same `severity` strings as the
+JSON Lines format.
+
+The schema reserves `info` for informational diagnostics; no command emits it
+yet.
+
 ## Human format
 
 The default format is:
 
 ```text
 path/to/file.krit:4:11: error[K2001]: undefined name `total`
+path/to/file.krit:7:9: warning[K2003]: `_` is a discard; reading it will be an error in edition 2027
 ```
 
-An implementation may add source excerpts and suggestions after this first
-line. It must not expose a host-language stack trace unless explicitly
+The severity word comes first, followed by the code in brackets; warnings use
+the same location style as errors. An implementation may add source excerpts
+and suggestions after this first line. It must not expose a host-language stack trace unless explicitly
 requested with a developer option.
 
 Paths should be relative to the package root. Standalone files use the path
@@ -64,6 +89,13 @@ fields and must reject an unknown schema number.
 | `K6000`-`K6999` | Package, manifest, and lockfile errors |
 | `K7000`-`K7999` | Build and cache errors |
 | `K8000`-`K8999` | Formatter and tooling errors |
+| `K9000`-`K9999` | Lints: warnings by default |
+
+A code's severity is part of its contract within an edition. Codes outside the
+lint range are errors unless the table below marks them as warnings. Lints
+report readability, safety, and authority hazards in programs that are
+otherwise valid; they are warnings by default, so adding a lint never rejects
+a program that checked before.
 
 Initial required codes:
 
@@ -78,7 +110,8 @@ Initial required codes:
 | `K1004` | Webhook declaration is nested or otherwise misplaced |
 | `K1005` | Nesting depth limit exceeded: syntax nests more than 256 levels, nesting plus the `else if` continuations, operators, and call or field-access links above a point exceeds 4,096, or an inferred type would nest more than 256 levels |
 | `K2001` | Undefined name |
-| `K2002` | Duplicate binding or parameter |
+| `K2002` | Duplicate binding or parameter; the discard name `_` is exempt |
+| `K2003` | Warning: the discard name `_` is read as a value; this becomes an error in edition 2027 |
 | `K3001` | Static type mismatch or invalid typed operator |
 | `K3002` | Statically known non-function call target |
 | `K3003` | Static function argument count mismatch |
@@ -146,6 +179,8 @@ Initial required codes:
 | `3` | Package resolution, lockfile, registry, or build-plan failure |
 | `4` | Capability, unavailable-host, or import authorization denial (`K5001`, `K5002`, or `K5003`); artifact-aware permission reports are still printed |
 | `101` | Internal compiler error |
+
+Warnings never affect the exit status.
 
 An internal compiler error is always a Krit bug. It must include a stable crash
 identifier but must not include source content, environment variables, or

@@ -277,11 +277,23 @@ The binding extends from the following item in the current scope to the end of
 that scope.
 
 A lexical scope cannot declare the same name more than once. This applies
-across `let` and function declarations in that scope. A nested scope may
+across `let` and function declarations in that scope. The discard name `_` is
+the only exception (below). A nested scope may
 shadow a name from an outer scope. A binding cannot be read before its
 declaration. `krit check` enforces these rules as a deliberate readability
 constraint for both human- and AI-authored code, and `krit run` enforces them
 by checking first (section 14).
+
+The identifier `_` alone is the discard name. It is exempt from the
+one-declaration rule: any number of `let` bindings, function declarations,
+parameters, and match binders in one scope may use it, including both names of
+one `[_, .._]` list pattern. A program should bind `_` only for a value it
+does not use. Reading `_` as a value, that is, an identifier expression `_`
+that resolves to a binding, is valid in edition 2026 and refers to the most
+recent `_` binding in scope, exactly as shadowing does, but checking reports
+warning `K2003`; edition 2027 makes it an error. An identifier expression `_`
+with no `_` binding in scope is an undefined name (`K2001`). Warnings never
+change whether a program checks or runs (`DIAGNOSTICS.md`).
 
 A lexical binding shadows a built-in name of the same spelling for the
 binding's whole scope, in checking and evaluation alike. `let`, function, and
@@ -301,7 +313,7 @@ single exported host entrypoint.
 Krit uses lexical scope. A function expression captures bindings from the
 environment where it is created, not where it is called.
 
-Duplicate parameters are a compile error.
+Duplicate parameters are a compile error, except for the discard name `_`.
 
 ## 8. Functions and calls
 
@@ -446,8 +458,9 @@ The subject evaluates once and must be a list.
 - `tail` receives the remaining immutable list.
 - Pattern bindings exist only in the non-empty arm.
 
-The two pattern names must differ. Both arms are mandatory and their order is
-fixed, making the match visibly exhaustive.
+The two pattern names must differ unless both are the discard name `_`
+(section 7). Both arms are mandatory and their order is fixed, making the
+match visibly exhaustive.
 
 `Option` and `Result` matches contain exactly the two variants of one family.
 Their arms may appear in either order:
@@ -655,7 +668,8 @@ with explicit immutable host inputs.
 parsing, name resolution, type, effect, and capability analysis, and Core
 verification. A program that fails checking is never evaluated: `run`
 reports the same diagnostic with the same exit status as `check` and writes
-no program output.
+no program output. Warnings that checking reports, such as `K2003`, are
+printed exactly as `check` prints them and never prevent evaluation.
 
 A program that passes checking is still refused before evaluation, with
 `K5003` and exit status 4, when it declares a webhook, queue, or schedule

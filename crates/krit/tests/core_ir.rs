@@ -147,6 +147,49 @@ fn every_executable_variable_reference_has_a_resolved_identity() {
 }
 
 #[test]
+fn repeated_discards_lower_to_distinct_bindings() {
+    let source = Source::new(
+        "discards.krit",
+        r#"
+        let _ = 1;
+        let _ = 2;
+        fn second(_, _) { _ }
+        let rest = match [1, 2, 3] {
+            [] => [],
+            [_, .._] => _,
+        };
+        println(_);
+        "#,
+    );
+    let program = parse_source(&source).expect("source should parse");
+    let analysis = analyze(&program).expect("repeated discards should analyze");
+    for statement in &program.statements {
+        assert_statement_names_resolved(statement, &analysis);
+    }
+    let module = lower(&program, &analysis).expect("repeated discards should lower and verify");
+
+    // Two lets, two parameters, and the list head and tail each get their own
+    // binding at their own declaration site.
+    let discards = module
+        .bindings()
+        .iter()
+        .filter(|binding| binding.debug_name.as_deref() == Some("_"))
+        .collect::<Vec<_>>();
+    assert_eq!(discards.len(), 6);
+    let mut sources = discards
+        .iter()
+        .map(|binding| {
+            binding
+                .source
+                .expect("discard binding should have a source span")
+        })
+        .collect::<Vec<_>>();
+    sources.sort();
+    sources.dedup();
+    assert_eq!(sources.len(), 6, "each discard binding has a distinct site");
+}
+
+#[test]
 fn core_operations_preserve_left_to_right_evaluation_order() {
     let rendered = lower_source(
         "order.krit",

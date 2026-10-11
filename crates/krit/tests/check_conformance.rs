@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use krit::{Source, analyze, parse_source};
+use krit::{Severity, Source, analyze, analyze_with_warnings, parse_source};
 
 #[test]
 fn static_check_conformance_cases() {
@@ -81,7 +81,13 @@ fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) {
 fn run_case(case: &Path, root: &Path) {
     let text = fs::read_to_string(case.join("program.krit")).expect("program should be readable");
     let source = Source::new("program.krit", text);
-    let result = parse_source(&source).and_then(|program| analyze(&program));
+    let (result, warnings) = match parse_source(&source) {
+        Ok(program) => {
+            let report = analyze_with_warnings(&program);
+            (report.result.map(|_| ()), report.warnings)
+        }
+        Err(diagnostic) => (Err(diagnostic), Vec::new()),
+    };
 
     let expected_status = fs::read_to_string(case.join("expect.status"))
         .expect("expect.status should be readable")
@@ -91,6 +97,14 @@ fn run_case(case: &Path, root: &Path) {
     let expected_codes = read_optional(case.join("expect.diagnostics"))
         .lines()
         .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let expected_warnings = read_optional(case.join("expect.warnings"))
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let actual_warnings = warnings
+        .iter()
+        .map(|warning| warning.code().to_owned())
         .collect::<Vec<_>>();
     let (actual_status, actual_codes) = match result {
         Ok(_) => (0, Vec::new()),
@@ -109,6 +123,16 @@ fn run_case(case: &Path, root: &Path) {
     assert_eq!(
         actual_codes, expected_codes,
         "diagnostic mismatch in {case_name}"
+    );
+    assert_eq!(
+        actual_warnings, expected_warnings,
+        "warning mismatch in {case_name}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| warning.severity() == Severity::Warning),
+        "analysis returned a non-warning beside its result in {case_name}"
     );
 }
 

@@ -7,8 +7,8 @@ use std::{
 
 use krit::{
     Analysis, Block, Builtin, Diagnostic as CompilerDiagnostic, Effect, EntrypointKind, Expression,
-    ExpressionKind, MatchKind, Program, RequirementSet, ResolvedName, Source, Span, Statement,
-    StatementKind, SymbolKind as CompilerSymbolKind, Type, TypeAnnotation,
+    ExpressionKind, MatchKind, Program, RequirementSet, ResolvedName, Severity, Source, Span,
+    Statement, StatementKind, SymbolKind as CompilerSymbolKind, Type, TypeAnnotation,
 };
 use krit_package::Manifest;
 use lsp_server::ErrorCode;
@@ -197,7 +197,9 @@ struct Document {
     source: Source,
     lines: LineIndex,
     analysis: Option<Analysis>,
-    compiler_diagnostic: Option<CompilerDiagnostic>,
+    /// Analysis warnings in source order, followed by the parse or analysis
+    /// error that rejected the document, if any.
+    compiler_diagnostics: Vec<CompilerDiagnostic>,
     formatted: Result<String, CompilerDiagnostic>,
     declarations: Vec<DeclarationFact>,
     syntax_kinds: BTreeMap<Span, &'static str>,
@@ -221,7 +223,7 @@ impl Document {
                 lines: LineIndex::new(source.text()),
                 source,
                 analysis: None,
-                compiler_diagnostic: None,
+                compiler_diagnostics: Vec::new(),
                 formatted: Err(CompilerDiagnostic::new(
                     "K8002",
                     format!(
@@ -241,12 +243,19 @@ impl Document {
         let source = Source::new(document_name(&uri), text);
         let lines = LineIndex::new(source.text());
         let formatted = krit::format_source(&source);
-        let (program, analysis, compiler_diagnostic) = match krit::parse_source(&source) {
-            Ok(program) => match krit::analyze(&program) {
-                Ok(analysis) => (Some(program), Some(analysis), None),
-                Err(diagnostic) => (Some(program), None, Some(diagnostic)),
-            },
-            Err(diagnostic) => (None, None, Some(diagnostic)),
+        let (program, analysis, compiler_diagnostics) = match krit::parse_source(&source) {
+            Ok(program) => {
+                let report = krit::analyze_with_warnings(&program);
+                let mut diagnostics = report.warnings;
+                match report.result {
+                    Ok(analysis) => (Some(program), Some(analysis), diagnostics),
+                    Err(diagnostic) => {
+                        diagnostics.push(diagnostic);
+                        (Some(program), None, diagnostics)
+                    }
+                }
+            }
+            Err(diagnostic) => (None, None, vec![diagnostic]),
         };
         let (declarations, syntax_kinds) = match (&program, &analysis) {
             (Some(program), Some(analysis)) => {
@@ -265,7 +274,7 @@ impl Document {
             source,
             lines,
             analysis,
-            compiler_diagnostic,
+            compiler_diagnostics,
             formatted,
             declarations,
             syntax_kinds,
@@ -289,10 +298,10 @@ impl Document {
                 ..Diagnostic::default()
             }]
         } else {
-            self.compiler_diagnostic
-                .as_ref()
-                .map(|diagnostic| vec![self.lsp_diagnostic(diagnostic)])
-                .unwrap_or_default()
+            self.compiler_diagnostics
+                .iter()
+                .map(|diagnostic| self.lsp_diagnostic(diagnostic))
+                .collect()
         };
         PublishDiagnosticsParams::new(self.uri.clone(), diagnostics, Some(self.version))
     }
@@ -300,7 +309,10 @@ impl Document {
     fn lsp_diagnostic(&self, diagnostic: &CompilerDiagnostic) -> Diagnostic {
         Diagnostic {
             range: self.lines.range(self.source.text(), diagnostic.span()),
-            severity: Some(DiagnosticSeverity::ERROR),
+            severity: Some(match diagnostic.severity() {
+                Severity::Error => DiagnosticSeverity::ERROR,
+                Severity::Warning => DiagnosticSeverity::WARNING,
+            }),
             code: Some(NumberOrString::String(diagnostic.code().to_owned())),
             source: Some("krit".to_owned()),
             message: diagnostic.message().to_owned(),
@@ -713,18 +725,16 @@ impl Document {
                 range: Range::new(Position::new(0, 0), Position::new(0, 0)),
             }]
         } else {
-            self.compiler_diagnostic
-                .as_ref()
-                .map(|diagnostic| {
-                    vec![CompilerDiagnosticFact {
-                        severity: "error",
-                        code: diagnostic.code().to_owned(),
-                        message: diagnostic.message().to_owned(),
-                        span: diagnostic.span().into(),
-                        range: self.lines.range(self.source.text(), diagnostic.span()),
-                    }]
+            self.compiler_diagnostics
+                .iter()
+                .map(|diagnostic| CompilerDiagnosticFact {
+                    severity: diagnostic.severity().as_str(),
+                    code: diagnostic.code().to_owned(),
+                    message: diagnostic.message().to_owned(),
+                    span: diagnostic.span().into(),
+                    range: self.lines.range(self.source.text(), diagnostic.span()),
                 })
-                .unwrap_or_default()
+                .collect()
         };
 
         let analysis = self.analysis.as_ref();
@@ -1930,23 +1940,25 @@ impl<'a> DeclarationCollector<'a> {
                         MatchKind::List {
                             empty_case,
                             head_name,
+                            head_span,
                             tail_name,
+                            tail_span,
                             cons_case,
                         } => {
                             self.expression(empty_case);
                             self.add(
                                 head_name,
                                 CompilerSymbolKind::Match,
-                                current.span,
-                                None,
+                                *head_span,
+                                Some(*head_span),
                                 cons_case.span,
                                 None,
                             );
                             self.add(
                                 tail_name,
                                 CompilerSymbolKind::Match,
-                                current.span,
-                                None,
+                                *tail_span,
+                                Some(*tail_span),
                                 cons_case.span,
                                 None,
                             );
@@ -2548,6 +2560,76 @@ mod tests {
         );
         assert_eq!(diagnostic.range.start, Position::new(0, 30));
         assert_eq!(diagnostic.range.end, Position::new(0, 37));
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn publishes_warnings_beside_valid_analysis_and_before_errors() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+
+        let valid = state.open(
+            uri.clone(),
+            1,
+            "let _ = 1;\nlet _ = 2;\nprintln(_);\n".to_owned(),
+        );
+        assert_eq!(valid.diagnostics.len(), 1);
+        let warning = &valid.diagnostics[0];
+        assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(
+            warning.code,
+            Some(NumberOrString::String("K2003".to_owned()))
+        );
+        assert_eq!(warning.range.start, Position::new(2, 8));
+        assert_eq!(warning.range.end, Position::new(2, 9));
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        assert_eq!(facts["valid"], true);
+        assert_eq!(facts["diagnostics"][0]["severity"], "warning");
+        assert_eq!(facts["diagnostics"][0]["code"], "K2003");
+        assert_eq!(
+            facts["diagnostics"]
+                .as_array()
+                .expect("diagnostics should be an array")
+                .len(),
+            1
+        );
+
+        let invalid = state
+            .change(&uri, 2, "let _ = 1;\nlet text = _ + \"a\";\n".to_owned())
+            .expect("change should succeed");
+        let published = invalid
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.severity, diagnostic.code.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            published,
+            vec![
+                (
+                    Some(DiagnosticSeverity::WARNING),
+                    Some(NumberOrString::String("K2003".to_owned()))
+                ),
+                (
+                    Some(DiagnosticSeverity::ERROR),
+                    Some(NumberOrString::String("K3001".to_owned()))
+                ),
+            ]
+        );
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        assert_eq!(facts["valid"], false);
+        assert_eq!(facts["diagnostics"][0]["severity"], "warning");
+        assert_eq!(facts["diagnostics"][1]["severity"], "error");
     }
 
     #[test]

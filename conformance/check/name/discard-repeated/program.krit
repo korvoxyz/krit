@@ -1,0 +1,13 @@
+let _ = 1;
+let _ = "two";
+let text: String = _;
+
+fn second(_, _: Bool) {
+    _
+}
+
+let flag: Bool = second(1, true);
+let rest: List<Int> = match [1, 2] {
+    [] => [],
+    [_, .._] => _,
+};

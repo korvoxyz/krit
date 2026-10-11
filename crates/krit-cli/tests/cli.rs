@@ -1611,6 +1611,146 @@ fn emits_machine_readable_diagnostics() {
     assert!(diagnostic.ends_with('\n'));
 }
 
+const DISCARD_READ_SOURCE: &str = "let _ = 1;\nprintln(_);\n";
+const DISCARD_READ_WARNING: &str = "main.krit:2:9: warning[K2003]: `_` is a discard; reading it will be an error in edition 2027\n";
+
+fn assert_discard_read_json_warning(stderr: &[u8]) {
+    let diagnostics = parse_json_lines(stderr);
+    assert_eq!(diagnostics.len(), 1, "{}", String::from_utf8_lossy(stderr));
+    let warning = &diagnostics[0];
+    assert_eq!(warning["schema"], 1);
+    assert_eq!(warning["severity"], "warning");
+    assert_eq!(warning["code"], "K2003");
+    assert_eq!(warning["file"], "main.krit");
+    assert_eq!(warning["span"]["start"]["line"], 2);
+    assert_eq!(warning["span"]["start"]["column"], 9);
+    assert_eq!(warning["span"]["end"]["column"], 10);
+}
+
+#[test]
+fn check_run_and_explain_print_warnings_without_changing_the_exit_status() {
+    let directory = TestDirectory::new("discard-warning");
+    directory.file("main.krit", DISCARD_READ_SOURCE);
+
+    let check = krit_in(&directory)
+        .args(["check", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(check.status.code(), Some(0));
+    assert_eq!(check.stdout, b"checked main.krit\n");
+    assert_eq!(String::from_utf8_lossy(&check.stderr), DISCARD_READ_WARNING);
+
+    let check_json = krit_in(&directory)
+        .args(["check", "--diagnostic-format", "json", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(check_json.status.code(), Some(0));
+    assert_eq!(check_json.stdout, b"checked main.krit\n");
+    assert_discard_read_json_warning(&check_json.stderr);
+
+    let run = krit_in(&directory)
+        .args(["run", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(run.status.code(), Some(0));
+    assert_eq!(run.stdout, b"1\n");
+    assert_eq!(String::from_utf8_lossy(&run.stderr), DISCARD_READ_WARNING);
+
+    let run_json = krit_in(&directory)
+        .args(["run", "--diagnostic-format=json", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(run_json.status.code(), Some(0));
+    assert_eq!(run_json.stdout, b"1\n");
+    assert_discard_read_json_warning(&run_json.stderr);
+
+    let explain = krit_in(&directory)
+        .args(["explain", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(explain.status.code(), Some(0));
+    assert!(explain.stdout.starts_with(b"Krit explanation (schema 1)\n"));
+    assert_eq!(
+        String::from_utf8_lossy(&explain.stderr),
+        DISCARD_READ_WARNING
+    );
+
+    let explain_json = krit_in(&directory)
+        .args(["explain", "--json", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(explain_json.status.code(), Some(0));
+    let explanation: serde_json::Value =
+        serde_json::from_slice(&explain_json.stdout).expect("explanation should be JSON");
+    assert_eq!(explanation["schema"], 1);
+    assert_discard_read_json_warning(&explain_json.stderr);
+}
+
+#[test]
+fn build_prints_warnings_and_still_builds() {
+    let directory = TestDirectory::new("discard-warning-build");
+    directory.file("main.krit", DISCARD_READ_SOURCE);
+    directory.file("krit.pkg", &package_manifest(true));
+
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("Krit should build");
+    assert_eq!(
+        build.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&build.stderr), DISCARD_READ_WARNING);
+    assert!(build.stdout.starts_with(b"built "));
+    assert_valid_artifact(&directory.path.join("target/krit/program.wasm"));
+}
+
+#[test]
+fn warnings_found_before_an_error_are_printed_before_it() {
+    let directory = TestDirectory::new("discard-warning-error");
+    directory.file("main.krit", "let _ = 1;\nlet text = _ + \"a\";\n");
+
+    for command in ["check", "run"] {
+        let human = krit_in(&directory)
+            .args([command, "main.krit"])
+            .output()
+            .expect("Krit should start");
+        assert_eq!(human.status.code(), Some(1), "{command}");
+        assert!(human.stdout.is_empty(), "{command}");
+        let stderr = String::from_utf8(human.stderr).expect("diagnostics should be UTF-8");
+        let lines = stderr.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "{command}: {stderr}");
+        assert!(
+            lines[0].starts_with("main.krit:2:12: warning[K2003]: "),
+            "{command}: {stderr}"
+        );
+        assert!(
+            lines[1].starts_with("main.krit:2:12: error[K3001]: "),
+            "{command}: {stderr}"
+        );
+
+        let json = krit_in(&directory)
+            .args([command, "--diagnostic-format", "json", "main.krit"])
+            .output()
+            .expect("Krit should start");
+        assert_eq!(json.status.code(), Some(1), "{command}");
+        let diagnostics = parse_json_lines(&json.stderr);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic["severity"].as_str().unwrap_or_default(),
+                    diagnostic["code"].as_str().unwrap_or_default()
+                ))
+                .collect::<Vec<_>>(),
+            [("warning", "K2003"), ("error", "K3001")],
+            "{command}"
+        );
+    }
+}
+
 /// Every conformance case directory under `conformance/<suite>`, as sorted
 /// repository-relative paths.
 fn conformance_cases(suite: &str) -> Vec<PathBuf> {
@@ -1645,6 +1785,27 @@ fn conformance_expectation(case: &Path, name: &str) -> String {
     }
 }
 
+fn conformance_codes(case: &Path, name: &str) -> Vec<String> {
+    conformance_expectation(case, name)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The codes of the JSON Lines diagnostics with `severity`, in output order.
+fn diagnostic_codes(diagnostics: &[serde_json::Value], severity: &str) -> Vec<String> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic["severity"] == severity)
+        .map(|diagnostic| {
+            diagnostic["code"]
+                .as_str()
+                .expect("diagnostic code should be a string")
+                .to_owned()
+        })
+        .collect()
+}
+
 #[test]
 fn run_refuses_every_check_failure_with_checks_diagnostic_and_status() {
     for case in conformance_cases("check") {
@@ -1662,6 +1823,28 @@ fn run_refuses_every_check_failure_with_checks_diagnostic_and_status() {
                 "{} {format}",
                 case.display()
             );
+            if format == "json" {
+                let diagnostics = parse_json_lines(&check.stderr);
+                assert_eq!(
+                    diagnostic_codes(&diagnostics, "error"),
+                    conformance_codes(&case, "expect.diagnostics"),
+                    "{}",
+                    case.display()
+                );
+                assert_eq!(
+                    diagnostic_codes(&diagnostics, "warning"),
+                    conformance_codes(&case, "expect.warnings"),
+                    "{}",
+                    case.display()
+                );
+                assert_eq!(
+                    diagnostics.len(),
+                    diagnostic_codes(&diagnostics, "error").len()
+                        + diagnostic_codes(&diagnostics, "warning").len(),
+                    "{}: every diagnostic is an error or a warning",
+                    case.display()
+                );
+            }
             let run = krit()
                 .args(["run", "--diagnostic-format", format])
                 .arg(&program)
@@ -1732,22 +1915,24 @@ fn runtime_conformance_cases_pass_check_and_run_through_the_cli() {
             "{}",
             case.display()
         );
-        let codes = parse_json_lines(&run.stderr)
-            .iter()
-            .map(|diagnostic| {
-                diagnostic["code"]
-                    .as_str()
-                    .expect("diagnostic code should be a string")
-                    .to_owned()
-            })
-            .collect::<Vec<_>>();
+        let diagnostics = parse_json_lines(&run.stderr);
         assert_eq!(
-            codes,
-            conformance_expectation(&case, "expect.diagnostics")
-                .lines()
-                .map(str::to_owned)
-                .collect::<Vec<_>>(),
+            diagnostic_codes(&diagnostics, "error"),
+            conformance_codes(&case, "expect.diagnostics"),
             "{}",
+            case.display()
+        );
+        assert_eq!(
+            diagnostic_codes(&diagnostics, "warning"),
+            conformance_codes(&case, "expect.warnings"),
+            "{}",
+            case.display()
+        );
+        assert_eq!(
+            diagnostics.len(),
+            diagnostic_codes(&diagnostics, "error").len()
+                + diagnostic_codes(&diagnostics, "warning").len(),
+            "{}: every diagnostic is an error or a warning",
             case.display()
         );
     }
