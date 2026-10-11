@@ -1,4 +1,5 @@
 mod agent_compiler;
+mod compatibility;
 mod compiler;
 mod error;
 mod metadata;
@@ -13,6 +14,10 @@ use wasm_encoder::{CustomSection, Encode, Section};
 use wasm_metadata::{AddMetadata, AddMetadataField};
 use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
 
+pub use compatibility::{
+    PREVIOUS_MINOR_TOOLCHAINS, SUPPORTED_EDITIONS, SUPPORTED_METADATA_SCHEMAS,
+    SUPPORTED_POLICY_VERSIONS, SUPPORTED_RUNTIME_WIT_VERSIONS, toolchain_in_window,
+};
 pub use error::{BuildError, BuildErrorKind};
 pub use metadata::{
     ARTIFACT_METADATA_SCHEMA, ARTIFACT_POLICY_VERSION, ApprovalRequirementMetadata,

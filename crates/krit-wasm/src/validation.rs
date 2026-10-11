@@ -8,13 +8,18 @@ use wasmparser::{
 use wit_component::DecodedWasm;
 
 use crate::{
-    AI_INTERFACE, ARTIFACT_METADATA_SCHEMA, ApprovalRequirementMetadata, ArtifactMetadata,
-    BuildError, CACHE_READ_INTERFACE, CACHE_WRITE_INTERFACE, COMPILER_NAME, CONFIG_INTERFACE,
-    DATABASE_INTERFACE, EmbeddedMetadata, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, JOB_INTERFACE,
-    LANGUAGE_NAME, LANGUAGE_VERSION, LOGGING_INTERFACE, OBJECTS_READ_INTERFACE,
-    OBJECTS_WRITE_INTERFACE, QUEUE_INTERFACE, ResourceRequirementMetadata, SCHEDULE_INTERFACE,
-    SEARCH_QUERY_INTERFACE, SEARCH_VECTOR_INTERFACE, SECRETS_INTERFACE, STATE_INTERFACE,
-    STDOUT_INTERFACE, WASM_COMPONENT_TARGET, WEBHOOK_INTERFACE, artifact_policy_version,
+    AI_INTERFACE, ApprovalRequirementMetadata, ArtifactMetadata, BuildError, CACHE_READ_INTERFACE,
+    CACHE_WRITE_INTERFACE, COMPILER_NAME, CONFIG_INTERFACE, DATABASE_INTERFACE, EmbeddedMetadata,
+    HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, JOB_INTERFACE, LANGUAGE_NAME, LANGUAGE_VERSION,
+    LOGGING_INTERFACE, OBJECTS_READ_INTERFACE, OBJECTS_WRITE_INTERFACE, QUEUE_INTERFACE,
+    ResourceRequirementMetadata, SCHEDULE_INTERFACE, SEARCH_QUERY_INTERFACE,
+    SEARCH_VECTOR_INTERFACE, SECRETS_INTERFACE, STATE_INTERFACE, STDOUT_INTERFACE,
+    WASM_COMPONENT_TARGET, WEBHOOK_INTERFACE, artifact_policy_version,
+    compatibility::{
+        SUPPORTED_EDITIONS, SUPPORTED_METADATA_SCHEMAS, SUPPORTED_POLICY_VERSIONS,
+        SUPPORTED_RUNTIME_WIT_VERSIONS, runtime_wit_version, toolchain_in_window, toolchain_label,
+        window_label,
+    },
     wit::{
         AI_EFFECT, CACHE_READ_EFFECT, CACHE_WRITE_EFFECT, CONFIG_EFFECT, DATABASE_READ_EFFECT,
         DATABASE_WRITE_EFFECT, HTTP_EFFECT, LOGGING_EFFECT, OBJECT_READ_EFFECT,
@@ -26,9 +31,18 @@ use crate::{
 
 pub const EMBEDDED_METADATA_SECTION: &str = "krit.metadata";
 pub const MAX_EMBEDDED_METADATA_BYTES: usize = 48 * 1024;
+/// The toolchain version recorded artifacts are compared against, only through
+/// the compatibility window.
+const RUNTIME_TOOLCHAIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentInspection {
+    /// Compiler version recorded by the embedded metadata and producers section.
+    pub compiler_version: String,
+    /// Language version recorded by the producers section.
+    pub language_version: String,
+    /// Edition recorded by the embedded metadata.
+    pub edition: String,
     pub world: String,
     pub imports: Vec<String>,
     pub exports: Vec<String>,
@@ -395,6 +409,19 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
     }
     imports.sort();
     exports.sort();
+    // Name the unsupported WIT package version before the structural checks
+    // below, which would otherwise only report an unknown import or export.
+    if imports
+        .iter()
+        .chain(&exports)
+        .filter_map(|name| runtime_wit_version(name))
+        .any(|version| !SUPPORTED_RUNTIME_WIT_VERSIONS.contains(&version))
+    {
+        return Err(BuildError::artifact(format!(
+            "component uses a krit:runtime WIT package version this runtime does not support (supported: {})",
+            SUPPORTED_RUNTIME_WIT_VERSIONS.join(", ")
+        )));
+    }
     let kind = match exports.as_slice() {
         [export] if export == "run" => ProgramKind::Module,
         [export] if export == WEBHOOK_INTERFACE => ProgramKind::Webhook,
@@ -413,6 +440,16 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
     }
     let embedded =
         embedded.ok_or_else(|| BuildError::artifact("component metadata section is missing"))?;
+    if let Some(reason) = unsupported_facts(
+        embedded.schema,
+        embedded.policy_version,
+        &embedded.edition,
+        &embedded.compiler_version,
+    ) {
+        return Err(BuildError::artifact(format!(
+            "component metadata section {reason}"
+        )));
+    }
     let mut effects = Vec::with_capacity(imports.len() + 1);
     for import in &imports {
         // The narrow database interface is shared by read and write authority.
@@ -499,10 +536,7 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
         )));
     }
 
-    if embedded.schema != ARTIFACT_METADATA_SCHEMA
-        || embedded.compiler_version != env!("CARGO_PKG_VERSION")
-        || embedded.edition != "2026"
-        || embedded.world != contract.world
+    if embedded.world != contract.world
         || embedded.effects != effects
         || !valid_requirements(&embedded.requirements, &effects)
         || !valid_approvals(&embedded.approvals, &embedded.requirements, &effects)
@@ -515,9 +549,12 @@ pub fn validate_component(bytes: &[u8]) -> Result<ComponentInspection, BuildErro
     }
 
     verify_decoded_world(bytes, &contract)?;
-    verify_producers(bytes)?;
+    let language_version = verify_producers(bytes, &embedded.compiler_version)?;
 
     Ok(ComponentInspection {
+        compiler_version: embedded.compiler_version,
+        language_version,
+        edition: embedded.edition,
         world: contract.world,
         imports,
         exports,
@@ -537,13 +574,19 @@ pub fn validate_artifact(
     bytes: &[u8],
     metadata: &ArtifactMetadata,
 ) -> Result<ComponentInspection, BuildError> {
-    if metadata.schema != ARTIFACT_METADATA_SCHEMA
-        || metadata.policy_version != artifact_policy_version(&metadata.effects)
+    if let Some(reason) = unsupported_facts(
+        metadata.schema,
+        metadata.policy_version,
+        &metadata.edition,
+        &metadata.compiler.version,
+    )
+    .or_else(|| outside_window("language", &metadata.language.version, LANGUAGE_VERSION))
+    {
+        return Err(BuildError::metadata(format!("artifact metadata {reason}")));
+    }
+    if metadata.policy_version != artifact_policy_version(&metadata.effects)
         || metadata.compiler.name != COMPILER_NAME
-        || metadata.compiler.version != env!("CARGO_PKG_VERSION")
         || metadata.language.name != LANGUAGE_NAME
-        || metadata.language.version != LANGUAGE_VERSION
-        || metadata.edition != "2026"
         || metadata.target != WASM_COMPONENT_TARGET
         || metadata.package.name.is_empty()
         || metadata.package.version.is_empty()
@@ -574,6 +617,16 @@ pub fn validate_artifact(
     }
 
     let inspection = validate_component(bytes)?;
+    // The recorded toolchain is only window-checked against the runtime, but
+    // the artifact must agree with itself exactly.
+    if metadata.compiler.version != inspection.compiler_version
+        || metadata.language.version != inspection.language_version
+        || metadata.edition != inspection.edition
+    {
+        return Err(BuildError::metadata(
+            "artifact metadata compiler, language, or edition does not match the component",
+        ));
+    }
     if metadata.world != inspection.world
         || metadata.imports != inspection.imports
         || metadata.effects != inspection.effects
@@ -693,7 +746,66 @@ fn valid_approvals(
             })
 }
 
-fn verify_producers(bytes: &[u8]) -> Result<(), BuildError> {
+/// Checks the recorded schema, policy, edition, and compiler version against
+/// the runtime's published supported sets and toolchain window, returning why
+/// an artifact recording them is not loadable.
+fn unsupported_facts(
+    schema: u32,
+    policy_version: u32,
+    edition: &str,
+    compiler_version: &str,
+) -> Option<String> {
+    if !SUPPORTED_METADATA_SCHEMAS.contains(&schema) {
+        return Some(format!(
+            "records metadata schema {schema}, which this runtime does not support (supported: {})",
+            join_numbers(&SUPPORTED_METADATA_SCHEMAS)
+        ));
+    }
+    if !SUPPORTED_POLICY_VERSIONS.contains(&policy_version) {
+        return Some(format!(
+            "records validation policy {policy_version}, which this runtime does not support (supported: {})",
+            join_numbers(&SUPPORTED_POLICY_VERSIONS)
+        ));
+    }
+    if !SUPPORTED_EDITIONS.contains(&edition) {
+        // The edition is untrusted text, so it is not echoed.
+        return Some(format!(
+            "records an edition this runtime does not support (supported: {})",
+            SUPPORTED_EDITIONS.join(", ")
+        ));
+    }
+    outside_window("compiler", compiler_version, RUNTIME_TOOLCHAIN_VERSION)
+}
+
+/// Returns why a recorded tool `version` is outside the compatibility window
+/// of the runtime's `current` version, echoing only a parsed version line.
+fn outside_window(tool: &str, version: &str, current: &str) -> Option<String> {
+    if toolchain_in_window(version, current) {
+        return None;
+    }
+    let window = window_label(current);
+    Some(match toolchain_label(version) {
+        Some(line) => format!(
+            "records {tool} version {line}.x, outside this runtime's compatibility window of {window}"
+        ),
+        None => format!(
+            "records an unparsable {tool} version; this runtime's compatibility window is {window}"
+        ),
+    })
+}
+
+fn join_numbers(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Requires standard producers metadata that names Krit with the embedded
+/// compiler version and a language version inside the compatibility window,
+/// and returns that language version.
+fn verify_producers(bytes: &[u8], compiler_version: &str) -> Result<String, BuildError> {
     let producers = Producers::from_wasm(bytes)
         .map_err(|error| BuildError::artifact(format!("invalid producers metadata: {error}")))?
         .ok_or_else(|| BuildError::artifact("component producers metadata is missing"))?;
@@ -703,14 +815,22 @@ fn verify_producers(bytes: &[u8]) -> Result<(), BuildError> {
     let compiler = producers
         .get("processed-by")
         .and_then(|field| field.get(COMPILER_NAME));
-    if language.map(String::as_str) != Some(LANGUAGE_VERSION)
-        || compiler.map(String::as_str) != Some(env!("CARGO_PKG_VERSION"))
-    {
+    let (Some(language), Some(compiler)) = (language, compiler) else {
         return Err(BuildError::artifact(
             "component producers metadata does not identify Krit",
         ));
+    };
+    if compiler != compiler_version {
+        return Err(BuildError::artifact(
+            "component producers metadata does not match the embedded compiler version",
+        ));
     }
-    Ok(())
+    if let Some(reason) = outside_window("language", language, LANGUAGE_VERSION) {
+        return Err(BuildError::artifact(format!(
+            "component producers metadata {reason}"
+        )));
+    }
+    Ok(language.clone())
 }
 
 fn sorted_unique(values: &[String]) -> bool {

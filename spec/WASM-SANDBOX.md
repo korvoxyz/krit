@@ -332,6 +332,47 @@ import surfaces: zero imports mean no effects and `pure-program`; the exact
 stdout component interface and canonical core imports mean `io.stdout` and
 `program`. Embedded and adjacent claims must match those derived facts.
 
+## Artifact compatibility
+
+A runtime loads an artifact only when every recorded compatibility fact is a
+member of the runtime's published supported sets
+(`krit_wasm::SUPPORTED_*`):
+
+| Fact | Recorded in | Supported |
+|---|---|---|
+| Metadata schema | embedded and adjacent `schema` | 1 |
+| Validation policy version | embedded and adjacent `policyVersion` | 1, 2 |
+| `krit:runtime` WIT package version | component import and export names | 0.2.0 |
+| Edition | embedded and adjacent `edition` | 2026 |
+
+The compiler version (embedded `compilerVersion`, adjacent `compiler.version`,
+and the producers `processed-by` entry) and the language version (adjacent
+`language.version` and the producers `language` entry) are recorded, never
+required to equal the running toolchain. Each is compared with the runtime's
+own compiler or language version only by the toolchain window: it must be a
+strict Semantic Versioning 2.0 version with the runtime's major version, and
+its minor version must be the runtime's own or one of the two before it. A 0.3 runtime therefore loads artifacts from
+0.1, 0.2, and 0.3 toolchains and refuses 0.4 and newer, any other major, and
+unparsable versions. Patch, pre-release, and build components never affect
+the outcome. The same rule applies after 1.0 until a release publishes a
+longer window.
+
+Self-consistency stays exact. The adjacent compiler version, language
+version, and edition must equal the ones the component records, and the
+embedded compiler version must equal the producers `processed-by` version.
+Compatibility never relaxes derivation: effects, the WIT world, and the policy
+version are always re-derived from the validated component and core import
+surfaces, and every recorded claim must match them. An unsupported fact fails
+closed before compilation, as K7004 for adjacent metadata and K7003 for the
+component's own records. Messages name the supported set or window and echo
+only parsed version numbers, never other artifact text.
+
+Loading an older WIT package version means linking its worlds, so when the
+checked-in package moves to a new version, the previous one stays in the
+supported set while the window still includes a toolchain that emitted it.
+`conformance/build/compat/<toolchain>/` keeps golden artifacts written by each
+released toolchain; the runtime must load and run every case there.
+
 ## Host runtime
 
 `krit-runtime` uses one reusable Wasmtime engine and creates a fresh Store,

@@ -124,7 +124,7 @@ Initial required codes:
 | `K7001` | Residual or unresolved type requires specialization before layout |
 | `K7002` | Core semantics or concrete layout is unsupported by the artifact target |
 | `K7003` | WebAssembly emission, validation, metadata attachment, artifact loading, or output failed |
-| `K7004` | Artifact metadata, byte size, or content digest mismatch |
+| `K7004` | Artifact metadata, byte size, or content digest mismatch, or adjacent metadata outside the runtime's supported compatibility sets or toolchain window |
 | `K8001` | Source is not canonically formatted in formatter check mode |
 | `K8002` | Language-server input or open-document state exceeds a bounded limit |
 | `K8101` | Authoring assistance is disabled or provider configuration is invalid |

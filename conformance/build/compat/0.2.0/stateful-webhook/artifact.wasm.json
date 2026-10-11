@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "compiler": {
+    "name": "krit",
+    "version": "0.2.0"
+  },
+  "language": {
+    "name": "Krit",
+    "version": "0.2.0"
+  },
+  "edition": "2026",
+  "package": {
+    "name": "akshay/stateful-webhook",
+    "version": "0.2.0"
+  },
+  "target": "wasm-component",
+  "world": "krit:runtime/webhook-state-program@0.2.0",
+  "entry": "stateful-webhook.krit",
+  "digest": "blake3:a5c11286e425ab2bd33f4ff7d48d26cbcc88dd1d98f21d79c6960286f57570fc",
+  "byteSize": 5792,
+  "effects": [
+    "state.transaction"
+  ],
+  "requirements": [
+    {
+      "capability": "state.transaction",
+      "resource": "agent-work"
+    }
+  ],
+  "imports": [
+    "krit:runtime/state@0.2.0"
+  ],
+  "buildProfile": "default",
+  "policyVersion": 2
+}

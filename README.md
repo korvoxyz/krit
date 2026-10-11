@@ -294,7 +294,11 @@ metadata is attached. Pure programs select the
 zero-import `pure-program` world; programs with the checked `io.stdout` effect
 select `program` and its stdout interface. Unused manifest grants do not widen
 artifact imports, and validation derives the world and effects from the actual
-component/core import surface before accepting metadata claims.
+component/core import surface before accepting metadata claims. A runtime
+loads artifacts from its own and the two previous minor toolchains, never
+newer ones, when their metadata schema, policy, `krit:runtime` WIT version,
+and edition are supported; see
+[artifact compatibility](spec/WASM-SANDBOX.md#artifact-compatibility).
 
 Artifact policy 1 supports `Int`, `Bool`, `Unit`, recursive and higher-order
 non-capturing functions, blocks, conditionals/short circuit, checked integer

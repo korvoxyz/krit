@@ -1,0 +1,10 @@
+// Function declarations can call themselves recursively.
+fn factorial(number) {
+    if number == 0 {
+        1
+    } else {
+        number * factorial(number - 1)
+    }
+}
+
+println(factorial(6));
