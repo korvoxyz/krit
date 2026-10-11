@@ -50,8 +50,11 @@ network service, or nondeterministic value.
 | `core/arithmetic` | checked integer operators and precedence |
 | `core/booleans` | strict booleans and short-circuiting |
 | `core/strings` | UTF-8 strings and concatenation |
+| `core/chains` | `else if` chains and left-associative operator chains, including short-circuiting |
+| `core/else-if-chain` | a 300-branch `else if` chain adds no nesting levels |
 | `scope/closures` | immutable lexical capture and shadowing |
 | `functions/recursion` | recursive declaration and calls |
+| `functions/deep-recursion` | 9,000 nested calls stay within the call-depth limit |
 | `lists/match` | list construction and exhaustive decomposition |
 | `records/fields` | ordered record rendering and field access |
 | `variants/option-match` | exhaustive Option matching |
@@ -72,11 +75,14 @@ network service, or nondeterministic value.
 | `errors/json-function` | functions cannot be JSON encoded |
 | `errors/json-invalid` | invalid JSON input |
 | `errors/missing-record-field` | field access requires an existing field |
+| `errors/nesting-depth` | syntax nested past 256 levels fails with `K1005` |
+| `errors/call-depth` | runaway recursion fails with `K4010` instead of aborting |
 | `check/valid/inference` | recursion, closures, empty lists, None, and effects infer together |
 | `check/name/*` | lexical undefined and duplicate name diagnostics |
 | `check/type/*` | stable static operator, condition, field, call, annotation, and match errors |
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
+| `check/nesting/*` | syntactic and inferred-type nesting limits (`K1005`) |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |

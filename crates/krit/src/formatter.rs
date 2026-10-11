@@ -489,22 +489,43 @@ struct SyntaxCollector {
     breaks_after: HashMap<usize, usize>,
 }
 
+/// One syntax-tree node awaiting collection.
+enum SyntaxNode<'a> {
+    Statement(&'a Statement),
+    Block(&'a Block),
+    Expression(&'a Expression),
+    Annotation(&'a TypeAnnotation),
+}
+
 impl SyntaxCollector {
+    /// Collects formatting facts with an explicit work stack, so neither deep
+    /// nesting nor long `else if` and operator chains deepen native recursion.
+    /// Every fact is order-independent.
     fn program(&mut self, program: &Program) {
-        for statement in &program.statements {
-            self.statement(statement);
+        let mut pending = program
+            .statements
+            .iter()
+            .map(SyntaxNode::Statement)
+            .collect::<Vec<_>>();
+        while let Some(node) = pending.pop() {
+            match node {
+                SyntaxNode::Statement(statement) => Self::statement(statement, &mut pending),
+                SyntaxNode::Block(block) => self.block(block, &mut pending),
+                SyntaxNode::Expression(expression) => self.expression(expression, &mut pending),
+                SyntaxNode::Annotation(annotation) => self.annotation(annotation, &mut pending),
+            }
         }
     }
 
-    fn statement(&mut self, statement: &Statement) {
+    fn statement<'a>(statement: &'a Statement, pending: &mut Vec<SyntaxNode<'a>>) {
         match &statement.kind {
             StatementKind::Let {
                 annotation, value, ..
             } => {
                 if let Some(annotation) = annotation {
-                    self.annotation(annotation);
+                    pending.push(SyntaxNode::Annotation(annotation));
                 }
-                self.expression(value);
+                pending.push(SyntaxNode::Expression(value));
             }
             StatementKind::Function {
                 parameters,
@@ -532,52 +553,56 @@ impl SyntaxCollector {
             } => {
                 for parameter in parameters {
                     if let Some(annotation) = &parameter.annotation {
-                        self.annotation(annotation);
+                        pending.push(SyntaxNode::Annotation(annotation));
                     }
                 }
                 if let Some(annotation) = return_type {
-                    self.annotation(annotation);
+                    pending.push(SyntaxNode::Annotation(annotation));
                 }
-                self.block(body);
+                pending.push(SyntaxNode::Block(body));
             }
-            StatementKind::Expression(expression) => self.expression(expression),
+            StatementKind::Expression(expression) => {
+                pending.push(SyntaxNode::Expression(expression));
+            }
         }
     }
 
-    fn block(&mut self, block: &Block) {
+    fn block<'a>(&mut self, block: &'a Block, pending: &mut Vec<SyntaxNode<'a>>) {
         self.block_spans.insert((block.span.start, block.span.end));
         for statement in &block.statements {
-            self.statement(statement);
+            pending.push(SyntaxNode::Statement(statement));
             self.breaks_after.insert(statement.span.end, 1);
         }
         if let Some(tail) = &block.tail {
-            self.expression(tail);
+            pending.push(SyntaxNode::Expression(tail));
         }
     }
 
-    fn expression(&mut self, expression: &Expression) {
+    fn expression<'a>(&mut self, expression: &'a Expression, pending: &mut Vec<SyntaxNode<'a>>) {
         match &expression.kind {
             ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
             ExpressionKind::List(elements) => {
-                for element in elements {
-                    self.expression(element);
-                }
+                pending.extend(elements.iter().map(SyntaxNode::Expression));
             }
             ExpressionKind::Record(fields) => {
-                for field in fields {
-                    self.expression(&field.value);
-                }
+                pending.extend(
+                    fields
+                        .iter()
+                        .map(|field| SyntaxNode::Expression(&field.value)),
+                );
             }
-            ExpressionKind::FieldAccess { value, .. } => self.expression(value),
-            ExpressionKind::Block(block) => self.block(block),
+            ExpressionKind::FieldAccess { value, .. } => {
+                pending.push(SyntaxNode::Expression(value));
+            }
+            ExpressionKind::Block(block) => pending.push(SyntaxNode::Block(block)),
             ExpressionKind::If {
                 condition,
                 consequent,
                 alternative,
             } => {
-                self.expression(condition);
-                self.block(consequent);
-                self.expression(alternative);
+                pending.push(SyntaxNode::Expression(condition));
+                pending.push(SyntaxNode::Block(consequent));
+                pending.push(SyntaxNode::Expression(alternative));
             }
             ExpressionKind::Function {
                 parameters,
@@ -586,62 +611,68 @@ impl SyntaxCollector {
             } => {
                 for parameter in parameters {
                     if let Some(annotation) = &parameter.annotation {
-                        self.annotation(annotation);
+                        pending.push(SyntaxNode::Annotation(annotation));
                     }
                 }
                 if let Some(annotation) = return_type {
-                    self.annotation(annotation);
+                    pending.push(SyntaxNode::Annotation(annotation));
                 }
-                self.block(body);
+                pending.push(SyntaxNode::Block(body));
             }
             ExpressionKind::Call { callee, arguments } => {
                 self.call_spans
                     .push(Span::new(callee.span.end, expression.span.end));
-                self.expression(callee);
-                for argument in arguments {
-                    self.expression(argument);
-                }
+                pending.push(SyntaxNode::Expression(callee));
+                pending.extend(arguments.iter().map(SyntaxNode::Expression));
             }
             ExpressionKind::Match { subject, kind } => {
-                self.expression(subject);
+                pending.push(SyntaxNode::Expression(subject));
                 match kind {
                     MatchKind::List {
                         empty_case,
                         cons_case,
                         ..
                     } => {
-                        self.expression(empty_case);
-                        self.expression(cons_case);
+                        pending.push(SyntaxNode::Expression(empty_case));
+                        pending.push(SyntaxNode::Expression(cons_case));
                     }
                     MatchKind::Variants { arms, .. } => {
-                        for arm in arms {
-                            self.expression(&arm.value);
-                        }
+                        pending.extend(arms.iter().map(|arm| SyntaxNode::Expression(&arm.value)));
                     }
                 }
             }
-            ExpressionKind::Unary { operand, .. } => self.expression(operand),
+            ExpressionKind::Unary { operand, .. } => {
+                pending.push(SyntaxNode::Expression(operand));
+            }
             ExpressionKind::Binary { left, right, .. } => {
-                self.expression(left);
-                self.expression(right);
+                pending.push(SyntaxNode::Expression(left));
+                pending.push(SyntaxNode::Expression(right));
             }
         }
     }
 
-    fn annotation(&mut self, annotation: &TypeAnnotation) {
+    fn annotation<'a>(
+        &mut self,
+        annotation: &'a TypeAnnotation,
+        pending: &mut Vec<SyntaxNode<'a>>,
+    ) {
         self.type_spans.push(annotation.span);
         match &annotation.kind {
-            TypeKind::List(element) | TypeKind::Option(element) => self.annotation(element),
+            TypeKind::List(element) | TypeKind::Option(element) => {
+                pending.push(SyntaxNode::Annotation(element));
+            }
             TypeKind::Result(value, error) => {
                 self.result_separator_spans
                     .push(Span::new(value.span.end, error.span.start));
-                self.annotation(value);
-                self.annotation(error);
+                pending.push(SyntaxNode::Annotation(value));
+                pending.push(SyntaxNode::Annotation(error));
             }
             TypeKind::Record(fields) => {
-                for field in fields {
-                    self.annotation(&field.annotation);
-                }
+                pending.extend(
+                    fields
+                        .iter()
+                        .map(|field| SyntaxNode::Annotation(&field.annotation)),
+                );
             }
             TypeKind::Int
             | TypeKind::Bool
@@ -1081,6 +1112,29 @@ mod tests {
 
     fn format(text: &str) -> String {
         format_source(&Source::new("test.krit", text)).expect("source should format")
+    }
+
+    #[test]
+    fn formats_long_else_if_chains_and_rejects_excessive_nesting() {
+        // Runs on the default test stack: the chain is parsed and collected
+        // iteratively.
+        let mut text = String::from("let n = 1;\nlet value = if n == 0 { 0 }");
+        for branch in 1..1_000 {
+            text.push_str(&format!(" else if n == {branch} {{ {branch} }}"));
+        }
+        text.push_str(" else { -1 };\n");
+        let formatted = format(&text);
+        assert_eq!(format(&formatted), formatted);
+        assert_eq!(formatted.matches("} else if n == ").count(), 999);
+
+        let deep = format!("let value = {}1{};\n", "[".repeat(2_000), "]".repeat(2_000));
+        let error =
+            crate::run_on_thread("formatter-test", crate::COMPILER_STACK_BYTES, move || {
+                format_source(&Source::new("deep.krit", deep))
+            })
+            .expect("formatter test thread should start")
+            .expect_err("deep nesting should not format");
+        assert_eq!(error.code(), "K1005");
     }
 
     #[test]

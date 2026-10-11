@@ -101,93 +101,109 @@ impl DurableOperationFact {
 
 pub fn durable_operations(program: &Program) -> Vec<DurableOperationFact> {
     let mut facts = Vec::new();
-    for statement in &program.statements {
-        collect_statement(statement, &mut facts);
-    }
+    collect_program(program, &mut facts);
     facts.sort_by_key(|fact| fact.span);
     facts
 }
 
-fn collect_statement(statement: &Statement, facts: &mut Vec<DurableOperationFact>) {
-    match &statement.kind {
-        StatementKind::Let { value, .. } => collect_expression(value, facts),
-        StatementKind::Function { body, .. }
-        | StatementKind::Webhook { body, .. }
-        | StatementKind::QueueConsumer { body, .. }
-        | StatementKind::ScheduleHandler { body, .. } => {
-            collect_block(body, facts);
+/// One syntax-tree node awaiting collection.
+enum Pending<'a> {
+    Statement(&'a Statement),
+    Block(&'a Block),
+    Expression(&'a Expression),
+}
+
+/// Collects durable operation facts with an explicit work stack, so neither
+/// deep nesting nor long `else if` and operator chains deepen native
+/// recursion. Facts are sorted by span afterwards, so visiting order does not
+/// matter.
+fn collect_program(program: &Program, facts: &mut Vec<DurableOperationFact>) {
+    let mut pending = program
+        .statements
+        .iter()
+        .map(Pending::Statement)
+        .collect::<Vec<_>>();
+    while let Some(node) = pending.pop() {
+        match node {
+            Pending::Statement(statement) => match &statement.kind {
+                StatementKind::Let { value, .. } => pending.push(Pending::Expression(value)),
+                StatementKind::Function { body, .. }
+                | StatementKind::Webhook { body, .. }
+                | StatementKind::QueueConsumer { body, .. }
+                | StatementKind::ScheduleHandler { body, .. } => {
+                    pending.push(Pending::Block(body));
+                }
+                StatementKind::Expression(expression) => {
+                    pending.push(Pending::Expression(expression));
+                }
+            },
+            Pending::Block(block) => {
+                pending.extend(block.statements.iter().map(Pending::Statement));
+                if let Some(tail) = block.tail.as_deref() {
+                    pending.push(Pending::Expression(tail));
+                }
+            }
+            Pending::Expression(expression) => {
+                collect_expression(expression, &mut pending, facts);
+            }
         }
-        StatementKind::Expression(expression) => collect_expression(expression, facts),
     }
 }
 
-fn collect_block(block: &Block, facts: &mut Vec<DurableOperationFact>) {
-    for statement in &block.statements {
-        collect_statement(statement, facts);
-    }
-    if let Some(tail) = block.tail.as_deref() {
-        collect_expression(tail, facts);
-    }
-}
-
-fn collect_expression(expression: &Expression, facts: &mut Vec<DurableOperationFact>) {
+fn collect_expression<'a>(
+    expression: &'a Expression,
+    pending: &mut Vec<Pending<'a>>,
+    facts: &mut Vec<DurableOperationFact>,
+) {
     match &expression.kind {
         ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
         ExpressionKind::List(elements) => {
-            for element in elements {
-                collect_expression(element, facts);
-            }
+            pending.extend(elements.iter().map(Pending::Expression));
         }
         ExpressionKind::Record(fields) => {
-            for field in fields {
-                collect_expression(&field.value, facts);
-            }
+            pending.extend(fields.iter().map(|field| Pending::Expression(&field.value)));
         }
-        ExpressionKind::FieldAccess { value, .. } => collect_expression(value, facts),
-        ExpressionKind::Block(block) => collect_block(block, facts),
+        ExpressionKind::FieldAccess { value, .. } => pending.push(Pending::Expression(value)),
+        ExpressionKind::Block(block) => pending.push(Pending::Block(block)),
         ExpressionKind::If {
             condition,
             consequent,
             alternative,
         } => {
-            collect_expression(condition, facts);
-            collect_block(consequent, facts);
-            collect_expression(alternative, facts);
+            pending.push(Pending::Expression(condition));
+            pending.push(Pending::Block(consequent));
+            pending.push(Pending::Expression(alternative));
         }
-        ExpressionKind::Function { body, .. } => collect_block(body, facts),
+        ExpressionKind::Function { body, .. } => pending.push(Pending::Block(body)),
         ExpressionKind::Call { callee, arguments } => {
             if let ExpressionKind::Variable(name) = &callee.kind
                 && let Some(fact) = operation_fact(name, arguments, expression.span)
             {
                 facts.push(fact);
             }
-            collect_expression(callee, facts);
-            for argument in arguments {
-                collect_expression(argument, facts);
-            }
+            pending.push(Pending::Expression(callee));
+            pending.extend(arguments.iter().map(Pending::Expression));
         }
         ExpressionKind::Match { subject, kind } => {
-            collect_expression(subject, facts);
+            pending.push(Pending::Expression(subject));
             match kind {
                 MatchKind::List {
                     empty_case,
                     cons_case,
                     ..
                 } => {
-                    collect_expression(empty_case, facts);
-                    collect_expression(cons_case, facts);
+                    pending.push(Pending::Expression(empty_case));
+                    pending.push(Pending::Expression(cons_case));
                 }
                 MatchKind::Variants { arms, .. } => {
-                    for arm in arms {
-                        collect_expression(&arm.value, facts);
-                    }
+                    pending.extend(arms.iter().map(|arm| Pending::Expression(&arm.value)));
                 }
             }
         }
-        ExpressionKind::Unary { operand, .. } => collect_expression(operand, facts),
+        ExpressionKind::Unary { operand, .. } => pending.push(Pending::Expression(operand)),
         ExpressionKind::Binary { left, right, .. } => {
-            collect_expression(left, facts);
-            collect_expression(right, facts);
+            pending.push(Pending::Expression(left));
+            pending.push(Pending::Expression(right));
         }
     }
 }
@@ -321,4 +337,34 @@ fn string_argument(arguments: &[Expression], index: usize) -> Option<&str> {
         return None;
     };
     Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Source, parse_source};
+
+    use super::*;
+
+    #[test]
+    fn collects_facts_from_long_else_if_chains() {
+        // Runs on the default test stack: collection uses an explicit stack.
+        let mut text = String::from(
+            "fn pick(n) {\n    if n == 0 {\n        state_get(\"work\", \"first\")\n    }",
+        );
+        for branch in 1..1_000 {
+            text.push_str(&format!(
+                " else if n == {branch} {{\n        state_get(\"work\", \"key{branch}\")\n    }}"
+            ));
+        }
+        text.push_str(" else {\n        None\n    }\n}\n");
+        let program = parse_source(&Source::new("test.krit", text)).expect("chain should parse");
+
+        let facts = durable_operations(&program);
+        assert_eq!(facts.len(), 1_000);
+        assert!(facts.windows(2).all(|pair| pair[0].span() < pair[1].span()));
+        assert_eq!(facts[0].kind(), DurableOperationKind::StateGet);
+        assert_eq!(facts[0].store(), Some("work"));
+        assert_eq!(facts[0].identity(), Some("first"));
+        assert_eq!(facts[999].identity(), Some("key999"));
+    }
 }

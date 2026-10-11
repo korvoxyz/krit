@@ -12,6 +12,7 @@ pub enum BuildErrorKind {
     InvalidArtifact,
     DigestMismatch,
     Metadata,
+    NestingDepth,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +38,10 @@ impl BuildError {
 
     pub(crate) fn invalid_core(message: impl Into<String>) -> Self {
         Self::new("K7002", BuildErrorKind::InvalidCore, message, None)
+    }
+
+    pub(crate) fn nesting(message: impl Into<String>, span: Option<Span>) -> Self {
+        Self::new("K1005", BuildErrorKind::NestingDepth, message, span)
     }
 
     pub(crate) fn artifact(message: impl Into<String>) -> Self {

@@ -180,6 +180,37 @@ The source name is a compiler fact. The component host exports the declaration
 through the canonical `krit:runtime/webhook@0.2.0` interface's `handle`
 operation; the name does not create an ambient network listener.
 
+## 4.1 Nesting limits
+
+A source file may nest syntax at most **256 levels** deep. Each of the
+following opens one level for what it contains:
+
+- a parenthesized expression, a block, a list literal, and a record literal
+- the argument list of a call, and each call or field-access link of a
+  postfix chain (`a.b(c).d` opens three levels for what follows `a`)
+- the operand of a unary operator
+- the condition of an `if`, and the subject and the arm list of a `match`
+- the argument list of `List<…>`, `Option<…>`, or `Result<…, …>`, and the
+  field list of `Record { … }`
+
+An `else if` continuation stays at the level of the `if` it continues, and a
+chain of binary operators such as `a + b + c` stays at the level of its first
+operand, so long flat chains are not nesting. Each continuation and each
+chained operator still nests one step deeper in the program's tree, so they
+count toward a separate **structural depth** limit: the nesting level of any
+point plus the number of `else if` continuations and chained binary operators
+enclosing it may not exceed **4,096**. A 1,000-branch `else if` chain is
+valid.
+
+Inferred types are bounded the same way: a binding whose inferred type would
+nest more than 256 type constructors deep, such as the 257th binding of a
+chain of `let next = [previous];` declarations, is rejected.
+
+Exceeding any of these limits is error `K1005` at the construct, operator, or
+binding that crosses it. Parsing, static checking, Core lowering and
+verification, formatting, and component generation all enforce the same
+bounds, so no accepted program can exhaust the compiler's native stack.
+
 ## 5. Program and block values
 
 Items execute in source order.
@@ -353,8 +384,9 @@ if condition {
 ```
 
 The condition must be boolean. Only the selected branch evaluates.
-`else if` is accepted through the grammar above. Both branches should
-eventually have the same static type.
+`else if` is accepted through the grammar above; a continuation does not add
+a nesting level (section 4.1). Both branches should eventually have the same
+static type.
 
 ## 11. Records, lists, and matching
 
@@ -616,8 +648,19 @@ The following are errors rather than implementation-defined behavior:
 - unavailable webhook, configuration, secret, HTTP, AI, or logging direct-run
   host contract
 - invalid or unsupported JSON
+- more than 10,000 active function calls, or more than 100,000 nested
+  expression and block evaluations, in direct evaluation (`K4010`)
 
 Evaluation stops at the first error. Errors follow `DIAGNOSTICS.md`.
+
+The direct-evaluation limits count active frames, not total work: sequential
+calls that each recurse 9,000 levels deep are valid. A typical recursive
+function evaluates three to six nested expressions per call, so it reaches the
+call limit first; a function body nested unusually deeply reaches the
+evaluation limit first. `krit run` evaluates on a dedicated thread with a
+1 GiB stack reservation. The most stack measured at these limits is about
+85 MiB in optimized builds and 430 MiB in unoptimized builds, so `K4010` is
+always reported before the native stack is exhausted.
 
 ## 15. Determinism
 

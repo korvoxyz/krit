@@ -13,7 +13,7 @@ use std::{
 
 use krit::{
     Analysis, CoreModule, Diagnostic, EntrypointKind, RequirementSet, Source, Span, analyze,
-    execute, format_source, lower, parse_source,
+    execute, format_source, lower, parse_source, run_on_thread,
 };
 use krit_package::Manifest;
 use krit_runtime::{
@@ -33,7 +33,17 @@ enum DiagnosticFormat {
 }
 
 fn main() -> ExitCode {
-    ExitCode::from(run(env::args().skip(1).collect()))
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    // Every compiler stage recurses through nested syntax. Run commands on a
+    // thread whose stack is sized for the deepest program the parser accepts
+    // instead of relying on the platform's main-thread stack.
+    match run_on_thread("krit", krit::COMPILER_STACK_BYTES, move || run(arguments)) {
+        Ok(status) => ExitCode::from(status),
+        Err(error) => {
+            eprintln!("krit: could not start the compiler thread: {error}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn run(arguments: Vec<String>) -> u8 {
@@ -1213,12 +1223,22 @@ fn execute_source(source: &Source, format: DiagnosticFormat) -> u8 {
         let _ = report(&diagnostic, source, format);
         return 4;
     }
-    let mut output = io::stdout().lock();
-    match execute(&program, &mut output) {
-        Ok(_) => 0,
-        Err(diagnostic) => {
+    // The evaluator gets its own thread with a stack large enough that its
+    // call and evaluation depth limits (K4010) are always reached before the
+    // native stack is exhausted.
+    let result = run_on_thread("krit-evaluator", krit::EVALUATOR_STACK_BYTES, || {
+        let mut output = io::stdout().lock();
+        execute(&program, &mut output).map(|_| ())
+    });
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(diagnostic)) => {
             let _ = report(&diagnostic, source, format);
             if diagnostic.code() == "K5003" { 4 } else { 1 }
+        }
+        Err(error) => {
+            eprintln!("krit: could not start the evaluator thread: {error}");
+            1
         }
     }
 }

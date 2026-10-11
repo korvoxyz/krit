@@ -15,9 +15,14 @@ fn normative_conformance_cases() {
     cases.sort();
 
     assert!(!cases.is_empty(), "no conformance cases found");
-    for case in cases {
-        run_case(&case);
-    }
+    // `krit run` evaluates on a thread with this stack, so the depth limits
+    // are reached before the native stack is exhausted.
+    krit::run_on_thread("conformance", krit::EVALUATOR_STACK_BYTES, || {
+        for case in cases {
+            run_case(&case);
+        }
+    })
+    .expect("conformance thread should start");
 }
 
 fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) {

@@ -1,0 +1,24 @@
+fn classify(value) {
+    if value < 0 {
+        "negative"
+    } else if value == 0 {
+        "zero"
+    } else if value < 10 {
+        "small"
+    } else {
+        "large"
+    }
+}
+
+fn in_range(value) {
+    value >= 0 && value < 10 && value != 5 || value == 42
+}
+
+println(classify(-3));
+println(classify(0));
+println(classify(7));
+println(classify(12));
+println(in_range(3));
+println(in_range(5));
+println(in_range(42));
+println(1 + 2 * 3 - 4 + 5);

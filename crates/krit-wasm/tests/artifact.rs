@@ -38,6 +38,34 @@ fn compile_state(source_text: &str) -> Result<krit_wasm::BuiltComponent, krit_wa
     build_component(&module, &options)
 }
 
+fn else_if_chain_program(branches: usize) -> String {
+    let mut text = String::from("fn pick(n) {\n    if n == 0 {\n        0\n    }");
+    for branch in 1..branches {
+        text.push_str(&format!(
+            " else if n == {branch} {{\n        {branch}\n    }}"
+        ));
+    }
+    text.push_str(" else {\n        -1\n    }\n}\n\nprintln(pick(3));\n");
+    text
+}
+
+#[test]
+fn compiles_else_if_chains_up_to_the_structural_limit() {
+    // Each `else if` continuation is one more nested Core block, which both
+    // compilers walk recursively; the compiler stack covers the deepest chain
+    // the parser accepts.
+    for branches in [1_000, krit::MAX_STRUCTURAL_DEPTH - 16] {
+        let text = else_if_chain_program(branches);
+        let artifact = krit::run_on_thread("wasm-test", krit::COMPILER_STACK_BYTES, move || {
+            compile("chain.krit", &text, true)
+        })
+        .expect("compiler test thread should start")
+        .unwrap_or_else(|error| panic!("a {branches}-branch chain should compile: {error:?}"));
+        validate_artifact(&artifact.bytes, &artifact.metadata)
+            .expect("chain artifact should validate");
+    }
+}
+
 #[test]
 fn state_webhooks_select_the_exact_state_interface_and_policy() {
     let artifact = compile_state(

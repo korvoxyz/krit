@@ -14,6 +14,7 @@ use crate::{
         Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral,
         VariantFamily, VariantName,
     },
+    limits::{MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, tree_depth_error},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -832,6 +833,12 @@ struct Analyzer {
     host_builtin_references: Vec<(Span, Builtin)>,
     direct_host_builtin_references: BTreeSet<Span>,
     allowed_secret_constructor_spans: BTreeSet<Span>,
+    /// Nested expression and block analyses currently open.
+    depth: usize,
+    /// A binding that would have nested an inferred type too deeply; it takes
+    /// precedence over the generic mismatch reported by the failing
+    /// unification.
+    type_depth_error: Option<Diagnostic>,
 }
 
 #[derive(Clone)]
@@ -857,6 +864,8 @@ impl Analyzer {
             host_builtin_references: Vec::new(),
             direct_host_builtin_references: BTreeSet::new(),
             allowed_secret_constructor_spans: BTreeSet::new(),
+            depth: 0,
+            type_depth_error: None,
         }
     }
 
@@ -1166,7 +1175,27 @@ impl Analyzer {
         }
     }
 
+    /// Counts one level of analyzer recursion.
+    ///
+    /// The parser bounds every source program well below this limit, and
+    /// `else if` and binary-operator chains are analyzed iteratively, so this
+    /// only rejects hand-built syntax trees that bypassed the parser.
+    fn enter(&mut self, span: Span) -> Result<(), Diagnostic> {
+        if self.depth >= MAX_STRUCTURAL_DEPTH {
+            return Err(tree_depth_error(span));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
     fn block(&mut self, block: &Block) -> Result<ExpressionInfo, Diagnostic> {
+        self.enter(block.span)?;
+        let info = self.block_contents(block);
+        self.depth -= 1;
+        info
+    }
+
+    fn block_contents(&mut self, block: &Block) -> Result<ExpressionInfo, Diagnostic> {
         self.push_scope();
         let mut effects = InferEffects::default();
         for statement in &block.statements {
@@ -1190,6 +1219,16 @@ impl Analyzer {
     }
 
     fn expression(&mut self, expression: &Expression) -> Result<ExpressionInfo, Diagnostic> {
+        self.enter(expression.span)?;
+        let info = self.expression_contents(expression);
+        self.depth -= 1;
+        info
+    }
+
+    fn expression_contents(
+        &mut self,
+        expression: &Expression,
+    ) -> Result<ExpressionInfo, Diagnostic> {
         let mut resolved_name = None;
         let info = match &expression.kind {
             ExpressionKind::Literal(literal) => Ok(ExpressionInfo {
@@ -1284,32 +1323,7 @@ impl Analyzer {
                 })
             }
             ExpressionKind::Block(block) => self.block(block),
-            ExpressionKind::If {
-                condition,
-                consequent,
-                alternative,
-            } => {
-                let condition_source_span = condition.span;
-                let condition = self.expression(condition)?;
-                self.unify(
-                    InferType::Bool,
-                    condition.ty,
-                    condition_source_span,
-                    "if condition",
-                )?;
-                let consequent = self.block(consequent)?;
-                let alternative = self.expression(alternative)?;
-                let ty = self.unify(
-                    consequent.ty,
-                    alternative.ty,
-                    expression.span,
-                    "if branches",
-                )?;
-                let mut effects = condition.effects;
-                effects.union(consequent.effects);
-                effects.union(alternative.effects);
-                Ok(ExpressionInfo { ty, effects })
-            }
+            ExpressionKind::If { .. } => self.if_chain(expression),
             ExpressionKind::Function {
                 parameters,
                 return_type,
@@ -1333,18 +1347,96 @@ impl Analyzer {
                     effects: operand.effects,
                 })
             }
-            ExpressionKind::Binary {
-                left,
-                operator,
-                right,
-            } => self.binary(left, *operator, right, expression.span),
+            ExpressionKind::Binary { .. } => self.binary_chain(expression),
         }?;
+        self.record_expression(expression.span, &info, resolved_name);
+        Ok(info)
+    }
+
+    fn record_expression(
+        &mut self,
+        span: Span,
+        info: &ExpressionInfo,
+        resolved_name: Option<ResolvedName>,
+    ) {
         self.expressions.push(PendingExpression {
-            span: expression.span,
+            span,
             ty: info.ty.clone(),
             effects: info.effects.clone(),
             resolved_name,
         });
+    }
+
+    /// Analyzes an `if` expression and its whole `else if` chain.
+    ///
+    /// The chain is walked iteratively so its length never deepens analyzer
+    /// recursion. Conditions and consequents are analyzed in source order and
+    /// branch types are unified from the innermost link outward, exactly as a
+    /// recursive walk would.
+    fn if_chain(&mut self, expression: &Expression) -> Result<ExpressionInfo, Diagnostic> {
+        let mut links = Vec::new();
+        let mut current = expression;
+        let mut info = loop {
+            let ExpressionKind::If {
+                condition,
+                consequent,
+                alternative,
+            } = &current.kind
+            else {
+                break self.expression(current)?;
+            };
+            let condition_source_span = condition.span;
+            let condition = self.expression(condition)?;
+            self.unify(
+                InferType::Bool,
+                condition.ty,
+                condition_source_span,
+                "if condition",
+            )?;
+            let consequent = self.block(consequent)?;
+            links.push((current.span, condition.effects, consequent));
+            current = alternative;
+        };
+        while let Some((span, condition_effects, consequent)) = links.pop() {
+            let ty = self.unify(consequent.ty, info.ty, span, "if branches")?;
+            let mut effects = condition_effects;
+            effects.union(consequent.effects);
+            effects.union(info.effects);
+            info = ExpressionInfo { ty, effects };
+            // The outermost link is recorded by `expression`.
+            if !links.is_empty() {
+                self.record_expression(span, &info, None);
+            }
+        }
+        Ok(info)
+    }
+
+    /// Analyzes a left-nested chain of binary operators such as `a + b + c`.
+    ///
+    /// The left spine is walked iteratively so a long chain never deepens
+    /// analyzer recursion; operands are still analyzed left to right.
+    fn binary_chain(&mut self, expression: &Expression) -> Result<ExpressionInfo, Diagnostic> {
+        let mut spine = Vec::new();
+        let mut current = expression;
+        while let ExpressionKind::Binary { left, .. } = &current.kind {
+            spine.push(current);
+            current = left;
+        }
+        let mut info = self.expression(current)?;
+        while let Some(node) = spine.pop() {
+            let ExpressionKind::Binary {
+                operator, right, ..
+            } = &node.kind
+            else {
+                unreachable!("the binary spine holds only binary expressions")
+            };
+            let right = self.expression(right)?;
+            info = self.binary(info, *operator, right, node.span)?;
+            // The outermost operator is recorded by `expression`.
+            if !spine.is_empty() {
+                self.record_expression(node.span, &info, None);
+            }
+        }
         Ok(info)
     }
 
@@ -1849,13 +1941,11 @@ impl Analyzer {
 
     fn binary(
         &mut self,
-        left: &Expression,
+        left: ExpressionInfo,
         operator: BinaryOperator,
-        right: &Expression,
+        right: ExpressionInfo,
         span: Span,
     ) -> Result<ExpressionInfo, Diagnostic> {
-        let left = self.expression(left)?;
-        let right = self.expression(right)?;
         let mut effects = left.effects;
         effects.union(right.effects);
 
@@ -2109,8 +2199,9 @@ impl Analyzer {
         span: Span,
         context: &str,
     ) -> Result<InferType, Diagnostic> {
-        self.unify_inner(expected.clone(), actual.clone(), span)
-            .map_err(|()| {
+        match self.unify_inner(expected.clone(), actual.clone(), span) {
+            Ok(unified) => Ok(unified),
+            Err(()) => Err(self.type_depth_error.take().unwrap_or_else(|| {
                 Diagnostic::new(
                     "K3001",
                     format!(
@@ -2120,7 +2211,8 @@ impl Analyzer {
                     ),
                     span,
                 )
-            })
+            })),
+        }
     }
 
     fn unify_inner(
@@ -2346,16 +2438,18 @@ impl Analyzer {
             });
         }
         if let Some(existing) = self.substitutions.get(&variable).cloned() {
-            let unified = self.unify_inner(existing, ty.clone(), span).map_err(|()| {
-                Diagnostic::new(
-                    "K3001",
-                    format!(
-                        "{context} type mismatch: incompatible with `{}`",
-                        self.render_type(&ty)
-                    ),
-                    span,
-                )
-            })?;
+            let Ok(unified) = self.unify_inner(existing, ty.clone(), span) else {
+                return Err(self.type_depth_error.take().unwrap_or_else(|| {
+                    Diagnostic::new(
+                        "K3001",
+                        format!(
+                            "{context} type mismatch: incompatible with `{}`",
+                            self.render_type(&ty)
+                        ),
+                        span,
+                    )
+                }));
+            };
             self.substitutions.insert(variable, unified);
             return Ok(InferType::Variable(variable));
         }
@@ -2366,8 +2460,92 @@ impl Analyzer {
                 span,
             ));
         }
+        // Every inferred type deeper than its syntax grows through a binding
+        // like this one (for example `let next = [previous];`), so bounding
+        // bindings bounds every later walk over types.
+        if self.type_height(&ty, 0, &mut HashMap::new()) > MAX_NESTING_DEPTH {
+            let error = Diagnostic::new(
+                "K1005",
+                format!(
+                    "nesting depth limit exceeded: inferred types may nest at most \
+                     {MAX_NESTING_DEPTH} levels"
+                ),
+                span,
+            );
+            self.type_depth_error = Some(error.clone());
+            return Err(error);
+        }
         self.substitutions.insert(variable, ty);
         Ok(InferType::Variable(variable))
+    }
+
+    /// Returns how many type constructors `ty` nests, with bound variables
+    /// resolved, once `depth` constructors already enclose it.
+    ///
+    /// The walk stops below `MAX_NESTING_DEPTH + 1` enclosing constructors and
+    /// reports at least that height for anything it cuts off, so its recursion
+    /// is bounded and a result above the limit is exact enough to reject. Each
+    /// variable is measured once, which keeps shared type DAGs linear.
+    fn type_height(
+        &self,
+        ty: &InferType,
+        depth: usize,
+        measured: &mut HashMap<TypeVariable, usize>,
+    ) -> usize {
+        const CUTOFF: usize = MAX_NESTING_DEPTH + 1;
+        if depth >= CUTOFF {
+            return CUTOFF;
+        }
+        let nested = |children: &mut dyn Iterator<Item = &InferType>,
+                      measured: &mut HashMap<TypeVariable, usize>| {
+            1 + children
+                .map(|child| self.type_height(child, depth + 1, measured))
+                .max()
+                .unwrap_or(0)
+        };
+        match ty {
+            InferType::Variable(variable) => {
+                let root = self.root_variable(*variable);
+                if let Some(height) = measured.get(&root) {
+                    return *height;
+                }
+                let height = self
+                    .substitutions
+                    .get(&root)
+                    .map_or(0, |bound| self.type_height(bound, depth, measured));
+                measured.insert(root, height);
+                height
+            }
+            InferType::List(element) | InferType::Option(element) => {
+                nested(&mut std::iter::once(element.as_ref()), measured)
+            }
+            InferType::Result(value, error) => {
+                nested(&mut [value.as_ref(), error.as_ref()].into_iter(), measured)
+            }
+            InferType::Record { fields, .. } => nested(&mut fields.values(), measured),
+            InferType::Function {
+                parameters,
+                return_type,
+                ..
+            } => nested(
+                &mut parameters
+                    .iter()
+                    .chain(std::iter::once(return_type.as_ref())),
+                measured,
+            ),
+            InferType::Int
+            | InferType::Bool
+            | InferType::String
+            | InferType::Unit
+            | InferType::HttpHeader
+            | InferType::HttpRequest
+            | InferType::HttpResponse
+            | InferType::LogField
+            | InferType::QueueJob
+            | InferType::ScheduleEvent
+            | InferType::DatabaseTransaction
+            | InferType::Secret => 0,
+        }
     }
 
     fn occurs(&self, variable: TypeVariable, ty: &InferType) -> bool {
@@ -2429,11 +2607,15 @@ impl Analyzer {
     }
 
     fn root_variable(&self, variable: TypeVariable) -> TypeVariable {
-        let parent = self.type_parents[variable as usize];
-        if parent == variable {
-            variable
-        } else {
-            self.root_variable(parent)
+        // Iterative: alias chains grow with flat source such as a long list
+        // of distinct unannotated parameters.
+        let mut current = variable;
+        loop {
+            let parent = self.type_parents[current as usize];
+            if parent == current {
+                return current;
+            }
+            current = parent;
         }
     }
 
@@ -3880,6 +4062,127 @@ mod tests {
 
         let error = analyze(&program).expect_err("invalid AST should fail defensively");
         assert_eq!(error.code(), "K3005");
+    }
+
+    #[test]
+    fn analyzes_long_else_if_and_operator_chains_iteratively() {
+        // Runs on the default test stack: recursive analysis of either chain
+        // would need far more.
+        let mut text = String::from("fn pick(n) {\n    if n == 0 {\n        0\n    }");
+        for branch in 1..1_000 {
+            text.push_str(&format!(
+                " else if n == {branch} {{\n        {branch}\n    }}"
+            ));
+        }
+        text.push_str(" else {\n        -1\n    }\n}\n\nlet total = 0");
+        text.push_str(&" + pick(1)".repeat(4_000));
+        text.push_str(";\nprintln(total);\n");
+        let source = Source::new("test.krit", text);
+        let program = parse_source(&source).expect("long chains should parse");
+        let analysis = analyze(&program).expect("long chains should analyze");
+
+        let StatementKind::Function { body, .. } = &program.statements[0].kind else {
+            panic!("first statement should be a function");
+        };
+        let mut current = body.tail.as_deref().expect("function should have a tail");
+        let mut links = 0;
+        while let ExpressionKind::If { alternative, .. } = &current.kind {
+            let fact = analysis
+                .expression(current.span)
+                .expect("every else-if link should have a fact");
+            assert_eq!(fact.ty(), &Type::Int);
+            links += 1;
+            current = alternative;
+        }
+        assert_eq!(links, 1_000);
+
+        let StatementKind::Let { value, .. } = &program.statements[1].kind else {
+            panic!("second statement should be a let");
+        };
+        let mut current = value;
+        let mut operators = 0;
+        while let ExpressionKind::Binary { left, .. } = &current.kind {
+            let fact = analysis
+                .expression(current.span)
+                .expect("every chained operator should have a fact");
+            assert_eq!(fact.ty(), &Type::Int);
+            operators += 1;
+            current = left;
+        }
+        assert_eq!(operators, 4_000);
+    }
+
+    #[test]
+    fn rejects_hand_built_syntax_trees_beyond_the_structural_limit() {
+        let depth = MAX_STRUCTURAL_DEPTH + 10;
+        let error = crate::run_on_thread("analysis-test", crate::COMPILER_STACK_BYTES, move || {
+            let mut expression = Expression {
+                kind: ExpressionKind::Literal(ValueLiteral::Boolean(true)),
+                span: Span::new(depth, depth + 4),
+            };
+            for level in 1..=depth {
+                expression = Expression {
+                    kind: ExpressionKind::Unary {
+                        operator: UnaryOperator::Not,
+                        operand: Box::new(expression),
+                    },
+                    span: Span::new(depth - level, depth + 4),
+                };
+            }
+            let program = Program {
+                statements: vec![Statement {
+                    kind: StatementKind::Expression(expression),
+                    span: Span::new(0, depth + 5),
+                }],
+            };
+            analyze(&program).expect_err("an over-deep syntax tree should be rejected")
+        })
+        .expect("analysis test thread should start");
+        assert_eq!(error.code(), "K1005");
+        assert!(
+            error.message().contains("syntax tree"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn rejects_inferred_types_nested_beyond_the_limit() {
+        let chain = |levels: usize| {
+            let mut text = String::from("let level0 = 0;\n");
+            for level in 1..=levels {
+                text.push_str(&format!("let level{level} = [level{}];\n", level - 1));
+            }
+            text
+        };
+        let analysis = check(&chain(MAX_NESTING_DEPTH)).expect("types at the limit should analyze");
+        assert!(
+            analysis
+                .bindings()
+                .last()
+                .expect("chain should bind")
+                .ty()
+                .to_string()
+                .starts_with("List<List<")
+        );
+
+        let text = chain(MAX_NESTING_DEPTH + 1);
+        let error = check(&text).expect_err("one more level should be rejected");
+        assert_eq!(error.code(), "K1005");
+        assert!(
+            error.message().contains("inferred types"),
+            "{}",
+            error.message()
+        );
+        let crossing = format!("let level{} =", MAX_NESTING_DEPTH + 1);
+        assert_eq!(
+            error.span().start,
+            text.find(&crossing).expect("crossing binding should exist")
+        );
+
+        // Long chains fail at the same binding instead of slowing analysis.
+        let error = check(&chain(5_000)).expect_err("a long chain should be rejected");
+        assert_eq!(error.code(), "K1005");
     }
 
     #[test]

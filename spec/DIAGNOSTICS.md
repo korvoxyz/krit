@@ -76,6 +76,7 @@ Initial required codes:
 | `K1002` | Expected token not found |
 | `K1003` | Invalid match pattern |
 | `K1004` | Webhook declaration is nested or otherwise misplaced |
+| `K1005` | Nesting depth limit exceeded: syntax nests more than 256 levels, nesting plus `else if` continuations and chained operators exceeds 4,096, or an inferred type nests more than 256 levels |
 | `K2001` | Undefined name |
 | `K2002` | Duplicate binding or parameter |
 | `K3001` | Static type mismatch or invalid typed operator |
@@ -97,6 +98,7 @@ Initial required codes:
 | `K4007` | Output operation failed |
 | `K4008` | Value cannot be encoded as JSON |
 | `K4009` | Invalid or unsupported JSON input |
+| `K4010` | Direct-evaluation depth limit exceeded: more than 10,000 active function calls or 100,000 nested evaluations |
 | `K5001` | Required capability not granted |
 | `K5002` | Artifact import/world does not match the authorized host interface |
 | `K5003` | Required host contract is unavailable in direct source execution |

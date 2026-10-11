@@ -80,6 +80,17 @@ fn formatting_fixtures_are_canonical_and_idempotent() {
 
 #[test]
 fn every_repository_source_round_trips_through_the_formatter() {
+    // Some repository sources nest deeply, so give the pipeline the stack the
+    // CLI gives it.
+    krit::run_on_thread(
+        "formatting",
+        krit::COMPILER_STACK_BYTES,
+        round_trip_every_repository_source,
+    )
+    .expect("formatting thread should start");
+}
+
+fn round_trip_every_repository_source() {
     let root = repository_root();
     let mut paths = Vec::new();
     collect_krit_sources(&root, &mut paths);

@@ -3,9 +3,10 @@ use std::{fmt, io::Write, rc::Rc};
 use crate::{
     Diagnostic, Span,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Program, Statement,
-        StatementKind, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+        BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
+        Statement, StatementKind, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
     },
+    limits::{MAX_CALL_DEPTH, MAX_EVALUATION_DEPTH},
 };
 
 #[derive(Clone)]
@@ -223,12 +224,42 @@ impl Environment {
     }
 }
 
+impl Drop for Environment {
+    fn drop(&mut self) {
+        // Release uniquely owned bindings one at a time, so dropping a scope
+        // with many bindings does not recurse once per binding.
+        let mut next = self.0.take();
+        while let Some(binding) = next {
+            next = match Rc::try_unwrap(binding) {
+                Ok(mut binding) => binding.parent.0.take(),
+                Err(_) => None,
+            };
+        }
+    }
+}
+
+/// Evaluates a parsed program directly.
+///
+/// Evaluation fails with `K4010` once more than [`MAX_CALL_DEPTH`] function
+/// calls or [`MAX_EVALUATION_DEPTH`] nested evaluations are active. Callers
+/// that run untrusted programs must give the current thread at least
+/// [`crate::EVALUATOR_STACK_BYTES`] of stack so those limits are always
+/// reached before the native stack is exhausted.
 pub fn execute(program: &Program, output: &mut dyn Write) -> Result<Value, Diagnostic> {
-    Evaluator { output }.program(program)
+    Evaluator {
+        output,
+        depth: 0,
+        calls: 0,
+    }
+    .program(program)
 }
 
 struct Evaluator<'a> {
     output: &'a mut dyn Write,
+    /// Nested expression and block evaluations currently active.
+    depth: usize,
+    /// Function calls currently active.
+    calls: usize,
 }
 
 impl Evaluator<'_> {
@@ -274,16 +305,7 @@ impl Evaluator<'_> {
                 body,
                 ..
             } => {
-                let function = Value::Function(Rc::new(FunctionValue {
-                    name: Some(Rc::from(name.as_str())),
-                    parameters: parameters
-                        .iter()
-                        .map(|parameter| parameter.name.clone())
-                        .collect::<Vec<_>>()
-                        .into(),
-                    body: body.clone(),
-                    environment: environment.clone(),
-                }));
+                let function = closure(Some(name), parameters, body, environment);
                 Ok(environment.extend(name.clone(), function))
             }
             StatementKind::Expression(expression) => {
@@ -293,7 +315,33 @@ impl Evaluator<'_> {
         }
     }
 
+    fn enter(&mut self, span: Span) -> Result<(), Diagnostic> {
+        if self.depth >= MAX_EVALUATION_DEPTH {
+            return Err(Diagnostic::new(
+                "K4010",
+                format!(
+                    "evaluation depth limit exceeded: more than {MAX_EVALUATION_DEPTH} nested \
+                     evaluations"
+                ),
+                span,
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
     fn block(&mut self, block: &Block, environment: &Environment) -> Result<Value, Diagnostic> {
+        self.enter(block.span)?;
+        let value = self.block_contents(block, environment);
+        self.depth -= 1;
+        value
+    }
+
+    fn block_contents(
+        &mut self,
+        block: &Block,
+        environment: &Environment,
+    ) -> Result<Value, Diagnostic> {
         let mut local = environment.clone();
         for statement in &block.statements {
             local = self.statement(statement, &local)?;
@@ -309,187 +357,123 @@ impl Evaluator<'_> {
         expression: &Expression,
         environment: &Environment,
     ) -> Result<Value, Diagnostic> {
+        self.enter(expression.span)?;
+        let value = self.expression_contents(expression, environment);
+        self.depth -= 1;
+        value
+    }
+
+    fn expression_contents(
+        &mut self,
+        expression: &Expression,
+        environment: &Environment,
+    ) -> Result<Value, Diagnostic> {
         match &expression.kind {
             ExpressionKind::Literal(literal) => self.literal(literal, expression.span),
-            ExpressionKind::Variable(name) => match name.as_str() {
-                "ai_invoke" => Ok(Value::Builtin(BuiltinFunction::AiInvoke)),
-                "print" => Ok(Value::Builtin(BuiltinFunction::Print)),
-                "println" => Ok(Value::Builtin(BuiltinFunction::Println)),
-                "Some" => Ok(Value::Builtin(BuiltinFunction::Some)),
-                "None" => Ok(Value::Variant {
-                    name: VariantName::None,
-                    payload: None,
-                }),
-                "Ok" => Ok(Value::Builtin(BuiltinFunction::Ok)),
-                "Err" => Ok(Value::Builtin(BuiltinFunction::Err)),
-                "json_encode" => Ok(Value::Builtin(BuiltinFunction::JsonEncode)),
-                "json_decode" => Ok(Value::Builtin(BuiltinFunction::JsonDecode)),
-                "config_string" => Ok(Value::Builtin(BuiltinFunction::ConfigString)),
-                "secret" => Ok(Value::Builtin(BuiltinFunction::Secret)),
-                "http_request" => Ok(Value::Builtin(BuiltinFunction::HttpRequest)),
-                "log_info" => Ok(Value::Builtin(BuiltinFunction::LogInfo)),
-                "log_error" => Ok(Value::Builtin(BuiltinFunction::LogError)),
-                "state_get" => Ok(Value::Builtin(BuiltinFunction::StateGet)),
-                "state_put" => Ok(Value::Builtin(BuiltinFunction::StatePut)),
-                "state_delete" => Ok(Value::Builtin(BuiltinFunction::StateDelete)),
-                "checkpoint_get" => Ok(Value::Builtin(BuiltinFunction::CheckpointGet)),
-                "checkpoint_put" => Ok(Value::Builtin(BuiltinFunction::CheckpointPut)),
-                "replay_http" => Ok(Value::Builtin(BuiltinFunction::ReplayHttp)),
-                "replay_ai" => Ok(Value::Builtin(BuiltinFunction::ReplayAi)),
-                "queue_publish" => Ok(Value::Builtin(BuiltinFunction::QueuePublish)),
-                "cache_get" => Ok(Value::Builtin(BuiltinFunction::CacheGet)),
-                "cache_put" => Ok(Value::Builtin(BuiltinFunction::CachePut)),
-                "cache_delete" => Ok(Value::Builtin(BuiltinFunction::CacheDelete)),
-                "search_query" => Ok(Value::Builtin(BuiltinFunction::SearchQuery)),
-                "vector_search" => Ok(Value::Builtin(BuiltinFunction::VectorSearch)),
-                "object_get" => Ok(Value::Builtin(BuiltinFunction::ObjectGet)),
-                "object_put" => Ok(Value::Builtin(BuiltinFunction::ObjectPut)),
-                "object_delete" => Ok(Value::Builtin(BuiltinFunction::ObjectDelete)),
-                "db_begin_read" => Ok(Value::Builtin(BuiltinFunction::DatabaseBeginRead)),
-                "db_begin_write" => Ok(Value::Builtin(BuiltinFunction::DatabaseBeginWrite)),
-                "db_query" => Ok(Value::Builtin(BuiltinFunction::DatabaseQuery)),
-                "db_execute" => Ok(Value::Builtin(BuiltinFunction::DatabaseExecute)),
-                "db_commit" => Ok(Value::Builtin(BuiltinFunction::DatabaseCommit)),
-                "db_rollback" => Ok(Value::Builtin(BuiltinFunction::DatabaseRollback)),
-                _ => environment.lookup(name).ok_or_else(|| {
-                    Diagnostic::new("K2001", format!("undefined name `{name}`"), expression.span)
-                }),
-            },
+            ExpressionKind::Variable(name) => variable(name, environment, expression.span),
+            // Operands on the recursive evaluation path are collected with
+            // plain loops: iterator adapters add several native frames per
+            // nested evaluation in unoptimized builds.
             ExpressionKind::List(elements) => {
-                let values = elements
-                    .iter()
-                    .map(|element| self.expression(element, environment))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut values = Vec::with_capacity(elements.len());
+                for element in elements {
+                    values.push(self.expression(element, environment)?);
+                }
                 Ok(Value::List(values.into()))
             }
             ExpressionKind::Record(fields) => {
-                let values = fields
-                    .iter()
-                    .map(|field| {
-                        self.expression(&field.value, environment)
-                            .map(|value| (field.name.clone(), value))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut values = Vec::with_capacity(fields.len());
+                for field in fields {
+                    values.push((
+                        field.name.clone(),
+                        self.expression(&field.value, environment)?,
+                    ));
+                }
                 Ok(Value::Record(values.into()))
             }
             ExpressionKind::FieldAccess { value, field } => {
                 let value = self.expression(value, environment)?;
-                let Value::Record(fields) = value else {
-                    return Err(Diagnostic::new(
-                        "K4001",
-                        format!("expected record for field access, found {}", value.kind()),
-                        expression.span,
-                    ));
-                };
-                fields
-                    .iter()
-                    .find(|(name, _)| name == field)
-                    .map(|(_, value)| value.clone())
-                    .ok_or_else(|| {
-                        Diagnostic::new(
-                            "K4001",
-                            format!("record has no field `{field}`"),
-                            expression.span,
-                        )
-                    })
+                field_value(value, field, expression.span)
             }
             ExpressionKind::Block(block) => self.block(block, environment),
-            ExpressionKind::If {
-                condition,
-                consequent,
-                alternative,
-            } => {
-                let condition_value = self.expression(condition, environment)?;
-                if self.boolean(condition_value, condition.span)? {
-                    self.block(consequent, environment)
-                } else {
-                    self.expression(alternative, environment)
-                }
-            }
+            ExpressionKind::If { .. } => self.if_chain(expression, environment),
             ExpressionKind::Function {
                 parameters, body, ..
-            } => Ok(Value::Function(Rc::new(FunctionValue {
-                name: None,
-                parameters: parameters
-                    .iter()
-                    .map(|parameter| parameter.name.clone())
-                    .collect::<Vec<_>>()
-                    .into(),
-                body: body.clone(),
-                environment: environment.clone(),
-            }))),
+            } => Ok(closure(None, parameters, body, environment)),
             ExpressionKind::Call { callee, arguments } => {
                 self.call(callee, arguments, environment, expression.span)
             }
             ExpressionKind::Match { subject, kind } => {
-                let subject_value = self.expression(subject, environment)?;
-                match kind {
-                    MatchKind::List {
-                        empty_case,
-                        head_name,
-                        tail_name,
-                        cons_case,
-                    } => {
-                        let values = self.list(subject_value, subject.span)?;
-                        if values.is_empty() {
-                            self.expression(empty_case, environment)
-                        } else {
-                            let with_head =
-                                environment.extend(head_name.clone(), values[0].clone());
-                            let with_tail = with_head.extend(
-                                tail_name.clone(),
-                                Value::List(values[1..].to_vec().into()),
-                            );
-                            self.expression(cons_case, &with_tail)
-                        }
-                    }
-                    MatchKind::Variants { family, arms } => {
-                        let Value::Variant { name, payload } = subject_value else {
-                            return Err(Diagnostic::new(
-                                "K4001",
-                                format!(
-                                    "expected {} for variant match, found {}",
-                                    variant_family_name(*family),
-                                    subject_value.kind()
-                                ),
-                                subject.span,
-                            ));
-                        };
-                        if variant_family(name) != *family {
-                            return Err(Diagnostic::new(
-                                "K4001",
-                                format!(
-                                    "expected {} for variant match, found {}",
-                                    variant_family_name(*family),
-                                    variant_family_name(variant_family(name))
-                                ),
-                                subject.span,
-                            ));
-                        }
-                        let arm = arms
-                            .iter()
-                            .find(|arm| arm.variant == name)
-                            .expect("parser guarantees exhaustive variant arms");
-                        let arm_environment = match (&arm.binding, payload) {
-                            (Some(binding), Some(value)) => {
-                                environment.extend(binding.clone(), value.as_ref().clone())
-                            }
-                            (None, None) => environment.clone(),
-                            _ => unreachable!("variant payload shape is fixed"),
-                        };
-                        self.expression(&arm.value, &arm_environment)
-                    }
-                }
+                self.match_expression(subject, kind, environment)
             }
             ExpressionKind::Unary { operator, operand } => {
                 self.unary(*operator, operand, environment, expression.span)
             }
-            ExpressionKind::Binary {
-                left,
-                operator,
-                right,
-            } => self.binary(*operator, left, right, environment, expression.span),
+            ExpressionKind::Binary { .. } => self.binary_chain(expression, environment),
         }
+    }
+
+    fn match_expression(
+        &mut self,
+        subject: &Expression,
+        kind: &MatchKind,
+        environment: &Environment,
+    ) -> Result<Value, Diagnostic> {
+        let subject_value = self.expression(subject, environment)?;
+        let (arm, arm_environment) =
+            select_match_arm(subject_value, subject.span, kind, environment)?;
+        self.expression(arm, &arm_environment)
+    }
+
+    /// Evaluates an `if` expression and its `else if` chain iteratively, so a
+    /// long chain does not deepen evaluation.
+    fn if_chain(
+        &mut self,
+        expression: &Expression,
+        environment: &Environment,
+    ) -> Result<Value, Diagnostic> {
+        let mut current = expression;
+        loop {
+            let ExpressionKind::If {
+                condition,
+                consequent,
+                alternative,
+            } = &current.kind
+            else {
+                return self.expression(current, environment);
+            };
+            let condition_value = self.expression(condition, environment)?;
+            if expect_boolean(condition_value, condition.span)? {
+                return self.block(consequent, environment);
+            }
+            current = alternative;
+        }
+    }
+
+    /// Evaluates a left-nested chain of binary operators such as `a + b + c`
+    /// iteratively, left to right, so a long chain does not deepen evaluation.
+    fn binary_chain(
+        &mut self,
+        expression: &Expression,
+        environment: &Environment,
+    ) -> Result<Value, Diagnostic> {
+        let mut spine = Vec::new();
+        let mut current = expression;
+        while let ExpressionKind::Binary { left, .. } = &current.kind {
+            spine.push(current);
+            current = left;
+        }
+        let mut value = self.expression(current, environment)?;
+        while let Some(node) = spine.pop() {
+            let ExpressionKind::Binary {
+                operator, right, ..
+            } = &node.kind
+            else {
+                unreachable!("the binary spine holds only binary expressions")
+            };
+            value = self.binary(*operator, value, right, environment, node.span)?;
+        }
+        Ok(value)
     }
 
     fn literal(&self, literal: &ValueLiteral, span: Span) -> Result<Value, Diagnostic> {
@@ -512,199 +496,142 @@ impl Evaluator<'_> {
         let callee_value = self.expression(callee, environment)?;
         match callee_value {
             Value::Function(function) => {
-                if arguments.len() != function.parameters.len() {
-                    return Err(arity_error(
-                        function.parameters.len(),
-                        arguments.len(),
-                        span,
-                    ));
-                }
+                self.call_function(&function, arguments, environment, span)
+            }
+            Value::Builtin(builtin) => self.call_builtin(builtin, arguments, environment, span),
+            value => Err(not_callable(&value, callee.span)),
+        }
+    }
 
-                let values = arguments
-                    .iter()
-                    .map(|argument| self.expression(argument, environment))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut call_environment = function.environment.clone();
-                if let Some(name) = &function.name {
-                    call_environment = call_environment
-                        .extend(name.to_string(), Value::Function(Rc::clone(&function)));
-                }
-                for (parameter, value) in function.parameters.iter().zip(values) {
-                    call_environment = call_environment.extend(parameter.clone(), value);
-                }
-                self.block(&function.body, &call_environment)
+    fn call_function(
+        &mut self,
+        function: &Rc<FunctionValue>,
+        arguments: &[Expression],
+        environment: &Environment,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        if arguments.len() != function.parameters.len() {
+            return Err(arity_error(
+                function.parameters.len(),
+                arguments.len(),
+                span,
+            ));
+        }
+
+        let mut values = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            values.push(self.expression(argument, environment)?);
+        }
+        let mut call_environment = function.environment.clone();
+        if let Some(name) = &function.name {
+            call_environment =
+                call_environment.extend(name.to_string(), Value::Function(Rc::clone(function)));
+        }
+        for (parameter, value) in function.parameters.iter().zip(values) {
+            call_environment = call_environment.extend(parameter.clone(), value);
+        }
+        if self.calls >= MAX_CALL_DEPTH {
+            return Err(Diagnostic::new(
+                "K4010",
+                format!(
+                    "call depth limit exceeded: more than {MAX_CALL_DEPTH} nested function calls"
+                ),
+                span,
+            ));
+        }
+        self.calls += 1;
+        let value = self.block(&function.body, &call_environment);
+        self.calls -= 1;
+        value
+    }
+
+    fn call_builtin(
+        &mut self,
+        builtin: BuiltinFunction,
+        arguments: &[Expression],
+        environment: &Environment,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        let expected_arity = builtin_arity(builtin);
+        if arguments.len() != expected_arity {
+            return Err(arity_error(expected_arity, arguments.len(), span));
+        }
+        if let Some(message) = unavailable_builtin_message(builtin) {
+            for argument in arguments {
+                self.expression(argument, environment)?;
             }
-            Value::Builtin(builtin) => {
-                let expected_arity = match builtin {
-                    BuiltinFunction::HttpRequest => 3,
-                    BuiltinFunction::ReplayHttp | BuiltinFunction::ReplayAi => 4,
-                    BuiltinFunction::CachePut => 4,
-                    BuiltinFunction::StatePut
-                    | BuiltinFunction::CheckpointPut
-                    | BuiltinFunction::ObjectPut
-                    | BuiltinFunction::SearchQuery
-                    | BuiltinFunction::VectorSearch
-                    | BuiltinFunction::DatabaseQuery
-                    | BuiltinFunction::DatabaseExecute => 3,
-                    BuiltinFunction::AiInvoke
-                    | BuiltinFunction::LogInfo
-                    | BuiltinFunction::LogError
-                    | BuiltinFunction::StateGet
-                    | BuiltinFunction::StateDelete
-                    | BuiltinFunction::CheckpointGet
-                    | BuiltinFunction::QueuePublish
-                    | BuiltinFunction::ObjectGet
-                    | BuiltinFunction::CacheGet
-                    | BuiltinFunction::CacheDelete
-                    | BuiltinFunction::ObjectDelete => 2,
-                    _ => 1,
-                };
-                if arguments.len() != expected_arity {
-                    return Err(arity_error(expected_arity, arguments.len(), span));
+            return Err(Diagnostic::new("K5003", message, span));
+        }
+        let value = self.expression(&arguments[0], environment)?;
+        self.apply_builtin(builtin, value, span)
+    }
+
+    /// Applies a pure or output built-in to its evaluated argument.
+    fn apply_builtin(
+        &mut self,
+        builtin: BuiltinFunction,
+        value: Value,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        match builtin {
+            BuiltinFunction::Print | BuiltinFunction::Println => {
+                let rendered = value.render();
+                self.output
+                    .write_all(rendered.as_bytes())
+                    .map_err(|error| {
+                        Diagnostic::new("K4007", format!("output failed: {error}"), span)
+                    })?;
+                if builtin == BuiltinFunction::Println {
+                    self.output.write_all(b"\n").map_err(|error| {
+                        Diagnostic::new("K4007", format!("output failed: {error}"), span)
+                    })?;
                 }
-                if builtin == BuiltinFunction::HttpRequest {
-                    for argument in arguments {
-                        self.expression(argument, environment)?;
-                    }
-                    return Err(Diagnostic::new(
-                        "K5003",
-                        "HTTP host operations are unavailable in direct source execution",
-                        span,
-                    ));
-                }
-                if matches!(
-                    builtin,
-                    BuiltinFunction::AiInvoke
-                        | BuiltinFunction::LogInfo
-                        | BuiltinFunction::LogError
-                ) {
-                    for argument in arguments {
-                        self.expression(argument, environment)?;
-                    }
-                    let operation = match builtin {
-                        BuiltinFunction::AiInvoke => "AI invocation",
-                        BuiltinFunction::LogInfo | BuiltinFunction::LogError => {
-                            "structured logging"
-                        }
-                        _ => unreachable!("matched host operations"),
-                    };
-                    return Err(Diagnostic::new(
-                        "K5003",
-                        format!("{operation} is unavailable in direct source execution"),
-                        span,
-                    ));
-                }
-                if matches!(
-                    builtin,
-                    BuiltinFunction::StateGet
-                        | BuiltinFunction::StatePut
-                        | BuiltinFunction::StateDelete
-                        | BuiltinFunction::CheckpointGet
-                        | BuiltinFunction::CheckpointPut
-                        | BuiltinFunction::ReplayHttp
-                        | BuiltinFunction::ReplayAi
-                        | BuiltinFunction::QueuePublish
-                        | BuiltinFunction::ObjectGet
-                        | BuiltinFunction::ObjectPut
-                        | BuiltinFunction::ObjectDelete
-                        | BuiltinFunction::DatabaseBeginRead
-                        | BuiltinFunction::DatabaseBeginWrite
-                        | BuiltinFunction::DatabaseQuery
-                        | BuiltinFunction::DatabaseExecute
-                        | BuiltinFunction::DatabaseCommit
-                        | BuiltinFunction::DatabaseRollback
-                        | BuiltinFunction::CacheGet
-                        | BuiltinFunction::CachePut
-                        | BuiltinFunction::CacheDelete
-                        | BuiltinFunction::SearchQuery
-                        | BuiltinFunction::VectorSearch
-                ) {
-                    for argument in arguments {
-                        self.expression(argument, environment)?;
-                    }
-                    return Err(Diagnostic::new(
-                        "K5003",
-                        "durable state, queue, schedule, object, database, cache, search, and replay operations are unavailable in direct source execution",
-                        span,
-                    ));
-                }
-                let value = self.expression(&arguments[0], environment)?;
-                match builtin {
-                    BuiltinFunction::Print | BuiltinFunction::Println => {
-                        let rendered = value.render();
-                        self.output
-                            .write_all(rendered.as_bytes())
-                            .map_err(|error| {
-                                Diagnostic::new("K4007", format!("output failed: {error}"), span)
-                            })?;
-                        if builtin == BuiltinFunction::Println {
-                            self.output.write_all(b"\n").map_err(|error| {
-                                Diagnostic::new("K4007", format!("output failed: {error}"), span)
-                            })?;
-                        }
-                        Ok(Value::Unit)
-                    }
-                    BuiltinFunction::Some => Ok(Value::Variant {
-                        name: VariantName::Some,
-                        payload: Some(Rc::new(value)),
-                    }),
-                    BuiltinFunction::Ok => Ok(Value::Variant {
-                        name: VariantName::Ok,
-                        payload: Some(Rc::new(value)),
-                    }),
-                    BuiltinFunction::Err => Ok(Value::Variant {
-                        name: VariantName::Err,
-                        payload: Some(Rc::new(value)),
-                    }),
-                    BuiltinFunction::JsonEncode => json_encode(&value, span),
-                    BuiltinFunction::JsonDecode => json_decode(value, span),
-                    BuiltinFunction::ConfigString => Err(Diagnostic::new(
-                        "K5003",
-                        "configuration host operations are unavailable in direct source execution",
-                        span,
-                    )),
-                    BuiltinFunction::Secret => Err(Diagnostic::new(
-                        "K5003",
-                        "secret host operations are unavailable in direct source execution",
-                        span,
-                    )),
-                    BuiltinFunction::HttpRequest => {
-                        unreachable!("HTTP requests return before unary builtin dispatch")
-                    }
-                    BuiltinFunction::AiInvoke
-                    | BuiltinFunction::LogInfo
-                    | BuiltinFunction::LogError
-                    | BuiltinFunction::StateGet
-                    | BuiltinFunction::StatePut
-                    | BuiltinFunction::StateDelete
-                    | BuiltinFunction::CheckpointGet
-                    | BuiltinFunction::CheckpointPut
-                    | BuiltinFunction::ReplayHttp
-                    | BuiltinFunction::ReplayAi
-                    | BuiltinFunction::QueuePublish
-                    | BuiltinFunction::ObjectGet
-                    | BuiltinFunction::ObjectPut
-                    | BuiltinFunction::ObjectDelete
-                    | BuiltinFunction::DatabaseBeginRead
-                    | BuiltinFunction::DatabaseBeginWrite
-                    | BuiltinFunction::DatabaseQuery
-                    | BuiltinFunction::DatabaseExecute
-                    | BuiltinFunction::DatabaseCommit
-                    | BuiltinFunction::DatabaseRollback
-                    | BuiltinFunction::CacheGet
-                    | BuiltinFunction::CachePut
-                    | BuiltinFunction::CacheDelete
-                    | BuiltinFunction::SearchQuery
-                    | BuiltinFunction::VectorSearch => {
-                        unreachable!("binary host operations return before unary builtin dispatch")
-                    }
-                }
+                Ok(Value::Unit)
             }
-            value => Err(Diagnostic::new(
-                "K4002",
-                format!("cannot call {}", value.kind()),
-                callee.span,
-            )),
+            BuiltinFunction::Some => Ok(Value::Variant {
+                name: VariantName::Some,
+                payload: Some(Rc::new(value)),
+            }),
+            BuiltinFunction::Ok => Ok(Value::Variant {
+                name: VariantName::Ok,
+                payload: Some(Rc::new(value)),
+            }),
+            BuiltinFunction::Err => Ok(Value::Variant {
+                name: VariantName::Err,
+                payload: Some(Rc::new(value)),
+            }),
+            BuiltinFunction::JsonEncode => json_encode(&value, span),
+            BuiltinFunction::JsonDecode => json_decode(value, span),
+            BuiltinFunction::AiInvoke
+            | BuiltinFunction::ConfigString
+            | BuiltinFunction::Secret
+            | BuiltinFunction::HttpRequest
+            | BuiltinFunction::LogInfo
+            | BuiltinFunction::LogError
+            | BuiltinFunction::StateGet
+            | BuiltinFunction::StatePut
+            | BuiltinFunction::StateDelete
+            | BuiltinFunction::CheckpointGet
+            | BuiltinFunction::CheckpointPut
+            | BuiltinFunction::ReplayHttp
+            | BuiltinFunction::ReplayAi
+            | BuiltinFunction::QueuePublish
+            | BuiltinFunction::ObjectGet
+            | BuiltinFunction::ObjectPut
+            | BuiltinFunction::ObjectDelete
+            | BuiltinFunction::DatabaseBeginRead
+            | BuiltinFunction::DatabaseBeginWrite
+            | BuiltinFunction::DatabaseQuery
+            | BuiltinFunction::DatabaseExecute
+            | BuiltinFunction::DatabaseCommit
+            | BuiltinFunction::DatabaseRollback
+            | BuiltinFunction::CacheGet
+            | BuiltinFunction::CachePut
+            | BuiltinFunction::CacheDelete
+            | BuiltinFunction::SearchQuery
+            | BuiltinFunction::VectorSearch => {
+                unreachable!("host operations are refused before built-in application")
+            }
         }
     }
 
@@ -718,160 +645,398 @@ impl Evaluator<'_> {
         if operator == UnaryOperator::Negate
             && let ExpressionKind::Literal(ValueLiteral::Integer(value)) = &operand.kind
         {
-            let negated = value.checked_neg().ok_or_else(|| {
-                Diagnostic::new("K4005", "integer overflow during negation", span)
-            })?;
-            return i64::try_from(negated)
-                .map(Value::Integer)
-                .map_err(|_| Diagnostic::new("K4005", "integer overflow during negation", span));
+            return negate_literal(*value, span);
         }
-
         let value = self.expression(operand, environment)?;
-        match operator {
-            UnaryOperator::Not => Ok(Value::Boolean(!self.boolean(value, span)?)),
-            UnaryOperator::Negate => self
-                .integer(value, span)?
-                .checked_neg()
-                .map(Value::Integer)
-                .ok_or_else(|| Diagnostic::new("K4005", "integer overflow during negation", span)),
-        }
+        apply_unary(operator, value, span)
     }
 
     fn binary(
         &mut self,
         operator: BinaryOperator,
-        left: &Expression,
+        left_value: Value,
         right: &Expression,
         environment: &Environment,
         span: Span,
     ) -> Result<Value, Diagnostic> {
         if operator == BinaryOperator::And {
-            let left = self.expression(left, environment)?;
-            return if self.boolean(left, span)? {
+            return if expect_boolean(left_value, span)? {
                 let right = self.expression(right, environment)?;
-                Ok(Value::Boolean(self.boolean(right, span)?))
+                Ok(Value::Boolean(expect_boolean(right, span)?))
             } else {
                 Ok(Value::Boolean(false))
             };
         }
         if operator == BinaryOperator::Or {
-            let left = self.expression(left, environment)?;
-            return if self.boolean(left, span)? {
+            return if expect_boolean(left_value, span)? {
                 Ok(Value::Boolean(true))
             } else {
                 let right = self.expression(right, environment)?;
-                Ok(Value::Boolean(self.boolean(right, span)?))
+                Ok(Value::Boolean(expect_boolean(right, span)?))
             };
         }
 
-        let left_value = self.expression(left, environment)?;
         let right_value = self.expression(right, environment)?;
-        match operator {
-            BinaryOperator::Add => match (left_value, right_value) {
-                (Value::Integer(left), Value::Integer(right)) => left
-                    .checked_add(right)
-                    .map(Value::Integer)
-                    .ok_or_else(|| Diagnostic::new("K4005", "integer overflow", span)),
-                (Value::String(left), Value::String(right)) => {
-                    Ok(Value::String(Rc::from(format!("{left}{right}"))))
+        apply_binary(operator, left_value, right_value, span)
+    }
+}
+
+/// Resolves a reserved built-in name to its value, or `None` for any other
+/// name.
+fn builtin_value(name: &str) -> Option<Value> {
+    Some(match name {
+        "ai_invoke" => Value::Builtin(BuiltinFunction::AiInvoke),
+        "print" => Value::Builtin(BuiltinFunction::Print),
+        "println" => Value::Builtin(BuiltinFunction::Println),
+        "Some" => Value::Builtin(BuiltinFunction::Some),
+        "None" => Value::Variant {
+            name: VariantName::None,
+            payload: None,
+        },
+        "Ok" => Value::Builtin(BuiltinFunction::Ok),
+        "Err" => Value::Builtin(BuiltinFunction::Err),
+        "json_encode" => Value::Builtin(BuiltinFunction::JsonEncode),
+        "json_decode" => Value::Builtin(BuiltinFunction::JsonDecode),
+        "config_string" => Value::Builtin(BuiltinFunction::ConfigString),
+        "secret" => Value::Builtin(BuiltinFunction::Secret),
+        "http_request" => Value::Builtin(BuiltinFunction::HttpRequest),
+        "log_info" => Value::Builtin(BuiltinFunction::LogInfo),
+        "log_error" => Value::Builtin(BuiltinFunction::LogError),
+        "state_get" => Value::Builtin(BuiltinFunction::StateGet),
+        "state_put" => Value::Builtin(BuiltinFunction::StatePut),
+        "state_delete" => Value::Builtin(BuiltinFunction::StateDelete),
+        "checkpoint_get" => Value::Builtin(BuiltinFunction::CheckpointGet),
+        "checkpoint_put" => Value::Builtin(BuiltinFunction::CheckpointPut),
+        "replay_http" => Value::Builtin(BuiltinFunction::ReplayHttp),
+        "replay_ai" => Value::Builtin(BuiltinFunction::ReplayAi),
+        "queue_publish" => Value::Builtin(BuiltinFunction::QueuePublish),
+        "cache_get" => Value::Builtin(BuiltinFunction::CacheGet),
+        "cache_put" => Value::Builtin(BuiltinFunction::CachePut),
+        "cache_delete" => Value::Builtin(BuiltinFunction::CacheDelete),
+        "search_query" => Value::Builtin(BuiltinFunction::SearchQuery),
+        "vector_search" => Value::Builtin(BuiltinFunction::VectorSearch),
+        "object_get" => Value::Builtin(BuiltinFunction::ObjectGet),
+        "object_put" => Value::Builtin(BuiltinFunction::ObjectPut),
+        "object_delete" => Value::Builtin(BuiltinFunction::ObjectDelete),
+        "db_begin_read" => Value::Builtin(BuiltinFunction::DatabaseBeginRead),
+        "db_begin_write" => Value::Builtin(BuiltinFunction::DatabaseBeginWrite),
+        "db_query" => Value::Builtin(BuiltinFunction::DatabaseQuery),
+        "db_execute" => Value::Builtin(BuiltinFunction::DatabaseExecute),
+        "db_commit" => Value::Builtin(BuiltinFunction::DatabaseCommit),
+        "db_rollback" => Value::Builtin(BuiltinFunction::DatabaseRollback),
+        _ => return None,
+    })
+}
+
+const fn builtin_arity(builtin: BuiltinFunction) -> usize {
+    match builtin {
+        BuiltinFunction::ReplayHttp | BuiltinFunction::ReplayAi | BuiltinFunction::CachePut => 4,
+        BuiltinFunction::HttpRequest
+        | BuiltinFunction::StatePut
+        | BuiltinFunction::CheckpointPut
+        | BuiltinFunction::ObjectPut
+        | BuiltinFunction::SearchQuery
+        | BuiltinFunction::VectorSearch
+        | BuiltinFunction::DatabaseQuery
+        | BuiltinFunction::DatabaseExecute => 3,
+        BuiltinFunction::AiInvoke
+        | BuiltinFunction::LogInfo
+        | BuiltinFunction::LogError
+        | BuiltinFunction::StateGet
+        | BuiltinFunction::StateDelete
+        | BuiltinFunction::CheckpointGet
+        | BuiltinFunction::QueuePublish
+        | BuiltinFunction::ObjectGet
+        | BuiltinFunction::CacheGet
+        | BuiltinFunction::CacheDelete
+        | BuiltinFunction::ObjectDelete => 2,
+        _ => 1,
+    }
+}
+
+/// Returns the `K5003` message for a host built-in that direct source
+/// execution refuses after evaluating its arguments, or `None` for a built-in
+/// it can apply.
+const fn unavailable_builtin_message(builtin: BuiltinFunction) -> Option<&'static str> {
+    Some(match builtin {
+        BuiltinFunction::HttpRequest => {
+            "HTTP host operations are unavailable in direct source execution"
+        }
+        BuiltinFunction::AiInvoke => "AI invocation is unavailable in direct source execution",
+        BuiltinFunction::LogInfo | BuiltinFunction::LogError => {
+            "structured logging is unavailable in direct source execution"
+        }
+        BuiltinFunction::StateGet
+        | BuiltinFunction::StatePut
+        | BuiltinFunction::StateDelete
+        | BuiltinFunction::CheckpointGet
+        | BuiltinFunction::CheckpointPut
+        | BuiltinFunction::ReplayHttp
+        | BuiltinFunction::ReplayAi
+        | BuiltinFunction::QueuePublish
+        | BuiltinFunction::ObjectGet
+        | BuiltinFunction::ObjectPut
+        | BuiltinFunction::ObjectDelete
+        | BuiltinFunction::DatabaseBeginRead
+        | BuiltinFunction::DatabaseBeginWrite
+        | BuiltinFunction::DatabaseQuery
+        | BuiltinFunction::DatabaseExecute
+        | BuiltinFunction::DatabaseCommit
+        | BuiltinFunction::DatabaseRollback
+        | BuiltinFunction::CacheGet
+        | BuiltinFunction::CachePut
+        | BuiltinFunction::CacheDelete
+        | BuiltinFunction::SearchQuery
+        | BuiltinFunction::VectorSearch => {
+            "durable state, queue, schedule, object, database, cache, search, and replay \
+             operations are unavailable in direct source execution"
+        }
+        BuiltinFunction::ConfigString => {
+            "configuration host operations are unavailable in direct source execution"
+        }
+        BuiltinFunction::Secret => {
+            "secret host operations are unavailable in direct source execution"
+        }
+        BuiltinFunction::Print
+        | BuiltinFunction::Println
+        | BuiltinFunction::Some
+        | BuiltinFunction::Ok
+        | BuiltinFunction::Err
+        | BuiltinFunction::JsonEncode
+        | BuiltinFunction::JsonDecode => return None,
+    })
+}
+
+/// Applies a strict binary operator to its evaluated operands.
+fn apply_binary(
+    operator: BinaryOperator,
+    left_value: Value,
+    right_value: Value,
+    span: Span,
+) -> Result<Value, Diagnostic> {
+    match operator {
+        BinaryOperator::Add => match (left_value, right_value) {
+            (Value::Integer(left), Value::Integer(right)) => left
+                .checked_add(right)
+                .map(Value::Integer)
+                .ok_or_else(|| Diagnostic::new("K4005", "integer overflow", span)),
+            (Value::String(left), Value::String(right)) => {
+                Ok(Value::String(Rc::from(format!("{left}{right}"))))
+            }
+            (left, right) => Err(kind_pair_error("`+`", &left, &right, span)),
+        },
+        BinaryOperator::Subtract => {
+            checked_integer_operation(left_value, right_value, span, i64::checked_sub)
+        }
+        BinaryOperator::Multiply => {
+            checked_integer_operation(left_value, right_value, span, i64::checked_mul)
+        }
+        BinaryOperator::Divide => {
+            let (left, right) = integer_pair(left_value, right_value, span)?;
+            if right == 0 {
+                return Err(Diagnostic::new("K4004", "division by zero", span));
+            }
+            left.checked_div(right)
+                .map(Value::Integer)
+                .ok_or_else(|| Diagnostic::new("K4005", "integer overflow", span))
+        }
+        BinaryOperator::Remainder => {
+            let (left, right) = integer_pair(left_value, right_value, span)?;
+            if right == 0 {
+                return Err(Diagnostic::new("K4004", "remainder by zero", span));
+            }
+            left.checked_rem(right)
+                .map(Value::Integer)
+                .ok_or_else(|| Diagnostic::new("K4005", "integer overflow", span))
+        }
+        BinaryOperator::Equal | BinaryOperator::NotEqual => {
+            let equal = value_equal(&left_value, &right_value, span)?;
+            Ok(Value::Boolean(if operator == BinaryOperator::Equal {
+                equal
+            } else {
+                !equal
+            }))
+        }
+        BinaryOperator::Less
+        | BinaryOperator::LessEqual
+        | BinaryOperator::Greater
+        | BinaryOperator::GreaterEqual => {
+            let (left, right) = integer_pair(left_value, right_value, span)?;
+            let result = match operator {
+                BinaryOperator::Less => left < right,
+                BinaryOperator::LessEqual => left <= right,
+                BinaryOperator::Greater => left > right,
+                BinaryOperator::GreaterEqual => left >= right,
+                _ => unreachable!("operator was matched above"),
+            };
+            Ok(Value::Boolean(result))
+        }
+        BinaryOperator::And | BinaryOperator::Or => {
+            unreachable!("short-circuit operators returned above")
+        }
+    }
+}
+
+fn apply_unary(operator: UnaryOperator, value: Value, span: Span) -> Result<Value, Diagnostic> {
+    match operator {
+        UnaryOperator::Not => Ok(Value::Boolean(!expect_boolean(value, span)?)),
+        UnaryOperator::Negate => expect_integer(value, span)?
+            .checked_neg()
+            .map(Value::Integer)
+            .ok_or_else(|| Diagnostic::new("K4005", "integer overflow during negation", span)),
+    }
+}
+
+/// Negates an integer literal directly, so `-9223372036854775808` is
+/// representable even though its magnitude is not.
+fn negate_literal(value: i128, span: Span) -> Result<Value, Diagnostic> {
+    let negated = value
+        .checked_neg()
+        .ok_or_else(|| Diagnostic::new("K4005", "integer overflow during negation", span))?;
+    i64::try_from(negated)
+        .map(Value::Integer)
+        .map_err(|_| Diagnostic::new("K4005", "integer overflow during negation", span))
+}
+
+fn variable(name: &str, environment: &Environment, span: Span) -> Result<Value, Diagnostic> {
+    builtin_value(name)
+        .or_else(|| environment.lookup(name))
+        .ok_or_else(|| Diagnostic::new("K2001", format!("undefined name `{name}`"), span))
+}
+
+fn field_value(value: Value, field: &str, span: Span) -> Result<Value, Diagnostic> {
+    let Value::Record(fields) = value else {
+        return Err(Diagnostic::new(
+            "K4001",
+            format!("expected record for field access, found {}", value.kind()),
+            span,
+        ));
+    };
+    fields
+        .iter()
+        .find(|(name, _)| name == field)
+        .map(|(_, value)| value.clone())
+        .ok_or_else(|| Diagnostic::new("K4001", format!("record has no field `{field}`"), span))
+}
+
+fn closure(
+    name: Option<&str>,
+    parameters: &[Parameter],
+    body: &Block,
+    environment: &Environment,
+) -> Value {
+    Value::Function(Rc::new(FunctionValue {
+        name: name.map(Rc::from),
+        parameters: parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<Vec<_>>()
+            .into(),
+        body: body.clone(),
+        environment: environment.clone(),
+    }))
+}
+
+fn not_callable(value: &Value, span: Span) -> Diagnostic {
+    Diagnostic::new("K4002", format!("cannot call {}", value.kind()), span)
+}
+
+/// Selects the match arm for an evaluated subject and returns it with the
+/// environment that binds its pattern names.
+fn select_match_arm<'a>(
+    subject_value: Value,
+    subject_span: Span,
+    kind: &'a MatchKind,
+    environment: &Environment,
+) -> Result<(&'a Expression, Environment), Diagnostic> {
+    match kind {
+        MatchKind::List {
+            empty_case,
+            head_name,
+            tail_name,
+            cons_case,
+        } => {
+            let Value::List(values) = subject_value else {
+                return Err(Diagnostic::new(
+                    "K4001",
+                    format!("expected list, found {}", subject_value.kind()),
+                    subject_span,
+                ));
+            };
+            if values.is_empty() {
+                Ok((empty_case, environment.clone()))
+            } else {
+                let with_head = environment.extend(head_name.clone(), values[0].clone());
+                let with_tail =
+                    with_head.extend(tail_name.clone(), Value::List(values[1..].to_vec().into()));
+                Ok((cons_case, with_tail))
+            }
+        }
+        MatchKind::Variants { family, arms } => {
+            let Value::Variant { name, payload } = subject_value else {
+                return Err(Diagnostic::new(
+                    "K4001",
+                    format!(
+                        "expected {} for variant match, found {}",
+                        variant_family_name(*family),
+                        subject_value.kind()
+                    ),
+                    subject_span,
+                ));
+            };
+            if variant_family(name) != *family {
+                return Err(Diagnostic::new(
+                    "K4001",
+                    format!(
+                        "expected {} for variant match, found {}",
+                        variant_family_name(*family),
+                        variant_family_name(variant_family(name))
+                    ),
+                    subject_span,
+                ));
+            }
+            let arm = arms
+                .iter()
+                .find(|arm| arm.variant == name)
+                .expect("parser guarantees exhaustive variant arms");
+            let arm_environment = match (&arm.binding, payload) {
+                (Some(binding), Some(value)) => {
+                    environment.extend(binding.clone(), value.as_ref().clone())
                 }
-                (left, right) => Err(kind_pair_error("`+`", &left, &right, span)),
-            },
-            BinaryOperator::Subtract => {
-                checked_integer_operation(left_value, right_value, span, i64::checked_sub)
-            }
-            BinaryOperator::Multiply => {
-                checked_integer_operation(left_value, right_value, span, i64::checked_mul)
-            }
-            BinaryOperator::Divide => {
-                let (left, right) = self.integer_pair(left_value, right_value, span)?;
-                if right == 0 {
-                    return Err(Diagnostic::new("K4004", "division by zero", span));
-                }
-                left.checked_div(right)
-                    .map(Value::Integer)
-                    .ok_or_else(|| Diagnostic::new("K4005", "integer overflow", span))
-            }
-            BinaryOperator::Remainder => {
-                let (left, right) = self.integer_pair(left_value, right_value, span)?;
-                if right == 0 {
-                    return Err(Diagnostic::new("K4004", "remainder by zero", span));
-                }
-                left.checked_rem(right)
-                    .map(Value::Integer)
-                    .ok_or_else(|| Diagnostic::new("K4005", "integer overflow", span))
-            }
-            BinaryOperator::Equal | BinaryOperator::NotEqual => {
-                let equal = value_equal(&left_value, &right_value, span)?;
-                Ok(Value::Boolean(if operator == BinaryOperator::Equal {
-                    equal
-                } else {
-                    !equal
-                }))
-            }
-            BinaryOperator::Less
-            | BinaryOperator::LessEqual
-            | BinaryOperator::Greater
-            | BinaryOperator::GreaterEqual => {
-                let (left, right) = self.integer_pair(left_value, right_value, span)?;
-                let result = match operator {
-                    BinaryOperator::Less => left < right,
-                    BinaryOperator::LessEqual => left <= right,
-                    BinaryOperator::Greater => left > right,
-                    BinaryOperator::GreaterEqual => left >= right,
-                    _ => unreachable!("operator was matched above"),
-                };
-                Ok(Value::Boolean(result))
-            }
-            BinaryOperator::And | BinaryOperator::Or => {
-                unreachable!("short-circuit operators returned above")
-            }
+                (None, None) => environment.clone(),
+                _ => unreachable!("variant payload shape is fixed"),
+            };
+            Ok((&arm.value, arm_environment))
         }
     }
+}
 
-    fn boolean(&self, value: Value, span: Span) -> Result<bool, Diagnostic> {
-        match value {
-            Value::Boolean(value) => Ok(value),
-            value => Err(Diagnostic::new(
-                "K4001",
-                format!("expected boolean, found {}", value.kind()),
-                span,
-            )),
-        }
+fn expect_boolean(value: Value, span: Span) -> Result<bool, Diagnostic> {
+    match value {
+        Value::Boolean(value) => Ok(value),
+        value => Err(Diagnostic::new(
+            "K4001",
+            format!("expected boolean, found {}", value.kind()),
+            span,
+        )),
     }
+}
 
-    fn integer(&self, value: Value, span: Span) -> Result<i64, Diagnostic> {
-        match value {
-            Value::Integer(value) => Ok(value),
-            value => Err(Diagnostic::new(
-                "K4001",
-                format!("expected integer, found {}", value.kind()),
-                span,
-            )),
-        }
+fn expect_integer(value: Value, span: Span) -> Result<i64, Diagnostic> {
+    match value {
+        Value::Integer(value) => Ok(value),
+        value => Err(Diagnostic::new(
+            "K4001",
+            format!("expected integer, found {}", value.kind()),
+            span,
+        )),
     }
+}
 
-    fn integer_pair(
-        &self,
-        left: Value,
-        right: Value,
-        span: Span,
-    ) -> Result<(i64, i64), Diagnostic> {
-        match (left, right) {
-            (Value::Integer(left), Value::Integer(right)) => Ok((left, right)),
-            (left, right) => Err(kind_pair_error("integer operator", &left, &right, span)),
-        }
-    }
-
-    fn list(&self, value: Value, span: Span) -> Result<Rc<[Value]>, Diagnostic> {
-        match value {
-            Value::List(values) => Ok(values),
-            value => Err(Diagnostic::new(
-                "K4001",
-                format!("expected list, found {}", value.kind()),
-                span,
-            )),
-        }
+fn integer_pair(left: Value, right: Value, span: Span) -> Result<(i64, i64), Diagnostic> {
+    match (left, right) {
+        (Value::Integer(left), Value::Integer(right)) => Ok((left, right)),
+        (left, right) => Err(kind_pair_error("integer operator", &left, &right, span)),
     }
 }
 
@@ -1098,7 +1263,7 @@ fn json_to_value(value: serde_json::Value, span: Span) -> Result<Value, Diagnost
 
 #[cfg(test)]
 mod tests {
-    use crate::{Diagnostic, Source, Value, run_source};
+    use crate::{Diagnostic, MAX_CALL_DEPTH, Source, Value, run_source};
 
     fn run(text: &str) -> Result<(String, Value), Diagnostic> {
         let source = Source::new("test.krit", text);
@@ -1108,6 +1273,90 @@ mod tests {
             String::from_utf8(output).expect("output should be UTF-8"),
             value,
         ))
+    }
+
+    /// Runs on the stack `krit run` gives the evaluator and returns the output
+    /// or the diagnostic code.
+    fn run_on_evaluator_stack(text: String) -> Result<String, Diagnostic> {
+        crate::run_on_thread("evaluator-test", crate::EVALUATOR_STACK_BYTES, move || {
+            run(&text).map(|(output, _)| output)
+        })
+        .expect("evaluator test thread should start")
+    }
+
+    fn count_to(depth: usize) -> String {
+        format!(
+            "fn count(n) {{ if n == 0 {{ 0 }} else {{ 1 + count(n - 1) }} }}\nprintln(count({depth}));\n"
+        )
+    }
+
+    #[test]
+    fn deep_recursion_within_the_call_limit_succeeds() {
+        let output = run_on_evaluator_stack(count_to(9_000)).expect("9,000 calls should run");
+        assert_eq!(output, "9000\n");
+    }
+
+    #[test]
+    fn reports_the_call_depth_limit() {
+        let error = run_on_evaluator_stack(count_to(100_000))
+            .expect_err("100,000 nested calls should fail");
+        assert_eq!(error.code(), "K4010");
+        assert!(
+            error.message().contains(&MAX_CALL_DEPTH.to_string()),
+            "{}",
+            error.message()
+        );
+
+        // The limit counts active frames, not total calls.
+        let error = run_on_evaluator_stack(count_to(MAX_CALL_DEPTH))
+            .expect_err("one frame past the limit should fail");
+        assert_eq!(error.code(), "K4010");
+        let output = run_on_evaluator_stack(format!(
+            "{}println(count({}) + count({}));\n",
+            count_to(0),
+            MAX_CALL_DEPTH - 1,
+            MAX_CALL_DEPTH - 1
+        ))
+        .expect("sequential deep calls should run");
+        assert_eq!(output, format!("0\n{}\n", 2 * (MAX_CALL_DEPTH - 1)));
+    }
+
+    #[test]
+    fn reports_the_evaluation_depth_limit_for_deeply_nested_bodies() {
+        // Twenty nested blocks per call reach the evaluation bound well before
+        // the call bound.
+        let text = format!(
+            "fn f(n) {{ if n == 0 {{ 0 }} else {{ {}1 + f(n - 1){} }} }}\nprintln(f(100000));\n",
+            "{ ".repeat(20),
+            " }".repeat(20)
+        );
+        let error = run_on_evaluator_stack(text).expect_err("deep evaluation should fail");
+        assert_eq!(error.code(), "K4010");
+        assert!(
+            error.message().contains("evaluation depth"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn evaluates_long_else_if_and_operator_chains_iteratively() {
+        // Runs on the default test stack: recursive evaluation of either chain
+        // would need far more.
+        let mut text = String::from("fn pick(n) { if n == 0 { 0 }");
+        for branch in 1..1_000 {
+            text.push_str(&format!(" else if n == {branch} {{ {branch} }}"));
+        }
+        text.push_str(" else { -1 } }\nprintln(pick(999));\nprintln(pick(1000));\n");
+        text.push_str(&format!("println(0{});\n", " + 2".repeat(4_000)));
+        text.push_str(&format!("println(false{});\n", " || false".repeat(4_000)));
+        // Short-circuiting still skips every later operand.
+        text.push_str(&format!(
+            "println(false{});\n",
+            " && 1 / 0 == 0".repeat(4_000)
+        ));
+        let (output, _) = run(&text).expect("long chains should evaluate");
+        assert_eq!(output, "999\n-1\n8000\nfalse\nfalse\n");
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::{
         RecordField, RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind,
         UnaryOperator, ValueLiteral, VariantArm, VariantFamily, VariantName,
     },
+    limits::{MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, nesting_error, structural_error},
     token::{Token, TokenKind},
 };
 
@@ -17,11 +18,22 @@ pub fn parse(tokens: Vec<Token>) -> Result<Program, Diagnostic> {
 struct Parser {
     tokens: Vec<Token>,
     cursor: usize,
+    /// Syntactic nesting levels currently open (bounded by
+    /// [`MAX_NESTING_DEPTH`]).
+    depth: usize,
+    /// Enclosing `else if` continuations and chained binary operators; added
+    /// to `depth`, bounded by [`MAX_STRUCTURAL_DEPTH`].
+    chain_depth: usize,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, cursor: 0 }
+        Self {
+            tokens,
+            cursor: 0,
+            depth: 0,
+            chain_depth: 0,
+        }
     }
 
     fn program(mut self) -> Result<Program, Diagnostic> {
@@ -269,6 +281,10 @@ impl Parser {
 
     fn block(&mut self) -> Result<Block, Diagnostic> {
         let start = self.expect(TokenKind::LeftBrace)?.span;
+        self.nested(start, |parser| parser.block_contents(start))
+    }
+
+    fn block_contents(&mut self, start: Span) -> Result<Block, Diagnostic> {
         let mut statements = Vec::new();
         let mut tail = None;
 
@@ -323,106 +339,73 @@ impl Parser {
     }
 
     fn logical_or(&mut self) -> Result<Expression, Diagnostic> {
-        let mut expression = self.logical_and()?;
-        while self.consume(&TokenKind::OrOr) {
-            let right = self.logical_and()?;
-            expression = binary(expression, BinaryOperator::Or, right);
-        }
-        Ok(expression)
+        self.binary_chain(Self::logical_and, |kind| match kind {
+            TokenKind::OrOr => Some(BinaryOperator::Or),
+            _ => None,
+        })
     }
 
     fn logical_and(&mut self) -> Result<Expression, Diagnostic> {
-        let mut expression = self.equality()?;
-        while self.consume(&TokenKind::AndAnd) {
-            let right = self.equality()?;
-            expression = binary(expression, BinaryOperator::And, right);
-        }
-        Ok(expression)
+        self.binary_chain(Self::equality, |kind| match kind {
+            TokenKind::AndAnd => Some(BinaryOperator::And),
+            _ => None,
+        })
     }
 
     fn equality(&mut self) -> Result<Expression, Diagnostic> {
-        let mut expression = self.comparison()?;
-        loop {
-            let operator = if self.consume(&TokenKind::EqualEqual) {
-                Some(BinaryOperator::Equal)
-            } else if self.consume(&TokenKind::BangEqual) {
-                Some(BinaryOperator::NotEqual)
-            } else {
-                None
-            };
-
-            let Some(operator) = operator else {
-                break;
-            };
-            let right = self.comparison()?;
-            expression = binary(expression, operator, right);
-        }
-        Ok(expression)
+        self.binary_chain(Self::comparison, |kind| match kind {
+            TokenKind::EqualEqual => Some(BinaryOperator::Equal),
+            TokenKind::BangEqual => Some(BinaryOperator::NotEqual),
+            _ => None,
+        })
     }
 
     fn comparison(&mut self) -> Result<Expression, Diagnostic> {
-        let mut expression = self.term()?;
-        loop {
-            let operator = if self.consume(&TokenKind::Less) {
-                Some(BinaryOperator::Less)
-            } else if self.consume(&TokenKind::LessEqual) {
-                Some(BinaryOperator::LessEqual)
-            } else if self.consume(&TokenKind::Greater) {
-                Some(BinaryOperator::Greater)
-            } else if self.consume(&TokenKind::GreaterEqual) {
-                Some(BinaryOperator::GreaterEqual)
-            } else {
-                None
-            };
-
-            let Some(operator) = operator else {
-                break;
-            };
-            let right = self.term()?;
-            expression = binary(expression, operator, right);
-        }
-        Ok(expression)
+        self.binary_chain(Self::term, |kind| match kind {
+            TokenKind::Less => Some(BinaryOperator::Less),
+            TokenKind::LessEqual => Some(BinaryOperator::LessEqual),
+            TokenKind::Greater => Some(BinaryOperator::Greater),
+            TokenKind::GreaterEqual => Some(BinaryOperator::GreaterEqual),
+            _ => None,
+        })
     }
 
     fn term(&mut self) -> Result<Expression, Diagnostic> {
-        let mut expression = self.factor()?;
-        loop {
-            let operator = if self.consume(&TokenKind::Plus) {
-                Some(BinaryOperator::Add)
-            } else if self.consume(&TokenKind::Minus) {
-                Some(BinaryOperator::Subtract)
-            } else {
-                None
-            };
-
-            let Some(operator) = operator else {
-                break;
-            };
-            let right = self.factor()?;
-            expression = binary(expression, operator, right);
-        }
-        Ok(expression)
+        self.binary_chain(Self::factor, |kind| match kind {
+            TokenKind::Plus => Some(BinaryOperator::Add),
+            TokenKind::Minus => Some(BinaryOperator::Subtract),
+            _ => None,
+        })
     }
 
     fn factor(&mut self) -> Result<Expression, Diagnostic> {
-        let mut expression = self.unary()?;
-        loop {
-            let operator = if self.consume(&TokenKind::Star) {
-                Some(BinaryOperator::Multiply)
-            } else if self.consume(&TokenKind::Slash) {
-                Some(BinaryOperator::Divide)
-            } else if self.consume(&TokenKind::Percent) {
-                Some(BinaryOperator::Remainder)
-            } else {
-                None
-            };
+        self.binary_chain(Self::unary, |kind| match kind {
+            TokenKind::Star => Some(BinaryOperator::Multiply),
+            TokenKind::Slash => Some(BinaryOperator::Divide),
+            TokenKind::Percent => Some(BinaryOperator::Remainder),
+            _ => None,
+        })
+    }
 
-            let Some(operator) = operator else {
-                break;
-            };
-            let right = self.unary()?;
+    /// Parses one left-associative precedence level.
+    ///
+    /// A chain such as `a + b + c` is flat source, so it does not open
+    /// syntactic levels; each operator counts once toward the structural
+    /// depth because the resulting tree nests to the left.
+    fn binary_chain(
+        &mut self,
+        operand: impl Fn(&mut Self) -> Result<Expression, Diagnostic>,
+        operator: impl Fn(&TokenKind) -> Option<BinaryOperator>,
+    ) -> Result<Expression, Diagnostic> {
+        let chain_depth = self.chain_depth;
+        let mut expression = operand(self)?;
+        while let Some(operator) = operator(&self.current().kind) {
+            let operator_span = self.advance().span;
+            self.enter_chain_link(operator_span)?;
+            let right = operand(self)?;
             expression = binary(expression, operator, right);
         }
+        self.chain_depth = chain_depth;
         Ok(expression)
     }
 
@@ -435,7 +418,7 @@ impl Parser {
             return self.call();
         };
 
-        let operand = self.unary()?;
+        let operand = self.nested(start, Self::unary)?;
         let span = start.join(operand.span);
         Ok(Expression {
             kind: ExpressionKind::Unary {
@@ -448,8 +431,13 @@ impl Parser {
 
     fn call(&mut self) -> Result<Expression, Diagnostic> {
         let mut expression = self.primary()?;
+        // Each call or field-access link opens one level for the rest of the
+        // chain, because the resulting tree nests its callee or record.
+        let depth = self.depth;
         loop {
-            if self.consume(&TokenKind::LeftParen) {
+            if self.check(&TokenKind::LeftParen) {
+                let open = self.advance().span;
+                self.enter(open)?;
                 let mut arguments = Vec::new();
                 if !self.check(&TokenKind::RightParen) {
                     loop {
@@ -471,7 +459,9 @@ impl Parser {
                     },
                     span,
                 };
-            } else if self.consume(&TokenKind::Dot) {
+            } else if self.check(&TokenKind::Dot) {
+                let dot = self.advance().span;
+                self.enter(dot)?;
                 let (field, field_span) = self.identifier()?;
                 let span = expression.span.join(field_span);
                 expression = Expression {
@@ -485,6 +475,7 @@ impl Parser {
                 break;
             }
         }
+        self.depth = depth;
         Ok(expression)
     }
 
@@ -517,7 +508,7 @@ impl Parser {
                 span: token.span,
             }),
             TokenKind::LeftParen => {
-                let expression = self.expression()?;
+                let expression = self.nested(token.span, Self::expression)?;
                 let end = self.expect(TokenKind::RightParen)?.span;
                 Ok(Expression {
                     span: token.span.join(end),
@@ -546,6 +537,10 @@ impl Parser {
     }
 
     fn list(&mut self, start: Span) -> Result<Expression, Diagnostic> {
+        self.nested(start, |parser| parser.list_elements(start))
+    }
+
+    fn list_elements(&mut self, start: Span) -> Result<Expression, Diagnostic> {
         let mut elements = Vec::new();
         if !self.check(&TokenKind::RightBracket) {
             loop {
@@ -566,6 +561,10 @@ impl Parser {
     }
 
     fn record(&mut self, start: Span) -> Result<Expression, Diagnostic> {
+        self.nested(start, |parser| parser.record_fields(start))
+    }
+
+    fn record_fields(&mut self, start: Span) -> Result<Expression, Diagnostic> {
         self.expect(TokenKind::LeftBrace)?;
         let mut fields = Vec::new();
         let mut seen = HashSet::new();
@@ -601,31 +600,48 @@ impl Parser {
         })
     }
 
+    /// Parses an `if` expression and its whole `else if` chain.
+    ///
+    /// An `else if` continuation stays at the nesting level of the `if` it
+    /// continues, so the chain is parsed iteratively and only counts toward
+    /// the structural depth.
     fn if_expression(&mut self, start: Span) -> Result<Expression, Diagnostic> {
-        let condition = self.expression()?;
-        let consequent = self.block()?;
-        self.expect(TokenKind::Else)?;
-        let alternative = if self.check(&TokenKind::If) {
-            let nested_start = self.advance().span;
-            self.if_expression(nested_start)?
-        } else if self.check(&TokenKind::LeftBrace) {
-            let block = self.block()?;
-            Expression {
-                span: block.span,
-                kind: ExpressionKind::Block(block),
+        let chain_depth = self.chain_depth;
+        let mut links = Vec::new();
+        let mut link_start = start;
+        let alternative = loop {
+            let condition = self.nested(link_start, Self::expression)?;
+            let consequent = self.block()?;
+            self.expect(TokenKind::Else)?;
+            links.push((link_start, condition, consequent));
+            if self.check(&TokenKind::If) {
+                link_start = self.advance().span;
+                self.enter_chain_link(link_start)?;
+            } else if self.check(&TokenKind::LeftBrace) {
+                let block = self.block()?;
+                break Expression {
+                    span: block.span,
+                    kind: ExpressionKind::Block(block),
+                };
+            } else {
+                return Err(self.expected("`if` or `{`"));
             }
-        } else {
-            return Err(self.expected("`if` or `{`"));
         };
-        let span = start.join(alternative.span);
-        Ok(Expression {
-            kind: ExpressionKind::If {
-                condition: Box::new(condition),
-                consequent,
-                alternative: Box::new(alternative),
-            },
-            span,
-        })
+        self.chain_depth = chain_depth;
+
+        let mut expression = alternative;
+        while let Some((start, condition, consequent)) = links.pop() {
+            let span = start.join(expression.span);
+            expression = Expression {
+                kind: ExpressionKind::If {
+                    condition: Box::new(condition),
+                    consequent,
+                    alternative: Box::new(expression),
+                },
+                span,
+            };
+        }
+        Ok(expression)
     }
 
     fn function_expression(&mut self, start: Span) -> Result<Expression, Diagnostic> {
@@ -651,13 +667,15 @@ impl Parser {
     }
 
     fn match_expression(&mut self, start: Span) -> Result<Expression, Diagnostic> {
-        let subject = self.expression()?;
-        self.expect(TokenKind::LeftBrace)?;
-        if self.check(&TokenKind::LeftBracket) {
-            self.list_match(start, subject)
-        } else {
-            self.variant_match(start, subject)
-        }
+        let subject = self.nested(start, Self::expression)?;
+        let open = self.expect(TokenKind::LeftBrace)?.span;
+        self.nested(open, |parser| {
+            if parser.check(&TokenKind::LeftBracket) {
+                parser.list_match(start, subject)
+            } else {
+                parser.variant_match(start, subject)
+            }
+        })
     }
 
     fn list_match(&mut self, start: Span, subject: Expression) -> Result<Expression, Diagnostic> {
@@ -845,22 +863,25 @@ impl Parser {
             "DatabaseTransaction" => TypeKind::DatabaseTransaction,
             "Secret" => TypeKind::Secret,
             "List" => {
-                self.expect(TokenKind::Less)?;
-                let element = self.type_annotation()?;
+                let open = self.expect(TokenKind::Less)?.span;
+                let element = self.nested(open, Self::type_annotation)?;
                 self.expect(TokenKind::Greater)?;
                 TypeKind::List(Box::new(element))
             }
             "Option" => {
-                self.expect(TokenKind::Less)?;
-                let element = self.type_annotation()?;
+                let open = self.expect(TokenKind::Less)?.span;
+                let element = self.nested(open, Self::type_annotation)?;
                 self.expect(TokenKind::Greater)?;
                 TypeKind::Option(Box::new(element))
             }
             "Result" => {
-                self.expect(TokenKind::Less)?;
-                let value = self.type_annotation()?;
-                self.expect(TokenKind::Comma)?;
-                let error = self.type_annotation()?;
+                let open = self.expect(TokenKind::Less)?.span;
+                let (value, error) = self.nested(open, |parser| {
+                    let value = parser.type_annotation()?;
+                    parser.expect(TokenKind::Comma)?;
+                    let error = parser.type_annotation()?;
+                    Ok((value, error))
+                })?;
                 self.expect(TokenKind::Greater)?;
                 TypeKind::Result(Box::new(value), Box::new(error))
             }
@@ -881,7 +902,11 @@ impl Parser {
     }
 
     fn record_type_fields(&mut self) -> Result<Vec<RecordTypeField>, Diagnostic> {
-        self.expect(TokenKind::LeftBrace)?;
+        let open = self.expect(TokenKind::LeftBrace)?.span;
+        self.nested(open, Self::record_type_field_list)
+    }
+
+    fn record_type_field_list(&mut self) -> Result<Vec<RecordTypeField>, Diagnostic> {
         let mut fields = Vec::new();
         let mut seen = HashSet::new();
         if !self.check(&TokenKind::RightBrace) {
@@ -951,6 +976,40 @@ impl Parser {
             ));
         };
         Ok((name, token.span))
+    }
+
+    /// Parses one syntactic nesting level opened by the construct at `span`.
+    fn nested<T>(
+        &mut self,
+        span: Span,
+        parse: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
+    ) -> Result<T, Diagnostic> {
+        self.enter(span)?;
+        let result = parse(self);
+        self.depth -= 1;
+        result
+    }
+
+    fn enter(&mut self, span: Span) -> Result<(), Diagnostic> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            return Err(nesting_error(span));
+        }
+        self.check_structural_depth(span)
+    }
+
+    /// Records one `else if` continuation or chained binary operator.
+    fn enter_chain_link(&mut self, span: Span) -> Result<(), Diagnostic> {
+        self.chain_depth += 1;
+        self.check_structural_depth(span)
+    }
+
+    fn check_structural_depth(&self, span: Span) -> Result<(), Diagnostic> {
+        if self.depth + self.chain_depth > MAX_STRUCTURAL_DEPTH {
+            Err(structural_error(span))
+        } else {
+            Ok(())
+        }
     }
 
     fn check(&self, kind: &TokenKind) -> bool {
@@ -1113,6 +1172,150 @@ mod tests {
             parse_text("match Some(1) { Some(value) => value, Some(other) => other, None => 0 };")
                 .expect_err("duplicate arm should fail");
         assert_eq!(duplicate_arm.code(), "K1003");
+    }
+
+    /// Parses on the stack the CLI gives the compiler pipeline; unoptimized
+    /// builds need more than a default test thread for 256 levels.
+    fn parse_on_compiler_stack(text: String) -> Result<Program, Diagnostic> {
+        crate::run_on_thread("parser-test", crate::COMPILER_STACK_BYTES, move || {
+            parse_text(&text)
+        })
+        .expect("parser test thread should start")
+    }
+
+    /// Generates `depth` levels of one nesting construct.
+    fn nested_source(construct: &str, depth: usize) -> String {
+        let (open, inner, close, prefix) = match construct {
+            "parens" => ("(", "1", ")", ""),
+            "blocks" => ("{ ", "1", " }", ""),
+            "lists" => ("[", "1", "]", ""),
+            "records" => ("record { a: ", "1", " }", ""),
+            "ifs" => ("if true { ", "1", " } else { 0 }", ""),
+            "matches" => ("match Some(1) { None => 0, Some(x) => ", "1", " }", ""),
+            "calls" => ("f(", "1", ")", "fn f(x) { x }\n"),
+            "unary" => ("-", "1", "", ""),
+            "functions" => ("fn() { ", "1", " }", ""),
+            "fields" => ("", "r", ".a", "let r = record { a: 1 };\n"),
+            "types" => {
+                return format!(
+                    "let value: {}Int{} = [];\n",
+                    "List<".repeat(depth),
+                    ">".repeat(depth)
+                );
+            }
+            _ => unreachable!("unknown construct {construct}"),
+        };
+        format!(
+            "{prefix}let value = {}{inner}{};\n",
+            open.repeat(depth),
+            close.repeat(depth)
+        )
+    }
+
+    #[test]
+    fn rejects_two_thousand_levels_of_every_nesting_construct() {
+        for construct in [
+            "parens",
+            "blocks",
+            "lists",
+            "records",
+            "ifs",
+            "matches",
+            "calls",
+            "unary",
+            "functions",
+            "fields",
+            "types",
+        ] {
+            let error = parse_on_compiler_stack(nested_source(construct, 2_000))
+                .expect_err("deep nesting should be rejected");
+            assert_eq!(error.code(), "K1005", "{construct}");
+            assert!(
+                error.message().contains("256 levels"),
+                "{construct}: {}",
+                error.message()
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_exactly_the_nesting_limit() {
+        for construct in ["parens", "blocks", "lists", "types"] {
+            parse_on_compiler_stack(nested_source(construct, MAX_NESTING_DEPTH))
+                .unwrap_or_else(|error| panic!("{construct} at the limit should parse: {error:?}"));
+            let error = parse_on_compiler_stack(nested_source(construct, MAX_NESTING_DEPTH + 1))
+                .expect_err("one level past the limit should fail");
+            assert_eq!(error.code(), "K1005", "{construct}");
+        }
+    }
+
+    #[test]
+    fn reports_nesting_at_the_construct_that_crosses_the_limit() {
+        // `let value = ` is 12 bytes; the 257th `(` opens the 257th level.
+        let error = parse_on_compiler_stack(nested_source("parens", 300))
+            .expect_err("deep parentheses should fail");
+        assert_eq!(error.span(), Span::new(12 + 256, 12 + 257));
+
+        let error = parse_on_compiler_stack(nested_source("types", 300))
+            .expect_err("deep types should fail");
+        let generic_open = "let value: ".len() + 256 * "List<".len() + "List".len();
+        assert_eq!(error.span(), Span::new(generic_open, generic_open + 1));
+    }
+
+    fn else_if_chain(branches: usize) -> String {
+        let mut chain = String::from("if n == 0 { 0 }");
+        for branch in 1..branches {
+            chain.push_str(&format!(" else if n == {branch} {{ {branch} }}"));
+        }
+        chain.push_str(" else { -1 }");
+        chain
+    }
+
+    #[test]
+    fn else_if_continuations_do_not_add_nesting_levels() {
+        // A 1,000-branch chain inside 250 blocks stays within 256 levels.
+        let text = format!(
+            "let n = 3;\nlet value = {}{}{};\n",
+            "{ ".repeat(250),
+            else_if_chain(1_000),
+            " }".repeat(250)
+        );
+        let program = parse_on_compiler_stack(text).expect("long else-if chain should parse");
+        let StatementKind::Let { value, .. } = &program.statements[1].kind else {
+            panic!("second statement should be a let");
+        };
+        let mut current = value;
+        for _ in 0..250 {
+            let ExpressionKind::Block(block) = &current.kind else {
+                panic!("expected a block");
+            };
+            current = block.tail.as_deref().expect("block should have a tail");
+        }
+        let mut links = 0;
+        while let ExpressionKind::If { alternative, .. } = &current.kind {
+            links += 1;
+            current = alternative;
+        }
+        assert_eq!(links, 1_000);
+        assert!(matches!(current.kind, ExpressionKind::Block(_)));
+    }
+
+    #[test]
+    fn bounds_flat_chains_by_the_structural_depth() {
+        let chain = |branches| format!("let n = 1;\nlet value = {};\n", else_if_chain(branches));
+        parse_on_compiler_stack(chain(MAX_STRUCTURAL_DEPTH - 8))
+            .expect("a chain just under the structural limit should parse");
+        let error = parse_on_compiler_stack(chain(MAX_STRUCTURAL_DEPTH + 8))
+            .expect_err("a chain past the structural limit should fail");
+        assert_eq!(error.code(), "K1005");
+        assert!(error.message().contains("4096"), "{}", error.message());
+
+        let sum = |terms: usize| format!("let value = 1{};\n", " + 1".repeat(terms));
+        parse_on_compiler_stack(sum(MAX_STRUCTURAL_DEPTH - 8))
+            .expect("a long operator chain should parse");
+        let error = parse_on_compiler_stack(sum(MAX_STRUCTURAL_DEPTH + 8))
+            .expect_err("an operator chain past the structural limit should fail");
+        assert_eq!(error.code(), "K1005");
     }
 
     #[test]

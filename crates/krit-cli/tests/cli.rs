@@ -1764,6 +1764,174 @@ println(factorial(6));
     assert!(sandbox.stderr.is_empty());
 }
 
+/// Generates 2,000 levels of one nesting construct as a package entry.
+fn deeply_nested_source(construct: &str) -> String {
+    const DEPTH: usize = 2_000;
+    let (prefix, open, inner, close) = match construct {
+        "parens" => ("", "(", "1", ")"),
+        "blocks" => ("", "{ ", "1", " }"),
+        "lists" => ("", "[", "1", "]"),
+        "records" => ("", "record { a: ", "1", " }"),
+        "if" => ("", "if true { ", "1", " } else { 0 }"),
+        "match" => ("", "match Some(1) { None => 0, Some(x) => ", "1", " }"),
+        "calls" => ("fn f(x) { x }\n", "f(", "1", ")"),
+        "types" => {
+            return format!(
+                "let value: {}Int{} = [];\nprintln(1);\n",
+                "List<".repeat(DEPTH),
+                ">".repeat(DEPTH)
+            );
+        }
+        _ => unreachable!("unknown construct {construct}"),
+    };
+    format!(
+        "{prefix}println({}{inner}{});\n",
+        open.repeat(DEPTH),
+        close.repeat(DEPTH)
+    )
+}
+
+#[test]
+fn deep_nesting_reports_k1005_from_every_command_without_aborting() {
+    for construct in [
+        "parens", "blocks", "lists", "records", "if", "match", "calls", "types",
+    ] {
+        let directory = TestDirectory::new("deep-nesting");
+        let source = directory.file("main.krit", &deeply_nested_source(construct));
+        directory.file("krit.pkg", &package_manifest(true));
+        for command in [
+            vec!["check".into(), source.clone().into_os_string()],
+            vec!["run".into(), source.clone().into_os_string()],
+            vec!["fmt".into(), source.clone().into_os_string()],
+            vec!["build".into()],
+        ] {
+            let output = krit_in(&directory)
+                .args(&command)
+                .output()
+                .expect("Krit should start");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // A native stack overflow aborts with SIGABRT (shell status 134).
+            assert_ne!(output.status.code(), Some(134), "{construct} {command:?}");
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{construct} {command:?}: {stderr}"
+            );
+            assert!(
+                stderr.contains("error[K1005]"),
+                "{construct} {command:?}: {stderr}"
+            );
+            assert!(output.stdout.is_empty(), "{construct} {command:?}");
+        }
+    }
+}
+
+fn countdown_source(depth: usize) -> String {
+    format!(
+        "fn count(n) {{\n    if n == 0 {{\n        0\n    }} else {{\n        1 + count(n - 1)\n    }}\n}}\n\nprintln(count({depth}));\n"
+    )
+}
+
+#[test]
+fn direct_run_reports_k4010_for_runaway_recursion_and_runs_deep_recursion() {
+    let directory = TestDirectory::new("recursion-depth");
+    let runaway = directory.file("runaway.krit", &countdown_source(100_000));
+    let output = krit()
+        .args(["run", "--diagnostic-format", "json"])
+        .arg(&runaway)
+        .output()
+        .expect("Krit should start");
+    assert_ne!(output.status.code(), Some(134));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let diagnostics = parse_json_lines(&output.stderr);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "K4010");
+
+    let deep = directory.file("deep.krit", &countdown_source(9_000));
+    let output = krit()
+        .arg("run")
+        .arg(&deep)
+        .output()
+        .expect("Krit should start");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"9000\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn long_else_if_chains_check_run_format_build_and_execute() {
+    let directory = TestDirectory::new("else-if-chain");
+    let mut text = String::from("fn pick(n) {\n    if n == 0 {\n        0\n    }");
+    for branch in 1..1_000 {
+        text.push_str(&format!(
+            " else if n == {branch} {{\n        {}\n    }}",
+            branch * 3
+        ));
+    }
+    text.push_str(" else {\n        -1\n    }\n}\n\nprintln(pick(999));\n");
+    let source = directory.file("main.krit", &text);
+    directory.file("krit.pkg", &package_manifest(true));
+
+    let check = krit()
+        .arg("check")
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let run = krit()
+        .arg("run")
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"2997\n");
+
+    let format = krit()
+        .args(["fmt", "--check"])
+        .arg(&source)
+        .output()
+        .expect("Krit should start");
+    assert!(
+        format.status.success(),
+        "{}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("Krit should start");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let sandbox = krit_in(&directory)
+        .arg("sandbox")
+        .output()
+        .expect("Krit should start");
+    assert!(
+        sandbox.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sandbox.stderr)
+    );
+    assert_eq!(sandbox.stdout, b"2997\n");
+}
+
 #[test]
 fn sandbox_reports_missing_component_and_sidecar_actionably() {
     let directory = TestDirectory::new("sandbox-missing");

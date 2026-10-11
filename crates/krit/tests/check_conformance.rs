@@ -15,9 +15,17 @@ fn static_check_conformance_cases() {
     cases.sort();
 
     assert!(!cases.is_empty(), "no static check cases found");
-    for case in cases {
-        run_case(&case, &root);
-    }
+    on_compiler_stack(|| {
+        for case in cases {
+            run_case(&case, &root);
+        }
+    });
+}
+
+/// Runs `work` with the stack `krit check` gives the compiler pipeline.
+fn on_compiler_stack(work: impl FnOnce() + Send) {
+    krit::run_on_thread("check-conformance", krit::COMPILER_STACK_BYTES, work)
+        .expect("check thread should start");
 }
 
 #[test]
@@ -38,6 +46,10 @@ fn all_runtime_success_cases_and_examples_are_statically_valid() {
     ]);
     cases.sort();
 
+    on_compiler_stack(|| check_all_valid(cases));
+}
+
+fn check_all_valid(cases: Vec<PathBuf>) {
     for case in cases {
         let program_path = if case.is_dir() {
             case.join("program.krit")

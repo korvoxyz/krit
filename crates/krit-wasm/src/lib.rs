@@ -53,6 +53,20 @@ pub fn build_component(
     options: &BuildOptions,
 ) -> Result<BuiltComponent, BuildError> {
     options.validate()?;
+    // Support checking and both code generators recurse through nested Core
+    // blocks. Verification already bounds every lowered module; re-check here
+    // so the compilers fail closed rather than relying on that invariant.
+    let (depth, span) = module.deepest_block();
+    if depth > krit::MAX_CORE_BLOCK_DEPTH {
+        return Err(BuildError::nesting(
+            format!(
+                "nesting depth limit exceeded: Core blocks nest {depth} levels, more than the \
+                 {} the WebAssembly compilers accept",
+                krit::MAX_CORE_BLOCK_DEPTH
+            ),
+            span,
+        ));
+    }
     let checked = support::check_module(module)?;
     for effect in &checked.effects {
         if options.granted_effects.binary_search(effect).is_err() {
