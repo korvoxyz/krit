@@ -182,6 +182,14 @@ secret bytes. `ai_invoke` emits `ai.invoke` plus one named adapter.
 canonical literals and their ordered fields contain only ordinary strings.
 No host value is read during checking or explanation.
 
+An HTTP grant names an origin, never a path. The host holds every request path
+to the rule in [WEBHOOK-CONTRACTS.md](WEBHOOK-CONTRACTS.md): no `.` or `..`
+segment, no percent-encoded `.`, `/`, or `\`, and no malformed escape. A guest
+`http_request` that breaks the rule traps with `K4001` before any connection.
+The host sends every accepted path exactly as validated. A path built from
+untrusted text therefore cannot use server-side normalization to reach outside
+the prefix the program addressed.
+
 Phase 6 adds exact `state.transaction("store")` requirements for bounded
 state, checkpoint, and replay operations. Replay also retains the exact
 external HTTP-origin or AI-adapter requirement. Store/checkpoint/replay names

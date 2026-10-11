@@ -202,6 +202,11 @@ pub(crate) fn send(
     let mut easy = Easy::new();
     easy.url(&target)
         .map_err(|_| "invalid outbound HTTP URL".to_owned())?;
+    // The host validated the path exactly as written, so libcurl must not
+    // rewrite it: by default curl resolves dot segments itself, and the request
+    // on the wire would no longer be the one the host checked.
+    easy.path_as_is(true)
+        .map_err(|_| "could not send the outbound HTTP path as validated".to_owned())?;
     easy.proxy("")
         .map_err(|_| "could not disable outbound proxy inheritance".to_owned())?;
     easy.follow_location(false)
@@ -895,6 +900,75 @@ secrets = ["token"]
         assert_eq!(response.status, 200);
         assert!(response.body.is_empty());
         mock.join().expect("mock should finish");
+    }
+
+    /// Sends one GET for `path` to a loopback mock and returns the request line
+    /// the mock received.
+    fn request_line_on_the_wire(path: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock should bind");
+        let address = listener.local_addr().expect("mock address should exist");
+        let mock = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("mock should accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("mock read timeout should configure");
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !bytes.windows(2).any(|window| window == b"\r\n") {
+                let count = stream.read(&mut chunk).expect("mock should read request");
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .expect("mock should write response");
+            let text = String::from_utf8(bytes).expect("request should be UTF-8");
+            text.lines().next().unwrap_or_default().to_owned()
+        });
+        let origin = HttpOrigin::parse_exact(&format!("http://{address}"))
+            .expect("loopback origin should be canonical");
+        let request = HttpRequest {
+            method: "GET".to_owned(),
+            path: path.to_owned(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+
+        let response = send(
+            &origin,
+            &request,
+            None,
+            SendContext {
+                policy: NetworkPolicy::loopback_for_tests(),
+                limits: RuntimeLimits::default(),
+                remaining: Duration::from_secs(5),
+                cancellation: &CancellationHandle::new(),
+                active_dns_workers: &Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .expect("loopback request should complete");
+        assert_eq!(response.status, 204);
+        mock.join().expect("mock should finish")
+    }
+
+    #[test]
+    fn the_request_path_is_sent_exactly_as_validated() {
+        // `send` is reached only after validation, which already refuses dot
+        // segments. Calling it directly with one proves libcurl itself never
+        // rewrites a path: a dot segment curl resolved would have changed the
+        // target after the host checked it.
+        assert_eq!(
+            request_line_on_the_wire("/a/./b/../c"),
+            "GET /a/./b/../c HTTP/1.1"
+        );
+        // Escapes that validation keeps are not decoded or re-encoded either.
+        assert_eq!(
+            request_line_on_the_wire("/files/a%20b/100%25"),
+            "GET /files/a%20b/100%25 HTTP/1.1"
+        );
     }
 
     #[test]

@@ -1289,6 +1289,49 @@ fn ai_test_host(origin: String, max_response_bytes: usize, timeout: Duration) ->
 }
 
 #[test]
+fn ai_adapter_paths_refuse_traversal_forms_at_setup() {
+    let policy_with_path = |path: &str| {
+        let mut policy = AgentHostPolicy::default();
+        policy.ai_adapters.insert(
+            "reviewer".to_owned(),
+            AiAdapterConfig::HttpJson(HttpJsonAdapterConfig {
+                origin: "https://ai.example.com".to_owned(),
+                path: path.to_owned(),
+                model: "test".to_owned(),
+                secret: None,
+                max_input_bytes: 1024,
+                max_response_bytes: 1024,
+                timeout: Duration::from_millis(500),
+            }),
+        );
+        policy
+    };
+
+    // An adapter path obeys the same rule as every request path, so a bad one
+    // is refused when the host is configured, not on its first request.
+    for path in [
+        "/v1/../admin",
+        "/v1/./invoke",
+        "/v1/%2e%2e/admin",
+        "/v1%2Finvoke",
+        "/v1%5cinvoke",
+        "/v1/invoke%",
+    ] {
+        let error = krit_runtime::validate_policy(&policy_with_path(path))
+            .expect_err("a traversal form must be refused at setup");
+        assert_eq!(error.code(), "K7003", "`{path}`");
+        assert_eq!(
+            error.message(),
+            "AI adapter `reviewer` has an invalid relative path"
+        );
+    }
+    for path in ["/v1/invoke", "/v1.1/chat%20completions", "/.well-known/ai"] {
+        krit_runtime::validate_policy(&policy_with_path(path))
+            .unwrap_or_else(|error| panic!("`{path}` must be accepted: {error}"));
+    }
+}
+
+#[test]
 fn ai_adapter_secrets_cannot_widen_a_manifest_binding() {
     let artifact = compile(
         r#"

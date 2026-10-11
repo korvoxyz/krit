@@ -950,7 +950,9 @@ fn validate_http_json_adapter(
     HttpOrigin::parse_exact(&adapter.origin).map_err(|error| {
         RuntimeError::setup(format!("AI adapter `{name}` has invalid origin: {error}"))
     })?;
-    if !safe_origin_path(&adapter.path) {
+    // The adapter path obeys the one rule every host-owned path does, so a
+    // configured path is refused here rather than on its first request.
+    if !crate::webhook::is_origin_form_path(&adapter.path) {
         return Err(RuntimeError::setup(format!(
             "AI adapter `{name}` has an invalid relative path"
         )));
@@ -985,15 +987,6 @@ fn validate_http_json_adapter(
         )));
     }
     Ok(())
-}
-
-fn safe_origin_path(path: &str) -> bool {
-    path.starts_with('/')
-        && !path.starts_with("//")
-        && !path.contains("://")
-        && !path
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || matches!(byte, b'\\' | b'?' | b'#'))
 }
 
 pub(crate) fn valid_idempotency_key(value: &str, maximum: usize) -> bool {

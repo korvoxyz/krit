@@ -142,7 +142,8 @@ Two transports ship:
   bearer credential. The connector path must be a safe origin-form absolute
   path under the same rule every other host-owned path obeys: no authority
   form, no scheme, no backslash, no query or fragment delimiter, no control
-  byte, and ASCII only.
+  byte, no `.` or `..` segment, no percent-encoded `.`, `/`, or `\`, no
+  malformed escape (see `WEBHOOK-CONTRACTS.md`), and ASCII only.
 - `local` - a deterministic in-process document set, for reference examples and
   tests. It performs no I/O.
 

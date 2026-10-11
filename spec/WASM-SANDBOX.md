@@ -678,7 +678,9 @@ An outbound grant binds:
 - hostname
 - port
 - exact normalized origin (no path, query, fragment, or userinfo)
-- per-call validated origin-form path, query, method, and headers
+- per-call validated origin-form path, query, method, and headers; the path
+  has no `.` or `..` segment and no percent-encoded `.`, `/`, or `\`, and it is
+  sent exactly as validated (`WEBHOOK-CONTRACTS.md`)
 - fixed no-redirect policy
 - response-size limit
 - timeout and request quota

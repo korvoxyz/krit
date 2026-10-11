@@ -954,3 +954,139 @@ fn bound_secrets_reach_their_origin_and_legacy_secrets_stay_unbound() {
         "\"secretBindings\":[{{\"secret\":\"github-token\",\"inject\":\"bearer\",\"binding\":\"bound\",\"origins\":[\"{github_origin}\"]}}"
     )));
 }
+
+/// One spelling of every traversal form the host refuses in a request path:
+/// dot segments, percent-encoded `.`, `/`, and `\` in either case, and a
+/// malformed escape.
+const TRAVERSAL_PATHS: [&str; 9] = [
+    "/api/../admin",
+    "/api/./admin",
+    "/api/%2e%2e/admin",
+    "/api/.%2E/admin",
+    "/api%2fadmin",
+    "/api%2Fadmin",
+    "/api%5c..%5cadmin",
+    "/api%5C..%5Cadmin",
+    "/api/50%",
+];
+
+const TRAVERSAL_MESSAGE: &str = "HTTP request path must not contain a `.` or `..` segment, a percent-encoded `.`, `/`, or `\\`, or a malformed percent escape";
+
+#[test]
+fn inbound_paths_refuse_traversal_forms_before_guest_execution() {
+    let echo = compile(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.path }
+}
+"#,
+        &[],
+    );
+    let grants = GrantSet::from_manifest(&manifest(""));
+    let inputs =
+        HostInputs::new(BTreeMap::new(), SecretStore::default()).expect("inputs should be valid");
+    let with_path = |path: &str| HttpRequest {
+        path: path.to_owned(),
+        ..request("")
+    };
+
+    for path in TRAVERSAL_PATHS {
+        let error = Runtime::default()
+            .invoke_webhook(
+                &echo.bytes,
+                &echo.metadata,
+                &grants,
+                &inputs,
+                with_path(path),
+            )
+            .expect_err("a traversal form must fail before guest execution");
+        assert_eq!(error.code(), "K4001", "`{path}`");
+        assert_eq!(error.message(), TRAVERSAL_MESSAGE, "`{path}`");
+    }
+
+    // Ordinary dots and every other escape still reach the guest unchanged.
+    for path in ["/.well-known/hook", "/hooks/v1.2/a%20b", "/hooks/100%25"] {
+        let result = Runtime::default()
+            .invoke_webhook(
+                &echo.bytes,
+                &echo.metadata,
+                &grants,
+                &inputs,
+                with_path(path),
+            )
+            .unwrap_or_else(|error| panic!("`{path}` must be accepted: {error}"));
+        assert_eq!(result.response.body, path);
+    }
+}
+
+/// A webhook that forwards its inbound body as the outbound request path: the
+/// injection shape that string building opens up.
+fn path_forwarding_artifact(origin: &str) -> BuiltComponent {
+    compile(
+        &format!(
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    let outbound: HttpRequest = record {{
+        method: "GET",
+        path: request.body,
+        query: "",
+        headers: [],
+        body: "",
+    }};
+    match http_request("{origin}", outbound, None) {{
+        Ok(response) => response,
+        Err(error) => record {{ status: 598, headers: [], body: error }},
+    }}
+}}
+"#
+        ),
+        &["http.request"],
+    )
+}
+
+#[test]
+fn outbound_paths_refuse_traversal_forms_before_any_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("origin listener should bind");
+    let origin = listener_origin(&listener);
+    let artifact = path_forwarding_artifact(&origin);
+    let grants = GrantSet::from_manifest(&manifest(&format!("http = [\"{origin}\"]")));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default())
+        .expect("inputs should be valid")
+        .with_network_policy(NetworkPolicy::loopback_for_tests());
+
+    for path in TRAVERSAL_PATHS {
+        let error = Runtime::default()
+            .invoke_webhook(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &inputs,
+                request(path),
+            )
+            .expect_err("a traversal form must trap the invocation");
+        assert_eq!(error.code(), "K4001", "`{path}`");
+        assert_eq!(error.message(), TRAVERSAL_MESSAGE, "`{path}`");
+    }
+    assert_never_contacted(&listener);
+
+    // An ordinary path keeps its escapes and reaches the origin byte-for-byte.
+    listener
+        .set_nonblocking(false)
+        .expect("listener should become blocking");
+    let server = accept_one(listener);
+    let result = Runtime::default()
+        .invoke_webhook(
+            &artifact.bytes,
+            &artifact.metadata,
+            &grants,
+            &inputs,
+            request("/api/files/v1.2/a%20b/%7Euser"),
+        )
+        .expect("an ordinary path must be sent");
+    assert_eq!(result.response.status, 202);
+    let captured = server.join().expect("origin should finish");
+    assert!(
+        captured.starts_with("GET /api/files/v1.2/a%20b/%7Euser HTTP/1.1\r\n"),
+        "{captured}"
+    );
+}

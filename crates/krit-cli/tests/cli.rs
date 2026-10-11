@@ -2274,6 +2274,90 @@ license = "Apache-2.0"
     );
 }
 
+#[test]
+fn invoke_refuses_request_paths_with_traversal_forms() {
+    let directory = TestDirectory::new("invoke-path-traversal");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.path }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/webhook"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+"#,
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    for (name, path) in [
+        ("dot.json", "/hooks/hidden-seg/../admin"),
+        ("encoded-dot.json", "/hooks/hidden-seg/%2E%2e/admin"),
+        ("encoded-slash.json", "/hooks/hidden-seg%2Fadmin"),
+        ("encoded-backslash.json", "/hooks/hidden-seg%5C..%5Cadmin"),
+    ] {
+        let request = directory.file(
+            name,
+            &format!(r#"{{"method":"POST","path":"{path}","query":"","headers":[],"body":""}}"#),
+        );
+        let invoked = krit_in(&directory)
+            .args(["invoke", "--manifest"])
+            .arg(&manifest)
+            .arg("--request")
+            .arg(&request)
+            .output()
+            .expect("Krit should invoke");
+        assert_eq!(invoked.status.code(), Some(1), "`{path}`");
+        assert!(invoked.stdout.is_empty(), "`{path}`");
+        let stderr = String::from_utf8(invoked.stderr).expect("stderr should be UTF-8");
+        assert!(stderr.contains("error[K4001]"), "`{path}`: {stderr}");
+        // The diagnostic never echoes the refused path.
+        assert!(!stderr.contains("hidden-seg"), "`{path}` leaked: {stderr}");
+    }
+
+    let request = directory.file(
+        "ordinary.json",
+        r#"{"method":"POST","path":"/hooks/v1.2/a%20b","query":"","headers":[],"body":""}"#,
+    );
+    let invoked = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should invoke");
+    assert!(
+        invoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&invoked.stderr)
+    );
+    assert_eq!(
+        invoked.stdout,
+        b"{\"status\":200,\"headers\":[],\"body\":\"/hooks/v1.2/a%20b\"}\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn invoke_loads_owner_only_secret_files_without_disclosure() {
@@ -5828,6 +5912,24 @@ http = ["http://search.example", "https://search.example"]
             "https://search.example",
             "query",
             false,
+        ),
+        (
+            "dot-segment.host.json",
+            "https://search.example",
+            "/v1/../admin",
+            false,
+        ),
+        (
+            "encoded-slash.host.json",
+            "https://search.example",
+            "/v1%2Fadmin",
+            false,
+        ),
+        (
+            "escaped.host.json",
+            "https://search.example",
+            "/v1.2/search%20all",
+            true,
         ),
     ] {
         let search = format!(

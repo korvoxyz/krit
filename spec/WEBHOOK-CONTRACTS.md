@@ -45,6 +45,43 @@ order is preserved and duplicate names are representable. A response must
 contain exactly its three fields. The HTTP host validates status range,
 request limits, and protocol syntax.
 
+## Request paths and queries
+
+One path rule covers every `HttpRequest` the host accepts: an inbound webhook
+request, every guest `http_request`, durable HTTP replay, and the request an
+AI adapter or search connector builds. The path must be an origin-form
+absolute path. It starts with `/` but not `//`, and it contains no `://`, no
+backslash, no `?` or `#`, and no ASCII control byte. It also may not contain
+any form that a server could normalize or decode into a different segment
+structure:
+
+- a segment that is exactly `.` or `..`, such as `/a/./b`, `/a/../b`, or `/..`;
+- a percent-encoded `.`, `/`, or `\` anywhere in the path, in either case
+  (`%2E`, `%2F`, `%5C`, `%2e`, `%2f`, `%5c`), so `%2e%2e` and `.%2e` cannot
+  spell a dot segment and `%2f` cannot split one segment into two;
+- a `%` that does not begin a well-formed `%HH` escape, because servers decode
+  it in different ways.
+
+Dots inside a segment (`/.well-known`, `/v1.2`, `/a..b`) and every other
+well-formed escape (`%20`, `%25`, `%7E`, escaped UTF-8) remain valid. The query
+may not start with `?` and may not contain a fragment, a control byte, or a
+backslash. Encoded separators in a query are ordinary data.
+
+The origin is the only HTTP authority a program holds. This rule keeps a path
+built from untrusted text, such as an inbound field or model output, from
+escaping the prefix the program meant to address after a server resolves it.
+
+A violation is `K4001`, and the diagnostic never echoes the path. An inbound
+request is refused before guest execution. A guest `http_request` traps the
+invocation before approval, DNS resolution, or any connection. An AI adapter
+or search connector path that breaks the rule is refused earlier, when the
+host configuration is validated (`K7003` for an adapter, `K5404` for a
+connector).
+
+The host sends the path byte-for-byte as validated. libcurl's own dot-segment
+normalization is disabled (`CURLOPT_PATH_AS_IS`), so the request on the wire is
+the request the host checked.
+
 ## Request JSON Schema
 
 The exact schema-1 request document is:
@@ -235,15 +272,14 @@ adapter's or connector's origin, so host configuration cannot widen a binding
 bytes stay in a host-owned zeroizing store and only a Wasmtime resource handle
 enters the guest.
 
-Outbound HTTP verifies the exact origin on every call, disables redirects,
-pins the one request's DNS result, rejects non-public IPv4/IPv6 ranges
-including private, shared, documentation, benchmark, link-local, loopback,
-reserved, and metadata addresses by default, validates TLS certificates and
-hostnames, and
-enforces DNS/connect/read/overall timeouts plus call/header/body limits. An
-embedding-only test policy may allow loopback; a separate explicit policy is
-required to send bearer authentication over plain HTTP. Neither switch is
-available to guest code or manifests.
+Outbound HTTP verifies the exact origin on every call, sends the path exactly
+as validated, disables redirects, pins the one request's DNS result, rejects
+non-public IPv4/IPv6 ranges including private, shared, documentation,
+benchmark, link-local, loopback, reserved, and metadata addresses by default,
+validates TLS certificates and hostnames, and enforces DNS/connect/read/overall
+timeouts plus call/header/body limits. An embedding-only test policy may allow
+loopback; a separate explicit policy is required to send bearer authentication
+over plain HTTP. Neither switch is available to guest code or manifests.
 
 WIT 0.2 names the webhook and HTTP records separately but gives them identical
 field order and canonical shape. Reusing types from the function-owning
