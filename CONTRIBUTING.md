@@ -5,6 +5,12 @@ must preserve explicit semantics, deterministic behavior, and least authority.
 
 Krit and the Krit language are owned by Akshay Bhardwaj.
 
+## Security issues
+
+Do not report a suspected vulnerability in a public issue or pull request.
+Follow [SECURITY.md](SECURITY.md) to report it privately through GitHub
+private vulnerability reporting.
+
 ## Setup
 
 Install Rust 1.94 or newer, then run:

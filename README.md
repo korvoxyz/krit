@@ -958,6 +958,13 @@ recovery under failure, and measured performance before more service breadth.
 Completed implementation phases do not make Krit production-ready or remove
 the documented backend, package-system, and OS-isolation limitations.
 
+## Security
+
+Report suspected vulnerabilities privately through GitHub private
+vulnerability reporting (**Report a vulnerability** under the repository's
+**Security** tab), never in a public issue. [SECURITY.md](SECURITY.md) lists
+the supported versions, scope, response targets, and advisory process.
+
 ## License
 
 Krit's specifications, implementation, and documentation are licensed under
