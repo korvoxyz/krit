@@ -112,7 +112,7 @@ single allocation (roadmap §9.2).
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| R4.1 | **Stdlib v0** (pure, no effects, deterministic, flat prefixed names): `int_to_string(Int) -> String`; `url_path_segment(String) -> String` (percent-encodes all but RFC 3986 unreserved); `url_query(List<{name, value}>) -> String` (`k=v&…`, percent-encoded, no leading `?`); `string_byte_len(String) -> Int`; `string_is_empty(String) -> Bool`; `string_contains(String, String) -> Bool`; `string_starts_with(String, String) -> Bool`; `string_ends_with(String, String) -> Bool`. Each works in `check`, `run`, LSP, and Wasm. | Per-function conformance and evaluator/Wasm agreement. |
+| R4.1 | **Stdlib v0** (pure, no effects, deterministic, flat prefixed names): `int_to_string(Int) -> String`; `url_path_segment(String) -> Result<String, String>` (percent-encodes all but RFC 3986 unreserved; `Err` for text the host path rule would refuse — empty, `.`/`..` after the host's `;?#` cut and space trim, ASCII control characters, or `%` followed by a hex digit or `u`/`U` — so untrusted text fails recoverably instead of trapping the invocation; every `Ok` output is accepted by the host path rule); `url_query(List<{name, value}>) -> String` (`k=v&…`, percent-encoded, no leading `?`); `string_byte_len(String) -> Int`; `string_is_empty(String) -> Bool`; `string_contains(String, String) -> Bool`; `string_starts_with(String, String) -> Bool`; `string_ends_with(String, String) -> Bool`. Each works in `check`, `run`, LSP, and Wasm. | Per-function conformance and evaluator/Wasm agreement. |
 | R4.2 | **K9013 lint** (warning): a non-literal piece of an `HttpRequest` `path` or `query` (interpolation hole or `+` operand) that is not a call to `url_path_segment`, `url_query`, or `int_to_string`. | Lint fires on the injection probe, not on the examples. |
 | R4.3 | **Warnings channel.** Diagnostics carry severity; `check`, `run`, `build`, LSP print warnings (human: `warning[K…]`; JSON: `"severity": "warning"`) without changing the exit status. | K2003/K9013 shown, exit 0. |
 | R4.4 | **Habit codes** K1101–K1112 with a one-line fix hint in `notes`: `return`; `for`/`while`; assignment/`mut`/`var`/`const`; `struct`/`class`/`impl`/`trait`; `import`; `async`/`await`; `try`/`catch`/`throw`; `a[i]`; `(x) => e`; ternary; `switch`/`case`; `else { return … }`. **K2001** gains did-you-mean (and `null` → `None`); **K3011** method-call `s.len()` → stdlib function hint. | One conformance case per code. |
@@ -170,6 +170,11 @@ single allocation (roadmap §9.2).
    three functions; they reuse the guest string runtime and remove the
    grounded fit's #3 blocker for routing and validation.
 4. `krit:runtime` WIT stays at 0.2.0: no host interface changes.
+5. `url_path_segment` returns `Result` (the master plan sketched `String`):
+   the 0.3 host path rule refuses dot segments behind `;?#`, padded dot
+   segments, control-byte escapes, and double encodings, so a total function
+   would turn untrusted text into an invocation trap. `Err` keeps it
+   recoverable, and `?` makes it one character at the call site.
 
 ## 9. What moves to 0.4 "One semantics"
 
