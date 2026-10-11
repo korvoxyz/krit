@@ -103,11 +103,13 @@ fields and must reject an unknown schema number.
 | `K8000`-`K8999` | Formatter and tooling errors |
 | `K9000`-`K9999` | Lints: warnings by default |
 
-A code's severity is part of its contract within an edition. Codes outside the
-lint range are errors unless the table below gives them another severity. Lints
-report readability, safety, and authority hazards in programs that are
-otherwise valid; they are warnings by default, so adding a lint never rejects
-a program that checked before.
+Codes outside the lint range are errors unless the table below gives them
+another severity, and that severity is part of the code's contract within an
+edition. Lints report readability, safety, and authority hazards in programs
+that are otherwise valid. A lint is a warning by default; a project profile or
+command mode may configure a different severity for a specific lint, and that
+configuration is then part of the profile's or mode's contract. No profile or
+mode configures lint severity yet, so every lint is currently a warning.
 
 Initial required codes:
 
