@@ -579,6 +579,17 @@ impl HostConfigError {
         }
     }
 
+    /// Host configuration tried to send a bound secret to an origin its
+    /// manifest binding does not list. Configuration may narrow a binding but
+    /// never widen it.
+    fn unbound_secret(secret: &str, origin: &str) -> Self {
+        Self {
+            kind: HostConfigErrorKind::Authorization,
+            code: "K5006",
+            message: format!("secret `{secret}` is not bound to origin `{origin}`"),
+        }
+    }
+
     fn durable(error: krit_runtime::RuntimeError) -> Self {
         Self {
             kind: HostConfigErrorKind::Input,
@@ -829,7 +840,7 @@ fn load_configured_services(
             } => {
                 require_manifest_http(manifest, &origin)?;
                 if let Some(secret) = &secret {
-                    require_manifest_secret(manifest, secret)?;
+                    require_manifest_bearer(manifest, secret, &origin)?;
                 }
                 AiAdapterConfig::HttpJson(HttpJsonAdapterConfig {
                     origin,
@@ -1158,7 +1169,7 @@ fn validate_search(
                     ));
                 }
                 if let Some(secret) = secret {
-                    require_manifest_secret(manifest, secret)?;
+                    require_manifest_bearer(manifest, secret, origin)?;
                 }
                 SearchTransport::HttpJson(HttpJsonConnectorConfig {
                     origin: origin.clone(),
@@ -1819,17 +1830,27 @@ fn require_manifest_http(manifest: &Manifest, origin: &str) -> Result<(), HostCo
 }
 
 fn require_manifest_secret(manifest: &Manifest, name: &str) -> Result<(), HostConfigError> {
-    if manifest
-        .capabilities
-        .secrets
-        .iter()
-        .any(|entry| entry == name)
-    {
+    if manifest.grants_permission("secret.read", Some(name)) {
         Ok(())
     } else {
         Err(HostConfigError::authorization(format!(
             "host secret `{name}` is not granted by the package manifest"
         )))
+    }
+}
+
+/// Requires a host-configured credential to be both granted and bound to the
+/// exact origin the host will send it to.
+fn require_manifest_bearer(
+    manifest: &Manifest,
+    secret: &str,
+    origin: &str,
+) -> Result<(), HostConfigError> {
+    require_manifest_secret(manifest, secret)?;
+    if manifest.permits_bearer(secret, origin) {
+        Ok(())
+    } else {
+        Err(HostConfigError::unbound_secret(secret, origin))
     }
 }
 
@@ -2439,5 +2460,84 @@ searchIndexes = ["search"]
             );
             assert_eq!(directory.snapshot(), before, "{pointer}");
         }
+    }
+
+    #[test]
+    fn host_credentials_cannot_widen_a_manifest_secret_binding() {
+        let bound = |origin: &str| {
+            Manifest::parse(&format!(
+                r#"
+schema = 1
+[package]
+name = "test/configuration"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+[capabilities]
+config = ["setting"]
+http = ["https://example.com", "https://other.example"]
+ai = ["reviewer"]
+searchIndexes = ["search"]
+[secrets.token]
+origins = ["{origin}"]
+"#
+            ))
+            .unwrap()
+        };
+        let directory = TestDirectory::new();
+        let before = directory.snapshot();
+
+        // The AI adapter would carry `token` to an origin outside its binding.
+        let mut adapter = document(2);
+        adapter.as_object_mut().unwrap().remove("retries");
+        adapter.as_object_mut().unwrap().remove("rateLimits");
+        fs::write(directory.config(), adapter.to_string()).unwrap();
+        let error = load(
+            Some(&directory.config()),
+            &bound("https://other.example"),
+            RuntimeLimits::default(),
+        )
+        .expect_err("an adapter must not widen a binding");
+        assert_eq!(error.code(), "K5006");
+        assert_eq!(error.kind(), HostConfigErrorKind::Authorization);
+        assert_eq!(
+            error.message(),
+            "secret `token` is not bound to origin `https://example.com`"
+        );
+
+        // A search connector is held to the same rule, before any side effect.
+        let connector = json!({
+            "schema": 6,
+            "secrets": {"token": {"file": "token"}},
+            "state": {},
+            "search": {"search": {
+                "kind": "query", "maxResults": 4,
+                "transport": {
+                    "type": "http-json", "origin": "https://example.com", "path": "/query",
+                    "secret": "token", "maxResponseBytes": 1024, "timeoutMs": 500
+                }
+            }}
+        });
+        fs::write(directory.config(), connector.to_string()).unwrap();
+        let error = load(
+            Some(&directory.config()),
+            &bound("https://other.example"),
+            RuntimeLimits::default(),
+        )
+        .expect_err("a connector must not widen a binding");
+        assert_eq!(error.code(), "K5006");
+        assert_eq!(directory.snapshot(), before);
+
+        // Bound to the adapter's own origin, the same configuration loads.
+        fs::write(directory.config(), adapter.to_string()).unwrap();
+        drop(
+            load(
+                Some(&directory.config()),
+                &bound("https://example.com"),
+                RuntimeLimits::default(),
+            )
+            .unwrap_or_else(|error| panic!("{error:?}")),
+        );
     }
 }

@@ -196,14 +196,20 @@ struct HostStateConfig {
     artifact_identity: [u8; 32],
 }
 
+/// Guest-held secret resource.
+///
+/// It carries the secret's logical manifest name so every bearer injection can
+/// be checked against that name's origin binding; the bytes never leave the
+/// host.
 pub struct SecretHandle {
+    name: String,
     bytes: Arc<host::SecretBytes>,
 }
 
 struct RetryRequest<'a> {
     origin: &'a krit_capability::HttpOrigin,
     request: &'a HttpRequest,
-    bearer: Option<&'a host::SecretBytes>,
+    bearer: Option<&'a permissions::AuthorizedBearer>,
     rate_resource: policy::RateResource,
     /// Guest-visible name for a rate denial. It is not the bucket identity: a
     /// connector shares its origin's bucket but must never disclose that
@@ -898,12 +904,15 @@ impl Runtime {
                             adapter.origin
                         )));
                     }
-                    if let Some(secret) = &adapter.secret
-                        && !grants.grants("secret.read", Some(secret))
-                    {
-                        return Err(RuntimeError::authorization(format!(
-                            "AI adapter `{name}` secret `{secret}` is not granted by the manifest"
-                        )));
+                    if let Some(secret) = &adapter.secret {
+                        if !grants.grants("secret.read", Some(secret)) {
+                            return Err(RuntimeError::authorization(format!(
+                                "AI adapter `{name}` secret `{secret}` is not granted by the manifest"
+                            )));
+                        }
+                        if !grants.permits_bearer(secret, &adapter.origin) {
+                            return Err(RuntimeError::unbound_secret(secret, &adapter.origin));
+                        }
                     }
                 }
             }
@@ -1028,12 +1037,15 @@ impl Runtime {
                         config.origin
                     )));
                 }
-                if let Some(secret) = &config.secret
-                    && !grants.grants("secret.read", Some(secret))
-                {
-                    return Err(RuntimeError::authorization(format!(
-                        "search connector `{name}` secret `{secret}` is not granted by the manifest"
-                    )));
+                if let Some(secret) = &config.secret {
+                    if !grants.grants("secret.read", Some(secret)) {
+                        return Err(RuntimeError::authorization(format!(
+                            "search connector `{name}` secret `{secret}` is not granted by the manifest"
+                        )));
+                    }
+                    if !grants.permits_bearer(secret, &config.origin) {
+                        return Err(RuntimeError::unbound_secret(secret, &config.origin));
+                    }
                 }
             }
         }
@@ -1417,7 +1429,7 @@ impl bindings::webhook::krit::runtime::secrets::Host for HostState {
         };
         let handle = self
             .resources
-            .push(SecretHandle { bytes })
+            .push(SecretHandle { name, bytes })
             .map_err(|error| {
                 wasmtime::Error::new(RuntimeError::resource(format!(
                     "secret handle table is full: {error}"
@@ -2273,6 +2285,27 @@ impl HostState {
         }
     }
 
+    /// Pins a secret to one origin after checking its manifest binding.
+    ///
+    /// A refusal traps with `K5006`, like any other use of authority the
+    /// manifest does not grant, and happens before any request is sent.
+    fn authorize_bearer(
+        &self,
+        secret_name: &str,
+        origin: &krit_capability::HttpOrigin,
+        secret: Arc<host::SecretBytes>,
+    ) -> wasmtime::Result<permissions::AuthorizedBearer> {
+        let Some(grants) = self.grants.as_ref() else {
+            return Err(wasmtime::Error::new(RuntimeError::unbound_secret(
+                secret_name,
+                origin.as_str(),
+            )));
+        };
+        grants
+            .authorize_bearer(secret_name, origin, secret)
+            .map_err(wasmtime::Error::new)
+    }
+
     fn require_grant(&self, capability: &str, resource: &str) -> wasmtime::Result<()> {
         if self
             .grants
@@ -2343,6 +2376,19 @@ impl HostState {
                 "guest requested invalid HTTP origin `{origin}`: {error}"
             )))
         })?;
+        // The secret's origin binding is checked first, so a misdirected
+        // credential is refused before any limit, approval, DNS lookup, or
+        // connection is attempted.
+        let bearer = bearer
+            .as_ref()
+            .map(|handle| {
+                let secret = self.resources.get(handle).map_err(|error| {
+                    wasmtime::Error::msg(format!("invalid secret handle: {error}"))
+                })?;
+                let (name, bytes) = (secret.name.clone(), Arc::clone(&secret.bytes));
+                self.authorize_bearer(&name, &parsed, bytes)
+            })
+            .transpose()?;
         let next_http_calls = self
             .http_calls
             .checked_add(1)
@@ -2365,15 +2411,6 @@ impl HostState {
                 "approval denied for bearer HTTP origin `{origin}`"
             )));
         }
-        let bearer = bearer
-            .as_ref()
-            .map(|handle| {
-                self.resources
-                    .get(handle)
-                    .map(|secret| Arc::clone(&secret.bytes))
-            })
-            .transpose()
-            .map_err(|error| wasmtime::Error::msg(format!("invalid secret handle: {error}")))?;
         let retry = self
             .agent_host
             .policy()
@@ -2394,7 +2431,7 @@ impl HostState {
         Ok(self.send_with_retry(RetryRequest {
             origin: &parsed,
             request: &request,
-            bearer: bearer.as_deref(),
+            bearer: bearer.as_ref(),
             rate_resource: policy::RateResource::Http(origin.clone()),
             rate_label: origin.clone(),
             approval_label: origin,
@@ -2459,6 +2496,14 @@ impl HostState {
                 "approval denied for AI adapter `{adapter_name}`"
             )));
         }
+        let origin = krit_capability::HttpOrigin::parse_exact(adapter.origin()).map_err(|_| {
+            wasmtime::Error::new(RuntimeError::setup(
+                "validated AI adapter origin became invalid",
+            ))
+        })?;
+        // An adapter credential is host-configured, but it is still held to
+        // the manifest binding of its secret: configuration may narrow where a
+        // secret goes, never widen it.
         let bearer = match adapter.secret_name() {
             Some(secret_name) => {
                 let Some(secret) = self.agent_host.inputs().secrets().get(secret_name) else {
@@ -2466,7 +2511,7 @@ impl HostState {
                         "AI adapter `{adapter_name}` secret is not configured"
                     )));
                 };
-                Some(secret)
+                Some(self.authorize_bearer(secret_name, &origin, secret)?)
             }
             None => None,
         };
@@ -2487,11 +2532,6 @@ impl HostState {
         if let Err(error) = request.validate(self.limits) {
             return Ok(Err(error.message().to_owned()));
         }
-        let origin = krit_capability::HttpOrigin::parse_exact(adapter.origin()).map_err(|_| {
-            wasmtime::Error::new(RuntimeError::setup(
-                "validated AI adapter origin became invalid",
-            ))
-        })?;
         let retry = self
             .agent_host
             .policy()
@@ -2513,7 +2553,7 @@ impl HostState {
         let response = match self.send_with_retry(RetryRequest {
             origin: &origin,
             request: &request,
-            bearer: bearer.as_deref(),
+            bearer: bearer.as_ref(),
             rate_resource: policy::RateResource::Ai(adapter_name.clone()),
             rate_label: adapter_name.clone(),
             approval_label: adapter_name.clone(),
@@ -2634,6 +2674,11 @@ impl HostState {
         // embedding that builds a catalog directly cannot reach an origin or a
         // credential the manifest never granted.
         self.require_effect_resource("http.request", &config.origin)?;
+        let origin = krit_capability::HttpOrigin::parse_exact(&config.origin).map_err(|_| {
+            wasmtime::Error::new(RuntimeError::setup(
+                "validated search connector origin became invalid",
+            ))
+        })?;
         let bearer = match config.secret.as_deref() {
             Some(name) => {
                 self.require_effect_resource("secret.read", name)?;
@@ -2642,7 +2687,7 @@ impl HostState {
                         "search connector `{index}` secret is not configured"
                     )));
                 };
-                Some(secret)
+                Some(self.authorize_bearer(name, &origin, secret)?)
             }
             None => None,
         };
@@ -2657,11 +2702,6 @@ impl HostState {
         if let Err(error) = request.validate(self.limits) {
             return Ok(Err(error.message().to_owned()));
         }
-        let origin = krit_capability::HttpOrigin::parse_exact(&config.origin).map_err(|_| {
-            wasmtime::Error::new(RuntimeError::setup(
-                "validated search connector origin became invalid",
-            ))
-        })?;
         // Retry and rate selection match guest HTTP exactly: an exact-origin
         // override wins, otherwise the default applies. A connector is ordinary
         // HTTP traffic and must not get its own weaker or stronger policy.
@@ -2692,7 +2732,7 @@ impl HostState {
         let response = match self.send_with_retry(RetryRequest {
             origin: &origin,
             request: &request,
-            bearer: bearer.as_deref(),
+            bearer: bearer.as_ref(),
             // Charged against the origin, not the connector name, so every
             // connector and every direct request to one origin share a single
             // bucket. Charging per connector would multiply the configured cap

@@ -16,7 +16,7 @@ use zeroize::Zeroize;
 
 use crate::{
     CancellationHandle, HttpHeader, HttpRequest, HttpResponse, NetworkPolicy, RuntimeLimits,
-    host::SecretBytes,
+    permissions::AuthorizedBearer,
 };
 
 const MIN_CURL_TIMEOUT: Duration = Duration::from_millis(1);
@@ -124,7 +124,7 @@ fn sanitize_transfer_error(error: &curl::Error) -> NetworkFailure {
 pub(crate) fn send(
     origin: &HttpOrigin,
     request: &HttpRequest,
-    bearer: Option<&SecretBytes>,
+    bearer: Option<&AuthorizedBearer>,
     context: SendContext<'_>,
 ) -> Result<HttpResponse, NetworkFailure> {
     let SendContext {
@@ -134,6 +134,20 @@ pub(crate) fn send(
         cancellation,
         active_dns_workers,
     } = context;
+    // The binding was checked for one exact origin when the credential was
+    // authorized. Refusing any other origin here, before DNS or a connection,
+    // keeps a secret from being redirected even if a caller pairs it wrongly.
+    // The message is fixed: an adapter's or connector's endpoint and secret
+    // name are never disclosed to guest code.
+    if let Some(bearer) = bearer
+        && bearer.origin() != origin.as_str()
+    {
+        return Err(
+            "outbound HTTP bearer credential is not bound to this origin"
+                .to_owned()
+                .into(),
+        );
+    }
     if cancellation.is_cancelled() {
         return Err(NetworkFailure::new(
             NetworkFailureKind::Cancelled,
@@ -246,8 +260,8 @@ pub(crate) fn send(
             .append(&format!("{}: {}", header.name, header.value))
             .map_err(|_| "could not encode outbound HTTP header".to_owned())?;
     }
-    if let Some(secret) = bearer {
-        let bytes = secret.expose_for_bearer();
+    if let Some(bearer) = bearer {
+        let bytes = bearer.secret().expose_for_bearer();
         let header = HeaderValue::from_bytes(bytes)
             .map_err(|_| "secret is not a valid bearer credential".to_owned())?;
         header
@@ -617,6 +631,77 @@ mod tests {
         .expect_err("sub-millisecond budget must not become an unlimited curl timeout");
 
         assert!(error.message.contains("deadline expired"));
+    }
+
+    #[test]
+    fn an_authorized_bearer_is_never_injected_into_another_origin() {
+        let grants = crate::GrantSet::from_manifest(
+            &krit_package::Manifest::parse(
+                r#"
+schema = 1
+
+[package]
+name = "test/network"
+version = "1.0.0"
+edition = "2026"
+entry = "src/main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+http = ["https://192.0.2.1", "https://192.0.2.2"]
+secrets = ["token"]
+"#,
+            )
+            .expect("manifest should parse"),
+        );
+        let store = crate::SecretStore::new(std::collections::BTreeMap::from([(
+            "token".to_owned(),
+            b"fixture-private".to_vec(),
+        )]))
+        .expect("secret store should be valid");
+        let authorized =
+            HttpOrigin::parse_exact("https://192.0.2.1").expect("origin should be canonical");
+        let other =
+            HttpOrigin::parse_exact("https://192.0.2.2").expect("origin should be canonical");
+        let bearer = grants
+            .authorize_bearer(
+                "token",
+                &authorized,
+                store.get("token").expect("secret should exist"),
+            )
+            .unwrap_or_else(|error| panic!("an unbound secret is authorized: {error}"));
+        let request = HttpRequest {
+            method: "GET".to_owned(),
+            path: "/".to_owned(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        let workers = Arc::new(AtomicUsize::new(0));
+
+        // Without the origin check this would fail later, on the
+        // documentation-range address; refusing first proves the credential is
+        // rejected before any address is even considered.
+        let error = send(
+            &other,
+            &request,
+            Some(&bearer),
+            SendContext {
+                policy: NetworkPolicy::default(),
+                limits: RuntimeLimits::default(),
+                remaining: Duration::from_secs(5),
+                cancellation: &CancellationHandle::new(),
+                active_dns_workers: &workers,
+            },
+        )
+        .expect_err("a credential must never reach a second origin");
+
+        assert_eq!(error.kind, NetworkFailureKind::Fatal);
+        assert_eq!(
+            error.message,
+            "outbound HTTP bearer credential is not bound to this origin"
+        );
+        assert_eq!(workers.load(Ordering::SeqCst), 0);
     }
 
     /// Every message a transfer failure may present to guest code.

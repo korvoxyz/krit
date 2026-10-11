@@ -153,7 +153,7 @@ fn build_command(arguments: &[String]) -> u8 {
     if !manifest.capabilities.http.is_empty() {
         options.grant_effect("http.request");
     }
-    if !manifest.capabilities.secrets.is_empty() {
+    if !manifest.secret_names().is_empty() {
         options.grant_effect("secret.read");
     }
     if !manifest.capabilities.ai.is_empty() {

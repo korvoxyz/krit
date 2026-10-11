@@ -5867,3 +5867,237 @@ http = ["http://search.example", "https://search.example"]
         }
     }
 }
+
+/// The reference webhook-agent manifest with every secret bound to its origin,
+/// plus one legacy unbound secret so both report forms are exercised.
+const BOUND_SECRETS_MANIFEST: &str = r#"
+schema = 1
+
+[package]
+name = "test/bound-secrets"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+http = [
+    "https://ai.example.invalid",
+    "https://github.example.invalid",
+    "https://message.example.invalid",
+]
+secrets = ["legacy-token"]
+
+[secrets.github-token]
+origins = ["https://github.example.invalid"]
+
+[secrets.message-token]
+origins = ["https://message.example.invalid"]
+inject = "bearer"
+"#;
+
+/// A webhook that presents `secret` as the bearer credential of `origin`.
+fn bearer_source(secret: &str, origin: &str) -> String {
+    format!(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    match secret("{secret}") {{
+        Ok(token) => match http_request("{origin}", request, Some(token)) {{
+            Ok(response) => response,
+            Err(error) => record {{ status: 502, headers: [], body: error }},
+        }},
+        Err(error) => record {{ status: 500, headers: [], body: error }},
+    }}
+}}
+"#
+    )
+}
+
+#[test]
+fn permissions_report_secret_bindings_and_label_legacy_secrets_unbound() {
+    let directory = TestDirectory::new("permissions-secret-bindings");
+    directory.file(
+        "main.krit",
+        &bearer_source("github-token", "https://github.example.invalid"),
+    );
+    let manifest = directory.file("krit.pkg", BOUND_SECRETS_MANIFEST);
+
+    let human = krit_in(&directory)
+        .args(["permissions"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should start");
+    assert!(human.status.success());
+    assert!(human.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(human.stdout).expect("report should be UTF-8"),
+        "Requested capabilities for test/bound-secrets:\n  \
+         http.request: https://ai.example.invalid\n  \
+         http.request: https://github.example.invalid\n  \
+         http.request: https://message.example.invalid\n  \
+         secret.read: github-token\n  \
+         secret.read: legacy-token\n  \
+         secret.read: message-token\n\
+         Secret bindings:\n  \
+         github-token (bearer): https://github.example.invalid\n  \
+         legacy-token (bearer): UNBOUND (any granted origin)\n  \
+         message-token (bearer): https://message.example.invalid\n\
+         Deployment grants: not evaluated\n"
+    );
+
+    let json = krit_in(&directory)
+        .args(["permissions", "--json"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should start");
+    assert!(json.status.success());
+    let report: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("report should be JSON");
+    assert_eq!(
+        report["secretBindings"],
+        serde_json::json!([
+            {"secret": "github-token", "inject": "bearer", "binding": "bound",
+             "origins": ["https://github.example.invalid"]},
+            {"secret": "legacy-token", "inject": "bearer", "binding": "unbound", "origins": []},
+            {"secret": "message-token", "inject": "bearer", "binding": "bound",
+             "origins": ["https://message.example.invalid"]},
+        ])
+    );
+
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let artifact = directory.path.join("target/krit/bound-secrets.wasm");
+    let human = krit_in(&directory)
+        .args(["permissions", "--artifact"])
+        .arg(&artifact)
+        .arg(&manifest)
+        .output()
+        .expect("Krit should start");
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).expect("report should be UTF-8");
+    assert!(human.contains(
+        "Secret bindings:\n  \
+         github-token (bearer): https://github.example.invalid\n  \
+         legacy-token (bearer): UNBOUND (any granted origin)\n"
+    ));
+    let json = krit_in(&directory)
+        .args(["permissions", "--json", "--artifact"])
+        .arg(&artifact)
+        .arg(&manifest)
+        .output()
+        .expect("Krit should start");
+    assert!(json.status.success());
+    let artifact_report: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("report should be JSON");
+    assert_eq!(artifact_report["secretBindings"], report["secretBindings"]);
+}
+
+#[test]
+fn invalid_secret_bindings_are_manifest_errors() {
+    let directory = TestDirectory::new("invalid-secret-bindings");
+    directory.file("main.krit", "1\n");
+    for (from, to, expected) in [
+        (
+            "origins = [\"https://github.example.invalid\"]",
+            "origins = [\"https://api.github.com\"]",
+            "not a granted `http` origin",
+        ),
+        (
+            "inject = \"bearer\"",
+            "inject = \"basic\"",
+            "unknown variant `basic`",
+        ),
+    ] {
+        let manifest = directory.file("krit.pkg", &BOUND_SECRETS_MANIFEST.replacen(from, to, 1));
+        let output = krit_in(&directory)
+            .args(["permissions"])
+            .arg(&manifest)
+            .output()
+            .expect("Krit should start");
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).expect("diagnostic should be UTF-8");
+        assert!(stderr.contains("error[K6001]"), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn invoke_refuses_the_swapped_token_probe_with_k5006() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The critic's probe: webhook-agent's GitHub credential sent to its
+    // messaging origin. It builds, because both resources are granted, but the
+    // host refuses the pairing before any request is resolved or sent.
+    let directory = TestDirectory::new("swapped-token-probe");
+    directory.file(
+        "main.krit",
+        &bearer_source("github-token", "https://message.example.invalid"),
+    );
+    let manifest = directory.file("krit.pkg", BOUND_SECRETS_MANIFEST);
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let secret_value = "fixture-github-value";
+    for (name, value) in [
+        ("github.secret", secret_value),
+        ("message.secret", "fixture-message-value"),
+    ] {
+        let path = directory.file(name, value);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("secret permissions should set");
+    }
+    let host = directory.file(
+        "host.json",
+        r#"{
+  "schema": 2,
+  "secrets": {
+    "github-token": {"file": "github.secret"},
+    "message-token": {"file": "message.secret"}
+  },
+  "approvals": [
+    {"operation": "http.bearer", "resource": "https://github.example.invalid"},
+    {"operation": "http.bearer", "resource": "https://message.example.invalid"}
+  ]
+}"#,
+    );
+    let request = directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/messages","query":"","headers":[],"body":"summary"}"#,
+    );
+    let invoked = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--host-config")
+        .arg(&host)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should invoke");
+    assert_eq!(invoked.status.code(), Some(4));
+    assert!(invoked.stdout.is_empty());
+    let stderr = String::from_utf8(invoked.stderr).expect("diagnostic should be UTF-8");
+    assert!(
+        stderr.contains(
+            "error[K5006]: secret `github-token` is not bound to origin `https://message.example.invalid`"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(secret_value));
+}

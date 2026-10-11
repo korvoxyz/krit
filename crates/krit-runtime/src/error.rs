@@ -61,6 +61,16 @@ impl RuntimeError {
         Self::new("K5001", RuntimeErrorKind::Authorization, message)
     }
 
+    /// A secret was about to be injected into an origin its manifest binding
+    /// does not list. Only identifiers are named; secret bytes never are.
+    pub(crate) fn unbound_secret(secret: &str, origin: &str) -> Self {
+        Self::new(
+            "K5006",
+            RuntimeErrorKind::Authorization,
+            format!("secret `{secret}` is not bound to origin `{origin}`"),
+        )
+    }
+
     pub(crate) fn import_mismatch(message: impl Into<String>) -> Self {
         Self::new("K5002", RuntimeErrorKind::ImportMismatch, message)
     }

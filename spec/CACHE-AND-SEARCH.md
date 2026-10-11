@@ -194,9 +194,10 @@ clamped to the invocation deadline.
 
 A connector's authority is complete and is checked twice. At setup, the
 connector name, its exact `http.request` origin, and its `secret.read`
-credential must all be granted by the manifest, and its transport is
-re-validated against the host's network policy. At dispatch the origin and the
-credential are rechecked against the current grant set, so an embedding that
+credential must all be granted by the manifest, a bound credential must list
+the connector origin (`K5006` otherwise), and its transport is re-validated
+against the host's network policy. At dispatch the origin, the credential, and
+its binding are rechecked against the current grant set, so an embedding that
 builds a catalog directly through the public API cannot reach authority the
 package never requested.
 

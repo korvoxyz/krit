@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
-use krit_package::Manifest;
+use krit_capability::HttpOrigin;
+use krit_package::{Manifest, SecretBindingFact, SecretBindingStatus, render_secret_bindings};
 use krit_wasm::{
     AI_INTERFACE, ArtifactMetadata, CACHE_READ_INTERFACE, CACHE_WRITE_INTERFACE, CONFIG_INTERFACE,
     DATABASE_INTERFACE, HTTP_ANONYMOUS_INTERFACE, HTTP_INTERFACE, LOGGING_INTERFACE,
@@ -10,7 +11,7 @@ use krit_wasm::{
 };
 use serde::Serialize;
 
-use crate::RuntimeError;
+use crate::{RuntimeError, host::SecretBytes};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GrantSet {
@@ -22,6 +23,30 @@ pub struct GrantSet {
     requested: Vec<PermissionFact>,
     effects: BTreeSet<String>,
     imports: BTreeSet<String>,
+    /// Every granted secret with its origin binding, sorted by name. It comes
+    /// only from the manifest, so no host configuration can widen it.
+    secret_bindings: Vec<SecretBindingFact>,
+}
+
+/// A secret that passed the binding check for exactly one origin.
+///
+/// Only [`GrantSet::authorize_bearer`] builds one, and the network layer
+/// refuses to inject it into any origin other than the one it records. Holding
+/// a credential for one origin therefore never lets a caller send it to
+/// another.
+pub(crate) struct AuthorizedBearer {
+    origin: String,
+    secret: Arc<SecretBytes>,
+}
+
+impl AuthorizedBearer {
+    pub(crate) fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    pub(crate) fn secret(&self) -> &SecretBytes {
+        &self.secret
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -44,6 +69,8 @@ pub struct EffectivePermissions {
     pub package: String,
     pub world: String,
     pub requested: Vec<PermissionFact>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub secret_bindings: Vec<SecretBindingFact>,
     pub required: Vec<PermissionFact>,
     pub effective: Vec<PermissionFact>,
     pub denied: Vec<PermissionFact>,
@@ -77,7 +104,8 @@ impl GrantSet {
             imports.insert(HTTP_INTERFACE.to_owned());
             imports.insert(HTTP_ANONYMOUS_INTERFACE.to_owned());
         }
-        if !manifest.capabilities.secrets.is_empty() {
+        let secret_bindings = manifest.secret_bindings();
+        if !secret_bindings.is_empty() {
             effects.insert("secret.read".to_owned());
             imports.insert(SECRETS_INTERFACE.to_owned());
         }
@@ -250,17 +278,10 @@ impl GrantSet {
                 resource: Some(resource),
             }
         }));
-        requested.extend(
-            manifest
-                .capabilities
-                .secrets
-                .iter()
-                .cloned()
-                .map(|resource| PermissionFact {
-                    capability: "secret.read".to_owned(),
-                    resource: Some(resource),
-                }),
-        );
+        requested.extend(secret_bindings.iter().map(|binding| PermissionFact {
+            capability: "secret.read".to_owned(),
+            resource: Some(binding.secret.clone()),
+        }));
         requested.sort();
         Self {
             package_name: manifest.package.name.clone(),
@@ -271,6 +292,7 @@ impl GrantSet {
             requested,
             effects,
             imports,
+            secret_bindings,
         }
     }
 
@@ -310,6 +332,44 @@ impl GrantSet {
         self.requested
             .iter()
             .any(|fact| fact.capability == capability && fact.resource.as_deref() == resource)
+    }
+
+    /// Whether the host may inject `secret` as the bearer credential of a
+    /// request to `origin`.
+    ///
+    /// The secret and the origin must both be granted. A secret bound by a
+    /// `[secrets.<name>]` table may reach only the origins it lists; a legacy
+    /// unbound secret may reach any granted origin.
+    pub(crate) fn permits_bearer(&self, secret: &str, origin: &str) -> bool {
+        self.grants("http.request", Some(origin))
+            && self
+                .secret_bindings
+                .iter()
+                .find(|binding| binding.secret == secret)
+                .is_some_and(|binding| match binding.binding {
+                    SecretBindingStatus::Bound => {
+                        binding.origins.iter().any(|bound| bound == origin)
+                    }
+                    SecretBindingStatus::Unbound => true,
+                })
+    }
+
+    /// Checks one bearer injection and, when it is permitted, returns the
+    /// credential pinned to that exact origin. A refusal is `K5006` and happens
+    /// before any request is built, resolved, or sent.
+    pub(crate) fn authorize_bearer(
+        &self,
+        secret_name: &str,
+        origin: &HttpOrigin,
+        secret: Arc<SecretBytes>,
+    ) -> Result<AuthorizedBearer, RuntimeError> {
+        if !self.permits_bearer(secret_name, origin.as_str()) {
+            return Err(RuntimeError::unbound_secret(secret_name, origin.as_str()));
+        }
+        Ok(AuthorizedBearer {
+            origin: origin.as_str().to_owned(),
+            secret,
+        })
     }
 
     pub(crate) fn evaluate(&self, metadata: &ArtifactMetadata) -> EffectivePermissions {
@@ -379,6 +439,7 @@ impl GrantSet {
             package: metadata.package.name.clone(),
             world: metadata.world.clone(),
             requested: self.requested.clone(),
+            secret_bindings: self.secret_bindings.clone(),
             required,
             effective,
             denied,
@@ -429,6 +490,7 @@ impl EffectivePermissions {
             self.package, self.schema
         );
         render_facts(&mut output, "Requested", &self.requested);
+        render_secret_bindings(&mut output, &self.secret_bindings);
         render_facts(&mut output, "Required", &self.required);
         render_facts(&mut output, "Effective", &self.effective);
         render_facts(&mut output, "Denied", &self.denied);
@@ -598,6 +660,69 @@ stdout = true
         imports.imports.clear();
         let error = grants.authorize(&imports).expect_err("imports must fail");
         assert_eq!(error.code(), "K5002");
+    }
+
+    #[test]
+    fn secret_bindings_gate_bearer_injection() {
+        let grants = GrantSet::from_manifest(
+            &Manifest::parse(
+                r#"
+schema = 1
+
+[package]
+name = "test/program"
+version = "1.2.3"
+edition = "2026"
+entry = "src/main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+http = ["https://a.example", "https://b.example"]
+secrets = ["legacy-token"]
+
+[secrets.bound-token]
+origins = ["https://a.example"]
+"#,
+            )
+            .expect("manifest should parse"),
+        );
+        assert!(grants.effects.contains("secret.read"));
+        assert!(grants.imports.contains(SECRETS_INTERFACE));
+        assert!(grants.grants("secret.read", Some("bound-token")));
+        assert!(grants.grants("secret.read", Some("legacy-token")));
+
+        assert!(grants.permits_bearer("bound-token", "https://a.example"));
+        assert!(!grants.permits_bearer("bound-token", "https://b.example"));
+        assert!(grants.permits_bearer("legacy-token", "https://a.example"));
+        assert!(grants.permits_bearer("legacy-token", "https://b.example"));
+        // Neither form reaches an origin the manifest never granted.
+        assert!(!grants.permits_bearer("legacy-token", "https://c.example"));
+        assert!(!grants.permits_bearer("missing-token", "https://a.example"));
+
+        let store = crate::SecretStore::new(std::collections::BTreeMap::from([(
+            "bound-token".to_owned(),
+            b"fixture-private".to_vec(),
+        )]))
+        .expect("secret store should be valid");
+        let secret = store.get("bound-token").expect("secret should exist");
+        let a = HttpOrigin::parse_exact("https://a.example").expect("origin should parse");
+        let b = HttpOrigin::parse_exact("https://b.example").expect("origin should parse");
+        let error = grants
+            .authorize_bearer("bound-token", &b, Arc::clone(&secret))
+            .err()
+            .expect("an unbound origin must be refused");
+        assert_eq!(error.code(), "K5006");
+        assert_eq!(error.kind(), crate::RuntimeErrorKind::Authorization);
+        assert_eq!(
+            error.message(),
+            "secret `bound-token` is not bound to origin `https://b.example`"
+        );
+        assert!(!error.message().contains("fixture-private"));
+        let bearer = grants
+            .authorize_bearer("bound-token", &a, secret)
+            .unwrap_or_else(|error| panic!("bound origin must be accepted: {error}"));
+        assert_eq!(bearer.origin(), "https://a.example");
+        assert_eq!(bearer.secret().expose_for_bearer(), b"fixture-private");
     }
 
     fn metadata() -> ArtifactMetadata {

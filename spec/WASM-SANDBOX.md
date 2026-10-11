@@ -376,9 +376,9 @@ needs a second explicit host-only switch.
 The neutral AI interface selects a named host adapter. Phase 4 includes only
 `http-json`, which constructs and parses one strict provider mapping behind a
 provider-neutral Rust trait. Adapter origin and optional secret must already
-be manifest-granted. Prompts, provider bodies, model output, and credentials
-are absent from metadata, permission output, default logs, cache keys, and
-stats.
+be manifest-granted, and a bound secret must list the adapter origin. Prompts,
+provider bodies, model output, and credentials are absent from metadata,
+permission output, default logs, cache keys, and stats.
 
 Transport retries occur inside one host operation and never re-enter guest
 code. Only connection/timeouts and 429/502/503/504 are retryable, and only for
@@ -692,8 +692,10 @@ manifest.
 
 Applications refer to secrets by manifest-approved logical name. The host
 acquires bounded owner-only files into a zeroizing store and returns only a
-WIT resource handle. The HTTP host borrows that resource and injects bearer
-authentication without returning bytes to the component.
+WIT resource handle that carries the secret's logical name. The HTTP host
+borrows that resource, checks the name's manifest origin binding (`K5006` on a
+mismatch, before any network I/O), and injects bearer authentication without
+returning bytes to the component.
 
 Secret data is excluded from:
 

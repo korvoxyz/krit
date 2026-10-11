@@ -270,11 +270,21 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
         expected_approvals
     );
 
+    // Every credential is bound to the one origin that should receive it, as
+    // in the shipped webhook-agent example.
     let manifest = manifest(&format!(
         "http = [\"{github_origin}\", \"{ai_origin}\", \"{messaging_origin}\"]\n\
-         secrets = [\"ai-token\", \"github-token\", \"message-token\"]\n\
          ai = [\"reviewer\"]\n\
-         logs = true"
+         logs = true\n\
+         \n\
+         [secrets.ai-token]\n\
+         origins = [\"{ai_origin}\"]\n\
+         \n\
+         [secrets.github-token]\n\
+         origins = [\"{github_origin}\"]\n\
+         \n\
+         [secrets.message-token]\n\
+         origins = [\"{messaging_origin}\"]"
     ));
     let inputs = HostInputs::new(
         BTreeMap::new(),
@@ -1276,6 +1286,89 @@ fn ai_test_host(origin: String, max_response_bytes: usize, timeout: Duration) ->
         ),
     )
     .expect("host")
+}
+
+#[test]
+fn ai_adapter_secrets_cannot_widen_a_manifest_binding() {
+    let artifact = compile(
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match ai_invoke("reviewer", request.body) {
+        Ok(output) => record { status: 200, headers: [], body: output },
+        Err(error) => record { status: 503, headers: [], body: error },
+    }
+}
+"#,
+        &["ai.invoke"],
+    );
+    let ai = TcpListener::bind("127.0.0.1:0").expect("AI listener should bind");
+    let ai_origin = listener_origin(&ai);
+    let github_origin = "https://github.example.invalid";
+    let host = |secret: &str| {
+        let inputs = HostInputs::new(
+            BTreeMap::new(),
+            SecretStore::new(BTreeMap::from([(
+                secret.to_owned(),
+                b"ai-private".to_vec(),
+            )]))
+            .expect("secrets should be valid"),
+        )
+        .expect("inputs should be valid")
+        .with_network_policy(NetworkPolicy::loopback_for_tests().with_plaintext_bearer_for_tests());
+        let mut policy = AgentHostPolicy::default();
+        policy.ai_adapters.insert(
+            "reviewer".to_owned(),
+            AiAdapterConfig::HttpJson(HttpJsonAdapterConfig {
+                origin: ai_origin.clone(),
+                path: "/invoke".to_owned(),
+                model: "test".to_owned(),
+                secret: Some(secret.to_owned()),
+                max_input_bytes: 1024,
+                max_response_bytes: 1024,
+                timeout: Duration::from_millis(500),
+            }),
+        );
+        AgentHost::new(
+            inputs,
+            policy,
+            Arc::new(
+                ExplicitApprovalPolicy::new([(ApprovalOperation::AiInvoke, "reviewer".to_owned())])
+                    .expect("approval"),
+            ),
+        )
+        .expect("host")
+    };
+
+    // The adapter would carry a credential the manifest binds only to another
+    // origin. The host configuration cannot widen that binding, so setup
+    // refuses before the guest runs or any connection is opened.
+    let manifest = manifest(&format!(
+        "http = [\"{ai_origin}\", \"{github_origin}\"]\n\
+         ai = [\"reviewer\"]\n\
+         \n\
+         [secrets.github-token]\n\
+         origins = [\"{github_origin}\"]"
+    ));
+    let error = Runtime::default()
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &GrantSet::from_manifest(&manifest),
+            &host("github-token"),
+            request("prompt"),
+        )
+        .expect_err("an adapter must not widen a secret binding");
+    assert_eq!(error.code(), "K5006");
+    assert_eq!(
+        error.message(),
+        format!("secret `github-token` is not bound to origin `{ai_origin}`")
+    );
+    ai.set_nonblocking(true)
+        .expect("listener should become nonblocking");
+    assert!(matches!(
+        ai.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
 }
 
 #[test]

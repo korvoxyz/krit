@@ -708,3 +708,249 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
     assert_eq!(error.code(), "K5104");
     mock.join().expect("first HTTP mock should finish");
 }
+
+/// Builds a webhook that acquires `secret` and presents it to `origin`.
+fn bearer_webhook(secret: &str, origin: &str) -> BuiltComponent {
+    compile(
+        &format!(
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    match secret("{secret}") {{
+        Ok(token) => match http_request("{origin}", request, Some(token)) {{
+            Ok(response) => response,
+            Err(error) => record {{ status: 598, headers: [], body: error }},
+        }},
+        Err(error) => record {{ status: 500, headers: [], body: error }},
+    }}
+}}
+"#
+        ),
+        &["http.request", "secret.read"],
+    )
+}
+
+/// A host holding both reference secrets that approves bearer use at every
+/// given origin, so only the manifest binding can refuse a request.
+fn bearer_host(origins: &[&str]) -> AgentHost {
+    let inputs = HostInputs::new(
+        BTreeMap::new(),
+        SecretStore::new(BTreeMap::from([
+            ("github-token".to_owned(), b"github-private".to_vec()),
+            ("message-token".to_owned(), b"message-private".to_vec()),
+        ]))
+        .expect("secret store should be valid"),
+    )
+    .expect("inputs should be valid")
+    .with_network_policy(NetworkPolicy::loopback_for_tests().with_plaintext_bearer_for_tests());
+    AgentHost::new(
+        inputs,
+        AgentHostPolicy::default(),
+        Arc::new(
+            ExplicitApprovalPolicy::new(
+                origins
+                    .iter()
+                    .map(|origin| (ApprovalOperation::HttpBearer, (*origin).to_owned())),
+            )
+            .expect("approvals should be valid"),
+        ),
+    )
+    .expect("agent host should be valid")
+}
+
+/// The webhook-agent manifest shape with each secret bound to its own origin.
+fn bound_manifest(github_origin: &str, message_origin: &str) -> Manifest {
+    manifest(&format!(
+        "http = [\"{github_origin}\", \"{message_origin}\"]\n\
+         \n\
+         [secrets.github-token]\n\
+         origins = [\"{github_origin}\"]\n\
+         \n\
+         [secrets.message-token]\n\
+         origins = [\"{message_origin}\"]\n\
+         inject = \"bearer\""
+    ))
+}
+
+/// Accepts one request on `listener`, answers 202, and returns the raw bytes.
+fn accept_one(listener: TcpListener) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("origin should accept one request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout should configure");
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).expect("request should read");
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 9\r\nConnection: close\r\n\r\ndelivered",
+            )
+            .expect("response should write");
+        String::from_utf8(bytes).expect("request should be UTF-8")
+    })
+}
+
+fn listener_origin(listener: &TcpListener) -> String {
+    format!(
+        "http://127.0.0.1:{}",
+        listener.local_addr().expect("listener address").port()
+    )
+}
+
+/// Proves that nothing connected to `listener`: a refused request must not
+/// even open a connection, let alone send a credential.
+fn assert_never_contacted(listener: &TcpListener) {
+    listener
+        .set_nonblocking(true)
+        .expect("listener should become nonblocking");
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) => panic!("unexpected accept failure: {error}"),
+        Ok(_) => panic!("a refused bearer request reached the network"),
+    }
+}
+
+#[test]
+fn a_swapped_secret_is_refused_with_k5006_before_any_bytes_leave() {
+    // The swapped-token probe: the reference agent's GitHub credential sent to
+    // its messaging origin. Both origins and both secrets are granted and both
+    // bearer uses are approved; only the binding forbids the pairing.
+    let github = TcpListener::bind("127.0.0.1:0").expect("GitHub listener should bind");
+    let message = TcpListener::bind("127.0.0.1:0").expect("message listener should bind");
+    let github_origin = listener_origin(&github);
+    let message_origin = listener_origin(&message);
+    let artifact = bearer_webhook("github-token", &message_origin);
+    let bound = bound_manifest(&github_origin, &message_origin);
+    let host = bearer_host(&[&github_origin, &message_origin]);
+
+    let error = Runtime::default()
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &GrantSet::from_manifest(&bound),
+            &host,
+            request("summary"),
+        )
+        .expect_err("a secret sent to an unbound origin must be refused");
+    assert_eq!(error.code(), "K5006");
+    assert_eq!(error.kind(), krit_runtime::RuntimeErrorKind::Authorization);
+    assert_eq!(
+        error.message(),
+        format!("secret `github-token` is not bound to origin `{message_origin}`")
+    );
+    assert!(!error.message().contains("github-private"));
+    assert_never_contacted(&message);
+    assert_never_contacted(&github);
+
+    // A name in both forms is bound by its table, so the legacy list entry
+    // does not reopen the swapped pairing.
+    let both = manifest(&format!(
+        "http = [\"{github_origin}\", \"{message_origin}\"]\n\
+         secrets = [\"github-token\", \"message-token\"]\n\
+         \n\
+         [secrets.github-token]\n\
+         origins = [\"{github_origin}\"]"
+    ));
+    let error = Runtime::default()
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &GrantSet::from_manifest(&both),
+            &host,
+            request("summary"),
+        )
+        .expect_err("the table binding must win over the legacy list");
+    assert_eq!(error.code(), "K5006");
+    assert_never_contacted(&message);
+}
+
+#[test]
+fn bound_secrets_reach_their_origin_and_legacy_secrets_stay_unbound() {
+    let github = TcpListener::bind("127.0.0.1:0").expect("GitHub listener should bind");
+    let message = TcpListener::bind("127.0.0.1:0").expect("message listener should bind");
+    let github_origin = listener_origin(&github);
+    let message_origin = listener_origin(&message);
+    let host = bearer_host(&[&github_origin, &message_origin]);
+
+    // A correctly bound pairing is delivered with its own credential.
+    let bound = bound_manifest(&github_origin, &message_origin);
+    let correct = bearer_webhook("message-token", &message_origin);
+    let server = accept_one(message);
+    let result = Runtime::default()
+        .invoke_webhook_with_host(
+            &correct.bytes,
+            &correct.metadata,
+            &GrantSet::from_manifest(&bound),
+            &host,
+            request(""),
+        )
+        .expect("a bound secret must reach its own origin");
+    assert_eq!(result.response.status, 202);
+    assert_eq!(result.response.body, "delivered");
+    let captured = server.join().expect("message origin should finish");
+    let lowercase = captured.to_ascii_lowercase();
+    assert!(lowercase.contains("authorization: bearer message-private\r\n"));
+    assert!(!captured.contains("github-private"));
+
+    // The legacy flat list keeps 0.2 behavior: an unbound secret may reach any
+    // granted origin, including the one the probe targets.
+    let message = TcpListener::bind("127.0.0.1:0").expect("message listener should bind");
+    let message_origin = listener_origin(&message);
+    let legacy = manifest(&format!(
+        "http = [\"{github_origin}\", \"{message_origin}\"]\n\
+         secrets = [\"github-token\", \"message-token\"]"
+    ));
+    let swapped = bearer_webhook("github-token", &message_origin);
+    let host = bearer_host(&[&github_origin, &message_origin]);
+    let server = accept_one(message);
+    let result = Runtime::default()
+        .invoke_webhook_with_host(
+            &swapped.bytes,
+            &swapped.metadata,
+            &GrantSet::from_manifest(&legacy),
+            &host,
+            request(""),
+        )
+        .expect("an unbound legacy secret still reaches any granted origin");
+    assert_eq!(result.response.status, 202);
+    let captured = server.join().expect("message origin should finish");
+    assert!(
+        captured
+            .to_ascii_lowercase()
+            .contains("authorization: bearer github-private\r\n")
+    );
+    drop(github);
+
+    // The artifact-aware report shows the difference a reviewer must see.
+    let runtime = Runtime::default();
+    let report = runtime
+        .permissions(
+            &swapped.bytes,
+            &swapped.metadata,
+            &GrantSet::from_manifest(&legacy),
+        )
+        .expect("legacy permissions should evaluate")
+        .render_human();
+    assert!(report.contains("  github-token (bearer): UNBOUND (any granted origin)\n"));
+    let report = runtime
+        .permissions(
+            &swapped.bytes,
+            &swapped.metadata,
+            &GrantSet::from_manifest(&bound_manifest(&github_origin, &message_origin)),
+        )
+        .expect("bound permissions should evaluate");
+    assert!(
+        report
+            .render_human()
+            .contains(&format!("  github-token (bearer): {github_origin}\n"))
+    );
+    assert!(report.render_json().contains(&format!(
+        "\"secretBindings\":[{{\"secret\":\"github-token\",\"inject\":\"bearer\",\"binding\":\"bound\",\"origins\":[\"{github_origin}\"]}}"
+    )));
+}

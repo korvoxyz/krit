@@ -140,6 +140,16 @@ The third argument is directly `None` or `Some(secret_handle)`. The latter is
 the only ordinary source position allowed to wrap a `Secret`; the host injects
 `Authorization: Bearer <secret>` without placing secret bytes in guest memory.
 
+The host injects a secret only into an origin its manifest binding allows. A
+secret declared by a `[secrets.<name>]` table may reach only the origins that
+table lists; a secret named only by the legacy `[capabilities] secrets` list is
+unbound and may reach any granted origin (see `CAPABILITIES.md`). The secret
+handle carries its logical name, and `http_request` checks the pairing
+immediately after the origin grant, before the call limit, approval, DNS
+resolution, or any request byte. A misdirected pairing, such as a GitHub token
+sent to a messaging origin, traps the invocation with `K5006`; it is not a
+guest-visible `Err`, and nothing is sent.
+
 Each host call requires a direct valid resource literal and contributes both a
 coarse effect and an exact requirement pair:
 
@@ -197,6 +207,8 @@ before a source webhook item.
 
 `krit check` and `krit explain` implement these contracts without a manifest.
 Package build planning rejects missing exact manifest resources with `K5001`.
+It does not yet relate secrets to origins; secret bindings are enforced by the
+host at invocation time with `K5006`.
 Direct `krit run` rejects webhook/config/secret/HTTP hosts with `K5003`;
 runtime access is only through a validated component.
 
@@ -216,9 +228,12 @@ tests.
 Host configuration is explicit immutable JSON. Schema 1 contains string
 config and relative secret-file references; schema 2 compatibly adds the
 bounded AI/reliability/approval policy defined in `AI-OBSERVABILITY.md`.
-Unknown fields and ungranted names fail closed. Unix secret files must grant
-no group/other permissions. Secret bytes stay in a host-owned zeroizing store
-and only a Wasmtime resource handle enters the guest.
+Unknown fields and ungranted names fail closed. A host-injected credential (an
+AI adapter or search connector `secret`) that the manifest binds must list that
+adapter's or connector's origin, so host configuration cannot widen a binding
+(`K5006`). Unix secret files must grant no group/other permissions. Secret
+bytes stay in a host-owned zeroizing store and only a Wasmtime resource handle
+enters the guest.
 
 Outbound HTTP verifies the exact origin on every call, disables redirects,
 pins the one request's DNS result, rejects non-public IPv4/IPv6 ranges

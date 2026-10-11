@@ -100,6 +100,7 @@ Initial required codes:
 | `K5001` | Required capability not granted |
 | `K5002` | Artifact import/world does not match the authorized host interface |
 | `K5003` | Required host contract is unavailable in direct source execution |
+| `K5006` | Secret would be injected into an origin its manifest binding does not list |
 | `K5101` | Wasm fuel budget exhausted |
 | `K5102` | Wasm wall-clock deadline exceeded |
 | `K5103` | Wasm memory, table, instance, stack, or host resource limit exceeded |
@@ -142,7 +143,7 @@ Initial required codes:
 | `1` | Source, compile, runtime, test, or conformance failure |
 | `2` | Invalid CLI usage |
 | `3` | Package resolution, lockfile, registry, or build-plan failure |
-| `4` | Capability, unavailable-host, or import authorization denial (`K5001`, `K5002`, or `K5003`); artifact-aware permission reports are still printed |
+| `4` | Capability, unavailable-host, import, or secret-binding authorization denial (`K5001`, `K5002`, `K5003`, or `K5006`); artifact-aware permission reports are still printed |
 | `101` | Internal compiler error |
 
 An internal compiler error is always a Krit bug. It must include a stable crash

@@ -88,10 +88,22 @@ http = [
   "https://ai.example",
   "https://message.example",
 ]
-secrets = ["github-token", "ai-token", "message-token"]
 ai = ["reviewer"]
 logs = true
+
+[secrets.ai-token]
+origins = ["https://ai.example"]
+
+[secrets.github-token]
+origins = ["https://api.github.example"]
+
+[secrets.message-token]
+origins = ["https://message.example"]
 ```
+
+Each `[secrets.<name>]` table binds its secret to the origins that may receive
+it; the legacy flat `secrets` list grants unbound secrets. See
+`CAPABILITIES.md`.
 
 `ai` is a sorted-unique set of canonical adapter names. `logs` is a boolean.
 The manifest requests authority but cannot configure adapters, approve an
@@ -184,8 +196,9 @@ hosts to strict schema 2 with an exact `http.bearer` approval:
 Every object denies unknown fields. Maps are bounded and their keys must be
 manifest-granted exact origins or adapter names. An adapter name must be
 manifest-granted and artifact-required before use. Its exact origin and
-optional secret must also be manifest-granted. Host configuration cannot add
-a grant.
+optional secret must also be manifest-granted, and a bound secret must list the
+adapter origin; otherwise loading fails with `K5006`. Host configuration cannot
+add a grant or widen a binding.
 
 Configuration, secret, adapter, approval, retry, and rate collections are each
 bounded to at most 256 entries, in addition to the selected host-config byte
