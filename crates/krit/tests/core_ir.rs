@@ -66,6 +66,27 @@ fn stable_core_rendering_matches_golden_cases() {
 }
 
 #[test]
+fn entry_lists_and_unit_lower_to_the_core_of_their_spelled_out_forms() {
+    // `["k": v]` is `[record { name: k, value: v }]`: the same operations in
+    // the same order (each key, then its value, then the entry's record).
+    let entries = lower_source(
+        "entries.krit",
+        "fn key(name: String) -> String { name }\nlet k = \"a\";\nlet fields = [key(k): \"1\", \"b\": key(k)];\nprintln(fields);\n",
+    );
+    let records = lower_source(
+        "records.krit",
+        "fn key(name: String) -> String { name }\nlet k = \"a\";\nlet fields = [record { name: key(k), value: \"1\" }, record { name: \"b\", value: key(k) }];\nprintln(fields);\n",
+    );
+    assert_eq!(entries, records);
+
+    let unit = lower_source("unit.krit", "let done: Result<Unit, String> = Ok(());\n");
+    assert!(
+        unit.contains("    v1: Unit = unit\n    v2: Result<Unit, String> = call v0(v1)\n"),
+        "{unit}"
+    );
+}
+
+#[test]
 fn lowering_is_deterministic_and_resolves_names_to_ids() {
     let source = Source::new(
         "deterministic.krit",
@@ -452,10 +473,16 @@ fn assert_expression_names_resolved(expression: &Expression, analysis: &Analysis
         );
     }
     match &expression.kind {
-        ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+        ExpressionKind::Literal(_) | ExpressionKind::Unit | ExpressionKind::Variable(_) => {}
         ExpressionKind::List(elements) => {
             for element in elements {
                 assert_expression_names_resolved(element, analysis);
+            }
+        }
+        ExpressionKind::EntryList(entries) => {
+            for entry in entries {
+                assert_expression_names_resolved(&entry.key, analysis);
+                assert_expression_names_resolved(&entry.value, analysis);
             }
         }
         ExpressionKind::Record(fields) => {

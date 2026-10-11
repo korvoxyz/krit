@@ -1,0 +1,41 @@
+/// Accepts every path but `/`.
+fn validate(path: String) -> Result<Unit, String> {
+    if path == "/" {
+        Err("root path")
+    } else {
+        Ok(())
+    }
+}
+
+/// Fetches the issue and echoes the request in headers and logs.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let fetch = HttpRequest {
+        method: "GET",
+        path: "/x",
+        headers: ["accept": "text/plain", "x-path": request.path],
+    };
+    match validate(request.path) {
+        Ok(valid) => match http_request("https://api.example.com", fetch, None) {
+            Ok(response) => {
+                let logged = log_info(
+                    "fetch.done",
+                    ["status": "ok", "body": response.body],
+                );
+                HttpResponse {
+                    status: 200,
+                    headers: ["x-method": request.method],
+                    body: request.path,
+                }
+            },
+            Err(error) => {
+                let logged = log_error("fetch.failed", ["error": error]);
+                HttpResponse { status: 502, body: error }
+            },
+        },
+        Err(reason) => HttpResponse {
+            status: 400,
+            headers: ["x-reason": reason],
+            body: reason,
+        },
+    }
+}

@@ -11,8 +11,8 @@ use crate::{
     Builtin, Diagnostic, Span,
     ast::{
         BinaryOperator, Block, ConstructField, ContractRecord, Expression, ExpressionKind,
-        MatchKind, Parameter, Program, Statement, StatementKind, TypeAnnotation, TypeKind,
-        UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+        ListEntry, MatchKind, Parameter, Program, Statement, StatementKind, TypeAnnotation,
+        TypeKind, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
     },
     habits::{MethodReceiver, closest_name, method_hint, undefined_name_note},
     limits::{MAX_NESTING_DEPTH, MAX_TREE_DEPTH, tree_depth_error},
@@ -1151,12 +1151,14 @@ impl Analyzer {
                 parameters,
                 return_type,
                 body,
+                ..
             }
             | StatementKind::Webhook {
                 name,
                 parameters,
                 return_type,
                 body,
+                ..
             }
             | StatementKind::QueueConsumer {
                 name,
@@ -1352,7 +1354,12 @@ impl Analyzer {
                     effects: InferEffects::default(),
                 })
             }
+            ExpressionKind::Unit => Ok(ExpressionInfo {
+                ty: InferType::Unit,
+                effects: InferEffects::default(),
+            }),
             ExpressionKind::List(elements) => self.list(elements),
+            ExpressionKind::EntryList(entries) => self.entry_list(entries),
             ExpressionKind::Record(fields) => {
                 let mut types = BTreeMap::new();
                 let mut effects = InferEffects::default();
@@ -1587,6 +1594,38 @@ impl Analyzer {
         }
         Ok(ExpressionInfo {
             ty: InferType::List(Box::new(element_type)),
+            effects,
+        })
+    }
+
+    /// Analyzes an entry list `["k": v, ...]`.
+    ///
+    /// Every key and value must be a `String`; they are analyzed in source
+    /// order (`k1`, `v1`, `k2`, ...). The list has exactly the type of
+    /// `[record { name: k, value: v }, ...]` with `String` fields, the closed
+    /// structural record that `HttpHeader` and `LogField` name.
+    fn entry_list(&mut self, entries: &[ListEntry]) -> Result<ExpressionInfo, Diagnostic> {
+        let mut effects = InferEffects::default();
+        for entry in entries {
+            for (part, context) in [(&entry.key, "entry key"), (&entry.value, "entry value")] {
+                let info = self.expression(part)?;
+                self.constraints.push(TypeConstraint {
+                    ty: info.ty.clone(),
+                    span: part.span,
+                    kind: ConstraintKind::StructuralValue,
+                });
+                self.unify(InferType::String, info.ty, part.span, context)?;
+                effects.union(info.effects);
+            }
+        }
+        Ok(ExpressionInfo {
+            ty: InferType::List(Box::new(InferType::Record {
+                fields: BTreeMap::from([
+                    ("name".to_owned(), InferType::String),
+                    ("value".to_owned(), InferType::String),
+                ]),
+                open: false,
+            })),
             effects,
         })
     }

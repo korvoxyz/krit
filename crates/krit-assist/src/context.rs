@@ -855,7 +855,7 @@ fn ast_sensitive_literal_spans(
                             targets.add_span(span);
                         }
                     }
-                    ExpressionKind::Literal(_) => {}
+                    ExpressionKind::Literal(_) | ExpressionKind::Unit => {}
                     ExpressionKind::Variable(name) => {
                         if let Some(bound) = resolve(scopes, name) {
                             targets.merge(bound);
@@ -864,6 +864,12 @@ fn ast_sensitive_literal_spans(
                     ExpressionKind::List(elements) => {
                         for element in elements {
                             collect(source, element, scopes, visited, targets);
+                        }
+                    }
+                    ExpressionKind::EntryList(entries) => {
+                        for entry in entries {
+                            collect(source, &entry.key, scopes, visited, targets);
+                            collect(source, &entry.value, scopes, visited, targets);
                         }
                     }
                     ExpressionKind::Record(fields) => {
@@ -987,9 +993,16 @@ fn ast_sensitive_literal_spans(
                     continue;
                 }
                 ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+                ExpressionKind::Unit => {}
                 ExpressionKind::List(elements) => {
                     for element in elements {
                         expression_spans(source, element, scopes, spans);
+                    }
+                }
+                ExpressionKind::EntryList(entries) => {
+                    for entry in entries {
+                        expression_spans(source, &entry.key, scopes, spans);
+                        expression_spans(source, &entry.value, scopes, spans);
                     }
                 }
                 ExpressionKind::Record(fields) => {
@@ -2761,6 +2774,32 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
                     .any(|(content, category)| content == "private-payload"
                         && *category == "cache-value"),
                 "{path}: a constructed payload leaked: {spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_list_values_inside_a_sensitive_argument_are_redacted() {
+        let source = r#"
+/// Caches the private payload.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let payload = json_encode(["kind": "private-payload"]);
+    match cache_put("lookups", "k", payload, 60) {
+        Ok(stored) => HttpResponse { status: 200, body: "ok" },
+        Err(problem) => HttpResponse { status: 500, body: problem },
+    }
+}
+"#;
+        for (path, spans) in [
+            ("parsed", redacted(source)),
+            ("tolerant", redacted_tolerant(source)),
+        ] {
+            assert!(
+                spans
+                    .iter()
+                    .any(|(content, category)| content == "private-payload"
+                        && *category == "cache-value"),
+                "{path}: an entry-list payload leaked: {spans:?}"
             );
         }
     }

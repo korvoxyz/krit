@@ -118,12 +118,15 @@ network service, or nondeterministic value.
 | `core/string-ordering` | byte-lexicographic UTF-8 string ordering and string equality |
 | `core/chains` | `else if` chains and left-associative operator chains, including short-circuiting |
 | `core/else-if-chain` | a 300-branch `else if` chain adds no nesting levels |
+| `core/unit` | the unit value `()`: printing, equality, `Ok(())`, and `Unit` results |
 | `scope/closures` | immutable lexical capture and shadowing |
 | `scope/builtin-shadowing` | match binders shadow unreserved built-in names, as in checking |
 | `scope/discard` | repeated `_` bindings in one scope; reading `_` evaluates the most recent one and warns (`K2003`) |
 | `functions/recursion` | recursive declaration and calls |
 | `functions/deep-recursion` | 9,000 nested calls stay within the call-depth limit |
+| `functions/doc-comments` | doc comments, banners, and `///` lines that document nothing change no behavior |
 | `lists/match` | list construction and exhaustive decomposition |
+| `lists/entry-lists` | entry lists: keys and values evaluated in source order, equality with the spelled-out records, header and log-field lists, trailing commas, and JSON encoding |
 | `records/fields` | ordered record rendering and field access |
 | `records/named-construction` | named construction of the four contract records: punning, spec-fixed defaults, contract field order, source-order evaluation, and equality with the full `record { ... }` |
 | `variants/option-match` | exhaustive Option matching |
@@ -141,6 +144,8 @@ network service, or nondeterministic value.
 | `check/syntax/missing-semicolon` | missing required syntax |
 | `check/syntax/habit-word-line-break` | a bound habit word ending a line before a missing `;` stays an ordinary name (`K1002`) |
 | `check/syntax/construction-in-condition` | a named construction written directly as an `if` condition is `K1001` with a note to add parentheses |
+| `check/syntax/entry-list-mixed-*`, `check/syntax/empty-entry-list` | a list literal that mixes `key: value` entries with plain elements, and `[:]`, are `K1001` with one note |
+| `check/syntax/unit-type` | `()` written as a type is `K1002` with a note to write `Unit` |
 | `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
 | `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, and an unbound `_` is undefined |
 | `check/name/did-you-mean`, `check/name/null` | undefined names (`K2001`) that carry a did-you-mean or `None` note |
@@ -149,12 +154,15 @@ network service, or nondeterministic value.
 | `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings and a method call on a string (`K3011`) |
 | `check/type/construction-*` | named construction with an unknown, repeated, or missing required field (`K3016`, one note) or a value of the wrong type (`K3001`) |
 | `check/valid/named-construction` | named constructions flow wherever contract records do: helper results, list annotations, parenthesized conditions, and equality with records |
+| `check/type/entry-list-*` | entry-list keys and values must be `String`, and an entry list is not a list of another element type (`K3001`) |
+| `check/valid/entry-lists-unit-docs` | entry lists flow into `List<HttpHeader>` and `List<LogField>`, constructions, and equality with records; the unit value; documented helpers |
+| `check/valid/doc-comments` | doc comments attach to declarations and entrypoints; banners, runs interrupted by an ordinary comment, and dangling `///` lines are ordinary comments |
 | `check/match/*` | unique, exhaustive, single-family Option and Result arms (`K1003`) |
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
 | `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, types that grow after they are bound, and types that grow when two solved types unify |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
-| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook built from named constructions builds |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook built from named constructions builds; a webhook writing headers and log fields as entry lists and returning `Ok(())` from a helper builds |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |
@@ -168,6 +176,9 @@ network service, or nondeterministic value.
 | `format/edition-2026` | canonical layout for all currently implemented syntax families |
 | `format/webhook` | canonical typed webhook and ordered duplicate-header layout |
 | `format/named-construction` | canonical named construction: one line when it fits, one field per line otherwise, and punning exactly when a value is the field's own name |
+| `format/entry-lists` | canonical entry lists: one line when they fit, one entry per line with a trailing comma otherwise |
+| `format/unit-literal` | the unit value is written `()` |
+| `format/doc-comments` | attached doc comments get exactly one space after `///`; banners, end-of-line and dangling `///` comments keep their text |
 
 ## Adding a case
 

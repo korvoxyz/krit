@@ -25,7 +25,9 @@ A source file is UTF-8 and conventionally ends in `.krit`.
 - Keywords and identifiers are case-sensitive.
 - Version 0.2 identifiers use ASCII letters, digits, and `_`.
 - An identifier starts with a letter or `_`.
-- `//` begins a comment ending at the next line break.
+- `//` begins a comment ending at the next line break. A comment that begins
+  with exactly three slashes, `///`, is a doc-comment line (section 2.1);
+  four or more slashes begin an ordinary comment.
 - Whitespace has no semantic meaning except token separation.
 - Tabs are permitted in input; the canonical formatter emits spaces.
 - Source positions are one-based Unicode scalar-value line and column numbers.
@@ -44,6 +46,38 @@ Err None Ok Some ai_invoke checkpoint_get checkpoint_put config_string db_begin_
 
 A binding cannot use a keyword or reserved built-in name.
 
+## 2.1 Doc comments
+
+The **doc comment** of an item is the run of `///` lines directly before it.
+Items are function declarations, nested ones included, and `webhook`,
+`queue`, and `schedule` entrypoint declarations.
+
+```krit
+/// Labels one issue.
+///
+/// Fails when the model's answer is not a known label.
+fn label(issue: String) -> Result<String, String> {
+    // ...
+}
+```
+
+- Reading upward from the item's first token, the run takes every `///` line
+  and skips blank lines; it ends at the first other line. Blank lines are
+  whitespace, so they neither split a doc comment nor separate it from its
+  item. Any other comment, including a `////` banner, ends the run, so `///`
+  lines above it document nothing.
+- A line's text is what follows its `///`, without one leading space and
+  without trailing whitespace. The doc comment's text is its lines' texts
+  joined by line feeds, so a `///` line with no text adds an empty line.
+- A `///` comment written after code on the same line, or one that no item
+  follows (before a `let`, an expression statement, a `}`, or the end of the
+  file), is an ordinary comment. It is never an error.
+
+Doc comments do not affect checking, evaluation, or building. The formatter
+preserves them (section 16), `krit explain` reports the doc comment of every
+top-level function and entrypoint, and the language server shows a function's
+doc comment when hovering over its declaration or a use of it.
+
 ## 3. Lexical grammar
 
 The grammar uses EBNF. `*` means zero or more, `?` means optional, and quoted
@@ -54,7 +88,11 @@ identifier  = (letter | "_"), (letter | digit | "_")* ;
 integer     = digit, (digit | "_")* ;
 string      = '"', string-character*, '"' ;
 comment     = "//", non-line-break* ;
+doc-comment = "///", (non-slash-non-line-break, non-line-break*)? ;
 ```
+
+A `doc-comment` is a `comment` too: both are trivia, which the syntactic grammar
+does not mention.
 
 Integer separators cannot be leading, trailing, or repeated. Integers are
 signed through unary `-`; the sign is not part of the token.
@@ -127,9 +165,12 @@ primary         = integer
                 | if-expression
                 | match-expression
                 | function-expression
+                | "(", ")"
                 | "(", expression, ")" ;
 
-list            = "[", arguments?, "]" ;
+list            = "[", (arguments | entries)?, "]" ;
+entries         = entry, (",", entry)*, ","? ;
+entry           = expression, ":", expression ;
 record          = "record", "{", record-fields?, "}" ;
 record-fields   = record-field, (",", record-field)*, ","? ;
 record-field    = identifier, ":", expression ;
@@ -175,6 +216,14 @@ record-type-field
                 = identifier, ":", type ;
 ```
 
+`()` is the unit value (section 5). A list whose first element is an
+`entry` is an entry list (section 11); every element after it must be an
+entry too, and a list whose first element is a plain expression cannot
+contain one. Mixing the two forms is `K1001` at the first element written the
+other way, with a note. `[]` is the empty list, entry lists included, and
+`[:]` is `K1001`. In a type the unit type is spelled `Unit`: `-> ()` is
+`K1002`, with a note.
+
 A `contract-name` is an ordinary identifier, not a keyword; only these four
 names followed by `{` start a `construction` (section 8.2), and any other
 identifier followed by `{` keeps its meaning. In the condition of an `if` or
@@ -212,8 +261,8 @@ operation; the name does not create an ambient network listener.
 A source file may nest syntax at most **256 levels** deep. Each of the
 following opens one level for what it contains:
 
-- a parenthesized expression, a block, a list literal, a record literal, and
-  a named construction
+- a parenthesized expression, a block, a list literal (an entry list
+  included), a record literal, and a named construction
 - the argument list of a call, and each call or field-access link of a
   postfix chain (`a.b(c).d` opens three levels for what follows `a`)
 - the operand of a unary operator
@@ -348,8 +397,10 @@ Items execute in source order.
 - An empty block or a block ending in a statement produces unit.
 - A file's value is not printed automatically.
 
-The unit value is written by the REPL as `()`. There is no unit literal in
-edition 2026; unit is produced by statements and empty blocks.
+The unit value is written `()`, in source and when printed. Statements and
+empty blocks produce it too. `()` evaluates to unit with no effect and is
+valid wherever a value is (`Ok(())`, `if ready { () } else { log() }`). It is
+a value, not a type: the unit type is spelled `Unit`.
 
 ## 6. Values
 
@@ -613,6 +664,26 @@ List literal:
 ```krit
 [1, 2, 3]
 ```
+
+An **entry list** writes a list of name/value records, such as HTTP headers
+and log fields:
+
+```krit
+["accept": "application/json", "x-request-id": id]
+```
+
+`["k1": v1, "k2": v2]` means
+`[record { name: k1, value: v1 }, record { name: k2, value: v2 }]`. Keys and
+values are arbitrary expressions of type `String` (`K3001` at the key or
+value otherwise, `TYPES-AND-EFFECTS.md`) and evaluate from left to right in
+source order: `k1`, `v1`, `k2`, `v2`. Each record lists `name` and then
+`value`. The list's type is `List<Record { name: String, value: String }>`,
+the closed structural record that `HttpHeader` and `LogField` name (sections
+8.1 and 13.1), so an entry list is a header list for `HttpRequest` and
+`HttpResponse` and a field list for `log_info` and `log_error`, and it is
+equal to the spelled-out list. A trailing comma is allowed. An entry list has
+at least one entry; `[]` is the empty list of every element type. One literal
+cannot mix entries with plain elements (section 4).
 
 The only list decomposition construct in edition 2026 is exhaustive matching:
 
@@ -952,6 +1023,19 @@ grammar-permitted trailing commas, not expression order or program semantics.
   `body: (body)`. A field keeps its `name: name` spelling when a comment
   stands between the name and the value, so no comment moves. Record literals
   are never punned.
+- An entry list is laid out like a list: on one line when it fits
+  (`["x-a": a, "x-b": b]`), otherwise one entry per line with a trailing
+  comma. Each entry is written `key: value`, with no space before the `:` and
+  one after it.
+- The unit value is written `()`, with nothing between its parentheses.
+- Each line of a doc comment (section 2.1) is written with exactly one space
+  between its `///` and its text, or as `///` alone when the line has no
+  text; the text after that one space, further indentation and trailing
+  whitespace included, is kept as written (`///Adds.` becomes `/// Adds.`,
+  `///   code` keeps its indentation). A `///` comment that documents
+  nothing keeps its exact text, as every other comment does. As before any
+  comment, blank lines between a doc comment and its item are removed, which
+  never changes the doc comment.
 - Top-level declarations are separated from executable expression statements
   by one blank line.
 - Integer separators are removed. Strings use direct printable Unicode plus
@@ -962,7 +1046,9 @@ grammar-permitted trailing commas, not expression order or program semantics.
 - Every `//` comment and its text is retained in source order. Standalone
   comments remain standalone, and end-of-line comments remain after code so
   they cannot comment out a following token. Whitespace inside comment text is
-  not rewritten.
+  not rewritten, apart from the one space after a doc comment's `///` (above).
+  Formatting therefore never attaches a doc comment to an item or detaches
+  one from it.
 
 The formatter uses a soft 100-column target. It wraps delimiter-based
 collections and signatures deterministically; an indivisible string, comment,

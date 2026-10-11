@@ -128,7 +128,7 @@ Initial required codes:
 | `K0001` | Invalid source character or token |
 | `K0002` | Unterminated string |
 | `K0003` | Invalid string escape |
-| `K1001` | Unexpected token, including a `?` that is not a conditional operator (`K1110`) and a named construction written directly as an `if` condition or `match` subject |
+| `K1001` | Unexpected token, including a `?` that is not a conditional operator (`K1110`), a named construction written directly as an `if` condition or `match` subject, a list literal that mixes `key: value` entries with plain elements, and `[:]` |
 | `K1002` | Expected token not found |
 | `K1003` | Invalid match pattern |
 | `K1004` | Webhook declaration is nested or otherwise misplaced |
@@ -245,6 +245,14 @@ may improve, but which diagnostics carry one is part of each code's contract:
   available yet.
 - `K1001` for a named construction written directly as an `if` condition or
   a `match` subject carries one note: wrap the construction in parentheses.
+- `K1001` for a list literal that mixes `key: value` entries with plain
+  elements carries one note: write every element as an entry, or none. It is
+  reported at the first element written in the other form than the list's
+  first element (an entry's key and `:`, or a plain element).
+- `K1001` for `[:]` carries one note: the empty list is `[]`, for entry lists
+  too.
+- `K1002` for `()` written as a type (`fn f() -> () { ... }`) carries one
+  note: the unit type is spelled `Unit`, and `()` is the unit value.
 - `K3016` always carries exactly one note. For an unknown field it lists the
   contract's fields, preceded by `did you mean `name`?` when one of them is
   close by the rule for undefined names below; for a repeated field it lists

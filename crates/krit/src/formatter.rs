@@ -81,9 +81,10 @@ struct Formatter {
 }
 
 impl Formatter {
-    fn new(tokens: Vec<Token>, comments: Vec<Comment>, program: &Program) -> Self {
+    fn new(tokens: Vec<Token>, mut comments: Vec<Comment>, program: &Program) -> Self {
         let token_text = tokens.iter().map(canonical_token_text).collect::<Vec<_>>();
         let syntax = SyntaxMap::new(program, &tokens);
+        canonicalize_doc_comments(&mut comments, &syntax.doc_spans);
         let omitted = punned_tokens(&tokens, &comments, &syntax.pun_values);
         let (groups, close_to_open) = build_groups(
             &tokens,
@@ -395,6 +396,7 @@ impl Writer {
 }
 
 struct SyntaxMap {
+    doc_spans: Vec<Span>,
     block_spans: HashSet<(usize, usize)>,
     call_group_spans: HashSet<(usize, usize)>,
     type_tokens: Vec<bool>,
@@ -488,12 +490,45 @@ impl SyntaxMap {
         }
 
         Self {
+            doc_spans: collector.doc_spans,
             block_spans: collector.block_spans,
             call_group_spans,
             type_tokens,
             generic_commas,
             breaks_after,
             pun_values: collector.pun_values,
+        }
+    }
+}
+
+/// Writes every line of an attached doc comment with exactly one space
+/// between its `///` and its text (none when the text is empty), leaving the
+/// text itself as written. Other comments, including `///` lines that no item
+/// follows, keep their exact text.
+///
+/// Comments are in source order and doc comments never overlap, so one sweep
+/// over both finds the doc comment, if any, that holds each comment.
+fn canonicalize_doc_comments(comments: &mut [Comment], doc_spans: &[Span]) {
+    let mut doc_spans = doc_spans.to_vec();
+    doc_spans.sort_unstable_by_key(|span| span.start);
+    let mut docs = doc_spans.iter().peekable();
+    for comment in comments {
+        while docs
+            .next_if(|span| span.end <= comment.span.start)
+            .is_some()
+        {}
+        let attached = docs
+            .peek()
+            .is_some_and(|span| comment.span.start >= span.start && comment.span.start < span.end);
+        if !attached {
+            continue;
+        }
+        if let Some(text) = parser::doc_line_text(&comment.text) {
+            comment.text = if text.is_empty() {
+                "///".to_owned()
+            } else {
+                format!("/// {text}")
+            };
         }
     }
 }
@@ -531,6 +566,8 @@ fn punned_tokens(tokens: &[Token], comments: &[Comment], candidates: &[PunCandid
 
 #[derive(Default)]
 struct SyntaxCollector {
+    /// The spans of the doc comments attached to items.
+    doc_spans: Vec<Span>,
     block_spans: HashSet<(usize, usize)>,
     call_spans: Vec<Span>,
     type_spans: Vec<Span>,
@@ -559,7 +596,7 @@ impl SyntaxCollector {
             .collect::<Vec<_>>();
         while let Some(node) = pending.pop() {
             match node {
-                SyntaxNode::Statement(statement) => Self::statement(statement, &mut pending),
+                SyntaxNode::Statement(statement) => self.statement(statement, &mut pending),
                 SyntaxNode::Block(block) => self.block(block, &mut pending),
                 SyntaxNode::Expression(expression) => self.expression(expression, &mut pending),
                 SyntaxNode::Annotation(annotation) => self.annotation(annotation, &mut pending),
@@ -567,7 +604,7 @@ impl SyntaxCollector {
         }
     }
 
-    fn statement<'a>(statement: &'a Statement, pending: &mut Vec<SyntaxNode<'a>>) {
+    fn statement<'a>(&mut self, statement: &'a Statement, pending: &mut Vec<SyntaxNode<'a>>) {
         match &statement.kind {
             StatementKind::Let {
                 annotation, value, ..
@@ -581,26 +618,33 @@ impl SyntaxCollector {
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             }
             | StatementKind::Webhook {
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             }
             | StatementKind::QueueConsumer {
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             }
             | StatementKind::ScheduleHandler {
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             } => {
+                if let Some(doc) = doc {
+                    self.doc_spans.push(doc.span);
+                }
                 for parameter in parameters {
                     if let Some(annotation) = &parameter.annotation {
                         pending.push(SyntaxNode::Annotation(annotation));
@@ -630,9 +674,15 @@ impl SyntaxCollector {
 
     fn expression<'a>(&mut self, expression: &'a Expression, pending: &mut Vec<SyntaxNode<'a>>) {
         match &expression.kind {
-            ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+            ExpressionKind::Literal(_) | ExpressionKind::Unit | ExpressionKind::Variable(_) => {}
             ExpressionKind::List(elements) => {
                 pending.extend(elements.iter().map(SyntaxNode::Expression));
+            }
+            ExpressionKind::EntryList(entries) => {
+                for entry in entries {
+                    pending.push(SyntaxNode::Expression(&entry.key));
+                    pending.push(SyntaxNode::Expression(&entry.value));
+                }
             }
             ExpressionKind::Record(fields) => {
                 pending.extend(
@@ -1391,6 +1441,65 @@ mod tests {
             "let r = HttpResponse {\n    status: // why\n    status,\n};\n"
         );
         assert_eq!(format(&commented), commented);
+    }
+
+    #[test]
+    fn lays_out_entry_lists_like_lists() {
+        assert_eq!(
+            format("let f=[\"x-a\" : a,\"x-b\":b,];\n"),
+            "let f = [\"x-a\": a, \"x-b\": b];\n"
+        );
+        let long = format(
+            "let f = [\"x-request-identifier\": \"0123456789abcdef\", \"x-forwarded-for\": \"203.0.113.7\", \"accept\": \"json\"];\n",
+        );
+        assert_eq!(
+            long,
+            "let f = [\n    \"x-request-identifier\": \"0123456789abcdef\",\n    \"x-forwarded-for\": \"203.0.113.7\",\n    \"accept\": \"json\",\n];\n"
+        );
+        assert_eq!(format(&long), long);
+        // A comment inside keeps the list multiline, one entry per line.
+        let commented = format("let f = [\"a\": a, // first\n\"b\": b];\n");
+        assert_eq!(
+            commented,
+            "let f = [\n    \"a\": a, // first\n    \"b\": b,\n];\n"
+        );
+        assert_eq!(format(&commented), commented);
+    }
+
+    #[test]
+    fn writes_the_unit_value_compactly() {
+        assert_eq!(
+            format("let u = ( );\nprintln(Ok(( )), [(),( )]);\n"),
+            "let u = ();\n\nprintln(Ok(()), [(), ()]);\n"
+        );
+    }
+
+    #[test]
+    fn normalizes_only_the_space_after_attached_doc_comment_slashes() {
+        let source = "///Adds.\n///\n/// \n///   kept indentation\nfn add() -> Int { 1 }\n\n\
+                      ////banner\n///dangling before a let\nlet x = 1; ///inline\n///at the end\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "/// Adds.\n///\n///\n///   kept indentation\nfn add() -> Int {\n    1\n}\n\n\
+             ////banner\n///dangling before a let\nlet x = 1; ///inline\n///at the end\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+
+        // Formatting keeps every doc comment attached to its item.
+        let program = |text: &str| {
+            crate::parse_source(&Source::new("doc.krit", text)).expect("source should parse")
+        };
+        let before = program(source);
+        let after = program(&formatted);
+        assert_eq!(
+            before.statements[0].doc().map(|doc| doc.text.clone()),
+            after.statements[0].doc().map(|doc| doc.text.clone())
+        );
+        assert_eq!(
+            after.statements[0].doc().map(|doc| doc.text.as_str()),
+            Some("Adds.\n\n\n  kept indentation")
+        );
     }
 
     #[test]

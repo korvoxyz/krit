@@ -58,6 +58,20 @@ requirements are the union of its written values'. Core lowering emits the
 same record operation the full `record { ... }` would, with one pure literal
 operation per omitted field at the type name's span.
 
+The unit value `()` has type `Unit` and no effect. An entry list
+`["k": v, ...]` (`LANGUAGE.md` section 11) has type
+`List<Record { name: String, value: String }>`, the type
+`[record { name: k, value: v }, ...]` has once its fields are `String`, so it
+unifies with `List<HttpHeader>` and `List<LogField>`. The checker analyzes
+each key and then its value in source order and unifies each with `String`,
+reporting a mismatch as `K3001` at that key or value (`entry key type
+mismatch`, `entry value type mismatch`). The entry list's effects and literal
+requirements are the union of its keys' and values'. Core lowering emits the
+operations of the spelled-out list: each key and then its value, one record
+operation per entry at the entry's span (from the key to the value), and the
+list operation. Doc comments (`LANGUAGE.md` section 2.1) take no part in
+checking.
+
 There are no implicit numeric, string, boolean, or collection conversions.
 Union types, subtyping, null, exceptions, and user-defined mutable objects are
 out of scope for the first static checker.
@@ -180,11 +194,15 @@ WebAssembly target check described in `WASM-SANDBOX.md`, which reports every
 `K7001` residual type and `K7002` unsupported construct that `krit build`
 would, after eliminating functions the selected entrypoint cannot reach.
 `krit explain FILE` renders module-init effects, top-level binding types,
-stable Core facts, and a compact webhook contract when present.
+stable Core facts, and a compact webhook contract when present; each
+top-level function or entrypoint binding with a doc comment (`LANGUAGE.md`
+section 2.1) is followed by its doc comment's lines, each written `/// text`.
 `krit explain --json FILE` keeps schema 1 compatibility and adds a versioned
 entrypoint-contract fact containing source name, kind, normalized signature,
 sorted effects, sorted capability requirements, and exact draft-2020-12
-request/response JSON Schemas.
+request/response JSON Schemas. A binding or entrypoint fact whose declaration
+has a doc comment carries its text in an optional `doc` string field; the
+field is absent otherwise.
 
 ## Effects versus capabilities
 

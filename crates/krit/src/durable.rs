@@ -156,7 +156,7 @@ fn collect_expression<'a>(
     facts: &mut Vec<DurableOperationFact>,
 ) {
     match &expression.kind {
-        ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+        ExpressionKind::Literal(_) | ExpressionKind::Unit | ExpressionKind::Variable(_) => {}
         ExpressionKind::List(elements) => {
             pending.extend(elements.iter().map(Pending::Expression));
         }
@@ -165,6 +165,12 @@ fn collect_expression<'a>(
         }
         ExpressionKind::Construct { fields, .. } => {
             pending.extend(fields.iter().map(|field| Pending::Expression(&field.value)));
+        }
+        ExpressionKind::EntryList(entries) => {
+            for entry in entries {
+                pending.push(Pending::Expression(&entry.key));
+                pending.push(Pending::Expression(&entry.value));
+            }
         }
         ExpressionKind::FieldAccess { value, .. } => pending.push(Pending::Expression(value)),
         ExpressionKind::Block(block) => pending.push(Pending::Block(block)),

@@ -7,9 +7,9 @@ use std::{
 
 use crate::{
     Analysis, BinaryOperator, Block, Builtin, ConstructField, ContractRecord, EffectSet,
-    Expression, ExpressionKind, FieldDefault, FunctionType, MatchKind, Parameter, Program,
-    RequirementSet, ResolvedName, Span, Statement, StatementKind, SymbolId, SymbolKind, Type,
-    UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+    Expression, ExpressionKind, FieldDefault, FunctionType, ListEntry, MatchKind, Parameter,
+    Program, RequirementSet, ResolvedName, Span, Statement, StatementKind, SymbolId, SymbolKind,
+    Type, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
     limits::{MAX_CORE_BLOCK_DEPTH, MAX_TREE_DEPTH},
 };
 
@@ -903,6 +903,16 @@ impl<'a> Lowerer<'a> {
                     )),
                 }
             }
+            ExpressionKind::Unit => Ok(self.emit(
+                operations,
+                ty,
+                EffectSet::default(),
+                source,
+                OperationKind::Unit,
+            )),
+            ExpressionKind::EntryList(entries) => {
+                self.lower_entry_list(entries, ty, source, operations)
+            }
             ExpressionKind::List(elements) => {
                 let values = elements
                     .iter()
@@ -1087,6 +1097,50 @@ impl<'a> Lowerer<'a> {
             }
             ExpressionKind::Binary { .. } => self.lower_binary_chain(expression, operations),
         }
+    }
+
+    /// Lowers an entry list to the operations `[record { name: k, value: v },
+    /// ...]` would produce: each key and then its value in source order, one
+    /// record operation per entry at the entry's span, and the list
+    /// operation.
+    fn lower_entry_list(
+        &mut self,
+        entries: &[ListEntry],
+        ty: Arc<Type>,
+        source: Option<Span>,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<ValueId, IrError> {
+        let Type::List(element) = ty.as_ref() else {
+            return Err(IrError::new(format!("entry list has non-list type `{ty}`")));
+        };
+        let mut values = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let name = self.lower_expression(&entry.key, operations)?;
+            let value = self.lower_expression(&entry.value, operations)?;
+            values.push(self.emit(
+                operations,
+                Arc::clone(element),
+                EffectSet::default(),
+                Some(entry.span),
+                OperationKind::Record(vec![
+                    RecordOperand {
+                        name: "name".to_owned(),
+                        value: name,
+                    },
+                    RecordOperand {
+                        name: "value".to_owned(),
+                        value,
+                    },
+                ]),
+            ));
+        }
+        Ok(self.emit(
+            operations,
+            ty,
+            EffectSet::default(),
+            source,
+            OperationKind::List(values),
+        ))
     }
 
     /// Lowers a named construction to the same record operation that

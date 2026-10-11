@@ -1,0 +1,21 @@
+///Adds one to `value`.
+///
+///    Indentation after the space is kept.
+fn add_one(value:Int)->Int{
+    ///nested docs are normalized too
+    fn one()->Int{1}
+    value+one()
+}
+
+////////////////
+// Banner text //
+////////////////
+
+
+/// Blank lines between a doc and its item are removed.
+
+webhook fn handle(request:HttpRequest)->HttpResponse{HttpResponse{status:200,body:request.path}}
+
+///not attached: the next statement is a `let`
+let x=1; ///end of line
+///dangling at the end of the file

@@ -566,6 +566,9 @@ struct JsonBinding {
     name: String,
     kind: &'static str,
     r#type: String,
+    /// The `///` doc comment of a function or entrypoint declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -586,6 +589,9 @@ struct JsonEntrypointFact {
     capability_requirements: Vec<JsonCapabilityRequirement>,
     #[serde(skip_serializing_if = "Option::is_none")]
     contract: Option<JsonWebhookContract>,
+    /// The `///` doc comment of the entrypoint declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -748,6 +754,7 @@ fn render_explanation_human(program: &krit::Program, analysis: &Analysis, module
         }
     }
     println!("top-level bindings:");
+    let docs = item_docs(program);
     let mut found = false;
     for binding in analysis
         .bindings()
@@ -757,6 +764,15 @@ fn render_explanation_human(program: &krit::Program, analysis: &Analysis, module
         found = true;
         let core_binding = &module.bindings()[binding.id().as_u32() as usize];
         println!("  {} {}: {}", core_binding.id, binding.name(), binding.ty());
+        if let Some(doc) = docs.get(&binding.span()) {
+            for line in doc.split('\n') {
+                if line.is_empty() {
+                    println!("    ///");
+                } else {
+                    println!("    /// {line}");
+                }
+            }
+        }
     }
     if !found {
         println!("  (none)");
@@ -771,6 +787,7 @@ fn render_explanation_json(
     module: &CoreModule,
 ) -> u8 {
     let entrypoint = module.entrypoint_function();
+    let docs = item_docs(program);
     let explanation = JsonExplanation {
         schema: 1,
         entrypoint: JsonEntrypoint {
@@ -817,6 +834,10 @@ fn render_explanation_json(
                                 response_schema: webhook_response_schema(),
                             }
                         }),
+                        doc: function
+                            .source
+                            .and_then(|span| docs.get(&span))
+                            .map(|doc| (*doc).to_owned()),
                     }
                 })
                 .collect(),
@@ -832,6 +853,7 @@ fn render_explanation_json(
                     name: binding.name().to_owned(),
                     kind: core_binding.kind.as_str(),
                     r#type: binding.ty().to_string(),
+                    doc: docs.get(&binding.span()).map(|doc| (*doc).to_owned()),
                 }
             })
             .collect(),
@@ -864,6 +886,21 @@ fn render_explanation_json(
         }
         Err(error) => internal_error("KICE0002", "rendering an explanation", &error),
     }
+}
+
+/// The doc comment text of every top-level function and entrypoint
+/// declaration, by the declaration's span, which is also the span of its
+/// binding and of its Core function.
+fn item_docs(program: &krit::Program) -> BTreeMap<krit::Span, &str> {
+    program
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            statement
+                .doc()
+                .map(|doc| (statement.span, doc.text.as_str()))
+        })
+        .collect()
 }
 
 fn normalized_entrypoint_signature(

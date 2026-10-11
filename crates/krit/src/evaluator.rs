@@ -527,6 +527,7 @@ impl Evaluator<'_> {
     ) -> Result<Value, Diagnostic> {
         match &expression.kind {
             ExpressionKind::Literal(literal) => self.literal(literal, expression.span),
+            ExpressionKind::Unit => Ok(Value::Unit),
             ExpressionKind::Variable(name) => variable(name, environment, expression.span),
             // Operands on the recursive evaluation path are collected with
             // plain loops: iterator adapters add several native frames per
@@ -547,6 +548,19 @@ impl Evaluator<'_> {
                     ));
                 }
                 Value::record(values, expression.span)
+            }
+            // `["k": v, ...]` is `[record { name: k, value: v }, ...]`.
+            ExpressionKind::EntryList(entries) => {
+                let mut values = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let name = self.expression(&entry.key, environment)?;
+                    let value = self.expression(&entry.value, environment)?;
+                    values.push(Value::record(
+                        vec![("name".to_owned(), name), ("value".to_owned(), value)],
+                        entry.span,
+                    )?);
+                }
+                Value::list(values, expression.span)
             }
             ExpressionKind::Construct {
                 contract,

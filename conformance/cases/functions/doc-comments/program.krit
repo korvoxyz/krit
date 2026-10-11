@@ -1,0 +1,19 @@
+//////////////////////////////////////
+// A banner is an ordinary comment. //
+//////////////////////////////////////
+/// Doubles `value`.
+///
+/// Doc comments change no behavior.
+fn double(value: Int) -> Int {
+    /// A nested declaration has its own doc.
+    fn twice(item: Int) -> Int {
+        item + item
+    }
+    twice(value)
+}
+
+/// A `///` line before a `let` is an ordinary comment.
+let answer = double(21);
+
+println(answer); /// So is one at the end of a line.
+/// And one that no item follows.

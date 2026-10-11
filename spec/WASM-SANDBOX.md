@@ -265,7 +265,8 @@ Policy 1 represents `Int` as core `i64`, `Bool` as core `i32`, `Unit` as a
 zero-width value, and non-capturing function values as bounded-table `i32`
 slots. It supports:
 
-- integer, boolean, unit, and non-capturing function values
+- integer, boolean, unit (including the unit value `()`, `LANGUAGE.md`
+  section 5), and non-capturing function values
 - named recursion and higher-order non-capturing calls through `call_indirect`
 - literals, immutable binds, discards, nested blocks, conditionals, and
   source-ordered short circuiting
@@ -290,7 +291,11 @@ Policy 2 adds a deliberately bounded webhook ABI:
   `record { ... }` or by named construction (`HttpResponse { status: 200 }`,
   `LANGUAGE.md` section 8.2), whose omitted fields lower to the same `""` and
   `[]` literals the full record would write
-- ordered lists of headers
+- ordered lists of headers, written as list literals or as entry lists
+  (`["x-path": request.path]`, `LANGUAGE.md` section 11), which lower to the
+  same record and list operations as the spelled-out
+  `[record { name: ..., value: ... }]`, so an entry list builds wherever a
+  header list or a `log_info`/`log_error` field list does
 - the Result/Option shapes returned by config, secrets, and HTTP
 - Result/Option matching and static references to non-capturing helpers
 - a typed webhook export plus exact stdout/config/secrets/HTTP imports
@@ -395,7 +400,8 @@ recursively; source nesting limits (`LANGUAGE.md` section 4.1) bound that
 nesting, and the backend independently refuses Core nested more than 8,192
 blocks deep with `K1005`, before support checking and equally in a
 `krit check` target check, rather than relying on that bound. Policy 1 rejects
-strings, lists, records (named constructions included), options, results,
+strings, lists (entry lists included), records (named constructions
+included), options, results,
 JSON conversion, lexical captures, matches, unsupported print values, and any
 operation without a correct lowering. It never substitutes a trapping placeholder or direct-evaluator
 fallback. Policy 1 has no linear memory, so a String operator in a module

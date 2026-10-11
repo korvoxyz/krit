@@ -51,7 +51,8 @@ This layer supplies facts to both people and models.
 The 0.2 bootstrap provides the comment-preserving canonical formatter,
 `krit fmt --check`, and the first deterministic language-server milestone.
 `krit lsp` now supplies compiler diagnostics, canonical document edits, a
-format fix action, type/effect/resource hover, bounded completion, document
+format fix action, type/effect/resource hover (with a function's `///` doc
+comment at its declaration and its uses), bounded completion, document
 symbols, and versioned compiler facts. Import completion remains unavailable
 because edition 2026 has no implemented import syntax. Broader deterministic
 refactors and provider-neutral prediction remain later authoring milestones.

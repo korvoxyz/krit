@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use crate::{
     Diagnostic, Source, Span,
     ast::{
-        BinaryOperator, Block, ConstructField, ContractRecord, Expression, ExpressionKind,
-        MatchKind, Parameter, Program, RecordField, RecordTypeField, Statement, StatementKind,
-        TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral, VariantArm, VariantFamily,
-        VariantName,
+        BinaryOperator, Block, ConstructField, ContractRecord, DocComment, Expression,
+        ExpressionKind, ListEntry, MatchKind, Parameter, Program, RecordField, RecordTypeField,
+        Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral,
+        VariantArm, VariantFamily, VariantName,
     },
     habits::Habit,
     limits::{MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, nesting_error, structural_error},
@@ -154,6 +154,7 @@ impl<'source> Parser<'source> {
     }
 
     fn function_declaration(&mut self) -> Result<Statement, Diagnostic> {
+        let doc = self.doc_comment();
         let start = self.expect(TokenKind::Fn)?.span;
         let (name, _) = self.binding_name()?;
         let parameters = self.parameters()?;
@@ -170,12 +171,14 @@ impl<'source> Parser<'source> {
                 parameters,
                 return_type,
                 body,
+                doc,
             },
             span,
         })
     }
 
     fn webhook_declaration(&mut self) -> Result<Statement, Diagnostic> {
+        let doc = self.doc_comment();
         let start = self.expect(TokenKind::Webhook)?.span;
         self.expect(TokenKind::Fn)?;
         let (name, _) = self.binding_name()?;
@@ -193,6 +196,7 @@ impl<'source> Parser<'source> {
                 parameters,
                 return_type,
                 body,
+                doc,
             },
             span,
         })
@@ -207,6 +211,7 @@ impl<'source> Parser<'source> {
         let keyword = self
             .entrypoint_keyword()
             .ok_or_else(|| self.expected("`queue` or `schedule`"))?;
+        let doc = self.doc_comment();
         let start = self.advance().span;
         let token = self.advance().clone();
         let TokenKind::String(resource) = token.kind else {
@@ -237,6 +242,7 @@ impl<'source> Parser<'source> {
                 parameters,
                 return_type,
                 body,
+                doc,
             }
         } else {
             StatementKind::ScheduleHandler {
@@ -246,9 +252,25 @@ impl<'source> Parser<'source> {
                 parameters,
                 return_type,
                 body,
+                doc,
             }
         };
         Ok(Statement { kind, span })
+    }
+
+    /// The doc comment of the item whose first token is the current one: the
+    /// `///` lines directly before it ([`doc_comment_before`]).
+    fn doc_comment(&self) -> Option<DocComment> {
+        let previous = self
+            .cursor
+            .checked_sub(1)
+            .map(|index| self.tokens[index].span);
+        doc_comment_before(
+            self.text,
+            previous.map_or(0, |span| span.end),
+            self.current().span.start,
+            previous.is_some(),
+        )
     }
 
     fn entrypoint_keyword(&self) -> Option<&'static str> {
@@ -632,11 +654,21 @@ impl<'source> Parser<'source> {
         }
     }
 
-    /// Parses `( expression )` after its `(` at `open`, and reports an arrow
-    /// function's parameter list followed by `=>` (`K1109`): `(x) => e`,
-    /// `(x, y) => e`, `() => e`.
+    /// Parses `( expression )` or the unit value `()` after its `(` at `open`,
+    /// and reports an arrow function's parameter list followed by `=>`
+    /// (`K1109`): `(x) => e`, `(x, y) => e`, `() => e`.
     fn parenthesized(&mut self, open: Span) -> Result<Expression, Diagnostic> {
         let open_index = self.cursor - 1;
+        if self.check(&TokenKind::RightParen) {
+            let end = self.advance().span;
+            if self.check(&TokenKind::FatArrow) {
+                return Err(arrow_function(open.join(self.current().span)));
+            }
+            return Ok(Expression {
+                kind: ExpressionKind::Unit,
+                span: open.join(end),
+            });
+        }
         let expression = match self.nested(open, |parser| {
             parser.with_construction(true, Self::expression)
         }) {
@@ -915,11 +947,44 @@ impl<'source> Parser<'source> {
         })
     }
 
+    /// Parses the elements of a list literal after its `[` at `start`: plain
+    /// elements (`[a, b]`), or `key: value` entries (`["k": v]`), which make
+    /// it an entry list. The first element decides; a list that mixes the two
+    /// forms is `K1001` at the first element written the other way.
     fn list_elements(&mut self, start: Span) -> Result<Expression, Diagnostic> {
+        if self.check(&TokenKind::Colon)
+            && self
+                .tokens
+                .get(self.cursor + 1)
+                .is_some_and(|token| token.kind == TokenKind::RightBracket)
+        {
+            let end = self.tokens[self.cursor + 1].span;
+            return Err(
+                Diagnostic::new("K1001", "`[:]` is not Krit syntax", start.join(end))
+                    .with_note("the empty list is `[]`, for entry lists too"),
+            );
+        }
         let mut elements = Vec::new();
+        let mut entries = Vec::new();
         if !self.check(&TokenKind::RightBracket) {
             loop {
-                elements.push(self.expression()?);
+                let element = self.expression()?;
+                if self.check(&TokenKind::Colon) {
+                    if !elements.is_empty() {
+                        return Err(mixed_list(element.span.join(self.current().span)));
+                    }
+                    self.advance();
+                    let value = self.expression()?;
+                    entries.push(ListEntry {
+                        span: element.span.join(value.span),
+                        key: element,
+                        value,
+                    });
+                } else if !entries.is_empty() {
+                    return Err(mixed_list(element.span));
+                } else {
+                    elements.push(element);
+                }
                 if !self.consume(&TokenKind::Comma) {
                     break;
                 }
@@ -929,8 +994,13 @@ impl<'source> Parser<'source> {
             }
         }
         let end = self.expect(TokenKind::RightBracket)?.span;
+        let kind = if entries.is_empty() {
+            ExpressionKind::List(elements)
+        } else {
+            ExpressionKind::EntryList(entries)
+        };
         Ok(Expression {
-            kind: ExpressionKind::List(elements),
+            kind,
             span: start.join(end),
         })
     }
@@ -1322,11 +1392,19 @@ impl<'source> Parser<'source> {
         let start = self.current().span;
         let token = self.advance().clone();
         let TokenKind::Identifier(name) = token.kind else {
-            return Err(Diagnostic::new(
+            let error = Diagnostic::new(
                 "K1002",
                 format!("expected built-in type, found {}", token.kind.description()),
                 token.span,
-            ));
+            );
+            // `-> ()`: the unit value is not a type.
+            return Err(
+                if token.kind == TokenKind::LeftParen && self.check(&TokenKind::RightParen) {
+                    error.with_note("the unit type is spelled `Unit`; `()` is the unit value")
+                } else {
+                    error
+                },
+            );
         };
         let kind = match name.as_str() {
             "Int" => TypeKind::Int,
@@ -1562,6 +1640,89 @@ impl<'source> Parser<'source> {
     }
 }
 
+/// A list literal at `span` that writes one element in the other form than
+/// its first element: a plain element in an entry list, or a `key: value`
+/// entry in a list of plain elements (`K1001`).
+fn mixed_list(span: Span) -> Diagnostic {
+    Diagnostic::new(
+        "K1001",
+        "a list literal cannot mix `key: value` entries and plain elements",
+        span,
+    )
+    .with_note(
+        "write every element as `key: value` for a list of `record { name, value }` entries, \
+         or write none that way",
+    )
+}
+
+/// The doc comment written directly before an item that starts at
+/// `item_start`, found in the trivia between `trivia_start` and the item:
+/// the end of the previous token (`after_token`) or the start of the file.
+///
+/// Trivia holds only whitespace and `//` comments, and a comment ends its
+/// line, so each line of it is blank or holds one comment after its
+/// indentation. The doc comment is the run of `///` lines that ends at the
+/// item, read upward and skipping blank lines; it stops at the first other
+/// comment, including a `////` banner, and at the line of the previous token,
+/// where a comment is an end-of-line comment.
+fn doc_comment_before(
+    text: &str,
+    trivia_start: usize,
+    item_start: usize,
+    after_token: bool,
+) -> Option<DocComment> {
+    let trivia = &text[trivia_start..item_start];
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    for (index, character) in trivia.char_indices() {
+        if character == '\n' || character == '\r' {
+            lines.push((trivia_start + line_start, &trivia[line_start..index]));
+            line_start = index + 1;
+        }
+    }
+    // The last piece is the item's own indentation, and with `after_token`
+    // the first shares the previous token's line.
+    let own_lines = lines.get(usize::from(after_token)..)?;
+    let mut doc_lines = Vec::new();
+    for (start, line) in own_lines.iter().rev() {
+        let comment = line.trim_start();
+        if comment.is_empty() {
+            continue;
+        }
+        let Some(line_text) = doc_line_text(comment) else {
+            break;
+        };
+        let comment_start = start + (line.len() - comment.len());
+        doc_lines.push((
+            Span::new(comment_start, comment_start + comment.trim_end().len()),
+            line_text.trim_end(),
+        ));
+    }
+    let (last, _) = *doc_lines.first()?;
+    let (first, _) = *doc_lines.last()?;
+    let text = doc_lines
+        .iter()
+        .rev()
+        .map(|(_, line)| *line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(DocComment {
+        text,
+        span: first.join(last),
+    })
+}
+
+/// The text of a doc comment line `comment` (from its `//` to the end of the
+/// line): what follows `///`, without one leading space. `None` when the
+/// comment is not a doc line, including a `////` banner.
+pub(crate) fn doc_line_text(comment: &str) -> Option<&str> {
+    let rest = comment.strip_prefix("///")?;
+    if rest.starts_with('/') {
+        return None;
+    }
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
 /// An arrow function at `span` (`K1109`).
 fn arrow_function(span: Span) -> Diagnostic {
     Habit::ArrowFunction.diagnostic("arrow functions are not Krit syntax", span)
@@ -1731,6 +1892,7 @@ mod tests {
             "lists" => ("[", "1", "]", ""),
             "records" => ("record { a: ", "1", " }", ""),
             "constructions" => ("HttpResponse { status: ", "1", " }", ""),
+            "entries" => ("[\"k\": ", "\"v\"", "]", ""),
             "ifs" => ("if true { ", "1", " } else { 0 }", ""),
             "matches" => ("match Some(1) { None => 0, Some(x) => ", "1", " }", ""),
             "calls" => ("f(", "1", ")", "fn f(x) { x }\n"),
@@ -1761,6 +1923,7 @@ mod tests {
             "lists",
             "records",
             "constructions",
+            "entries",
             "ifs",
             "matches",
             "calls",
@@ -2390,6 +2553,177 @@ mod tests {
             let error = parse_text(text).expect_err("should not parse");
             assert_eq!(error.code(), "K1110", "{text}");
         }
+    }
+
+    fn let_value(program: &Program, index: usize) -> &Expression {
+        let StatementKind::Let { value, .. } = &program.statements[index].kind else {
+            panic!("statement {index} should be a `let`");
+        };
+        value
+    }
+
+    #[test]
+    fn parses_entry_lists_with_entry_spans_and_trailing_commas() {
+        let text = "let fields = [\"x-a\": a, \"x-\" + b: f(c),];";
+        let program = parse_text(text).expect("entry list should parse");
+        let value = let_value(&program, 0);
+        let ExpressionKind::EntryList(entries) = &value.kind else {
+            panic!("an entry list expected, found {:?}", value.kind);
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            &text[entries[0].span.start..entries[0].span.end],
+            "\"x-a\": a"
+        );
+        assert!(matches!(entries[0].key.kind, ExpressionKind::Literal(_)));
+        assert_eq!(
+            &text[entries[1].span.start..entries[1].span.end],
+            "\"x-\" + b: f(c)"
+        );
+        assert!(matches!(entries[1].key.kind, ExpressionKind::Binary { .. }));
+        assert!(matches!(entries[1].value.kind, ExpressionKind::Call { .. }));
+        assert_eq!(
+            &text[value.span.start..value.span.end],
+            &text[13..text.len() - 1]
+        );
+
+        // `[]` stays the plain empty list.
+        let program = parse_text("let empty = [];").expect("empty list should parse");
+        assert!(matches!(
+            &let_value(&program, 0).kind,
+            ExpressionKind::List(elements) if elements.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_list_cannot_mix_entries_and_plain_elements() {
+        for (text, offending) in [
+            ("let l = [\"k\": \"v\", plain];", "plain"),
+            ("let l = [plain, \"k\": \"v\"];", "\"k\":"),
+            ("let l = [\"k\": \"v\", \"j\": \"w\", [1]];", "[1]"),
+        ] {
+            let error = parse_text(text).expect_err("a mixed list should not parse");
+            assert_eq!(error.code(), "K1001", "{text}");
+            assert_eq!(
+                &text[error.span().start..error.span().end],
+                offending,
+                "{text}"
+            );
+            assert_eq!(error.notes().len(), 1, "{text}");
+        }
+
+        let error = parse_text("let l = [:];").expect_err("`[:]` should not parse");
+        assert_eq!(error.code(), "K1001");
+        assert_eq!(error.span(), Span::new(8, 11));
+        assert_eq!(error.notes().len(), 1);
+
+        let error = parse_text("let l = [\"k\" \"v\"];").expect_err("a missing `,` fails");
+        assert_eq!(error.code(), "K1002");
+    }
+
+    #[test]
+    fn parses_the_unit_value_and_keeps_unit_types_spelled_unit() {
+        let text = "let done = Ok(( ));\nlet unit: Unit = ();";
+        let program = parse_text(text).expect("unit values should parse");
+        let ExpressionKind::Call { arguments, .. } = &let_value(&program, 0).kind else {
+            panic!("a call expected");
+        };
+        assert!(matches!(arguments[0].kind, ExpressionKind::Unit));
+        assert_eq!(&text[arguments[0].span.start..arguments[0].span.end], "( )");
+        assert!(matches!(let_value(&program, 1).kind, ExpressionKind::Unit));
+
+        for text in ["let f = () => 1;", "let f = (  ) => { 1 };"] {
+            let error = parse_text(text).expect_err("an arrow function should not parse");
+            assert_eq!(error.code(), "K1109", "{text}");
+        }
+
+        let error = parse_text("fn f() -> () { () }").expect_err("`()` is not a type");
+        assert_eq!(error.code(), "K1002");
+        assert_eq!(error.span(), Span::new(10, 11));
+        assert_eq!(
+            error.notes(),
+            ["the unit type is spelled `Unit`; `()` is the unit value"]
+        );
+        let error = parse_text("fn f() -> [Int] { [] }").expect_err("not a type either");
+        assert!(error.notes().is_empty());
+    }
+
+    /// The doc comment of each item statement of `program`, in order.
+    fn docs(program: &Program) -> Vec<Option<String>> {
+        program
+            .statements
+            .iter()
+            .filter(|statement| !matches!(statement.kind, StatementKind::Let { .. }))
+            .map(|statement| statement.doc().map(|doc| doc.text.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn attaches_doc_comments_to_the_next_item() {
+        let text = "/// First line.\n///\n///   indented\n/// trailing   \nfn first() {}\n";
+        let program = parse_text(text).expect("documented function should parse");
+        let doc = program.statements[0].doc().expect("the doc should attach");
+        assert_eq!(doc.text, "First line.\n\n  indented\ntrailing");
+        assert_eq!(
+            &text[doc.span.start..doc.span.end],
+            &text[..text.find("   \n").unwrap()]
+        );
+
+        // Blank lines are whitespace: they neither split nor end a doc.
+        let program = parse_text(
+            "///A\n\n///B\n\nwebhook fn handle(request: HttpRequest) -> HttpResponse { x }\n",
+        )
+        .expect("documented webhook should parse");
+        assert_eq!(docs(&program), [Some("A\nB".to_owned())]);
+        let program = parse_text(
+            "/// Queue.\nqueue \"jobs\" fn work(job: QueueJob) -> Result<String, String> { x }\n",
+        )
+        .expect("documented queue consumer should parse");
+        assert_eq!(docs(&program), [Some("Queue.".to_owned())]);
+
+        let program = parse_text(
+            "/// Schedule.\r\nschedule \"hourly\" fn tick(event: ScheduleEvent) -> Result<String, String> {\n    /// Nested.\n    fn inner() {}\n    x\n}\n",
+        )
+        .expect("documented schedule should parse");
+        assert_eq!(docs(&program), [Some("Schedule.".to_owned())]);
+        let StatementKind::ScheduleHandler { body, .. } = &program.statements[0].kind else {
+            panic!("schedule expected");
+        };
+        assert_eq!(
+            body.statements[0].doc().map(|doc| doc.text.as_str()),
+            Some("Nested.")
+        );
+    }
+
+    #[test]
+    fn other_comments_and_end_of_line_doc_comments_document_nothing() {
+        for text in [
+            // Four slashes are a banner.
+            "//// Banner.\nfn f() {}\n",
+            // An ordinary comment ends the run before the item.
+            "/// Lost.\n// ordinary\nfn f() {}\n",
+            // An end-of-line comment belongs to its line.
+            "let x = 1; /// end of line\nfn f() {}\n",
+            // A `let` and a function expression are not items.
+            "/// Not an item.\nlet g = fn() { 1 };\nfn f() {}\n",
+            // No doc at all.
+            "fn f() {}\n",
+            "let x = 1; fn f() {}\n",
+        ] {
+            let program = parse_text(text).expect("source should parse");
+            assert_eq!(docs(&program), [None], "{text:?}");
+        }
+
+        let program =
+            parse_text("/// Kept.\n//// banner\n/// Only this.\nfn f() {}\n/// Dangling.\n")
+                .expect("source should parse");
+        assert_eq!(docs(&program), [Some("Only this.".to_owned())]);
+        let program = parse_text("fn f() { /// after the brace\n    fn g() {}\n}\n")
+            .expect("source should parse");
+        let StatementKind::Function { body, .. } = &program.statements[0].kind else {
+            panic!("function expected");
+        };
+        assert!(body.statements[0].doc().is_none());
     }
 
     #[test]

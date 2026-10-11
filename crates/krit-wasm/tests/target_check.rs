@@ -243,6 +243,53 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
 }
 
 #[test]
+fn entry_lists_and_unit_build_in_webhooks_and_fail_at_their_span_in_modules() {
+    let webhook = lower_source(
+        r#"
+/// Accepts every path but `/`.
+fn validate(path: String) -> Result<Unit, String> {
+    if path == "/" { Err("root") } else { Ok(()) }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let fetch = HttpRequest { method: "GET", path: "/x", headers: ["accept": "text/plain"] };
+    let logged = log_info("seen", ["path": fetch.path, "method": request.method]);
+    match validate(request.path) {
+        Ok(done) => HttpResponse { status: 200, headers: ["x-" + "path": request.path], body: fetch.path },
+        Err(reason) => {
+            let failed = log_error("rejected", ["reason": reason]);
+            HttpResponse { status: 400, body: reason }
+        },
+    }
+}
+"#,
+    );
+    let effects = options(&["observe.log"]);
+    assert!(check_target(&webhook, &effects, CheckTarget::Component).is_empty());
+    let artifact = build_component(&webhook, &effects).expect("a webhook of entry lists builds");
+    validate_artifact(&artifact.bytes, &artifact.metadata)
+        .expect("a webhook of entry lists validates");
+
+    // Policy 1 has no string or list layout: the entry list and its key and
+    // value are reported at their own spans, never at `1:1`.
+    let text = "let fields = [\"k\": \"v\"];\nprintln(1);\n";
+    let errors = check_target(&lower_source(text), &options(&[]), CheckTarget::Module);
+    assert_sorted_unique_and_located(&errors);
+    assert!(
+        errors.iter().all(|error| error.code() == "K7002"),
+        "{errors:#?}"
+    );
+    assert_eq!(
+        starts(&errors),
+        [
+            span_of(text, "[").start,
+            span_of(text, "\"k\"").start,
+            span_of(text, "\"v\"").start,
+        ]
+    );
+}
+
+#[test]
 fn target_checks_ignore_package_grants_that_builds_enforce() {
     let module = lower_source("println(1);\n");
     assert!(check_target(&module, &options(&[]), CheckTarget::Component).is_empty());

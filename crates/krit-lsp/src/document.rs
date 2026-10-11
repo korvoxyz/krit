@@ -1040,9 +1040,10 @@ impl Document {
     ) -> Result<String, String> {
         let inferred = render_type(symbol.ty())?;
         let mut output = format!(
-            "```krit\n{}: {}\n```\n\n**Kind:** `{}`",
+            "```krit\n{}: {}\n```{}\n\n**Kind:** `{}`",
             symbol.name(),
             inferred,
+            hover_doc(declaration.doc.as_deref()),
             compiler_symbol_kind(symbol.kind())
         );
         if let Some(declared) = &declaration.declared_type {
@@ -1087,10 +1088,16 @@ impl Document {
                 if let Some(analysis) = &self.analysis
                     && let Some(symbol) = analysis.symbols().iter().find(|symbol| symbol.id() == id)
                 {
+                    let doc = self
+                        .declarations
+                        .iter()
+                        .find(|declaration| analysis.symbols()[declaration.symbol_index].id() == id)
+                        .and_then(|declaration| declaration.doc.as_deref());
                     format!(
-                        "```krit\n{}: {}\n```\n\n**Kind:** `{}`",
+                        "```krit\n{}: {}\n```{}\n\n**Kind:** `{}`",
                         symbol.name(),
                         inferred,
+                        hover_doc(doc),
                         compiler_symbol_kind(symbol.kind())
                     )
                 } else {
@@ -1112,6 +1119,14 @@ impl Document {
         );
         Ok(output)
     }
+}
+
+/// A declaration's doc comment as a hover paragraph after its signature, or
+/// nothing when it has none.
+fn hover_doc(doc: Option<&str>) -> String {
+    doc.filter(|doc| !doc.trim().is_empty())
+        .map(|doc| format!("\n\n{doc}"))
+        .unwrap_or_default()
 }
 
 fn append_effects_and_requirements(
@@ -1506,9 +1521,19 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
                     continue;
                 }
                 ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+                ExpressionKind::Unit => {}
                 ExpressionKind::List(elements) => {
                     for element in elements {
                         expression_fields(element, fields);
+                    }
+                }
+                ExpressionKind::EntryList(entries) => {
+                    // Each entry is a `record { name, value }`.
+                    fields.insert("name".to_owned());
+                    fields.insert("value".to_owned());
+                    for entry in entries {
+                        expression_fields(&entry.key, fields);
+                        expression_fields(&entry.value, fields);
                     }
                 }
                 ExpressionKind::Record(record_fields) => {
@@ -1917,6 +1942,9 @@ struct DeclarationFact {
     name_span: Option<Span>,
     visibility: Span,
     declared_type: Option<String>,
+    /// The text of the `///` doc comment of a function or entrypoint
+    /// declaration.
+    doc: Option<String>,
 }
 
 struct DeclarationCollector<'a> {
@@ -1978,18 +2006,21 @@ impl<'a> DeclarationCollector<'a> {
                 parameters,
                 return_type,
                 body,
+                doc,
             }
             | StatementKind::Webhook {
                 name,
                 parameters,
                 return_type,
                 body,
+                doc,
             }
             | StatementKind::QueueConsumer {
                 name,
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             }
             | StatementKind::ScheduleHandler {
@@ -1997,6 +2028,7 @@ impl<'a> DeclarationCollector<'a> {
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             } => {
                 let kind = match statement.kind {
@@ -2014,7 +2046,7 @@ impl<'a> DeclarationCollector<'a> {
                     }
                     _ => statement.span,
                 };
-                self.add(
+                if let Some(declaration) = self.add(
                     name,
                     kind,
                     statement.span,
@@ -2027,7 +2059,9 @@ impl<'a> DeclarationCollector<'a> {
                             .map(|parameter| parameter.annotation.as_ref()),
                         return_type.as_ref(),
                     )),
-                );
+                ) {
+                    declaration.doc = doc.as_ref().map(|doc| doc.text.clone());
+                }
                 for parameter in parameters {
                     self.add(
                         &parameter.name,
@@ -2080,9 +2114,16 @@ impl<'a> DeclarationCollector<'a> {
                     continue;
                 }
                 ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+                ExpressionKind::Unit => {}
                 ExpressionKind::List(elements) => {
                     for element in elements {
                         self.expression(element);
+                    }
+                }
+                ExpressionKind::EntryList(entries) => {
+                    for entry in entries {
+                        self.expression(&entry.key);
+                        self.expression(&entry.value);
                     }
                 }
                 ExpressionKind::Record(fields) => {
@@ -2174,6 +2215,9 @@ impl<'a> DeclarationCollector<'a> {
         }
     }
 
+    /// Records the declaration of the analyzed symbol `name` declared at
+    /// `symbol_span`, and returns it; `None` when analysis has no such
+    /// symbol.
     fn add(
         &mut self,
         name: &str,
@@ -2182,20 +2226,19 @@ impl<'a> DeclarationCollector<'a> {
         name_span: Option<Span>,
         visibility: Span,
         declared_type: Option<String>,
-    ) {
-        let Some(symbol_index) = self
+    ) -> Option<&mut DeclarationFact> {
+        let symbol_index = self
             .symbols
             .get(&(symbol_span, name.to_owned(), kind))
-            .copied()
-        else {
-            return;
-        };
+            .copied()?;
         self.declarations.push(DeclarationFact {
             symbol_index,
             name_span,
             visibility,
             declared_type,
+            doc: None,
         });
+        self.declarations.last_mut()
     }
 }
 
@@ -2243,8 +2286,10 @@ fn find_identifier_span(text: &str, span: Span, name: &str) -> Option<Span> {
 fn expression_kind(kind: &ExpressionKind) -> &'static str {
     match kind {
         ExpressionKind::Literal(_) => "literal",
+        ExpressionKind::Unit => "unit",
         ExpressionKind::Variable(_) => "name",
         ExpressionKind::List(_) => "list",
+        ExpressionKind::EntryList(_) => "entry-list",
         ExpressionKind::Record(_) => "record",
         ExpressionKind::Construct { .. } => "construction",
         ExpressionKind::FieldAccess { .. } => "field-access",
@@ -3625,6 +3670,117 @@ fn unused() -> Result<String, String> {{
         for ty in ["HttpRequest", "HttpResponse", "QueueJob", "ScheduleEvent"] {
             assert!(type_completions().iter().any(|item| item.label == ty));
         }
+    }
+
+    #[test]
+    fn hover_shows_doc_comments_at_declarations_and_uses() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let source = "///Greets `name`.\n///\n/// Pure.\nfn greet(name: String) -> String {\n    /// Never shown at the top level.\n    fn inner() -> Int { 1 }\n    \"hi \" + name\n}\n\n/// Dangling: a `let` is not an item.\nlet greeting = greet(\"krit\");\n";
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let published = state.open(uri.clone(), 1, source.to_owned());
+        assert!(published.diagnostics.is_empty(), "{published:?}");
+
+        let markdown = |position: Position| {
+            let hover = state
+                .hover(&uri, position)
+                .expect("hover should succeed")
+                .expect("the position should have hover facts");
+            let HoverContents::Markup(markup) = hover.contents else {
+                panic!("hover should use markdown")
+            };
+            markup.value
+        };
+
+        // At the declaration the doc follows the signature, before the facts.
+        let declaration = markdown(Position::new(3, 4));
+        assert!(
+            declaration.starts_with(
+                "```krit\ngreet: fn(String) -> String effects {}\n```\n\nGreets `name`.\n\nPure.\n\n**Kind:** `function`"
+            ),
+            "{declaration}"
+        );
+        // A use of the function shows the same doc.
+        let call = markdown(Position::new(10, 16));
+        assert!(call.contains("Greets `name`.\n\nPure."), "{call}");
+        // A nested declaration has its own doc.
+        let nested = markdown(Position::new(5, 7));
+        assert!(nested.contains("Never shown at the top level."), "{nested}");
+        // A `///` line before a `let` documents nothing.
+        let binding = markdown(Position::new(10, 5));
+        assert!(!binding.contains("Dangling"), "{binding}");
+
+        let edits = state.formatting(&uri).expect("formatting should succeed");
+        assert!(
+            edits[0]
+                .new_text
+                .starts_with("/// Greets `name`.\n///\n/// Pure.\nfn greet"),
+            "{}",
+            edits[0].new_text
+        );
+        assert!(
+            edits[0]
+                .new_text
+                .contains("/// Dangling: a `let` is not an item.\nlet greeting"),
+            "{}",
+            edits[0].new_text
+        );
+    }
+
+    #[test]
+    fn reports_entry_list_and_unit_facts() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let source = "let id = \"r-1\";\nlet fields = [\"request-id\": id, \"source\": \"lsp\"];\nlet done = Ok(());\n";
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let published = state.open(uri.clone(), 1, source.to_owned());
+        assert!(published.diagnostics.is_empty(), "{published:?}");
+
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        let expressions = facts["expressions"]
+            .as_array()
+            .expect("expression facts should be a list");
+        let entries = expressions
+            .iter()
+            .find(|fact| fact["syntaxKind"] == "entry-list")
+            .expect("the entry list should have an expression fact");
+        assert_eq!(
+            entries["inferredType"],
+            "List<Record { name: String, value: String }>"
+        );
+        assert!(
+            expressions
+                .iter()
+                .any(|fact| fact["syntaxKind"] == "name" && fact["resolved"]["name"] == "id"),
+            "the entry value should resolve: {expressions:?}"
+        );
+        let unit = expressions
+            .iter()
+            .find(|fact| fact["syntaxKind"] == "unit")
+            .expect("the unit value should have an expression fact");
+        assert_eq!(unit["inferredType"], "Unit");
+
+        let published = state
+            .change(&uri, 2, "let fields = [\"a\": 1];\n".to_owned())
+            .expect("the document should change");
+        assert_eq!(published.diagnostics.len(), 1);
+        assert_eq!(
+            published.diagnostics[0].code,
+            Some(NumberOrString::String("K3001".to_owned()))
+        );
+        let published = state
+            .change(&uri, 3, "let fields = [\"a\": \"b\", \"c\"];\n".to_owned())
+            .expect("the document should change");
+        assert_eq!(published.diagnostics.len(), 1);
+        assert_eq!(
+            published.diagnostics[0].code,
+            Some(NumberOrString::String("K1001".to_owned()))
+        );
     }
 
     #[test]

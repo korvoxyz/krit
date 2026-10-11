@@ -13,6 +13,19 @@ pub struct Statement {
     pub span: Span,
 }
 
+impl Statement {
+    /// The doc comment of a function or entrypoint declaration.
+    pub fn doc(&self) -> Option<&DocComment> {
+        match &self.kind {
+            StatementKind::Function { doc, .. }
+            | StatementKind::Webhook { doc, .. }
+            | StatementKind::QueueConsumer { doc, .. }
+            | StatementKind::ScheduleHandler { doc, .. } => doc.as_ref(),
+            StatementKind::Let { .. } | StatementKind::Expression(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum StatementKind {
     Let {
@@ -25,12 +38,16 @@ pub enum StatementKind {
         parameters: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Block,
+        /// The `///` doc comment written directly before the declaration.
+        doc: Option<DocComment>,
     },
     Webhook {
         name: String,
         parameters: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Block,
+        /// The `///` doc comment written directly before the declaration.
+        doc: Option<DocComment>,
     },
     QueueConsumer {
         queue: String,
@@ -39,6 +56,8 @@ pub enum StatementKind {
         parameters: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Block,
+        /// The `///` doc comment written directly before the declaration.
+        doc: Option<DocComment>,
     },
     ScheduleHandler {
         schedule: String,
@@ -47,8 +66,25 @@ pub enum StatementKind {
         parameters: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Block,
+        /// The `///` doc comment written directly before the declaration.
+        doc: Option<DocComment>,
     },
     Expression(Expression),
+}
+
+/// A `///` doc comment: the run of `///` lines written directly before an
+/// item, with only whitespace between them and the item.
+///
+/// Analysis ignores it; the formatter preserves it, and `krit explain` and
+/// the language server show its text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocComment {
+    /// The text of the lines in order, joined by `\n`. Each line is what
+    /// follows its `///`, without one leading space and without trailing
+    /// whitespace.
+    pub text: String,
+    /// From the first line's `///` to the end of the last line's text.
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -67,8 +103,18 @@ pub struct Expression {
 #[derive(Clone, Debug)]
 pub enum ExpressionKind {
     Literal(ValueLiteral),
+    /// The unit value `()`.
+    Unit,
     Variable(String),
     List(Vec<Expression>),
+    /// An entry list `["name": value, ...]`: the list of
+    /// `record { name: key, value: value }` records, one per entry, in
+    /// source order.
+    ///
+    /// The records have no syntax node of their own; each is identified by
+    /// its entry's span, which covers the key, the `:`, and the value. The
+    /// empty list `[]` is always [`ExpressionKind::List`].
+    EntryList(Vec<ListEntry>),
     Record(Vec<RecordField>),
     /// Named construction of a built-in contract record:
     /// `HttpResponse { status: 200, body }`.
@@ -122,6 +168,15 @@ pub enum ExpressionKind {
 pub struct RecordField {
     pub name: String,
     pub value: Expression,
+    pub span: Span,
+}
+
+/// One `key: value` entry of an entry list.
+#[derive(Clone, Debug)]
+pub struct ListEntry {
+    pub key: Expression,
+    pub value: Expression,
+    /// From the start of the key to the end of the value.
     pub span: Span,
 }
 
