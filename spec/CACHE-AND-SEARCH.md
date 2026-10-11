@@ -140,10 +140,8 @@ Two transports ship:
   text and, when configured, a credential, so plaintext transport is refused.
   Only an explicit loopback test policy relaxes this, exactly as it does for a
   bearer credential. The connector path must be a safe origin-form absolute
-  path under the same rule every other host-owned path obeys: no authority
-  form, no scheme, no backslash, no query or fragment delimiter, no control
-  byte, no `.` or `..` segment, no percent-encoded `.`, `/`, or `\`, no
-  malformed escape (see `WEBHOOK-CONTRACTS.md`), and ASCII only.
+  path under the request path rule every other host-owned path obeys
+  (`WEBHOOK-CONTRACTS.md`, "Request paths and queries"), and ASCII only.
 - `local` - a deterministic in-process document set, for reference examples and
   tests. It performs no I/O.
 

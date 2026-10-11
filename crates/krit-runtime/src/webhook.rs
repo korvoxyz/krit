@@ -111,59 +111,120 @@ pub(crate) fn validate_headers(
 /// Shared so every host-owned path - an inbound webhook request path, a guest
 /// outbound request path, an AI adapter path, and a search connector path
 /// alike - is held to exactly the same rule: absolute, no authority form, no
-/// scheme, no backslash, no query or fragment delimiter, no control byte, and
-/// no traversal form (see [`has_traversal_form`]).
+/// scheme, no space, no backslash, no query or fragment delimiter, no control
+/// byte, and no traversal form (see [`has_traversal_form`]).
 pub(crate) fn is_origin_form_path(path: &str) -> bool {
     has_origin_form_shape(path) && !has_traversal_form(path)
 }
 
 fn has_origin_form_shape(path: &str) -> bool {
+    // A raw space can never be sent: HTTP/1.1 forbids it in a request target
+    // and libcurl refuses it, but only after approval and DNS resolution.
     path.starts_with('/')
         && !path.starts_with("//")
         && !path.contains("://")
         && !path
             .bytes()
-            .any(|byte| byte.is_ascii_control() || matches!(byte, b'\\' | b'?' | b'#'))
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b' ' | b'\\' | b'?' | b'#'))
 }
 
 /// Whether a path could address a different resource once a server or proxy
 /// normalizes or decodes it.
 ///
 /// An exact origin is the only HTTP authority a program holds, but servers
-/// commonly resolve dot segments and decode percent escapes before routing, so
-/// a path built from untrusted text could otherwise climb out of the prefix the
-/// program meant to address. Every form that can change the segment structure
-/// is refused:
+/// commonly resolve dot segments, strip `;` path parameters, and percent-decode
+/// (sometimes twice, behind a proxy) before routing, so a path built from
+/// untrusted text could otherwise climb out of the prefix the program meant to
+/// address. Each segment is decoded once, and the path is refused when:
 ///
-/// - a segment that is exactly `.` or `..`;
-/// - a percent-encoded `.`, `/`, or `\` (`%2E`, `%2F`, `%5C`, either case)
-///   anywhere, so `%2e%2e` or `.%2e` cannot spell a dot segment and `%2f`
-///   cannot split one segment into two;
-/// - a `%` that does not begin a well-formed `%HH` escape, because how a server
+/// - a segment is a dot segment: once decoded, the part before its first `;`
+///   is exactly `.` or `..` (`..`, `..;`, `.;x=1`, `..%3B`);
+/// - an escape decodes to `.`, `/`, `\`, or NUL (`%2E`, `%2F`, `%5C`, `%00`,
+///   either case), so `%2e%2e` or `.%2e` cannot spell a dot segment, `%2f`
+///   cannot split one segment into two, and `%00` cannot truncate one;
+/// - a decoded segment still holds a `%` followed by a hex digit or `u`
+///   (`%252e`, `%2541`, `%25%32%65`), so a second decoding pass cannot produce
+///   another escaped byte;
+/// - escapes begin an overlong UTF-8 sequence (`%C0%AE`), which a lenient
+///   decoder reads as `.`, `/`, or another ASCII byte;
+/// - a `%` does not begin a well-formed `%HH` escape, because how a server
 ///   decodes it is implementation-defined and so unknown.
 ///
-/// Every other well-formed escape, such as `%20` or `%25`, stays allowed. The
-/// outbound transfer then sends the path byte-for-byte as validated, with
-/// libcurl's own dot-segment normalization disabled.
+/// Every other form stays allowed, such as dots inside a segment, `%20`, or a
+/// `%25` that no hex digit or `u` follows. Transforms specific to one server,
+/// such as Unicode compatibility normalization, are not modelled
+/// (WEBHOOK-CONTRACTS.md, "Request paths and queries"). The outbound transfer
+/// never resolves or decodes the path: libcurl's own dot-segment normalization
+/// is disabled.
 fn has_traversal_form(path: &str) -> bool {
-    if path.split('/').any(|segment| matches!(segment, "." | "..")) {
-        return true;
-    }
-    let mut bytes = path.bytes();
+    // No accepted escape decodes to `/`, so the raw segments are exactly the
+    // decoded ones and each can be checked on its own.
+    let mut decoded = Vec::new();
+    path.split('/').any(|segment| {
+        decoded.clear();
+        !decode_segment(segment, &mut decoded)
+            || is_dot_segment(&decoded)
+            || holds_escape(&decoded)
+            || holds_overlong_utf8(&decoded)
+    })
+}
+
+/// Percent-decodes `segment` once into `decoded`, or returns `false` for a `%`
+/// that does not begin a well-formed `%HH` escape or for an escape of `.`, `/`,
+/// `\`, or NUL.
+fn decode_segment(segment: &str, decoded: &mut Vec<u8>) -> bool {
+    let mut bytes = segment.bytes();
     while let Some(byte) = bytes.next() {
         if byte != b'%' {
+            decoded.push(byte);
             continue;
         }
         let high = bytes.next().and_then(hex_digit);
         let low = bytes.next().and_then(hex_digit);
         let (Some(high), Some(low)) = (high, low) else {
-            return true;
+            return false;
         };
-        if matches!((high << 4) | low, b'.' | b'/' | b'\\') {
-            return true;
+        let byte = (high << 4) | low;
+        if matches!(byte, b'.' | b'/' | b'\\' | 0) {
+            return false;
         }
+        decoded.push(byte);
     }
-    false
+    true
+}
+
+/// Whether a decoded segment names `.` or `..` once a server strips its `;`
+/// path parameters, as Tomcat, Jetty, and Spring do before resolving it.
+fn is_dot_segment(decoded: &[u8]) -> bool {
+    matches!(
+        decoded.split(|byte| *byte == b';').next(),
+        Some(b"." | b"..")
+    )
+}
+
+/// Whether a decoded segment would hold another escape (`%HH`, or IIS-style
+/// `%uHHHH`) for a server that decodes it a second time.
+fn holds_escape(decoded: &[u8]) -> bool {
+    decoded.windows(2).any(|pair| {
+        pair[0] == b'%' && (hex_digit(pair[1]).is_some() || matches!(pair[1], b'u' | b'U'))
+    })
+}
+
+/// Whether decoded bytes begin an overlong UTF-8 sequence, which a lenient
+/// decoder reads as a shorter character such as `.` (`C0 AE`) or `/` (`C0 AF`).
+///
+/// Only escapes can produce one: the raw path is a Rust string and so valid
+/// UTF-8, and a raw character's bytes always sit together.
+fn holds_overlong_utf8(decoded: &[u8]) -> bool {
+    decoded.windows(2).any(|pair| match pair[0] {
+        0xC0 | 0xC1 => (0x80..=0xBF).contains(&pair[1]),
+        0xE0 => (0x80..=0x9F).contains(&pair[1]),
+        0xF0 => (0x80..=0x8F).contains(&pair[1]),
+        // Five- and six-byte forms, which only pre-RFC 3629 decoders accept.
+        0xF8 => (0x80..=0x87).contains(&pair[1]),
+        0xFC => (0x80..=0x83).contains(&pair[1]),
+        _ => false,
+    })
 }
 
 fn hex_digit(byte: u8) -> Option<u8> {
@@ -175,6 +236,8 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
+const TRAVERSAL_MESSAGE: &str = "HTTP request path must not contain a dot segment, a percent-encoded `.`, `/`, `\\`, or NUL, a double-encoded or overlong UTF-8 escape, or a malformed percent escape";
+
 fn validate_path_query(path: &str, query: &str) -> Result<(), RuntimeError> {
     if !has_origin_form_shape(path) {
         return Err(RuntimeError::guest(
@@ -185,19 +248,18 @@ fn validate_path_query(path: &str, query: &str) -> Result<(), RuntimeError> {
     // The path is never echoed: it may carry data a diagnostic must not
     // disclose.
     if has_traversal_form(path) {
-        return Err(RuntimeError::guest(
-            "K4001",
-            "HTTP request path must not contain a `.` or `..` segment, a percent-encoded `.`, `/`, or `\\`, or a malformed percent escape",
-        ));
+        return Err(RuntimeError::guest("K4001", TRAVERSAL_MESSAGE));
     }
+    // A query keeps its own rule: encoded separators in it are ordinary data,
+    // but a raw space can no more be sent there than in the path.
     if query.starts_with('?')
         || query
             .bytes()
-            .any(|byte| byte.is_ascii_control() || matches!(byte, b'#' | b'\\'))
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b' ' | b'#' | b'\\'))
     {
         return Err(RuntimeError::guest(
             "K4001",
-            "HTTP request query must not contain a leading `?`, fragment, control byte, or backslash",
+            "HTTP request query must not contain a leading `?`, fragment, control byte, space, or backslash",
         ));
     }
     Ok(())
@@ -237,7 +299,7 @@ mod tests {
 
     /// Paths whose segment structure a server could change by normalizing or
     /// decoding them.
-    const TRAVERSAL_PATHS: [&str; 26] = [
+    const TRAVERSAL_PATHS: &[&str] = &[
         // Dot segments, wherever they sit.
         "/.",
         "/..",
@@ -248,6 +310,15 @@ mod tests {
         "/a/./b",
         "/a/../b",
         "/a/b/../../c",
+        // Dot segments behind `;` path parameters, which Tomcat, Jetty, and
+        // Spring strip before resolving the segment.
+        "/a/..;/b",
+        "/a/.;/b",
+        "/a/..;x=1/b",
+        "/a/..;a;b",
+        "/..;",
+        "/a/..%3b/b",
+        "/a/.%3B/b",
         // Percent-encoded `.` in either case, alone or completing a dot segment.
         "/%2e",
         "/%2E",
@@ -262,6 +333,31 @@ mod tests {
         // Percent-encoded `\` in either case.
         "/a%5cb",
         "/a%5C..%5Cb",
+        // Percent-encoded NUL, which can truncate `..%00` to `..`.
+        "/a%00",
+        "/a/..%00/b",
+        // Escapes that survive one decoding pass, at any depth.
+        "/a/%252e%252e/b",
+        "/a/%252E",
+        "/a%252fb",
+        "/a%255Cb",
+        "/a/%2500",
+        "/a/%25252e",
+        "/a/%25%32%65",
+        "/a/%2541",
+        "/a/100%25A",
+        "/%2525",
+        "/a/%25u002e",
+        "/a/%25U002E",
+        "/a/%25c0%25ae",
+        // Overlong UTF-8, which a lenient decoder reads as ASCII.
+        "/a/%c0%ae%c0%ae/b",
+        "/a%c0%afb",
+        "/a/%C1%9C",
+        "/a/%e0%80%ae",
+        "/a/%f0%80%80%ae",
+        "/a/%f8%80%80%80%ae",
+        "/a/%fc%80%80%80%80%ae",
         // Malformed escapes, whose decoding is implementation-defined.
         "/%",
         "/a%2",
@@ -269,6 +365,7 @@ mod tests {
         "/a%%2e",
         "/a%2g",
         "/100%",
+        "/a%u002e",
     ];
 
     #[test]
@@ -279,12 +376,12 @@ mod tests {
                 .validate(RuntimeLimits::default())
                 .expect_err("a traversal form must fail validation");
             assert_eq!(error.code(), "K4001", "`{path}`");
-            assert_eq!(
-                error.message(),
-                "HTTP request path must not contain a `.` or `..` segment, a percent-encoded `.`, `/`, or `\\`, or a malformed percent escape",
-                "`{path}`"
-            );
+            assert_eq!(error.message(), TRAVERSAL_MESSAGE, "`{path}`");
         }
+        assert_eq!(
+            TRAVERSAL_MESSAGE,
+            "HTTP request path must not contain a dot segment, a percent-encoded `.`, `/`, `\\`, or NUL, a double-encoded or overlong UTF-8 escape, or a malformed percent escape"
+        );
     }
 
     #[test]
@@ -313,14 +410,34 @@ mod tests {
             "/a/.../b",
             "/..a",
             "/a/b.",
-            // Well-formed escapes of anything but `.`, `/`, or `\`.
+            // Path parameters on a segment that is not a dot segment.
+            "/files;v=2/report",
+            "/a/.x;y/b",
+            "/a/..b;c",
+            "/a/...;x",
+            "/a/;../b",
+            // Well-formed escapes of anything but `.`, `/`, `\`, or NUL, and a
+            // `%25` that no hex digit or `u` follows.
             "/a%20b",
             "/search/caf%C3%A9",
+            "/search/caf%c3%a9",
             "/100%25",
-            "/%2525",
+            "/50%25off",
+            "/%25/next",
             "/a%2Db",
             "/a%3a%3Ab",
             "/%7Euser",
+            "/a%3Bb",
+            // A lone Latin-1 byte is invalid UTF-8 but not overlong.
+            "/caf%E9",
+            "/%C0",
+            "/%E0%A4%85",
+            // Raw non-ASCII text.
+            "/caf\u{e9}",
+            // Unicode compatibility forms are server-specific and out of scope
+            // (WEBHOOK-CONTRACTS.md, "Request paths and queries").
+            "/\u{ff0e}\u{ff0e}/admin",
+            "/%EF%BC%8E%EF%BC%8E/admin",
         ] {
             assert!(is_origin_form_path(path), "`{path}` must be allowed");
             request_with_path(path)
@@ -333,7 +450,7 @@ mod tests {
     fn the_query_keeps_its_own_rule() {
         // Encoded separators and dots are ordinary data in a query string.
         let request = HttpRequest {
-            query: "next=%2Fadmin%2F..&path=../a&q=a%2eb".to_owned(),
+            query: "next=%2Fadmin%2F..&path=../a&q=a%2eb&d=%252e&s=a+b%20c".to_owned(),
             ..request_with_path("/search")
         };
         request
@@ -342,8 +459,42 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_space_is_refused_in_the_path_and_the_query() {
+        // libcurl refuses a raw space anywhere in the target, so the host
+        // refuses it first, before approval or DNS resolution.
+        for path in ["/a b", "/a/ ", " /a"] {
+            assert!(!is_origin_form_path(path), "`{path}` must be refused");
+            let error = request_with_path(path)
+                .validate(RuntimeLimits::default())
+                .expect_err("a raw space must fail validation");
+            assert_eq!(error.code(), "K4001");
+            assert_eq!(
+                error.message(),
+                "HTTP request path must be a safe origin-form absolute path",
+                "`{path:?}`"
+            );
+        }
+        let error = HttpRequest {
+            query: "q=a b".to_owned(),
+            ..request_with_path("/search")
+        }
+        .validate(RuntimeLimits::default())
+        .expect_err("a raw space in a query must fail validation");
+        assert_eq!(error.code(), "K4001");
+        assert_eq!(
+            error.message(),
+            "HTTP request query must not contain a leading `?`, fragment, control byte, space, or backslash"
+        );
+    }
+
+    #[test]
     fn the_shape_rule_is_reported_before_the_traversal_rule() {
-        for path in ["relative/../path", "//evil.example/..", "/a\\..\\b"] {
+        for path in [
+            "relative/../path",
+            "//evil.example/..",
+            "/a\\..\\b",
+            "/a b/..",
+        ] {
             let error = request_with_path(path)
                 .validate(RuntimeLimits::default())
                 .expect_err("an unsafe shape must fail validation");
@@ -354,5 +505,13 @@ mod tests {
                 "`{path}`"
             );
         }
+    }
+
+    #[test]
+    fn a_deeply_nested_encoding_is_refused_in_one_pass() {
+        // One decoding pass decides every depth, so a long nested encoding is
+        // refused without decoding it level by level.
+        let path = format!("/{}2e", "%25".repeat(200_000));
+        assert!(!is_origin_form_path(&path));
     }
 }

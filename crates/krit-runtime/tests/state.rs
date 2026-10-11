@@ -698,6 +698,121 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
     assert_eq!(error.code(), "K5203");
 }
 
+/// Proves that nothing connected to `listener`.
+fn assert_never_contacted(listener: &TcpListener) {
+    listener
+        .set_nonblocking(true)
+        .expect("listener should become nonblocking");
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) => panic!("unexpected accept failure: {error}"),
+        Ok(_) => panic!("a refused replay request reached the network"),
+    }
+}
+
+#[test]
+fn durable_http_replay_refuses_traversal_paths_before_the_journal_or_network() {
+    let directory = TestDirectory::new("replay-traversal");
+    let database = directory.database();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("origin should bind");
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    // The inbound body becomes the outbound path: the injection shape string
+    // building opens up, now behind a durable replay journal.
+    let artifact = compile(
+        &format!(
+            r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {{
+    let outbound: HttpRequest = record {{
+        method: "GET",
+        path: request.body,
+        query: "",
+        headers: [],
+        body: "",
+    }};
+    match replay_http("agent-work", "fetch-work", "{origin}", outbound) {{
+        Ok(response) => response,
+        Err(error) => record {{ status: 502, headers: [], body: error }},
+    }}
+}}
+"#
+        ),
+        &["state.transaction"],
+    );
+    let grants = GrantSet::from_manifest(&manifest(&format!(
+        "http = [\"{origin}\"]\nstate = [\"agent-work\"]"
+    )));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default())
+        .unwrap()
+        .with_network_policy(NetworkPolicy::loopback_for_tests());
+    let runtime = Runtime::default();
+    let agent_host = host(inputs, durable(database.clone(), false));
+    let traversal_paths = [
+        "/work/../admin",
+        "/work/..;/admin",
+        "/work/%2e%2e/admin",
+        "/work/%252e%252e/admin",
+    ];
+    let refuse_all = || {
+        for path in traversal_paths {
+            let error = runtime
+                .invoke_webhook_with_host(
+                    &artifact.bytes,
+                    &artifact.metadata,
+                    &grants,
+                    &agent_host,
+                    request(path),
+                )
+                .expect_err("a traversal path must trap durable replay");
+            // `K4001`, not a replay conflict: the path is refused before the
+            // journal is consulted.
+            assert_eq!(error.code(), "K4001", "`{path}`");
+            assert!(!error.message().contains("admin"), "`{path}`");
+        }
+    };
+
+    // With no journal entry, a refused path reserves nothing.
+    refuse_all();
+    assert_never_contacted(&listener);
+    let store = DurableStore::open(&database, Durability::Full, store_limits()).unwrap();
+    assert_eq!(store.replay_counts().unwrap().0, 0);
+    drop(store);
+
+    // Record one completion for the operation with an ordinary path.
+    listener
+        .set_nonblocking(false)
+        .expect("listener should become blocking");
+    let origin_server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("one request should arrive");
+        let mut request = [0; 2048];
+        let size = stream
+            .read(&mut request)
+            .expect("request should be readable");
+        assert!(request[..size].starts_with(b"GET /work HTTP/1.1\r\n"));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nremote")
+            .expect("response should write");
+        listener
+    });
+    let recorded = runtime
+        .invoke_webhook_with_host(
+            &artifact.bytes,
+            &artifact.metadata,
+            &grants,
+            &agent_host,
+            request("/work"),
+        )
+        .expect("an ordinary path should complete");
+    assert_eq!(recorded.response.body, "remote");
+    let listener = origin_server.join().expect("origin should finish");
+
+    // A recorded completion neither answers nor conflicts with a refused path,
+    // and nothing is sent for one.
+    refuse_all();
+    assert_never_contacted(&listener);
+    let store = DurableStore::open(&database, Durability::Full, store_limits()).unwrap();
+    assert_eq!(store.replay_counts().unwrap().0, 1);
+}
+
 #[test]
 fn protocol_one_rejects_cross_store_transactions_without_partial_commit() {
     let directory = TestDirectory::new("cross-store");

@@ -233,8 +233,9 @@ keys, or stats.
 Adapter input, response, and timeout values must be nonzero and no greater
 than both the selected runtime limits and the hard maxima. Paths are safe
 origin-form absolute paths without query or fragment, held to the request path
-rule in `WEBHOOK-CONTRACTS.md` (no `.` or `..` segment, no percent-encoded `.`,
-`/`, or `\`). Model identifiers are bounded printable identifiers and are not
+rule in `WEBHOOK-CONTRACTS.md` ("Request paths and queries"); an adapter path
+that breaks it is refused with `K7003` when the host configuration is
+validated. Model identifiers are bounded printable identifiers and are not
 artifact facts.
 
 ## Structured logging and publication

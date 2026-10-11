@@ -88,7 +88,7 @@ Initial required codes:
 | `K3008` | Host capability resource is not a direct valid string literal |
 | `K3009` | Opaque secret is used by a revealing or structural operation |
 | `K3010` | Opaque database transaction handle is used outside a database operation |
-| `K4001` | Generic guest trap, wrong runtime value kind, or HTTP request/response the host refuses (including a request path with a `.`/`..` segment or a percent-encoded `.`, `/`, or `\`) |
+| `K4001` | Generic guest trap, wrong runtime value kind, or HTTP request/response the host refuses (including a request path that breaks the rule in `WEBHOOK-CONTRACTS.md`, "Request paths and queries") |
 | `K4002` | Calling a non-function |
 | `K4003` | Function argument count mismatch |
 | `K4004` | Division or remainder by zero |

@@ -1312,10 +1312,14 @@ fn ai_adapter_paths_refuse_traversal_forms_at_setup() {
     for path in [
         "/v1/../admin",
         "/v1/./invoke",
+        "/v1/..;/admin",
         "/v1/%2e%2e/admin",
         "/v1%2Finvoke",
         "/v1%5cinvoke",
+        "/v1/%252e%252e/admin",
+        "/v1/%c0%ae%c0%ae/admin",
         "/v1/invoke%",
+        "/v1/chat completions",
     ] {
         let error = krit_runtime::validate_policy(&policy_with_path(path))
             .expect_err("a traversal form must be refused at setup");

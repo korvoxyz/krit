@@ -203,8 +203,10 @@ pub(crate) fn send(
     easy.url(&target)
         .map_err(|_| "invalid outbound HTTP URL".to_owned())?;
     // The host validated the path exactly as written, so libcurl must not
-    // rewrite it: by default curl resolves dot segments itself, and the request
-    // on the wire would no longer be the one the host checked.
+    // resolve it: by default curl removes dot segments itself, and the request
+    // on the wire would no longer address the resource the host checked. curl
+    // still respells the path without changing what it decodes to (uppercase
+    // escape hex, non-ASCII bytes percent-encoded); see WEBHOOK-CONTRACTS.md.
     easy.path_as_is(true)
         .map_err(|_| "could not send the outbound HTTP path as validated".to_owned())?;
     easy.proxy("")
@@ -902,9 +904,9 @@ secrets = ["token"]
         mock.join().expect("mock should finish");
     }
 
-    /// Sends one GET for `path` to a loopback mock and returns the request line
-    /// the mock received.
-    fn request_line_on_the_wire(path: &str) -> String {
+    /// Sends one GET for `path` and `query` to a loopback mock and returns the
+    /// request line the mock received.
+    fn request_line_on_the_wire(path: &str, query: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock should bind");
         let address = listener.local_addr().expect("mock address should exist");
         let mock = thread::spawn(move || {
@@ -932,7 +934,7 @@ secrets = ["token"]
         let request = HttpRequest {
             method: "GET".to_owned(),
             path: path.to_owned(),
-            query: String::new(),
+            query: query.to_owned(),
             headers: Vec::new(),
             body: String::new(),
         };
@@ -955,19 +957,48 @@ secrets = ["token"]
     }
 
     #[test]
-    fn the_request_path_is_sent_exactly_as_validated() {
+    fn libcurl_never_resolves_or_decodes_the_request_path() {
         // `send` is reached only after validation, which already refuses dot
         // segments. Calling it directly with one proves libcurl itself never
-        // rewrites a path: a dot segment curl resolved would have changed the
+        // resolves a path: a dot segment curl removed would have changed the
         // target after the host checked it.
         assert_eq!(
-            request_line_on_the_wire("/a/./b/../c"),
+            request_line_on_the_wire("/a/./b/../c", ""),
             "GET /a/./b/../c HTTP/1.1"
         );
-        // Escapes that validation keeps are not decoded or re-encoded either.
         assert_eq!(
-            request_line_on_the_wire("/files/a%20b/100%25"),
-            "GET /files/a%20b/100%25 HTTP/1.1"
+            request_line_on_the_wire("/a;v=1/..;/b", ""),
+            "GET /a;v=1/..;/b HTTP/1.1"
+        );
+        // Escapes are never decoded, and ASCII punctuation passes unchanged.
+        assert_eq!(
+            request_line_on_the_wire("/files/a%20b/100%25/%7E", ""),
+            "GET /files/a%20b/100%25/%7E HTTP/1.1"
+        );
+        assert_eq!(
+            request_line_on_the_wire("/a\"b<c>{d}|e^f`g", ""),
+            "GET /a\"b<c>{d}|e^f`g HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn libcurl_respells_the_path_but_sends_the_query_byte_for_byte() {
+        // The documented exception to "sent as validated" (WEBHOOK-CONTRACTS.md,
+        // "What reaches the wire"): curl writes escape hex in uppercase and
+        // percent-encodes raw non-ASCII path bytes as UTF-8. Neither changes
+        // what the path decodes to, so the traversal decision is unaffected, but
+        // a program that signs its path must sign this spelling.
+        assert_eq!(
+            request_line_on_the_wire("/%41%7e%c3%a9/A%2d", ""),
+            "GET /%41%7E%C3%A9/A%2D HTTP/1.1"
+        );
+        assert_eq!(
+            request_line_on_the_wire("/caf\u{e9}", ""),
+            "GET /caf%C3%A9 HTTP/1.1"
+        );
+        assert_eq!(
+            request_line_on_the_wire("/search", "q=%7e%c3%a9&next=%2f%2e&r=caf\u{e9}"),
+            "GET /search?q=%7e%c3%a9&next=%2f%2e&r=caf\u{e9} HTTP/1.1"
         );
     }
 

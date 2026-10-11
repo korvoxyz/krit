@@ -51,36 +51,71 @@ One path rule covers every `HttpRequest` the host accepts: an inbound webhook
 request, every guest `http_request`, durable HTTP replay, and the request an
 AI adapter or search connector builds. The path must be an origin-form
 absolute path. It starts with `/` but not `//`, and it contains no `://`, no
-backslash, no `?` or `#`, and no ASCII control byte. It also may not contain
-any form that a server could normalize or decode into a different segment
-structure:
+space, no backslash, no `?` or `#`, and no ASCII control byte.
 
-- a segment that is exactly `.` or `..`, such as `/a/./b`, `/a/../b`, or `/..`;
-- a percent-encoded `.`, `/`, or `\` anywhere in the path, in either case
-  (`%2E`, `%2F`, `%5C`, `%2e`, `%2f`, `%5c`), so `%2e%2e` and `.%2e` cannot
-  spell a dot segment and `%2f` cannot split one segment into two;
-- a `%` that does not begin a well-formed `%HH` escape, because servers decode
-  it in different ways.
+Before routing, servers and proxies commonly resolve dot segments, strip `;`
+path parameters, and percent-decode the path, sometimes twice when a proxy
+decodes in front of a backend that decodes again. The rule refuses every path
+whose segment structure one of those transforms could change. Each
+`/`-separated segment is percent-decoded once, and the path is refused when:
 
-Dots inside a segment (`/.well-known`, `/v1.2`, `/a..b`) and every other
-well-formed escape (`%20`, `%25`, `%7E`, escaped UTF-8) remain valid. The query
-may not start with `?` and may not contain a fragment, a control byte, or a
-backslash. Encoded separators in a query are ordinary data.
+- a segment is a dot segment: once decoded, its part before the first `;` is
+  exactly `.` or `..`. This covers `/a/./b`, `/a/../b`, `/..`, `/a/..;/b`,
+  `/a/.;x=1/b`, and `/a/..%3B/b`;
+- an escape decodes to `.`, `/`, `\`, or NUL, in either case (`%2E`, `%2F`,
+  `%5C`, `%00`, `%2e`, `%2f`, `%5c`), so `%2e%2e` and `.%2e` cannot spell a dot
+  segment, `%2f` cannot split one segment into two, and `%00` cannot truncate
+  `..%00` to `..`;
+- a decoded segment still contains a `%` followed by a hex digit or `u`
+  (`%252e`, `%2541`, `%25%32%65`, `%25u002e`), so a second decoding pass cannot
+  produce another escaped byte at any depth;
+- escapes begin an overlong UTF-8 sequence: `%C0` or `%C1` before a
+  continuation byte, `%E0` before `%80`-`%9F`, `%F0` before `%80`-`%8F`, or the
+  five- and six-byte forms `%F8` before `%80`-`%87` and `%FC` before
+  `%80`-`%83`. A lenient decoder reads `%C0%AE` as `.` and `%C0%AF` as `/`;
+- a `%` does not begin a well-formed `%HH` escape (`%`, `%2`, `%zz`,
+  `%u002e`), because servers decode it in different ways.
+
+Dots inside a segment (`/.well-known`, `/v1.2`, `/a..b`), `;` parameters on any
+other segment (`/files;v=2`), and every other well-formed escape remain valid:
+`%20`, `%7E`, escaped UTF-8 such as `%C3%A9`, a lone escaped byte that is not
+UTF-8 such as `%E9`, and a `%25` that no hex digit or `u` follows (`/100%25`,
+`/50%25off`). Raw non-ASCII text such as `/café` is valid as well.
+
+The rule does not model transforms that belong to one server, framework, or
+platform: Unicode compatibility normalization (NFKC turns a fullwidth `．．`,
+raw or escaped as `%EF%BC%8E%EF%BC%8E`, into `..`), case folding, or the Windows
+trimming of trailing dots and spaces from a segment. A path that relies on
+such a transform is accepted. An origin that applies one must enforce its own
+confinement, because the host cannot.
+
+The query may not start with `?` and may not contain a fragment, a space, a
+control byte, or a backslash. Encoded separators in a query are ordinary data.
 
 The origin is the only HTTP authority a program holds. This rule keeps a path
 built from untrusted text, such as an inbound field or model output, from
 escaping the prefix the program meant to address after a server resolves it.
 
 A violation is `K4001`, and the diagnostic never echoes the path. An inbound
-request is refused before guest execution. A guest `http_request` traps the
-invocation before approval, DNS resolution, or any connection. An AI adapter
-or search connector path that breaks the rule is refused earlier, when the
-host configuration is validated (`K7003` for an adapter, `K5404` for a
-connector).
+request is refused before guest execution. A guest `http_request` or durable
+`replay_http` traps the invocation before approval, before the replay journal
+is consulted, and before DNS resolution or any connection. An AI adapter or
+search connector path that breaks the rule is refused earlier, when the host
+configuration is validated (`K7003` for an adapter, `K5404` for a connector).
 
-The host sends the path byte-for-byte as validated. libcurl's own dot-segment
-normalization is disabled (`CURLOPT_PATH_AS_IS`), so the request on the wire is
-the request the host checked.
+### What reaches the wire
+
+The host never resolves dot segments in an accepted path and never decodes its
+escapes, and it disables libcurl's own dot-segment normalization
+(`CURLOPT_PATH_AS_IS`). Dot segments, `;` parameters, and every escape
+therefore reach the origin with the meaning the host checked. libcurl still
+respells the path in two ways that leave its decoded bytes unchanged. It writes
+the hex digits of every escape in uppercase, so `%7e` is sent as `%7E`. It also
+percent-encodes each raw non-ASCII byte, so `/café` is sent as `/caf%C3%A9`.
+The query is sent byte-for-byte. A program that signs its request path should
+sign this spelling, or use uppercase escapes and escape non-ASCII bytes itself.
+libcurl refuses a raw space anywhere in the request target, which is why the
+rule refuses one before approval rather than letting the transfer fail later.
 
 ## Request JSON Schema
 
@@ -272,14 +307,15 @@ adapter's or connector's origin, so host configuration cannot widen a binding
 bytes stay in a host-owned zeroizing store and only a Wasmtime resource handle
 enters the guest.
 
-Outbound HTTP verifies the exact origin on every call, sends the path exactly
-as validated, disables redirects, pins the one request's DNS result, rejects
-non-public IPv4/IPv6 ranges including private, shared, documentation,
-benchmark, link-local, loopback, reserved, and metadata addresses by default,
-validates TLS certificates and hostnames, and enforces DNS/connect/read/overall
-timeouts plus call/header/body limits. An embedding-only test policy may allow
-loopback; a separate explicit policy is required to send bearer authentication
-over plain HTTP. Neither switch is available to guest code or manifests.
+Outbound HTTP verifies the exact origin on every call, never resolves or
+decodes the validated path, disables redirects, pins the one request's DNS
+result, rejects non-public IPv4/IPv6 ranges including private, shared,
+documentation, benchmark, link-local, loopback, reserved, and metadata
+addresses by default, validates TLS certificates and hostnames, and enforces
+DNS/connect/read/overall timeouts plus call/header/body limits. An
+embedding-only test policy may allow loopback; a separate explicit policy is
+required to send bearer authentication over plain HTTP. Neither switch is
+available to guest code or manifests.
 
 WIT 0.2 names the webhook and HTTP records separately but gives them identical
 field order and canonical shape. Reusing types from the function-owning

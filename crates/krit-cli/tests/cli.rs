@@ -2316,6 +2316,10 @@ license = "Apache-2.0"
         ("encoded-dot.json", "/hooks/hidden-seg/%2E%2e/admin"),
         ("encoded-slash.json", "/hooks/hidden-seg%2Fadmin"),
         ("encoded-backslash.json", "/hooks/hidden-seg%5C..%5Cadmin"),
+        ("path-parameter.json", "/hooks/hidden-seg/..;/admin"),
+        ("double-encoded.json", "/hooks/hidden-seg/%252e%252e/admin"),
+        ("overlong.json", "/hooks/hidden-seg/%c0%ae%c0%ae/admin"),
+        ("encoded-nul.json", "/hooks/hidden-seg/..%00/admin"),
     ] {
         let request = directory.file(
             name,
@@ -5923,6 +5927,12 @@ http = ["http://search.example", "https://search.example"]
             "encoded-slash.host.json",
             "https://search.example",
             "/v1%2Fadmin",
+            false,
+        ),
+        (
+            "path-parameter.host.json",
+            "https://search.example",
+            "/v1/..;/admin",
             false,
         ),
         (

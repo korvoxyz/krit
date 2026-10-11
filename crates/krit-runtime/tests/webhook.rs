@@ -956,21 +956,31 @@ fn bound_secrets_reach_their_origin_and_legacy_secrets_stay_unbound() {
 }
 
 /// One spelling of every traversal form the host refuses in a request path:
-/// dot segments, percent-encoded `.`, `/`, and `\` in either case, and a
-/// malformed escape.
-const TRAVERSAL_PATHS: [&str; 9] = [
+/// dot segments (bare and behind `;` path parameters), percent-encoded `.`,
+/// `/`, `\`, and NUL in either case, double-encoded and overlong UTF-8 escapes,
+/// and a malformed escape.
+const TRAVERSAL_PATHS: [&str; 18] = [
     "/api/../admin",
     "/api/./admin",
+    "/api/..;/admin",
+    "/api/.;/admin",
+    "/api/..;x=1/admin",
+    "/api/..%3B/admin",
     "/api/%2e%2e/admin",
     "/api/.%2E/admin",
     "/api%2fadmin",
     "/api%2Fadmin",
     "/api%5c..%5cadmin",
     "/api%5C..%5Cadmin",
+    "/api/..%00/admin",
+    "/api/%252e%252e/admin",
+    "/api%252fadmin",
+    "/api/%c0%ae%c0%ae/admin",
+    "/api/%e0%80%ae",
     "/api/50%",
 ];
 
-const TRAVERSAL_MESSAGE: &str = "HTTP request path must not contain a `.` or `..` segment, a percent-encoded `.`, `/`, or `\\`, or a malformed percent escape";
+const TRAVERSAL_MESSAGE: &str = "HTTP request path must not contain a dot segment, a percent-encoded `.`, `/`, `\\`, or NUL, a double-encoded or overlong UTF-8 escape, or a malformed percent escape";
 
 #[test]
 fn inbound_paths_refuse_traversal_forms_before_guest_execution() {
@@ -1005,7 +1015,12 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
     }
 
     // Ordinary dots and every other escape still reach the guest unchanged.
-    for path in ["/.well-known/hook", "/hooks/v1.2/a%20b", "/hooks/100%25"] {
+    for path in [
+        "/.well-known/hook",
+        "/hooks/v1.2/a%20b",
+        "/hooks/100%25",
+        "/hooks/files;v=2",
+    ] {
         let result = Runtime::default()
             .invoke_webhook(
                 &echo.bytes,
@@ -1069,7 +1084,8 @@ fn outbound_paths_refuse_traversal_forms_before_any_connection() {
     }
     assert_never_contacted(&listener);
 
-    // An ordinary path keeps its escapes and reaches the origin byte-for-byte.
+    // An ordinary path reaches the origin unresolved and undecoded. libcurl only
+    // respells it: escape hex is sent in uppercase.
     listener
         .set_nonblocking(false)
         .expect("listener should become blocking");
@@ -1080,13 +1096,13 @@ fn outbound_paths_refuse_traversal_forms_before_any_connection() {
             &artifact.metadata,
             &grants,
             &inputs,
-            request("/api/files/v1.2/a%20b/%7Euser"),
+            request("/api/files;v=2/v1.2/a%20b/%7euser"),
         )
         .expect("an ordinary path must be sent");
     assert_eq!(result.response.status, 202);
     let captured = server.join().expect("origin should finish");
     assert!(
-        captured.starts_with("GET /api/files/v1.2/a%20b/%7Euser HTTP/1.1\r\n"),
+        captured.starts_with("GET /api/files;v=2/v1.2/a%20b/%7Euser HTTP/1.1\r\n"),
         "{captured}"
     );
 }
