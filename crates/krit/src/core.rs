@@ -293,6 +293,16 @@ pub enum OperationKind {
     Discard {
         value: ValueId,
     },
+    /// Returns `value` from the enclosing function immediately.
+    ///
+    /// `value` has the function's declared result type. An exit is the last
+    /// operation of its block and that block's result, which it never
+    /// produces: control leaves the function, so the operation's own type is
+    /// whatever the block's type requires. It is never valid in module
+    /// initialization.
+    Exit {
+        value: ValueId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -466,14 +476,18 @@ struct FunctionContext {
     scopes: Vec<BTreeMap<BindingId, ValueId>>,
     captures: Vec<CapturePlan>,
     capture_by_binding: BTreeMap<BindingId, usize>,
+    /// The result type an exit from this function returns, or `None` for
+    /// module initialization, which cannot exit.
+    exit: Option<Arc<Type>>,
 }
 
 impl FunctionContext {
-    fn new() -> Self {
+    fn new(exit: Option<Arc<Type>>) -> Self {
         Self {
             scopes: vec![BTreeMap::new()],
             captures: Vec::new(),
             capture_by_binding: BTreeMap::new(),
+            exit,
         }
     }
 
@@ -554,7 +568,7 @@ impl<'a> Lowerer<'a> {
     fn program(mut self, program: &Program) -> Result<CoreModule, IrError> {
         let entrypoint = self.allocate_function();
         debug_assert_eq!(entrypoint, FunctionId(0));
-        self.contexts.push(FunctionContext::new());
+        self.contexts.push(FunctionContext::new(None));
         let block_id = self.allocate_block();
         let body = self.lower_statements_block(
             block_id,
@@ -1066,6 +1080,9 @@ impl<'a> Lowerer<'a> {
                     }
                 }
             }
+            ExpressionKind::Propagate { operand, question } => {
+                self.lower_propagate(operand, *question, ty, source, operations)
+            }
             ExpressionKind::Unary { operator, operand } => {
                 let operand = self.lower_expression(operand, operations)?;
                 Ok(self.emit(
@@ -1081,6 +1098,131 @@ impl<'a> Lowerer<'a> {
             }
             ExpressionKind::Binary { .. } => self.lower_binary_chain(expression, operations),
         }
+    }
+
+    /// Lowers `operand?`, whose `?` is at `question` and whose value has type
+    /// `ty`, to a variant match on the operand.
+    ///
+    /// The `Ok` or `Some` arm yields the payload. The `Err` or `None` arm
+    /// rebuilds the failure at the enclosing function's result type, which
+    /// analysis gave the identical error type, and exits the function with
+    /// it. The arms bind Core-only match bindings, since no source name
+    /// refers to the values they bind.
+    fn lower_propagate(
+        &mut self,
+        operand: &Expression,
+        question: Span,
+        ty: Arc<Type>,
+        source: Option<Span>,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<ValueId, IrError> {
+        let subject = self.lower_expression(operand, operations)?;
+        let exit = self
+            .contexts
+            .last()
+            .and_then(|context| context.exit.clone())
+            .ok_or_else(|| {
+                IrError::new(format!(
+                    "`?` at {question:?} has no enclosing function to return from"
+                ))
+            })?;
+        let subject_type = self.expression_fact(operand)?.shared_type();
+        let (family, success, failure, payload, error) = match subject_type.as_ref() {
+            Type::Option(payload) => (
+                VariantFamily::Option,
+                VariantName::Some,
+                VariantName::None,
+                Arc::clone(payload),
+                None,
+            ),
+            Type::Result(payload, error) => (
+                VariantFamily::Result,
+                VariantName::Ok,
+                VariantName::Err,
+                Arc::clone(payload),
+                Some(Arc::clone(error)),
+            ),
+            other => {
+                return Err(IrError::new(format!(
+                    "`?` at {question:?} has an operand of non-variant type `{other}`"
+                )));
+            }
+        };
+
+        let success_binding = self.synthetic_match_binding("$value", payload, question);
+        let success_parameter = self.block_parameter(success_binding)?;
+        let success_match_binding = success_parameter.match_binding;
+        let success_block = CoreBlock {
+            id: self.allocate_block(),
+            result: success_parameter.value,
+            parameters: vec![success_parameter],
+            operations: Vec::new(),
+            ty: Arc::clone(&ty),
+            effects: EffectSet::default(),
+            requirements: RequirementSet::default(),
+            source: Some(question),
+        };
+
+        let (failure_match_binding, failure_parameters) = match error {
+            Some(error) => {
+                let binding = self.synthetic_match_binding("$error", error, question);
+                let parameter = self.block_parameter(binding)?;
+                (Some(parameter.match_binding), vec![parameter])
+            }
+            None => (None, Vec::new()),
+        };
+        let failure_id = self.allocate_block();
+        let mut failure_operations = Vec::new();
+        let returned = self.emit(
+            &mut failure_operations,
+            exit,
+            EffectSet::default(),
+            Some(question),
+            OperationKind::Variant {
+                variant: failure,
+                payload: failure_parameters.first().map(|parameter| parameter.value),
+            },
+        );
+        let exited = self.emit(
+            &mut failure_operations,
+            Arc::clone(&ty),
+            EffectSet::default(),
+            Some(question),
+            OperationKind::Exit { value: returned },
+        );
+        let failure_block = CoreBlock {
+            id: failure_id,
+            parameters: failure_parameters,
+            operations: failure_operations,
+            result: exited,
+            ty: Arc::clone(&ty),
+            effects: EffectSet::default(),
+            requirements: RequirementSet::default(),
+            source: Some(question),
+        };
+
+        Ok(self.emit(
+            operations,
+            ty,
+            EffectSet::default(),
+            source,
+            OperationKind::MatchVariant {
+                subject,
+                family,
+                arms: vec![
+                    VariantArmBlock {
+                        variant: success,
+                        binding: Some(success_match_binding),
+                        block: success_block,
+                    },
+                    VariantArmBlock {
+                        variant: failure,
+                        binding: failure_match_binding,
+                        block: failure_block,
+                    },
+                ],
+            },
+        ))
     }
 
     /// Lowers an `if` expression and its whole `else if` chain.
@@ -1303,7 +1445,8 @@ impl<'a> Lowerer<'a> {
         }
         let function_id = self.allocate_function();
         let closure_id = self.allocate_closure();
-        self.contexts.push(FunctionContext::new());
+        self.contexts
+            .push(FunctionContext::new(Some(Arc::clone(&signature.result))));
 
         let recursive = if let Some((binding, _)) = named {
             let value = self.allocate_value();
@@ -1377,6 +1520,30 @@ impl<'a> Lowerer<'a> {
             },
         );
         Ok((value, function_id))
+    }
+
+    /// Adds a Core-only match binding of type `ty` for the construct at
+    /// `source`, which binds a value that no source name refers to.
+    ///
+    /// Its debug name starts with `$`, which no source name can, and analysis
+    /// symbols number the bindings below it, so it never shares a name or an
+    /// identifier with a source binding.
+    fn synthetic_match_binding(
+        &mut self,
+        debug_name: &str,
+        ty: Arc<Type>,
+        source: Span,
+    ) -> BindingId {
+        let id = BindingId(self.bindings.len() as u32);
+        self.bindings.push(CoreBinding {
+            id,
+            kind: BindingKind::Match,
+            ty,
+            debug_name: Some(debug_name.to_owned()),
+            source: Some(source),
+            top_level: false,
+        });
+        id
     }
 
     fn block_parameter(&mut self, binding: BindingId) -> Result<BlockParameter, IrError> {
@@ -1920,14 +2087,22 @@ impl<'a> Verifier<'a> {
                 )));
             }
         }
-        self.verify_block(&function.body, &available, &bindings)
+        // Module initialization runs every top-level statement in order, so
+        // nothing may leave it early.
+        let exit = (function.id != self.module.entrypoints[0].function)
+            .then_some(function.signature.result.as_ref());
+        self.verify_block(&function.body, &available, &bindings, exit)
     }
 
+    /// Verifies `block`, where `exit` is the result type of the enclosing
+    /// function that an exit operation returns from, or `None` where exits
+    /// are invalid.
     fn verify_block(
         &self,
         block: &CoreBlock,
         incoming: &BTreeSet<ValueId>,
         incoming_bindings: &BTreeMap<BindingId, ValueId>,
+        exit: Option<&Type>,
     ) -> Result<(), IrError> {
         let mut available = incoming.clone();
         let mut bindings = incoming_bindings.clone();
@@ -1945,8 +2120,16 @@ impl<'a> Verifier<'a> {
         }
         let mut operation_effects = Vec::new();
         let mut operation_requirements = Vec::new();
-        for operation in &block.operations {
-            self.verify_operation(operation, &available, &bindings)?;
+        for (index, operation) in block.operations.iter().enumerate() {
+            self.verify_operation(operation, &available, &bindings, exit)?;
+            if matches!(operation.kind, OperationKind::Exit { .. })
+                && (index + 1 != block.operations.len() || block.result != operation.result)
+            {
+                return Err(IrError::new(format!(
+                    "{} exit {} is not the last operation and the result of its block",
+                    block.id, operation.result
+                )));
+            }
             operation_effects.push(&operation.effects);
             operation_requirements.push(&operation.requirements);
             available.insert(operation.result);
@@ -1983,6 +2166,7 @@ impl<'a> Verifier<'a> {
         operation: &CoreOperation,
         available: &BTreeSet<ValueId>,
         bindings: &BTreeMap<BindingId, ValueId>,
+        exit: Option<&Type>,
     ) -> Result<(), IrError> {
         let pure = EffectSet::default();
         match &operation.kind {
@@ -2089,7 +2273,7 @@ impl<'a> Verifier<'a> {
                 expect_effects(operation, &pure)?;
             }
             OperationKind::Block { block } => {
-                self.verify_block(block, available, bindings)?;
+                self.verify_block(block, available, bindings, exit)?;
                 expect_type(operation, &block.ty)?;
                 require_effects(operation, &block.effects)?;
             }
@@ -2151,8 +2335,8 @@ impl<'a> Verifier<'a> {
             } => {
                 require_available(*condition, available, operation.result)?;
                 self.expect_value_type(*condition, &Type::Bool)?;
-                self.verify_block(consequent, available, bindings)?;
-                self.verify_block(alternative, available, bindings)?;
+                self.verify_block(consequent, available, bindings, exit)?;
+                self.verify_block(alternative, available, bindings, exit)?;
                 if !type_equivalent(&consequent.ty, &alternative.ty)
                     || !type_equivalent(&consequent.ty, &operation.ty)
                 {
@@ -2178,8 +2362,8 @@ impl<'a> Verifier<'a> {
                         operation.result
                     )));
                 };
-                self.verify_block(empty, available, bindings)?;
-                self.verify_block(cons, available, bindings)?;
+                self.verify_block(empty, available, bindings, exit)?;
+                self.verify_block(cons, available, bindings, exit)?;
                 if !type_equivalent(&empty.ty, &cons.ty)
                     || !type_equivalent(&empty.ty, &operation.ty)
                 {
@@ -2250,7 +2434,7 @@ impl<'a> Verifier<'a> {
                             )));
                         }
                     }
-                    self.verify_block(&arm.block, available, bindings)?;
+                    self.verify_block(&arm.block, available, bindings, exit)?;
                     if !type_equivalent(&arm.block.ty, &operation.ty) {
                         return Err(IrError::new(format!(
                             "{} variant arm result type is inconsistent",
@@ -2305,6 +2489,17 @@ impl<'a> Verifier<'a> {
                 expect_type(operation, &Type::Unit)?;
                 expect_effects(operation, &pure)?;
             }
+            OperationKind::Exit { value } => {
+                require_available(*value, available, operation.result)?;
+                let Some(exit) = exit else {
+                    return Err(IrError::new(format!(
+                        "{} exits module initialization",
+                        operation.result
+                    )));
+                };
+                self.expect_value_type(*value, exit)?;
+                expect_effects(operation, &pure)?;
+            }
         }
         self.verify_operation_requirements(operation)?;
         Ok(())
@@ -2355,7 +2550,8 @@ impl<'a> Verifier<'a> {
             | OperationKind::Unary { .. }
             | OperationKind::Binary { .. }
             | OperationKind::Bind { .. }
-            | OperationKind::Discard { .. } => {
+            | OperationKind::Discard { .. }
+            | OperationKind::Exit { .. } => {
                 expect_requirements(operation, &RequirementSet::default())
             }
         }
@@ -3224,7 +3420,8 @@ fn block_has_residual(block: &CoreBlock, visited: &mut HashSet<*const Type>) -> 
                     | OperationKind::Unary { .. }
                     | OperationKind::Binary { .. }
                     | OperationKind::Bind { .. }
-                    | OperationKind::Discard { .. } => false,
+                    | OperationKind::Discard { .. }
+                    | OperationKind::Exit { .. } => false,
                 }
         })
 }
@@ -3636,6 +3833,9 @@ fn render_operation(output: &mut String, operation: &CoreOperation, indent: usiz
         OperationKind::Discard { value } => {
             output.push_str(&format!("discard {value}"));
         }
+        OperationKind::Exit { value } => {
+            output.push_str(&format!("exit {value}"));
+        }
     }
     if !operation.effects.is_empty() {
         output.push_str(&format!(" effects {}", operation.effects));
@@ -3738,7 +3938,8 @@ mod tests {
                 | OperationKind::Unary { .. }
                 | OperationKind::Binary { .. }
                 | OperationKind::Bind { .. }
-                | OperationKind::Discard { .. } => {}
+                | OperationKind::Discard { .. }
+                | OperationKind::Exit { .. } => {}
             }
         }
     }
@@ -3918,6 +4119,158 @@ mod tests {
                 .to_string()
                 .contains("unavailable")
         );
+    }
+
+    const PROPAGATING: &str = "fn digit(text: String) -> Result<Int, String> { Err(text) }\n\
+                               fn total(text: String) -> Result<Int, String> {\n\
+                               digit(text)?;\n\
+                               Ok(1)\n\
+                               }";
+
+    /// The body of the function named `name`.
+    fn function_body<'m>(module: &'m mut CoreModule, name: &str) -> &'m mut CoreBlock {
+        &mut module
+            .functions
+            .iter_mut()
+            .find(|function| function.debug_name.as_deref() == Some(name))
+            .expect("the function should be lowered")
+            .body
+    }
+
+    /// The arms of the first variant match among `operations`.
+    fn match_arms(operations: &mut [CoreOperation]) -> &mut Vec<VariantArmBlock> {
+        operations
+            .iter_mut()
+            .find_map(|operation| match &mut operation.kind {
+                OperationKind::MatchVariant { arms, .. } => Some(arms),
+                _ => None,
+            })
+            .expect("the body should contain a variant match")
+    }
+
+    #[test]
+    fn lowers_postfix_question_marks_to_matches_whose_failure_arm_exits() {
+        let mut module = lowered(PROPAGATING);
+        let arms = match_arms(&mut function_body(&mut module, "total").operations);
+        assert_eq!(arms[0].variant, VariantName::Ok);
+        assert!(arms[0].block.operations.is_empty());
+        assert_eq!(arms[0].block.result, arms[0].block.parameters[0].value);
+        assert_eq!(arms[1].variant, VariantName::Err);
+        let failure = &arms[1].block;
+        let [rebuilt, exit] = failure.operations.as_slice() else {
+            panic!("the failure arm should rebuild the error and exit");
+        };
+        assert!(matches!(
+            rebuilt.kind,
+            OperationKind::Variant {
+                variant: VariantName::Err,
+                payload: Some(payload),
+            } if payload == failure.parameters[0].value
+        ));
+        assert_eq!(rebuilt.ty.to_string(), "Result<Int, String>");
+        assert!(matches!(exit.kind, OperationKind::Exit { value } if value == rebuilt.result));
+        assert_eq!(failure.result, exit.result);
+        let rendered = module.render_text();
+        assert!(rendered.contains("= exit v"), "{rendered}");
+        assert!(rendered.contains("match $value: Int"), "{rendered}");
+        assert!(rendered.contains("match $error: String"), "{rendered}");
+
+        // A `None` arm binds nothing and exits with `None`.
+        let mut module = lowered(
+            "fn first(items: List<Int>) -> Option<Int> {\n\
+             match items { [] => None, [head, .._] => Some(head) }\n}\n\
+             fn second(items: List<Int>) -> Option<Bool> { Some(first(items)? > 0) }",
+        );
+        let arms = match_arms(&mut function_body(&mut module, "second").operations);
+        assert_eq!(arms[1].variant, VariantName::None);
+        assert!(arms[1].binding.is_none() && arms[1].block.parameters.is_empty());
+        assert!(matches!(
+            arms[1].block.operations[0].kind,
+            OperationKind::Variant {
+                variant: VariantName::None,
+                payload: None
+            }
+        ));
+        assert_eq!(arms[1].block.operations[0].ty.to_string(), "Option<Bool>");
+    }
+
+    #[test]
+    fn lowers_long_question_mark_chains_without_nesting_core_blocks() {
+        // Each `?` unwraps one `Option` level; the operand of every `?` is
+        // lowered before its match, so the matches follow each other in one
+        // block instead of nesting.
+        const LINKS: usize = 200;
+        let text = format!(
+            "fn f(x: {}Int{}) -> Option<Int> {{\n    Some(x{})\n}}\n",
+            "Option<".repeat(LINKS),
+            ">".repeat(LINKS),
+            "?".repeat(LINKS)
+        );
+        let mut module =
+            crate::run_on_thread("core-test", crate::COMPILER_STACK_BYTES, move || {
+                lowered(&text)
+            })
+            .expect("core test thread should start");
+        let body = function_body(&mut module, "f");
+        let matches = body
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation.kind, OperationKind::MatchVariant { .. }))
+            .count();
+        assert_eq!(matches, LINKS);
+        assert_eq!(module.deepest_block().0, 2);
+    }
+
+    #[test]
+    fn verification_rejects_misplaced_and_mistyped_exits() {
+        let error = |module: &CoreModule| {
+            module
+                .verify()
+                .expect_err("a malformed exit should fail verification")
+                .to_string()
+        };
+
+        // An exit must end its block.
+        let mut module = lowered(PROPAGATING);
+        let body = function_body(&mut module, "total");
+        let literal = body
+            .operations
+            .iter()
+            .position(|operation| matches!(operation.kind, OperationKind::Literal(_)))
+            .expect("the body should contain a literal");
+        let literal = body.operations.remove(literal);
+        match_arms(&mut body.operations)[1]
+            .block
+            .operations
+            .push(literal);
+        assert!(error(&module).contains("is not the last operation and the result of its block"));
+
+        // An exit must be its block's result.
+        let mut module = lowered(PROPAGATING);
+        let failure = &mut match_arms(&mut function_body(&mut module, "total").operations)[1].block;
+        failure.result = failure.operations[0].result;
+        assert!(error(&module).contains("is not the last operation and the result of its block"));
+
+        // An exit returns the function's result type.
+        let mut module = lowered(PROPAGATING);
+        let failure = &mut match_arms(&mut function_body(&mut module, "total").operations)[1].block;
+        let error_value = failure.parameters[0].value;
+        failure.operations[1].kind = OperationKind::Exit { value: error_value };
+        assert!(error(&module).contains("expected `Result<Int, String>`"));
+
+        // Module initialization never exits.
+        let mut module = lowered("1;");
+        let discard = module.functions[0]
+            .body
+            .operations
+            .iter_mut()
+            .find(|operation| matches!(operation.kind, OperationKind::Discard { .. }))
+            .expect("the statement should be discarded");
+        let OperationKind::Discard { value } = discard.kind else {
+            unreachable!("operation was selected as a discard");
+        };
+        discard.kind = OperationKind::Exit { value };
+        assert!(error(&module).contains("exits module initialization"));
     }
 
     #[test]

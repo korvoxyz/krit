@@ -1,0 +1,16 @@
+fn failing(label: String) -> Result<Int, String> {
+    println(label);
+    Err(label)
+}
+
+fn pair(first: Unit, second: Int) -> Int {
+    second
+}
+
+fn ordered() -> Result<Int, String> {
+    let value = pair(println("a"), failing("b")?);
+    println("never");
+    Ok(value)
+}
+
+println(ordered());

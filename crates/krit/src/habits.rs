@@ -98,7 +98,8 @@ impl Habit {
         match self {
             Self::Return => {
                 "a block's value is its final expression, written without `return` or `;`; \
-                 for early exit, `?` and let-else arrive in Krit 0.3"
+                 for early exit, use postfix `?` on a `Result` or `Option` (let-else arrives in \
+                 Krit 0.3)"
             }
             Self::Loop => {
                 "Krit has no loops; write a recursive function that matches `[]` and \
@@ -120,8 +121,8 @@ impl Habit {
                  they return, so call them directly"
             }
             Self::Exception => {
-                "Krit has no exceptions; return `Ok(value)` or `Err(error)` and handle the \
-                 `Result` with `match`"
+                "Krit has no exceptions; return `Ok(value)` or `Err(error)`, then handle the \
+                 `Result` with `match` or pass its error on with postfix `?`"
             }
             Self::Indexing => {
                 "match the list with `[]` and `[head, ..tail]` patterns (`list_get` arrives \
@@ -293,8 +294,8 @@ pub(crate) fn method_hint(receiver: MethodReceiver, method: &str, value: &str) -
         MethodReceiver::List => "match the list with `[]` and `[head, ..tail]` patterns instead \
                                  (list functions arrive in Krit 0.4)"
             .to_owned(),
-        MethodReceiver::Variant => "handle both outcomes with `match` instead \
-                                    (`?` and let-else arrive in Krit 0.3)"
+        MethodReceiver::Variant => "handle both outcomes with `match` instead, or pass the \
+                                    failure on with postfix `?` (let-else arrives in Krit 0.3)"
             .to_owned(),
         MethodReceiver::Other => {
             format!("pass the value to a function instead, as in `f({value})`")

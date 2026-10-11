@@ -89,6 +89,15 @@ pub enum ExpressionKind {
         callee: Box<Expression>,
         arguments: Vec<Expression>,
     },
+    /// Postfix `?`: `operand?` yields the payload of `Ok` or `Some`, and an
+    /// `Err` or `None` operand makes the enclosing function return it.
+    ///
+    /// The node's span extends past the operand's to the `?` at `question`,
+    /// so the two never share a span.
+    Propagate {
+        operand: Box<Expression>,
+        question: Span,
+    },
     Match {
         subject: Box<Expression>,
         kind: MatchKind,

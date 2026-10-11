@@ -200,7 +200,9 @@ fn collect_expression<'a>(
                 }
             }
         }
-        ExpressionKind::Unary { operand, .. } => pending.push(Pending::Expression(operand)),
+        ExpressionKind::Unary { operand, .. } | ExpressionKind::Propagate { operand, .. } => {
+            pending.push(Pending::Expression(operand));
+        }
         ExpressionKind::Binary { left, right, .. } => {
             pending.push(Pending::Expression(left));
             pending.push(Pending::Expression(right));

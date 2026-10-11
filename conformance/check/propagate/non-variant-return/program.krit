@@ -1,0 +1,3 @@
+fn count(value: Option<Int>) -> Int {
+    value? + 1
+}

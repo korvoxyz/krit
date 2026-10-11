@@ -1,0 +1,3 @@
+Ok(3)
+Err("not a digit: x")
+Err("not a digit: y")

@@ -84,6 +84,43 @@ records, and Option/Result matches. An unresolved variable may remain generic;
 a known contradiction is always rejected. Full Hindley-Milner generalization
 across independently polymorphic uses is still draft.
 
+## Error propagation
+
+Postfix `?` (`LANGUAGE.md` section 8.2) is typed against the innermost
+enclosing function body. Analysis records, for each body, whether `?` may
+return from it: a named function or `queue`/`schedule` entrypoint whose
+declared return type is `Result<_, E>` or `Option<_>` may be exited; an
+anonymous function, a webhook entrypoint, a named function without a declared
+return type or with another declared return type, and the top level may not
+(`K3012`). The decision uses the declared annotation, never an inferred
+return type, so a function's signature alone shows whether its body can exit
+early.
+
+For `e?` in a body that may be exited:
+
+| Declared return | Type of `e` | Type of `e?` | Otherwise |
+|---|---|---|---|
+| `Result<U, E>` | `Result<T, E>` (same `E`) | `T` | `K3013` for another `E` or an `Option` |
+| `Option<U>` | `Option<T>` | `T` | `K3013` for a `Result` |
+
+An operand of an unresolved type is unified with `Result<T, E>` or
+`Option<T>` for a fresh `T`; any other operand type is `K3001`. The error
+types are unified, not converted, so `E` is identical after inference. Every
+diagnostic is reported at the `?` token, after the operand's own errors. `?`
+adds no effect and no capability requirement: the facts of `e?` carry exactly
+the effects and requirements of `e`.
+
+Core IR represents the early return natively. `e?` lowers to a variant match
+on `e`; the success arm binds the payload and yields it, and the failure arm
+binds the error (for `Result`), rebuilds `Err(error)` or `None` at the
+function's declared return type, and ends with an `exit` operation. Those
+arm bindings are Core-only match bindings (debug names `$value` and `$error`)
+numbered after every analysis symbol. Core verification requires an `exit`'s
+value to have the enclosing function's result type, the `exit` to be the last
+operation of its block and that block's result, and no `exit` in module
+initialization; the exit's own type is whatever its block requires, since
+control never continues past it.
+
 ## Effects
 
 A value type describes what an expression returns. An effect row describes
@@ -199,7 +236,8 @@ serialize, or turn the handle into ordinary application data:
 - equality or inequality
 - `json_encode`
 - list and record construction
-- `Some`, `Ok`, or `Err` construction
+- `Some`, `Ok`, or `Err` construction, including the `Err` that propagating an
+  error with `?` rebuilds
 - structured logging fields
 
 `Result<Secret, String>` produced by `secret("literal")` is an explicit host

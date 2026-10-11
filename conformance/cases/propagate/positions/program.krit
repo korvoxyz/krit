@@ -1,0 +1,41 @@
+fn parse(text: String) -> Result<Int, String> {
+    if text == "" {
+        Err("empty")
+    } else {
+        Ok(1)
+    }
+}
+
+fn flag(text: String) -> Result<Bool, String> {
+    Ok(parse(text)? > 0)
+}
+
+fn pick(text: String) -> Result<Option<Int>, String> {
+    if text == "none" {
+        Ok(None)
+    } else {
+        Ok(Some(parse(text)?))
+    }
+}
+
+fn shapes(a: String, b: String, c: String) -> Result<String, String> {
+    let chosen = if flag(a)? {
+        match pick(b)? {
+            Some(value) => {
+                let items = [value, parse(c)?];
+                let shape = record { size: parse(c)? + 1, items: items };
+                "some " + json_encode(shape)
+            },
+            None => "none",
+        }
+    } else {
+        "unreachable"
+    };
+    Ok(chosen)
+}
+
+println(shapes("a", "b", "c"));
+println(shapes("a", "none", ""));
+println(shapes("", "b", "c"));
+println(shapes("a", "", "c"));
+println(shapes("a", "b", ""));

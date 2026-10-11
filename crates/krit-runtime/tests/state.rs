@@ -242,6 +242,71 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
 }
 
 #[test]
+fn option_and_result_question_marks_exit_durable_state_helpers() {
+    let directory = TestDirectory::new("propagate");
+    let database = directory.database();
+    let artifact = compile(
+        r#"
+fn both(first: Option<String>, second: Option<String>) -> Option<String> {
+    first?;
+    second
+}
+
+fn respond(request: HttpRequest) -> Result<String, String> {
+    if request.method == "PUT" {
+        state_put("agent-work", request.path, request.body)?;
+        Ok("stored")
+    } else {
+        let first = state_get("agent-work", "/a")?;
+        let second = state_get("agent-work", "/b")?;
+        match both(first, second) {
+            Some(value) => Ok("both, the second is " + value),
+            None => Ok("missing"),
+        }
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match respond(request) {
+        Ok(body) => record { status: 200, headers: [], body: body },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}
+"#,
+        &["state.transaction"],
+    );
+    let grants = GrantSet::from_manifest(&manifest("state = [\"agent-work\"]"));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default()).unwrap();
+    let state_host = host(inputs, durable(database, false));
+    let send = |method: &str, path: &str, body: &str| {
+        Runtime::default()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &state_host,
+                HttpRequest {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    query: String::new(),
+                    headers: Vec::new(),
+                    body: body.to_owned(),
+                },
+            )
+            .expect("the webhook should run")
+            .response
+            .body
+    };
+
+    // `first?` exits `both` with `None` while `/a` is unset.
+    assert_eq!(send("GET", "/read", ""), "missing");
+    assert_eq!(send("PUT", "/b", "two"), "stored");
+    assert_eq!(send("GET", "/read", ""), "missing");
+    assert_eq!(send("PUT", "/a", "one"), "stored");
+    assert_eq!(send("GET", "/read", ""), "both, the second is two");
+}
+
+#[test]
 fn checkpoint_resume_replays_completed_http_without_repeating_the_mock_call() {
     let directory = TestDirectory::new("checkpoint-replay");
     let database = directory.database();

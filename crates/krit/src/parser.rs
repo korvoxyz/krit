@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::{
     Diagnostic, Source, Span,
@@ -42,10 +42,15 @@ struct Parser<'source> {
     /// Conditional-operator checks currently parsing a first branch
     /// speculatively ([`Self::ternary_after`]).
     speculations: usize,
+    /// For each `?` token followed by a `:` that could end a conditional
+    /// operator's first branch, the `?` to report and that `:`
+    /// ([`ternary_colons`]).
+    ternary_colons: BTreeMap<usize, (Span, Span)>,
 }
 
 impl<'source> Parser<'source> {
     fn new(text: &'source str, tokens: Vec<Token>) -> Self {
+        let ternary_colons = ternary_colons(&tokens);
         Self {
             text,
             tokens,
@@ -54,6 +59,7 @@ impl<'source> Parser<'source> {
             chain_depth: 0,
             peak: 0,
             speculations: 0,
+            ternary_colons,
         }
     }
 
@@ -478,10 +484,10 @@ impl<'source> Parser<'source> {
         let base = self.structural_depth();
         let outer_peak = std::mem::replace(&mut self.peak, base);
         let mut expression = self.primary()?;
-        // Each call or field-access link opens one level for the rest of the
-        // chain. The tree nests the other way, with the first callee or record
-        // deepest, so the chain also measures the tree it builds and checks
-        // its structural depth after each link, as operator chains do.
+        // Each call, field-access, or `?` link opens one level for the rest of
+        // the chain. The tree nests the other way, with the first callee or
+        // record deepest, so the chain also measures the tree it builds and
+        // checks its structural depth after each link, as operator chains do.
         let mut height = self.peak - base;
         let depth = self.depth;
         loop {
@@ -536,7 +542,21 @@ impl<'source> Parser<'source> {
                     expression.span.join(self.current().span),
                 ));
             } else if self.check(&TokenKind::Question) {
-                return Err(self.question_mark());
+                let question = self.advance().span;
+                if let Some(error) = self.question_misuse(question) {
+                    return Err(error);
+                }
+                self.enter(question)?;
+                height += 1;
+                self.reach(base + height, question)?;
+                let span = expression.span.join(question);
+                expression = Expression {
+                    kind: ExpressionKind::Propagate {
+                        operand: Box::new(expression),
+                        question,
+                    },
+                    span,
+                };
             } else {
                 break;
             }
@@ -730,40 +750,65 @@ impl<'source> Parser<'source> {
         })
     }
 
-    /// Diagnoses a `?` that follows an expression.
+    /// Diagnoses the `?` at `question`, just consumed after an operand, when it
+    /// is not a postfix `?` operator, or returns `None` when it is one.
     ///
-    /// `c ? a : b` is another language's conditional operator (`K1110`, see
-    /// [`Self::ternary_after`]). Any other `?` there is a postfix operator that
-    /// Krit does not have yet.
-    fn question_mark(&mut self) -> Diagnostic {
-        let question = self.advance().span;
-        self.ternary_after(question).unwrap_or_else(|| {
+    /// `c ? a : b` is another language's conditional operator (`K1110`). The
+    /// token after the `?` decides how it is recognized:
+    ///
+    /// - A token that cannot start an expression (`;`, `)`, `.`, an operator
+    ///   other than `-`, `?`, ...) follows only a postfix `?`.
+    /// - A token that can only start an operand (an identifier, a literal,
+    ///   `!`, ...) never follows a postfix `?`, so the first branch is parsed
+    ///   speculatively ([`Self::ternary_after`]). Without a conditional
+    ///   operator, the `?` is unexpected (`K1001`) when that token is on the
+    ///   same line; on a later line it is a postfix `?` before a missing `;`
+    ///   or `,`, which the parser reports next.
+    /// - `-`, `(`, `[`, or `{` may continue a postfix `?` (`x? - 1`,
+    ///   `f()?(1)`, `if x? {`), so only the bracket scan decides
+    ///   ([`ternary_colons`]): a `:` at the `?`'s bracket depth before the
+    ///   branch could end makes it a conditional operator, which no valid
+    ///   program contains there. Nothing is parsed twice, so a long chain of
+    ///   postfix `?` operators parses in linear time.
+    fn question_misuse(&mut self, question: Span) -> Option<Diagnostic> {
+        let next = self.current().clone();
+        if !starts_expression(&next.kind) {
+            return None;
+        }
+        if !starts_operand_only(&next.kind) {
+            let &(innermost, colon) = self.ternary_colons.get(&(self.cursor - 1))?;
+            return Some(ternary(innermost.join(colon)));
+        }
+        if let Some(error) = self.ternary_after(question) {
+            return Some(error);
+        }
+        self.same_line(question, next.span).then(|| {
             Diagnostic::new("K1001", "unexpected `?`", question).with_note(
-                "postfix `?` arrives in Krit 0.3; until then, handle the `Result` or \
-                 `Option` with `match`",
+                "postfix `?` takes no operand after it; to choose between two values, write \
+                 `if condition { a } else { b }`",
             )
         })
     }
 
-    /// Returns `K1110` when the `?` at `question` starts another language's
-    /// conditional operator: the tokens after it are an expression and then
-    /// `:`, or they start an expression that does not parse and a `:` follows
-    /// at the `?`'s bracket depth ([`Self::ternary_colon`]), as in
-    /// `ready ? items[0] : None`.
+    /// Returns `K1110` when the `?` at `question`, followed by a token that can
+    /// only start an operand, starts another language's conditional operator:
+    /// the tokens after it are an expression and then `:`, or they start an
+    /// expression that does not parse and a `:` follows at the `?`'s bracket
+    /// depth ([`ternary_colons`]), as in `ready ? items[0] : None`.
     ///
     /// The first branch is parsed speculatively, one nesting level deeper, and
     /// the parser is restored either way, so the check never consumes input.
     /// A nesting limit (`K1005`) or a conditional operator reached inside the
     /// first branch is reported in place of the outer one.
     ///
-    /// Every `?` ends the parse with an error, and only this speculation
-    /// recovers from one, so only the outermost `?` is examined outside a
-    /// speculation. The speculations add at most one parse of the tokens after
-    /// it, and only the outermost `?` scans for a `:`.
+    /// No valid program has an operand right after a `?`, so the parse fails
+    /// once this check returns, whatever it finds: a `?` it does not report is
+    /// either `K1001` or a postfix `?` that a missing `;` or `,` follows. A `?`
+    /// inside the first branch that this check examines ends that branch the
+    /// same way. The speculations therefore add at most one parse of the
+    /// tokens after the outermost `?`, and only the outermost `?` looks up a
+    /// `:` when its branch does not parse.
     fn ternary_after(&mut self, question: Span) -> Option<Diagnostic> {
-        if !starts_expression(&self.current().kind) {
-            return None;
-        }
         let question_index = self.cursor - 1;
         let saved = (self.cursor, self.depth, self.chain_depth, self.peak);
         self.speculations += 1;
@@ -776,41 +821,13 @@ impl<'source> Parser<'source> {
             Err(error) if error.code() == "K1005" || error.code() == Habit::Ternary.code() => {
                 return Some(error);
             }
-            Err(_) if self.speculations == 0 => self.ternary_colon(question_index),
+            Err(_) if self.speculations == 0 => self
+                .ternary_colons
+                .get(&question_index)
+                .map(|&(_, colon)| colon),
             Err(_) => None,
         };
-        colon.map(|colon| {
-            Habit::Ternary.diagnostic(
-                "the conditional operator `? :` is not Krit syntax",
-                question.join(colon),
-            )
-        })
-    }
-
-    /// The `:` that would end a conditional operator's first branch after the
-    /// `?` at token `question`: the first `:` at the `?`'s bracket depth,
-    /// looking no further than the end of the file, a closing bracket opened
-    /// before the `?`, or the first `;`, `,`, or `let` at that depth, none of
-    /// which a first branch contains outside brackets.
-    fn ternary_colon(&self, question: usize) -> Option<Span> {
-        let mut depth = 0_usize;
-        for token in &self.tokens[question + 1..] {
-            match &token.kind {
-                TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace => {
-                    depth += 1;
-                }
-                TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
-                    depth = depth.checked_sub(1)?;
-                }
-                TokenKind::Colon if depth == 0 => return Some(token.span),
-                TokenKind::Semicolon | TokenKind::Comma | TokenKind::Let if depth == 0 => {
-                    return None;
-                }
-                TokenKind::Eof => return None,
-                _ => {}
-            }
-        }
-        None
+        colon.map(|colon| ternary(question.join(colon)))
     }
 
     /// Reports `else { return value }` or `else return value` (`K1112`): an
@@ -1428,6 +1445,67 @@ fn arrow_function(span: Span) -> Diagnostic {
     Habit::ArrowFunction.diagnostic("arrow functions are not Krit syntax", span)
 }
 
+/// A conditional operator at `span`, from its `?` to its `:` (`K1110`).
+fn ternary(span: Span) -> Diagnostic {
+    Habit::Ternary.diagnostic("the conditional operator `? :` is not Krit syntax", span)
+}
+
+/// Finds, for every `?` token, the `:` that would end a conditional
+/// operator's first branch: the first `:` at the `?`'s bracket depth, looking
+/// no further than the end of the file, a closing bracket opened before the
+/// `?`, or the first `;`, `,`, or `let` at that depth, none of which a first
+/// branch contains outside brackets.
+///
+/// Each `?` that has such a `:` maps to the `?` to report with it and to the
+/// `:`. The `?` to report is the last one before the `:` at the same depth
+/// that a token able to start an expression follows: the innermost
+/// conditional operator ending at that `:` (`a ? -b ? c : d : e` reports
+/// `? c :`). One pass over the tokens finds every `?`'s `:`.
+fn ternary_colons(tokens: &[Token]) -> BTreeMap<usize, (Span, Span)> {
+    let mut colons = BTreeMap::new();
+    // The `?` tokens still looking for their `:`, one list per open bracket
+    // level, outermost first. The outermost level is never closed.
+    let mut levels: Vec<Vec<usize>> = vec![Vec::new()];
+    for (index, token) in tokens.iter().enumerate() {
+        let open = levels.len();
+        let level = levels
+            .last_mut()
+            .expect("the outermost bracket level stays open");
+        match &token.kind {
+            TokenKind::Question => level.push(index),
+            TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace => {
+                levels.push(Vec::new());
+            }
+            TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
+                // A bracket that closes the level of a `?` ends its search, and
+                // so does one that closes nothing opened in the file.
+                if open > 1 {
+                    levels.pop();
+                } else {
+                    level.clear();
+                }
+            }
+            TokenKind::Colon => {
+                let pending = std::mem::take(level);
+                let Some(&innermost) = pending.iter().rev().find(|question| {
+                    tokens
+                        .get(**question + 1)
+                        .is_some_and(|next| starts_expression(&next.kind))
+                }) else {
+                    continue;
+                };
+                for question in pending {
+                    colons.insert(question, (tokens[innermost].span, token.span));
+                }
+            }
+            TokenKind::Semicolon | TokenKind::Comma | TokenKind::Let => level.clear(),
+            TokenKind::Eof => break,
+            _ => {}
+        }
+    }
+    colons
+}
+
 /// Whether `error` already explains the construct it reports, so an
 /// enclosing construct must pass it on rather than reinterpret it: a nesting
 /// limit, or a construct from another language.
@@ -1970,29 +2048,162 @@ mod tests {
     }
 
     #[test]
-    fn a_question_mark_outside_the_ternary_shape_is_an_unexpected_token() {
-        for (text, spanned) in [
-            ("fn f(x) { x? }", "?"),
-            ("fn f(x) { x?.y }", "?"),
-            ("fn f(x) { x ?? 1 }", "?"),
-            ("fn f(x) { x ? 1 }", "?"),
-            ("let y = ?;", "?"),
+    fn a_question_mark_before_an_operand_is_an_unexpected_token() {
+        for (text, start) in [
+            ("fn f(x) { x ? 1 }", 12),
+            ("fn f(x) { x ?? 1 }", 13),
+            ("fn f(x) { x? y }", 11),
         ] {
-            let error = parse_text(text).expect_err("`?` should not parse yet");
+            let error = parse_text(text).expect_err("`?` before an operand should not parse");
             assert_eq!(error.code(), "K1001", "{text}");
-            assert_eq!(
-                &text[error.span().start..error.span().end],
-                spanned,
-                "{text}"
-            );
+            assert_eq!(error.span(), Span::new(start, start + 1), "{text}");
+            assert_eq!(error.notes().len(), 1, "{text}");
         }
-        // The ternary check leaves the parser where it was: the first `?`
-        // here is not a ternary, so the second one is never examined.
+        // A `?` that starts an operand is an ordinary unexpected token.
+        let error = parse_text("let y = ?;").expect_err("should not parse");
+        assert_eq!(error.code(), "K1001");
+        assert!(error.notes().is_empty());
+        // The first `?` is a postfix `?` before a parenthesized call
+        // argument; the second is a conditional operator.
         let error = parse_text("let y = a ? (b ? c : d);").expect_err("should not parse");
         assert_eq!(error.code(), "K1110");
-        let error = parse_text("let y = a ?;").expect_err("should not parse");
-        assert_eq!(error.code(), "K1001");
-        assert_eq!(error.notes().len(), 1);
+        // An operand on a later line follows a postfix `?` whose `;` is
+        // missing.
+        let error = parse_text("fn f(x) -> Option<Int> {\n    let y = x?\n    Some(y)\n}")
+            .expect_err("should not parse");
+        assert_eq!(error.code(), "K1002");
+        assert!(error.notes().is_empty());
+    }
+
+    /// The operand of the outermost postfix `?` in `expression`.
+    fn propagated(expression: &Expression) -> &Expression {
+        let ExpressionKind::Propagate { operand, .. } = &expression.kind else {
+            panic!("expected a postfix `?`, found {:?}", expression.kind);
+        };
+        operand
+    }
+
+    /// The value of the single `let` statement in `text`.
+    fn let_value(text: &str) -> Expression {
+        let program = parse_text(text).unwrap_or_else(|error| panic!("{text}: {error:?}"));
+        let [statement] = program.statements.as_slice() else {
+            panic!("{text} should hold one statement");
+        };
+        let StatementKind::Let { value, .. } = &statement.kind else {
+            panic!("{text} should be a `let`");
+        };
+        value.clone()
+    }
+
+    #[test]
+    fn parses_postfix_question_marks_as_links_of_a_call_chain() {
+        let text = "let v = load(1)?;";
+        let value = let_value(text);
+        assert_eq!(&text[value.span.start..value.span.end], "load(1)?");
+        let ExpressionKind::Propagate { question, .. } = &value.kind else {
+            panic!("expected a postfix `?`");
+        };
+        assert_eq!(&text[question.start..question.end], "?");
+        assert!(matches!(
+            propagated(&value).kind,
+            ExpressionKind::Call { .. }
+        ));
+
+        // `?` binds like a call or field access: before `.`, `(`, and
+        // another `?`, and tighter than unary and binary operators.
+        let value = let_value("let v = a.b?.c;");
+        let ExpressionKind::FieldAccess {
+            value: inner,
+            field,
+        } = &value.kind
+        else {
+            panic!("expected a field access");
+        };
+        assert_eq!(field, "c");
+        assert!(matches!(
+            propagated(inner).kind,
+            ExpressionKind::FieldAccess { .. }
+        ));
+        let value = let_value("let v = pick()?(1);");
+        let ExpressionKind::Call { callee, .. } = &value.kind else {
+            panic!("expected a call");
+        };
+        assert!(matches!(
+            propagated(callee).kind,
+            ExpressionKind::Call { .. }
+        ));
+        let value = let_value("let v = nested??;");
+        assert!(matches!(
+            propagated(propagated(&value)).kind,
+            ExpressionKind::Variable(_)
+        ));
+        let value = let_value("let v = -count?;");
+        let ExpressionKind::Unary { operand, .. } = &value.kind else {
+            panic!("expected a unary operator");
+        };
+        propagated(operand);
+        let value = let_value("let v = count? - 1;");
+        let ExpressionKind::Binary { left, .. } = &value.kind else {
+            panic!("expected a binary operator");
+        };
+        propagated(left);
+
+        // Parenthesizing keeps the `?` node and its `?` span.
+        let text = "let v = (count?);";
+        let value = let_value(text);
+        assert_eq!(&text[value.span.start..value.span.end], "(count?)");
+        let ExpressionKind::Propagate { question, .. } = &value.kind else {
+            panic!("expected a postfix `?`");
+        };
+        assert_eq!(question.start, 14);
+
+        for text in [
+            "let v = if ready? { 1 } else { 2 };",
+            "let v = match found? { Some(x) => x, None => 0 };",
+            "let v = [a?, b?];",
+            "let v = record { a: a?, b: b? };",
+            "let v = f(a?, g(b?)?);",
+            "let v = a? == b?;",
+            "let v = !ok?;",
+        ] {
+            parse_text(text).unwrap_or_else(|error| panic!("{text} should parse: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn postfix_question_marks_count_toward_the_nesting_limits() {
+        // Each `?` link opens one level for the rest of its chain.
+        let text = format!("let v = {}x{};\n", "(".repeat(255), "?)".repeat(255));
+        parse_on_compiler_stack(text).expect("255 parenthesized links should parse");
+        let text = format!("let v = {}x{};\n", "(".repeat(256), "?)".repeat(256));
+        let error = parse_on_compiler_stack(text).expect_err("too deep");
+        assert_eq!(error.code(), "K1005");
+        let text = format!("let v = x{};\n", "?".repeat(MAX_STRUCTURAL_DEPTH + 1));
+        let error = parse_on_compiler_stack(text).expect_err("too long a chain");
+        assert_eq!(error.code(), "K1005");
+    }
+
+    #[test]
+    fn postfix_question_marks_parse_without_reparsing_what_follows() {
+        // A `?` before `(`, `-`, or `{` is decided by the precomputed bracket
+        // scan, so neither a nested call chain nor a long operator chain is
+        // parsed more than once (a speculative parse of each first branch
+        // would take exponential and quadratic time here).
+        // Each `g()?(` opens three levels.
+        let calls = format!(
+            "fn f(g) -> Option<Int> {{ {}1{} }}\n",
+            "g()?(".repeat(80),
+            ")".repeat(80)
+        );
+        parse_on_compiler_stack(calls).expect("nested calls after `?` should parse");
+        let terms = vec!["a?"; 4_000].join(" - ");
+        parse_on_compiler_stack(format!("fn f(a) -> Option<Int> {{ Some({terms}) }}\n"))
+            .expect("a long operator chain of `?` operands should parse");
+        let branches = "if a? { 1 } else ".repeat(1_000);
+        parse_on_compiler_stack(format!(
+            "fn f(a) -> Option<Int> {{ Some({branches}{{ 0 }}) }}\n"
+        ))
+        .expect("a long `else if` chain of `?` conditions should parse");
     }
 
     #[test]
@@ -2023,10 +2234,31 @@ mod tests {
         // the same branch does without the `?`.
         let nested = format!("{}1{}", "(".repeat(300), ")".repeat(300));
         let error =
-            parse_on_compiler_stack(format!("let y = x ? {nested} : 2;\n")).expect_err("deep");
+            parse_on_compiler_stack(format!("let y = x ? f{nested} : 2;\n")).expect_err("deep");
         assert_eq!(error.code(), "K1005");
         let error = parse_on_compiler_stack(format!("let y = {nested};\n")).expect_err("deep");
         assert_eq!(error.code(), "K1005");
+        // A first branch that starts with `(` may continue a postfix `?`, so
+        // only the bracket scan examines it and nothing in it is parsed.
+        let error =
+            parse_on_compiler_stack(format!("let y = x ? {nested} : 2;\n")).expect_err("ternary");
+        assert_eq!(error.code(), "K1110");
+    }
+
+    #[test]
+    fn a_conditional_operator_after_a_postfix_question_mark_is_reported() {
+        for (text, spanned) in [
+            ("let y = a ? -b ? c : d : e;", "? c :"),
+            ("let y = x? - c ? 1 : 2;", "? 1 :"),
+            ("let y = a ? (b) ? c : d : e;", "? c :"),
+            ("let y = a ? [1] : [2];", "? [1] :"),
+            ("fn f(x) { x? ? 1 : 2 }", "? 1 :"),
+        ] {
+            let (code, actual_span, notes) = habit(text);
+            assert_eq!(code, "K1110", "{text}");
+            assert_eq!(actual_span, spanned, "{text}");
+            assert_eq!(notes.len(), 1, "{text}");
+        }
     }
 
     #[test]

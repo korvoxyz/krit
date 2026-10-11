@@ -1,0 +1,9 @@
+fn first_or_none(items: List<Option<Int>>) -> Option<Int> {
+    let unwrap = fn(item: Option<Int>) -> Option<Int> {
+        Some(item?)
+    };
+    match items {
+        [] => None,
+        [head, .._] => unwrap(head),
+    }
+}

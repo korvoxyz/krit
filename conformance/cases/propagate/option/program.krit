@@ -1,0 +1,14 @@
+fn first(items: List<Int>) -> Option<Int> {
+    match items {
+        [] => None,
+        [head, .._] => Some(head),
+    }
+}
+
+fn add_firsts(left: List<Int>, right: List<Int>) -> Option<Int> {
+    Some(first(left)? + first(right)?)
+}
+
+println(add_firsts([1, 9], [2]));
+println(add_firsts([], [2]));
+println(add_firsts([1], []));

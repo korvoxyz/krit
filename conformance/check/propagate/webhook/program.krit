@@ -1,0 +1,4 @@
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let model = config_string("agent.model")?;
+    record { status: 200, headers: [], body: model }
+}

@@ -409,6 +409,24 @@ pub fn execute(program: &Program, output: &mut dyn Write) -> Result<Value, Diagn
     .program(program)
 }
 
+/// Why the evaluation of an expression stopped without producing its value.
+enum Interrupt {
+    /// Evaluation failed.
+    Error(Diagnostic),
+    /// The postfix `?` at `question` met an `Err` or `None` value, which the
+    /// innermost enclosing function call returns.
+    Exit { value: Value, question: Span },
+}
+
+impl From<Diagnostic> for Interrupt {
+    fn from(diagnostic: Diagnostic) -> Self {
+        Self::Error(diagnostic)
+    }
+}
+
+/// The outcome of evaluating an expression, block, or statement.
+type Flow<T> = Result<T, Interrupt>;
+
 struct Evaluator<'a> {
     output: &'a mut dyn Write,
     /// Nested expression and block evaluations currently active.
@@ -421,16 +439,24 @@ impl Evaluator<'_> {
     fn program(&mut self, program: &Program) -> Result<Value, Diagnostic> {
         let mut environment = Environment::empty();
         for statement in &program.statements {
-            environment = self.statement(statement, &environment)?;
+            environment = match self.statement(statement, &environment) {
+                Ok(environment) => environment,
+                Err(Interrupt::Error(diagnostic)) => return Err(diagnostic),
+                // Analysis accepts `?` only inside a named function, so only
+                // a program evaluated without analysis gets here.
+                Err(Interrupt::Exit { question, .. }) => {
+                    return Err(Diagnostic::new(
+                        "K3012",
+                        "`?` is not allowed at the top level",
+                        question,
+                    ));
+                }
+            };
         }
         Ok(Value::Unit)
     }
 
-    fn statement(
-        &mut self,
-        statement: &Statement,
-        environment: &Environment,
-    ) -> Result<Environment, Diagnostic> {
+    fn statement(&mut self, statement: &Statement, environment: &Environment) -> Flow<Environment> {
         match &statement.kind {
             StatementKind::Let { name, value, .. } => {
                 let value = self.expression(value, environment)?;
@@ -485,18 +511,14 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    fn block(&mut self, block: &Block, environment: &Environment) -> Result<Value, Diagnostic> {
+    fn block(&mut self, block: &Block, environment: &Environment) -> Flow<Value> {
         self.enter(block.span)?;
         let value = self.block_contents(block, environment);
         self.depth -= 1;
         value
     }
 
-    fn block_contents(
-        &mut self,
-        block: &Block,
-        environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    fn block_contents(&mut self, block: &Block, environment: &Environment) -> Flow<Value> {
         let mut local = environment.clone();
         for statement in &block.statements {
             local = self.statement(statement, &local)?;
@@ -507,11 +529,7 @@ impl Evaluator<'_> {
             .map_or(Ok(Value::Unit), |tail| self.expression(tail, &local))
     }
 
-    fn expression(
-        &mut self,
-        expression: &Expression,
-        environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    fn expression(&mut self, expression: &Expression, environment: &Environment) -> Flow<Value> {
         self.enter(expression.span)?;
         let value = self.expression_contents(expression, environment);
         self.depth -= 1;
@@ -522,10 +540,10 @@ impl Evaluator<'_> {
         &mut self,
         expression: &Expression,
         environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         match &expression.kind {
-            ExpressionKind::Literal(literal) => self.literal(literal, expression.span),
-            ExpressionKind::Variable(name) => variable(name, environment, expression.span),
+            ExpressionKind::Literal(literal) => Ok(self.literal(literal, expression.span)?),
+            ExpressionKind::Variable(name) => Ok(variable(name, environment, expression.span)?),
             // Operands on the recursive evaluation path are collected with
             // plain loops: iterator adapters add several native frames per
             // nested evaluation in unoptimized builds.
@@ -534,7 +552,7 @@ impl Evaluator<'_> {
                 for element in elements {
                     values.push(self.expression(element, environment)?);
                 }
-                Value::list(values, expression.span)
+                Ok(Value::list(values, expression.span)?)
             }
             ExpressionKind::Record(fields) => {
                 let mut values = Vec::with_capacity(fields.len());
@@ -544,11 +562,11 @@ impl Evaluator<'_> {
                         self.expression(&field.value, environment)?,
                     ));
                 }
-                Value::record(values, expression.span)
+                Ok(Value::record(values, expression.span)?)
             }
             ExpressionKind::FieldAccess { value, field } => {
                 let value = self.expression(value, environment)?;
-                field_value(value, field, expression.span)
+                Ok(field_value(value, field, expression.span)?)
             }
             ExpressionKind::Block(block) => self.block(block, environment),
             ExpressionKind::If { .. } => self.if_chain(expression, environment),
@@ -557,6 +575,10 @@ impl Evaluator<'_> {
             } => Ok(closure(None, parameters, body, environment)),
             ExpressionKind::Call { callee, arguments } => {
                 self.call(callee, arguments, environment, expression.span)
+            }
+            ExpressionKind::Propagate { operand, question } => {
+                let value = self.expression(operand, environment)?;
+                propagate(value, *question)
             }
             ExpressionKind::Match { subject, kind } => {
                 self.match_expression(subject, kind, environment)
@@ -573,7 +595,7 @@ impl Evaluator<'_> {
         subject: &Expression,
         kind: &MatchKind,
         environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let subject_value = self.expression(subject, environment)?;
         let (arm, arm_environment) =
             select_match_arm(subject_value, subject.span, kind, environment)?;
@@ -582,11 +604,7 @@ impl Evaluator<'_> {
 
     /// Evaluates an `if` expression and its `else if` chain iteratively, so a
     /// long chain does not deepen evaluation.
-    fn if_chain(
-        &mut self,
-        expression: &Expression,
-        environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    fn if_chain(&mut self, expression: &Expression, environment: &Environment) -> Flow<Value> {
         let mut current = expression;
         loop {
             let ExpressionKind::If {
@@ -607,11 +625,7 @@ impl Evaluator<'_> {
 
     /// Evaluates a left-nested chain of binary operators such as `a + b + c`
     /// iteratively, left to right, so a long chain does not deepen evaluation.
-    fn binary_chain(
-        &mut self,
-        expression: &Expression,
-        environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    fn binary_chain(&mut self, expression: &Expression, environment: &Environment) -> Flow<Value> {
         let mut spine = Vec::new();
         let mut current = expression;
         while let ExpressionKind::Binary { left, .. } = &current.kind {
@@ -647,14 +661,14 @@ impl Evaluator<'_> {
         arguments: &[Expression],
         environment: &Environment,
         span: Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let callee_value = self.expression(callee, environment)?;
         match callee_value {
             Value::Function(function) => {
                 self.call_function(&function, arguments, environment, span)
             }
             Value::Builtin(builtin) => self.call_builtin(builtin, arguments, environment, span),
-            value => Err(not_callable(&value, callee.span)),
+            value => Err(not_callable(&value, callee.span).into()),
         }
     }
 
@@ -664,13 +678,9 @@ impl Evaluator<'_> {
         arguments: &[Expression],
         environment: &Environment,
         span: Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         if arguments.len() != function.parameters.len() {
-            return Err(arity_error(
-                function.parameters.len(),
-                arguments.len(),
-                span,
-            ));
+            return Err(arity_error(function.parameters.len(), arguments.len(), span).into());
         }
 
         let mut values = Vec::with_capacity(arguments.len());
@@ -692,12 +702,18 @@ impl Evaluator<'_> {
                     "call depth limit exceeded: more than {MAX_CALL_DEPTH} nested function calls"
                 ),
                 span,
-            ));
+            )
+            .into());
         }
         self.calls += 1;
         let value = self.block(&function.body, &call_environment);
         self.calls -= 1;
-        value
+        // A `?` in the body that met `Err` or `None` returns it from this
+        // call; one in an argument above belongs to the caller.
+        match value {
+            Err(Interrupt::Exit { value, .. }) => Ok(value),
+            value => value,
+        }
     }
 
     fn call_builtin(
@@ -706,19 +722,19 @@ impl Evaluator<'_> {
         arguments: &[Expression],
         environment: &Environment,
         span: Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let expected_arity = builtin_arity(builtin);
         if arguments.len() != expected_arity {
-            return Err(arity_error(expected_arity, arguments.len(), span));
+            return Err(arity_error(expected_arity, arguments.len(), span).into());
         }
         if let Some(message) = unavailable_builtin_message(builtin) {
             for argument in arguments {
                 self.expression(argument, environment)?;
             }
-            return Err(Diagnostic::new("K5003", message, span));
+            return Err(Diagnostic::new("K5003", message, span).into());
         }
         let value = self.expression(&arguments[0], environment)?;
-        self.apply_builtin(builtin, value, span)
+        Ok(self.apply_builtin(builtin, value, span)?)
     }
 
     /// Applies a pure or output built-in to its evaluated argument.
@@ -787,14 +803,14 @@ impl Evaluator<'_> {
         operand: &Expression,
         environment: &Environment,
         span: Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         if operator == UnaryOperator::Negate
             && let ExpressionKind::Literal(ValueLiteral::Integer(value)) = &operand.kind
         {
-            return negate_literal(*value, span);
+            return Ok(negate_literal(*value, span)?);
         }
         let value = self.expression(operand, environment)?;
-        apply_unary(operator, value, span)
+        Ok(apply_unary(operator, value, span)?)
     }
 
     fn binary(
@@ -804,7 +820,7 @@ impl Evaluator<'_> {
         right: &Expression,
         environment: &Environment,
         span: Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         if operator == BinaryOperator::And {
             return if expect_boolean(left_value, span)? {
                 let right = self.expression(right, environment)?;
@@ -823,7 +839,7 @@ impl Evaluator<'_> {
         }
 
         let right_value = self.expression(right, environment)?;
-        apply_binary(operator, left_value, right_value, span)
+        Ok(apply_binary(operator, left_value, right_value, span)?)
     }
 }
 
@@ -1192,6 +1208,28 @@ fn select_match_arm<'a>(
             };
             Ok((&arm.value, arm_environment))
         }
+    }
+}
+
+/// Applies the postfix `?` at `question` to its evaluated operand: `Ok` and
+/// `Some` yield their payload, and `Err` and `None` stop evaluation so that
+/// the innermost enclosing function call returns that same value.
+fn propagate(value: Value, question: Span) -> Flow<Value> {
+    match value {
+        Value::Variant {
+            name: VariantName::Ok | VariantName::Some,
+            payload: Some(payload),
+        } => Ok(Value::clone(&payload)),
+        Value::Variant {
+            name: VariantName::Err | VariantName::None,
+            ..
+        } => Err(Interrupt::Exit { value, question }),
+        value => Err(Diagnostic::new(
+            "K4001",
+            format!("expected result or option for `?`, found {}", value.kind()),
+            question,
+        )
+        .into()),
     }
 }
 
@@ -1758,6 +1796,75 @@ mod tests {
         .expect("variants should run");
 
         assert_eq!(output, "ready\nfailed\ntrue\n");
+    }
+
+    #[test]
+    fn postfix_question_marks_return_failures_from_the_enclosing_function() {
+        let (output, _) = run(r#"
+            fn digit(text: String) -> Result<Int, String> {
+                if text == "1" { Ok(1) } else { Err("bad " + text) }
+            }
+            fn sum(left: String, right: String) -> Result<Int, String> {
+                let first = digit(left)?;
+                println("after " + left);
+                Ok(first + digit(right)?)
+            }
+            fn first(items: List<Int>) -> Option<Int> {
+                match items { [] => None, [head, .._] => Some(head) }
+            }
+            fn nested(items: List<Int>) -> Option<Int> {
+                let doubled = if first(items)? > 0 {
+                    match Some(first(items)? * 2) { Some(value) => value, None => 0 }
+                } else {
+                    0
+                };
+                Some(doubled)
+            }
+            println(sum("1", "1"));
+            println(sum("x", "1"));
+            println(sum("1", "y"));
+            println(nested([4]));
+            println(nested([]));
+            "#)
+        .expect("propagation should run");
+        assert_eq!(
+            output,
+            "after 1\nOk(2)\nErr(\"bad x\")\nafter 1\nErr(\"bad y\")\nSome(8)\nNone\n"
+        );
+    }
+
+    #[test]
+    fn postfix_question_marks_keep_left_to_right_order_and_performed_effects() {
+        let (output, _) = run(r#"
+            fn failing(label: String) -> Result<Int, String> {
+                println(label);
+                Err(label)
+            }
+            fn three(a: Unit, b: Int, c: Unit) -> Int { b }
+            fn order() -> Result<Int, String> {
+                Ok(three(println("a"), failing("b")?, println("never")))
+            }
+            println(order());
+            "#)
+        .expect("propagation should run");
+        assert_eq!(output, "a\nb\nErr(\"b\")\n");
+    }
+
+    #[test]
+    fn a_failure_propagated_outside_every_function_is_an_error_without_analysis() {
+        let error = run_unchecked("println(1);\nErr(2)?;\nprintln(3);")
+            .expect_err("an unchecked top-level `?` should fail");
+        assert_eq!(error.code(), "K3012");
+        assert_eq!(error.span().start, 18);
+        let (output, _) = run_unchecked("println(Ok(2)?);").expect("`Ok` unwraps");
+        assert_eq!(output, "2\n");
+        let error = run_unchecked("fn f() { 1? }\nf();").expect_err("not a variant");
+        assert_eq!(error.code(), "K4001");
+        // A closure is a function call too, so its own call returns the
+        // failure.
+        let (output, _) = run_unchecked("let g = fn() { Err(1)?; 2 };\nprintln(g());")
+            .expect("a closure call returns the failure");
+        assert_eq!(output, "Err(1)\n");
     }
 
     #[test]

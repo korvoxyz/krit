@@ -475,6 +475,97 @@ queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
 }
 
 #[test]
+fn a_question_mark_exit_fails_a_queue_delivery_without_partial_state() {
+    let directory = TestDirectory::new("propagate");
+    let database = directory.database();
+    seed_job(&database, 1, "propagated");
+    let worker = compile(
+        r#"
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    object_put("render-output", job.id, job.body)?;
+    let mode = config_string("worker.mode")?;
+    Ok(mode + " " + job.body)
+}
+"#,
+        &[
+            "config.read",
+            "object.read",
+            "object.write",
+            "queue.consume",
+            "state.transaction",
+        ],
+    );
+    let worker_manifest = manifest(&format!(
+        "{WORKER_CAPABILITIES}config = [\"worker.mode\"]\n"
+    ));
+    let grants = GrantSet::from_manifest(&worker_manifest);
+    let configured_host = |config: &[(&str, &str)]| {
+        AgentHost::new_with_state(
+            HostInputs::new(
+                config
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+                SecretStore::default(),
+            )
+            .expect("inputs should be valid")
+            .with_network_policy(NetworkPolicy::loopback_for_tests()),
+            AgentHostPolicy::default(),
+            Arc::new(DenyAllApprovalPolicy),
+            durable(database.clone(), Resources::default()),
+        )
+        .expect("agent host should build")
+    };
+
+    // `config_string(...)?` meets `Err` after the object write was staged:
+    // the worker returns that `Err`, and the failed delivery commits nothing.
+    let first = Runtime::default()
+        .dispatch_job(DeliveryRequest {
+            bytes: &worker.bytes,
+            metadata: &worker.metadata,
+            grants: &grants,
+            agent_host: &configured_host(&[]),
+            resource: "render-jobs",
+            now_millis: 2_000,
+            cancellation: &CancellationHandle::new(),
+        })
+        .expect("first attempt should dispatch");
+    let DeliveryOutcome::Retried {
+        attempt: 1,
+        visible_at_millis,
+        ..
+    } = first.outcome
+    else {
+        panic!("the propagated error must retry the job");
+    };
+    assert_eq!(
+        first.detail,
+        "configuration key `worker.mode` is not configured"
+    );
+    let store = open_store(&database);
+    assert_eq!(store.object_stats("render-output").unwrap(), (0, 0));
+
+    let second = Runtime::default()
+        .dispatch_job(DeliveryRequest {
+            bytes: &worker.bytes,
+            metadata: &worker.metadata,
+            grants: &grants,
+            agent_host: &configured_host(&[("worker.mode", "fast")]),
+            resource: "render-jobs",
+            now_millis: visible_at_millis,
+            cancellation: &CancellationHandle::new(),
+        })
+        .expect("second attempt should dispatch");
+    assert!(matches!(
+        second.outcome,
+        DeliveryOutcome::Completed { attempt: 2, .. }
+    ));
+    assert_eq!(second.detail, "fast propagated");
+    assert_eq!(store.object_stats("render-output").unwrap().0, 1);
+    assert_eq!(store.queue_stats("render-jobs").unwrap(), (0, 0));
+}
+
+#[test]
 fn exhausted_attempts_dead_letter_and_stop_redelivering() {
     let directory = TestDirectory::new("dead-letter");
     let database = directory.database();

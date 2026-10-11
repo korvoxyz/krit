@@ -1,0 +1,3 @@
+fn model() -> Option<String> {
+    Some(config_string("agent.model")?)
+}

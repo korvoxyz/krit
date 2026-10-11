@@ -59,9 +59,9 @@ comment     = "//", non-line-break* ;
 Integer separators cannot be leading, trailing, or repeated. Integers are
 signed through unary `-`; the sign is not part of the token.
 
-`?` is a token of its own. Edition 2026 gives it no meaning, so it appears in
-no valid program; the parser uses it only to recognize another language's
-conditional operator (section 4.2).
+`?` is a token of its own: the postfix error-propagation operator (section
+8.2). After an operand, the parser also uses it to recognize another
+language's conditional operator (section 4.2).
 
 Strings support these escapes:
 
@@ -112,7 +112,7 @@ term            = factor, (("+" | "-"), factor)* ;
 factor          = unary, (("*" | "/" | "%"), unary)* ;
 unary           = ("!" | "-"), unary | call ;
 call            = primary,
-                  ("(", arguments?, ")" | ".", identifier)* ;
+                  ("(", arguments?, ")" | ".", identifier | "?")* ;
 arguments       = expression, (",", expression)*, ","? ;
 
 primary         = integer
@@ -170,7 +170,7 @@ record-type-field
 Assignments and mutable bindings do not exist in edition 2026. Neither do
 `return`, loops, classes, modules, `async`, exceptions, indexing, arrow
 functions, the conditional operator, or `switch`; section 4.2 specifies how
-the parser reports them.
+the parser reports them. The one early exit is postfix `?` (section 8.2).
 
 A `webhook` declaration is valid only as a direct program item. A source
 module contains zero or one webhook. Nested or duplicate webhook declarations
@@ -193,8 +193,8 @@ A source file may nest syntax at most **256 levels** deep. Each of the
 following opens one level for what it contains:
 
 - a parenthesized expression, a block, a list literal, and a record literal
-- the argument list of a call, and each call or field-access link of a
-  postfix chain (`a.b(c).d` opens three levels for what follows `a`)
+- the argument list of a call, and each call, field-access, or `?` link of a
+  postfix chain (`a.b(c)?.d` opens four levels for what follows `a`)
 - the operand of a unary operator
 - the condition of an `if`, and the subject and the arm list of a `match`
 - the argument list of `List<…>`, `Option<…>`, or `Result<…, …>`, and the
@@ -205,8 +205,8 @@ chain of binary operators such as `a + b + c` stays at the level of its first
 operand, so long flat chains are not nesting. They still nest in the
 program's syntax tree, so a separate **structural depth** limit applies: the
 nesting level of any point plus the number of `else if` continuations, binary
-operators, and call or field-access links above it in the tree may not exceed
-**4,096**.
+operators, and call, field-access, or `?` links above it in the tree may not
+exceed **4,096**.
 
 Operator and postfix chains nest to the left: their first operand lies below
 every operator or link of the chain. Parentheses group without changing that,
@@ -292,14 +292,29 @@ These constructs are reported wherever they occur:
 - `K1109`: an identifier or a parenthesized group followed by `=>`
   (`x => e`, `(x, y) => e`, `(x: Int) => e`, `() => e`). No expression is
   ever followed by `=>`; only match patterns are.
-- `K1110`: a `?` after an operand, followed by an expression and then `:`
-  (`ready ? 1 : 2`). When the tokens after the `?` start an expression that
-  does not parse, the `?` is still `K1110` if a `:` follows it at the same
-  bracket depth before the end of the file, a closing bracket opened before
-  the `?`, or the first `;`, `,`, or `let` at that depth
-  (`ready ? items[0] : None`, `ok ? { status: 200 } : { status: 500 }`). The
-  parser examines the tokens after the `?` without consuming them. A `?` in
-  any other position is an unexpected token (`K1001`).
+- `K1110`: a `?` after an operand that starts another language's
+  conditional operator. Call a `:` a **branch end** for the `?` when it
+  follows the `?` at the same bracket depth before the end of the file, a
+  closing bracket opened before the `?`, or the first `;`, `,`, or `let` at
+  that depth; no valid program has one, since a first branch contains none of
+  those outside brackets. What follows the `?` decides:
+  - A token that can only start an operand, as above (`ready ? 1 : 2`): the
+    `?` is `K1110` when the tokens after it are an expression and then `:`,
+    or start an expression that does not parse and a branch end follows
+    (`ready ? items[0] : None`, `c ? return 1 : 2`). Otherwise it is an
+    unexpected token (`K1001`) when that token is on the same line
+    (`ready ? 1`), and a postfix `?` followed by a missing `;` or `,`, which
+    the parser reports next, when it is on a later line.
+  - `-`, `(`, `[`, or `{`, which may also continue a postfix `?`
+    (`count? - 1`, `pick()?(1)`, `if ready? {`): the `?` is `K1110` exactly
+    when a branch end follows (`sign ? -1 : 1`,
+    `ok ? { status: 200 } : { status: 500 }`), and the tokens between are
+    never parsed.
+  - Any other token (`;`, `)`, `.`, `?`, a binary operator other than `-`):
+    the `?` is the postfix operator.
+
+  The parser examines the tokens after the `?` without consuming them, and a
+  `?` where an operand should start is an unexpected token (`K1001`).
 - `K1112`: `else` followed by `return` and a token that can only start an
   operand, as above, either as the first tokens of its block or directly
   (`else { return 0; }`, `else return 0;`).
@@ -313,9 +328,11 @@ Where a habit word could still be an ordinary name (`return;`,
 checking reports `K2001` with the construct's fix. Parsing stops at the first
 error, so the first construct reached in source order is the one reported,
 with two exceptions inside the first branch of a conditional operator: a
-conditional operator there is reported in place of the outer one
-(`a ? b ? c : d : e` reports `? c :`), and so is a nesting limit (`K1005`)
-crossed there.
+conditional operator there that ends at the same branch end is reported in
+place of the outer one (`a ? b ? c : d : e` and `a ? -b ? c : d : e` report
+`? c :`, while in `a ? (b ? c[0] : d) : e` the inner one ends inside the
+brackets and the outer one is reported), and so is a nesting limit (`K1005`)
+crossed in a first branch that the parser parses.
 
 ## 5. Program and block values
 
@@ -472,6 +489,63 @@ Header order is preserved and duplicate header names are representable.
 type error. Status-range validation belongs to the component HTTP host, not the
 static type checker. These built-ins do not add general user-defined type
 alias syntax.
+
+## 8.2 Error propagation
+
+Postfix `?` unwraps a `Result` or an `Option` and returns its failure from the
+enclosing function:
+
+```krit
+fn review(input: String) -> Result<String, String> {
+    let model = config_string("agent.model")?;
+    let answer = ai_invoke("reviewer", model + ": " + input)?;
+    Ok("reviewed: " + answer)
+}
+```
+
+`?` binds like a call or a field access: `load()?.body`, `pick()?(1)`, and
+`nested??` chain, `-count?` negates `count?`, and `count? + 1` adds to it.
+
+If `e` has type `Result<T, E>`, `e?` has type `T`; if `e` has type
+`Option<T>`, `e?` has type `T`. `?` is valid in any expression position of the
+body of a named function, including a `queue` or `schedule` entrypoint, whose
+declared return type is `Result<U, E>` with the identical error type `E` (for
+a `Result` operand) or `Option<U>` (for an `Option` operand); `U` need not be
+`T`. There is no error conversion. The innermost enclosing function decides;
+`?` never reaches through it to an outer one. Everywhere else `?` is `K3012`:
+
+- at the top level;
+- in an anonymous function `fn(...) { ... }`, even one with a declared
+  `Result` or `Option` return type;
+- in a `webhook` entrypoint, which returns `HttpResponse`: move the fallible
+  steps into a helper that returns `Result<HttpResponse, String>`, use `?`
+  there, and `match` the helper's result in the webhook;
+- in a named function without a declared return type, or whose declared
+  return type is neither a `Result` nor an `Option`.
+
+A `Result` operand in a function that returns `Option`, an `Option` operand in
+a function that returns `Result`, and a `Result` operand whose error type
+differs from the declared one are `K3013`; `K3012` and `K3013` each carry one
+note with the fix. An operand of any other type is `K3001`, and an operand
+whose type is not yet known takes the declared family and error type.
+Propagating rebuilds
+`Err(error)` at the function's return type, so an error type that contains
+`Secret` or `DatabaseTransaction` is rejected exactly as `Err(error)` is
+(`K3009`, `K3010`).
+
+`e` evaluates first. If it is `Ok(v)` or `Some(v)`, `e?` evaluates to `v`. If
+it is `Err(x)` or `None`, the enclosing function returns `Err(x)` or `None`
+immediately: nothing after the `?` in that function call evaluates, including
+the remaining operands and arguments of the expressions around it, while
+effects that already happened stay performed. In `f(println("a"), g()?)`,
+`a` is printed, then `g()` is called, and when it fails `f` is never called.
+`?` adds no effect and no capability requirement of its own.
+
+Core IR lowers `e?` to a variant match on `e`. The `Ok` or `Some` arm yields
+the payload; the `Err` or `None` arm rebuilds the failure at the function's
+return type and ends with a verified function exit (`TYPES-AND-EFFECTS.md`,
+"Error propagation"), which components lower to a WebAssembly `return`
+(`WASM-SANDBOX.md`).
 
 ## 9. Operators
 
@@ -814,6 +888,8 @@ Checking reports these, so a program containing one is never evaluated:
 - non-literal configuration, secret, HTTP-origin, AI-adapter, log-event,
   state-store, checkpoint, or replay-operation resource
 - printing, comparing, encoding, or structurally storing an opaque secret
+- `?` outside a named function that returns its operand's family, or with a
+  different error type (section 8.2)
 
 Evaluation reports these:
 
@@ -832,7 +908,8 @@ evaluator keeps its own kind, callee, arity, comparison, and encoding checks
 (`K4001`, `K4002`, `K4003`, `K4006`, `K4008`). In a checked program only a
 decoded JSON value can fail one of them; otherwise they make a program
 evaluated without checking, which `krit run` never does, fail with a
-diagnostic.
+diagnostic. Such a program also fails with `K3012` when a `?` outside every
+function meets `Err` or `None`.
 
 The direct-evaluation limits count active frames, not total work: sequential
 calls that each recurse 9,000 levels deep are valid. A typical recursive
@@ -872,8 +949,8 @@ grammar-permitted trailing commas, not expression order or program semantics.
   contains no tabs or trailing spaces.
 - Output uses LF line endings and exactly one final line feed.
 - Binary operators, `=`, `=>`, `->`, and type/value colons use stable spacing.
-  Calls, field access, unary operators, and generic type brackets remain
-  compact.
+  Calls, field access, postfix `?`, unary operators, and generic type
+  brackets remain compact (`load(id)?.body`, `-count? - 1`).
 - Non-empty blocks and every match are multiline. Short lists, records,
   parameter lists, argument lists, and record types remain on one line when
   readable.

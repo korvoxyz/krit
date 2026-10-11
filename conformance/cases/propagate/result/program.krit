@@ -1,0 +1,19 @@
+fn digit(text: String) -> Result<Int, String> {
+    if text == "1" {
+        Ok(1)
+    } else if text == "2" {
+        Ok(2)
+    } else {
+        Err("not a digit: " + text)
+    }
+}
+
+fn sum(left: String, right: String) -> Result<Int, String> {
+    let first = digit(left)?;
+    let second = digit(right)?;
+    Ok(first + second)
+}
+
+println(sum("1", "2"));
+println(sum("x", "2"));
+println(sum("1", "y"));

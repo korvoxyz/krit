@@ -904,7 +904,8 @@ fn ast_sensitive_literal_spans(
                             }
                         }
                     }
-                    ExpressionKind::Unary { operand, .. } => {
+                    ExpressionKind::Unary { operand, .. }
+                    | ExpressionKind::Propagate { operand, .. } => {
                         collect(source, operand, scopes, visited, targets);
                     }
                 }
@@ -1044,7 +1045,8 @@ fn ast_sensitive_literal_spans(
                         }
                     }
                 }
-                ExpressionKind::Unary { operand, .. } => {
+                ExpressionKind::Unary { operand, .. }
+                | ExpressionKind::Propagate { operand, .. } => {
                     expression_spans(source, operand, scopes, spans);
                 }
             }
@@ -2226,6 +2228,35 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
                         && *category == "search-query"),
                 "an aliased query leaked: {spans:?}"
             );
+        }
+    }
+
+    #[test]
+    fn sensitive_arguments_and_aliases_under_postfix_question_marks_are_redacted() {
+        let source = r#"
+fn lookup(request: HttpRequest) -> Result<String, String> {
+    let key = "private-cache-key";
+    let cached = cache_get("lookups", key)?;
+    let value = wrap("private-payload")?;
+    cache_put("lookups", "k", value, 60)?;
+    Ok(config_string("agent.model")?)
+}
+"#;
+
+        for spans in [redacted(source), redacted_tolerant(source)] {
+            for (content, expected) in [
+                ("private-cache-key", "cache-key"),
+                ("private-payload", "cache-value"),
+                ("lookups", "capability-resource"),
+                ("agent.model", "capability-resource"),
+            ] {
+                assert!(
+                    spans
+                        .iter()
+                        .any(|(actual, category)| actual == content && *category == expected),
+                    "{content} leaked: {spans:?}"
+                );
+            }
         }
     }
 

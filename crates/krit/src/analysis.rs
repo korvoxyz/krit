@@ -889,6 +889,45 @@ struct Analyzer {
     /// The span of the field access `call` is about to analyze as its callee,
     /// so a failed access reports the method call it is part of (`K3011`).
     method_callee: Option<Span>,
+    /// What a postfix `?` may exit, one entry per enclosing function body,
+    /// innermost last; empty at the top level.
+    exits: Vec<ExitContext>,
+}
+
+/// Whether a postfix `?` in a function body may return from that function.
+#[derive(Clone)]
+enum ExitContext {
+    Propagates(Propagation),
+    Refused(Refusal),
+}
+
+/// A named function (or a `queue`/`schedule` entrypoint) declared to return
+/// `Result<_, E>` or `Option<_>`, which a postfix `?` in its body returns
+/// from.
+#[derive(Clone)]
+struct Propagation {
+    name: String,
+    family: VariantFamily,
+    /// The declared error type `E` of a `Result` family.
+    error: Option<InferType>,
+    /// The declared return type as written.
+    return_type: String,
+}
+
+/// Why a postfix `?` cannot return from where it stands (`K3012`).
+#[derive(Clone)]
+enum Refusal {
+    /// Outside every function body.
+    TopLevel,
+    /// In an anonymous function `fn(...) { ... }`.
+    Closure,
+    /// In a webhook entrypoint, which returns `HttpResponse`.
+    Webhook,
+    /// In a named function without a declared return type.
+    Undeclared { name: String },
+    /// In a named function declared to return a type that is neither a
+    /// `Result` nor an `Option`.
+    Other { name: String, return_type: String },
 }
 
 #[derive(Clone)]
@@ -920,6 +959,7 @@ impl Analyzer {
             type_depth_error: None,
             warnings: Vec::new(),
             method_callee: None,
+            exits: Vec::new(),
         }
     }
 
@@ -1185,6 +1225,11 @@ impl Analyzer {
                     Some(annotation) => self.annotation(annotation),
                     None => self.fresh_type(),
                 };
+                let exit = if matches!(statement.kind, StatementKind::Webhook { .. }) {
+                    ExitContext::Refused(Refusal::Webhook)
+                } else {
+                    named_exit_context(name, return_type.as_ref(), &declared_return)
+                };
                 let effect = self.fresh_effect();
                 let function_type = InferType::Function {
                     parameters: parameter_types.clone(),
@@ -1202,7 +1247,10 @@ impl Analyzer {
 
                 self.push_scope();
                 self.define_parameters(parameters, &parameter_types)?;
-                let body_info = self.block(body)?;
+                self.exits.push(exit);
+                let body_info = self.block(body);
+                self.exits.pop();
+                let body_info = body_info?;
                 self.pop_scope();
                 self.unify(
                     declared_return,
@@ -1404,6 +1452,7 @@ impl Analyzer {
             ExpressionKind::Call { callee, arguments } => {
                 self.call(callee, arguments, expression.span)
             }
+            ExpressionKind::Propagate { operand, question } => self.propagate(operand, *question),
             ExpressionKind::Match { subject, kind } => {
                 self.match_expression(subject, kind, expression.span)
             }
@@ -1552,7 +1601,10 @@ impl Analyzer {
 
         self.push_scope();
         self.define_parameters(parameters, &parameter_types)?;
-        let body_info = self.block(body)?;
+        self.exits.push(ExitContext::Refused(Refusal::Closure));
+        let body_info = self.block(body);
+        self.exits.pop();
+        let body_info = body_info?;
         self.pop_scope();
         self.unify(
             declared_return.clone(),
@@ -1918,6 +1970,113 @@ impl Analyzer {
         Ok(ExpressionInfo {
             ty: return_type,
             effects,
+        })
+    }
+
+    /// Analyzes `operand?`, whose `?` is at `question`.
+    ///
+    /// `?` is valid only in the body of a named function declared to return
+    /// `Result<_, E>` (for a `Result<T, E>` operand with the identical `E`)
+    /// or `Option<_>` (for an `Option<T>` operand); its value is the `T`. It
+    /// adds no effect of its own.
+    fn propagate(
+        &mut self,
+        operand: &Expression,
+        question: Span,
+    ) -> Result<ExpressionInfo, Diagnostic> {
+        let operand_info = self.expression(operand)?;
+        let Propagation {
+            name,
+            family,
+            error,
+            return_type,
+        } = match self.exits.last().cloned() {
+            Some(ExitContext::Propagates(propagation)) => propagation,
+            Some(ExitContext::Refused(refusal)) => {
+                return Err(propagation_refused(&refusal, question));
+            }
+            None => return Err(propagation_refused(&Refusal::TopLevel, question)),
+        };
+        let found = self.resolve_head(&operand_info.ty);
+        let ty = match (family, found, error) {
+            (VariantFamily::Option, InferType::Option(value), _) => *value,
+            (VariantFamily::Result, InferType::Result(value, found_error), Some(error)) => {
+                // The failure arm rebuilds the `Err` around the error value,
+                // so an opaque error type is rejected as it is for `Err(x)`.
+                self.constraints.push(TypeConstraint {
+                    ty: error.clone(),
+                    span: question,
+                    kind: ConstraintKind::StructuralValue,
+                });
+                self.unify(error, *found_error, question, "`?` error")
+                    .map_err(|mismatch| {
+                        if mismatch.code() != "K3001" {
+                            return mismatch;
+                        }
+                        Diagnostic::new(
+                            "K3013",
+                            format!(
+                                "`?` cannot return this `Err` from `{name}`: its error type \
+                                 differs from the declared `{return_type}`"
+                            ),
+                            question,
+                        )
+                        .with_note(
+                            "`?` passes the error on unchanged, so both error types must be \
+                             identical; `match` the value to convert the error",
+                        )
+                    })?;
+                *value
+            }
+            (family, InferType::Variable(_), error) => {
+                let value = self.fresh_type();
+                let expected = match (family, error) {
+                    (VariantFamily::Result, Some(error)) => {
+                        self.constraints.push(TypeConstraint {
+                            ty: error.clone(),
+                            span: question,
+                            kind: ConstraintKind::StructuralValue,
+                        });
+                        InferType::Result(Box::new(value.clone()), Box::new(error))
+                    }
+                    _ => InferType::Option(Box::new(value.clone())),
+                };
+                self.unify(expected, operand_info.ty, question, "`?` operand")?;
+                value
+            }
+            (family, found @ (InferType::Option(_) | InferType::Result(_, _)), _) => {
+                let (found_family, expected_family) = match family {
+                    VariantFamily::Option => ("a `Result`", "an `Option`"),
+                    VariantFamily::Result => ("an `Option`", "a `Result`"),
+                };
+                return Err(Diagnostic::new(
+                    "K3013",
+                    format!(
+                        "`?` on {found_family} value cannot return from `{name}`, which \
+                         returns `{return_type}`",
+                    ),
+                    question,
+                )
+                .with_note(format!(
+                    "`?` returns the family it unwraps; `match` the `{}` to build \
+                     {expected_family}, or declare {found_family} return type",
+                    self.render_type(&found)
+                )));
+            }
+            (_, found, _) => {
+                return Err(Diagnostic::new(
+                    "K3001",
+                    format!(
+                        "`?` applies to a `Result` or `Option` value, found `{}`",
+                        self.render_type(&found)
+                    ),
+                    question,
+                ));
+            }
+        };
+        Ok(ExpressionInfo {
+            ty,
+            effects: operand_info.effects,
         })
     }
 
@@ -3857,6 +4016,77 @@ impl<'a> TypeNormalizer<'a> {
     }
 }
 
+/// Decides whether `?` may exit the named function `name`, declared with
+/// `return_type` (analyzed as `declared`).
+fn named_exit_context(
+    name: &str,
+    return_type: Option<&TypeAnnotation>,
+    declared: &InferType,
+) -> ExitContext {
+    let Some(annotation) = return_type else {
+        return ExitContext::Refused(Refusal::Undeclared {
+            name: name.to_owned(),
+        });
+    };
+    let (family, error) = match declared {
+        InferType::Result(_, error) => (VariantFamily::Result, Some(error.as_ref().clone())),
+        InferType::Option(_) => (VariantFamily::Option, None),
+        _ => {
+            return ExitContext::Refused(Refusal::Other {
+                name: name.to_owned(),
+                return_type: annotation.to_string(),
+            });
+        }
+    };
+    ExitContext::Propagates(Propagation {
+        name: name.to_owned(),
+        family,
+        error,
+        return_type: annotation.to_string(),
+    })
+}
+
+/// `K3012`: the `?` at `question` has no function it may return from, for
+/// the reason `refusal`.
+fn propagation_refused(refusal: &Refusal, question: Span) -> Diagnostic {
+    let (message, note) = match refusal {
+        Refusal::TopLevel => (
+            "`?` is not allowed at the top level".to_owned(),
+            "`?` returns early from the enclosing named function; at the top level, \
+             handle the value with `match`"
+                .to_owned(),
+        ),
+        Refusal::Closure => (
+            "`?` is not allowed in an anonymous function".to_owned(),
+            "`?` returns only from a named function; handle the value with `match` here, \
+             or move the code into a named `fn` that returns `Result` or `Option`"
+                .to_owned(),
+        ),
+        Refusal::Webhook => (
+            "`?` is not allowed in a webhook entrypoint, which returns `HttpResponse`".to_owned(),
+            "move the fallible steps into a helper `fn` that returns \
+             `Result<HttpResponse, String>`, use `?` there, and `match` its result here; \
+             let-else, arriving in Krit 0.3, also fits"
+                .to_owned(),
+        ),
+        Refusal::Undeclared { name } => (
+            format!("`?` is not allowed in `{name}`, which has no declared return type"),
+            format!(
+                "declare the return type of `{name}`, as in `-> Result<T, E>` or \
+                 `-> Option<T>`; `?` returns its `Err` or `None` from there"
+            ),
+        ),
+        Refusal::Other { name, return_type } => (
+            format!("`?` is not allowed in `{name}`, which returns `{return_type}`"),
+            format!(
+                "`?` returns an `Err` or `None` early, so `{name}` must return `Result<_, E>` \
+                 or `Option<_>`; otherwise handle the value with `match`"
+            ),
+        ),
+    };
+    Diagnostic::new("K3012", message, question).with_note(note)
+}
+
 /// The source spelling of a method call's receiver when it is a name or a
 /// short field path (`s`, `request.body`), for use in a fix; `None` for any
 /// other expression.
@@ -5200,5 +5430,149 @@ mod tests {
         // A field that exists but does not hold a function is a call error.
         let (code, _, _) = error_notes("let item = record { a: 1 };\nitem.a();");
         assert_eq!(code, "K3002");
+    }
+
+    /// The type and effects analysis recorded for the expression spelled
+    /// `snippet` in `text`.
+    fn expression_fact(text: &str, snippet: &str) -> (String, String) {
+        let analysis = check(text).unwrap_or_else(|error| panic!("{text}: {error:?}"));
+        let start = text
+            .find(snippet)
+            .expect("snippet should occur in the text");
+        let fact = analysis
+            .expression(Span::new(start, start + snippet.len()))
+            .expect("the snippet should be an analyzed expression");
+        (fact.ty().to_string(), fact.effects().to_string())
+    }
+
+    #[test]
+    fn postfix_question_marks_unwrap_results_and_options() {
+        let text = "fn digit(text: String) -> Result<Int, String> { Err(text) }\n\
+                    fn total(text: String) -> Result<Int, String> { Ok(digit(text)? + 1) }";
+        assert_eq!(
+            expression_fact(text, "digit(text)?"),
+            ("Int".to_owned(), "{}".to_owned())
+        );
+        let text = "fn first(items: List<String>) -> Option<String> {\n\
+                    match items { [] => None, [head, .._] => Some(head) }\n}\n\
+                    fn twice(items: List<String>) -> Option<String> { Some(first(items)? + \"!\") }";
+        assert_eq!(
+            expression_fact(text, "first(items)?"),
+            ("String".to_owned(), "{}".to_owned())
+        );
+
+        // `?` adds no effect: the operand's effects are its effects.
+        let text = "fn logged() -> Option<Int> { println(1); Some(1) }\n\
+                    fn use_it() -> Option<Int> { Some(logged()?) }";
+        assert_eq!(
+            expression_fact(text, "logged()?"),
+            ("Int".to_owned(), "{io.stdout}".to_owned())
+        );
+
+        // An operand of unknown type takes the declared family and error type.
+        let text = "fn pass(value) -> Result<Bool, String> { Ok(value?) }";
+        let analysis = check(text).expect("an inferred operand should check");
+        assert_eq!(
+            analysis.bindings()[0].ty().to_string(),
+            "fn(Result<Bool, String>) -> Result<Bool, String> effects {}"
+        );
+        check("fn pass(value) -> Option<Int> { Some(value? + 1) }")
+            .expect("an inferred Option operand should check");
+
+        // Entrypoints that return `Result<String, String>` accept `?`, and the
+        // innermost named function decides.
+        check(
+            "queue \"jobs\" fn work(job: QueueJob) -> Result<String, String> {\n\
+             Ok(config_string(\"agent.model\")? + job.body)\n}",
+        )
+        .expect("a queue entrypoint should accept `?`");
+        check(
+            "schedule \"tick\" fn tick(event: ScheduleEvent) -> Result<String, String> {\n\
+             Ok(config_string(\"agent.model\")?)\n}",
+        )
+        .expect("a schedule entrypoint should accept `?`");
+        check(
+            "fn outer() -> Int {\n\
+             fn inner(value: Option<Int>) -> Option<Int> { Some(value? + 1) }\n\
+             match inner(Some(1)) { Some(x) => x, None => 0 }\n}",
+        )
+        .expect("a nested named function returning Option should accept `?`");
+    }
+
+    #[test]
+    fn postfix_question_marks_need_a_function_that_returns_their_family() {
+        for (text, code, message) in [
+            (
+                "let x = Some(1)?;",
+                "K3012",
+                "`?` is not allowed at the top level",
+            ),
+            (
+                "fn f(x: Option<Int>) -> Option<Int> { let g = fn() -> Option<Int> { Some(x?) };\n\
+                 g() }",
+                "K3012",
+                "`?` is not allowed in an anonymous function",
+            ),
+            (
+                "webhook fn handle(request: HttpRequest) -> HttpResponse {\n\
+                 let model = config_string(\"agent.model\")?;\n\
+                 record { status: 200, headers: [], body: model }\n}",
+                "K3012",
+                "`?` is not allowed in a webhook entrypoint, which returns `HttpResponse`",
+            ),
+            (
+                "fn f(x: Option<Int>) { x? }",
+                "K3012",
+                "`?` is not allowed in `f`, which has no declared return type",
+            ),
+            (
+                "fn f(x: Option<Int>) -> Int { x? }",
+                "K3012",
+                "`?` is not allowed in `f`, which returns `Int`",
+            ),
+            (
+                "fn f(x: Option<Int>) -> Option<Int> { fn g(y: Option<Int>) -> Int { y? }\n\
+                 Some(g(x)) }",
+                "K3012",
+                "`?` is not allowed in `g`, which returns `Int`",
+            ),
+            (
+                "fn f(x: Result<Int, Int>) -> Result<Int, String> { Ok(x?) }",
+                "K3013",
+                "`?` cannot return this `Err` from `f`: its error type differs from the \
+                 declared `Result<Int, String>`",
+            ),
+            (
+                "fn f(x: Option<Int>) -> Result<Int, String> { Ok(x?) }",
+                "K3013",
+                "`?` on an `Option` value cannot return from `f`, which returns \
+                 `Result<Int, String>`",
+            ),
+            (
+                "fn f(x: Result<Int, String>) -> Option<Int> { Some(x?) }",
+                "K3013",
+                "`?` on a `Result` value cannot return from `f`, which returns `Option<Int>`",
+            ),
+        ] {
+            let error = check(text).expect_err("misplaced `?` should not check");
+            assert_eq!(error.code(), code, "{text}");
+            assert_eq!(error.message(), message, "{text}");
+            assert_eq!(error.notes().len(), 1, "{text}");
+            let question = text.rfind('?').expect("text has a `?`");
+            assert_eq!(error.span(), Span::new(question, question + 1), "{text}");
+        }
+
+        let error = check("fn f(x: Int) -> Option<Int> { Some(x?) }").expect_err("not a variant");
+        assert_eq!(error.code(), "K3001");
+        // Propagating rebuilds the `Err`, so an opaque error type is refused.
+        let error = check(
+            "fn g() -> Result<Int, Secret> { Ok(1) }\n\
+             fn f() -> Result<Int, Secret> { Ok(g()?) }",
+        )
+        .expect_err("a Secret error should not propagate");
+        assert_eq!(error.code(), "K3009");
+        // The operand is checked before the `?`.
+        let error = check("let x = missing?;").expect_err("undefined operand");
+        assert_eq!(error.code(), "K2001");
     }
 }

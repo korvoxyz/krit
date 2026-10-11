@@ -1,0 +1,3 @@
+fn model() {
+    config_string("agent.model")?
+}

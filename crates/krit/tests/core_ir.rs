@@ -502,7 +502,7 @@ fn assert_expression_names_resolved(expression: &Expression, analysis: &Analysis
                 }
             }
         }
-        ExpressionKind::Unary { operand, .. } => {
+        ExpressionKind::Unary { operand, .. } | ExpressionKind::Propagate { operand, .. } => {
             assert_expression_names_resolved(operand, analysis);
         }
         ExpressionKind::Binary { left, right, .. } => {

@@ -641,7 +641,7 @@ impl SyntaxCollector {
                     }
                 }
             }
-            ExpressionKind::Unary { operand, .. } => {
+            ExpressionKind::Unary { operand, .. } | ExpressionKind::Propagate { operand, .. } => {
                 pending.push(SyntaxNode::Expression(operand));
             }
             ExpressionKind::Binary { left, right, .. } => {
@@ -936,6 +936,7 @@ fn token_pair_needs_space(
             | TokenKind::Semicolon
             | TokenKind::Dot
             | TokenKind::Colon
+            | TokenKind::Question
     ) || matches!(previous_kind, TokenKind::Dot | TokenKind::DotDot)
     {
         return false;
@@ -1079,6 +1080,7 @@ fn can_end_expression(kind: &TokenKind) -> bool {
             | TokenKind::RightParen
             | TokenKind::RightBracket
             | TokenKind::RightBrace
+            | TokenKind::Question
     )
 }
 
@@ -1151,6 +1153,19 @@ mod tests {
         assert_eq!(
             formatted,
             "fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n\nlet values = [1, 2, 3];\n\nprintln(add(1, 2));\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+    }
+
+    #[test]
+    fn formats_postfix_question_marks_as_tight_call_links() {
+        let source = "fn f(a,pick,flag)->Option<Int>{let b=a ?;let c=pick( ) ? (1) ? .x;\n\
+                      if flag ? {Some(- b ?? - c)}else{Some(a? -1)}}";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "fn f(a, pick, flag) -> Option<Int> {\n    let b = a?;\n    let c = pick()?(1)?.x;\n    \
+             if flag? {\n        Some(-b?? - c)\n    } else {\n        Some(a? - 1)\n    }\n}\n"
         );
         assert_eq!(format(&formatted), formatted);
     }

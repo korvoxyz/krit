@@ -1561,7 +1561,10 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
                         }
                     }
                 }
-                ExpressionKind::Unary { operand, .. } => expression_fields(operand, fields),
+                ExpressionKind::Unary { operand, .. }
+                | ExpressionKind::Propagate { operand, .. } => {
+                    expression_fields(operand, fields);
+                }
             }
             let Some(operand) = pending_operands.pop() else {
                 break;
@@ -2152,7 +2155,10 @@ impl<'a> DeclarationCollector<'a> {
                         }
                     }
                 }
-                ExpressionKind::Unary { operand, .. } => self.expression(operand),
+                ExpressionKind::Unary { operand, .. }
+                | ExpressionKind::Propagate { operand, .. } => {
+                    self.expression(operand);
+                }
             }
             let Some(operand) = pending_operands.pop() else {
                 break;
@@ -2238,6 +2244,7 @@ fn expression_kind(kind: &ExpressionKind) -> &'static str {
         ExpressionKind::If { .. } => "if",
         ExpressionKind::Function { .. } => "function",
         ExpressionKind::Call { .. } => "call",
+        ExpressionKind::Propagate { .. } => "propagate",
         ExpressionKind::Match { .. } => "match",
         ExpressionKind::Unary { .. } => "unary",
         ExpressionKind::Binary { .. } => "binary",
@@ -2712,6 +2719,85 @@ mod tests {
             .expect("test thread should start")
             .join()
             .expect("long chains should be walked on a small stack");
+    }
+
+    #[test]
+    fn walks_postfix_question_marks_without_losing_symbols() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let source = "fn load(value: Option<Record { inner_field: Int }>) -> Option<Int> {\n    \
+                      let local = value?.inner_field;\n    Some(local)\n}\n";
+        let diagnostics = state.open(uri.clone(), 1, source.to_owned());
+        assert!(diagnostics.diagnostics.is_empty());
+
+        let CompletionResponse::List(inside) = state
+            .completion(&uri, Position::new(2, 9))
+            .expect("completion should succeed")
+        else {
+            panic!("completion should return a bounded list")
+        };
+        let inside = inside
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<BTreeSet<_>>();
+        for expected in ["load", "local", "value"] {
+            assert!(inside.contains(expected), "{expected} should be visible");
+        }
+
+        let hover = state
+            .hover(&uri, Position::new(1, 21))
+            .expect("hover should succeed")
+            .expect("the `?` expression should have hover facts");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("hover should use markdown")
+        };
+        assert!(
+            markup.value.contains("inner_field: Int"),
+            "{}",
+            markup.value
+        );
+
+        // A binding of a value unwrapped by `?` completes its fields.
+        state
+            .change(
+                &uri,
+                2,
+                "fn load(value: Option<Record { inner_field: Int }>) -> Option<Int> {\n    \
+                 let unwrapped = value?;\n    Some(unwrapped.)\n}\n"
+                    .to_owned(),
+            )
+            .expect("the document should change");
+        let CompletionResponse::List(fields) = state
+            .completion(&uri, Position::new(2, 19))
+            .expect("completion should succeed")
+        else {
+            panic!("completion should return a bounded list")
+        };
+        assert_eq!(
+            fields
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["inner_field"]
+        );
+
+        let changed = state
+            .change(&uri, 3, "let value = Some(1)?;\n".to_owned())
+            .expect("change should succeed");
+        let diagnostic = &changed.diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("K3012".to_owned()))
+        );
+        assert!(
+            diagnostic
+                .message
+                .starts_with("`?` is not allowed at the top level\nhelp: ")
+        );
+        assert_eq!(diagnostic.range.start, Position::new(0, 19));
     }
 
     #[test]

@@ -1,0 +1,12 @@
+fn code(text: String) -> Result<Int, Int> {
+    if text == "" {
+        Err(400)
+    } else {
+        Ok(200)
+    }
+}
+
+fn describe(text: String) -> Result<String, String> {
+    let status = code(text)?;
+    Ok("ok")
+}

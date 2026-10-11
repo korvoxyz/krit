@@ -17,7 +17,8 @@ Each directory contains:
   means no warnings
 - `expect.notes` — optional decimal number of notes (fix hints) the error
   carries, plus line feed, for `conformance/check` cases; absent means one
-  for a habit code (`K1101`-`K1112`) or `K3011` and none for any other error
+  for a habit code (`K1101`-`K1112`), `K3011`, `K3012`, or `K3013` and none
+  for any other error
 
 `conformance/cases` contains runtime cases. The harness invokes the
 equivalent of:
@@ -127,6 +128,9 @@ network service, or nondeterministic value.
 | `records/fields` | ordered record rendering and field access |
 | `variants/option-match` | exhaustive Option matching |
 | `variants/result-match` | exhaustive Result matching |
+| `propagate/result`, `propagate/option` | postfix `?` unwraps `Ok` and `Some` and returns `Err` and `None` from the enclosing function |
+| `propagate/order` | arguments evaluate left to right; effects before a `?` exit stay performed and nothing after it evaluates |
+| `propagate/positions` | `?` in `if` conditions, `match` subjects, list and record elements, and nested blocks |
 | `json/round-trip` | deterministic JSON conversion |
 | `json/string-escapes` | every JSON string escape, surrogate pairs, and surrounding whitespace decode |
 | `types/annotations` | parsed binding, parameter, return, and generic types |
@@ -142,7 +146,10 @@ network service, or nondeterministic value.
 | `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
 | `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, and an unbound `_` is undefined |
 | `check/name/did-you-mean`, `check/name/null` | undefined names (`K2001`) that carry a did-you-mean or `None` note |
-| `check/habit/*` | one case per construct from another language (`K1101`-`K1112`): `return`, loops, assignment, `struct`, `import`, `await`, `throw`, indexing, arrow functions, the conditional operator, `switch`, and `else { return ... }`; plus a conditional operator whose first branch does not parse |
+| `check/habit/*` | one case per construct from another language (`K1101`-`K1112`): `return`, loops, assignment, `struct`, `import`, `await`, `throw`, indexing, arrow functions, the conditional operator, `switch`, and `else { return ... }`; plus a conditional operator whose first branch does not parse and one after a postfix `?` |
+| `check/syntax/question-before-operand` | a `?` followed on its line by an operand, without a `:`, is an unexpected token (`K1001`) with one note |
+| `check/propagate/*` | postfix `?` where it cannot return (`K3012`: top level, anonymous function, webhook, missing or non-`Result`/`Option` return type), with another family or error type (`K3013`), and with an opaque `Secret` error type (`K3009`) |
+| `check/valid/propagate-queue` | a queue entrypoint returns its failures with `?` and builds |
 | `check/valid/habit-words-as-names` | habit words stay ordinary identifiers outside foreign constructs |
 | `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings and a method call on a string (`K3011`) |
 | `check/match/*` | unique, exhaustive, single-family Option and Result arms (`K1003`) |
@@ -150,7 +157,7 @@ network service, or nondeterministic value.
 | `check/capability/*` | literal-resource host capability contracts |
 | `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, types that grow after they are bound, and types that grow when two solved types unify |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
-| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook helper chaining config, secret, and HTTP calls with `?` builds |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |
@@ -163,6 +170,7 @@ network service, or nondeterministic value.
 | `format/comments` | exact standalone and end-of-line comment preservation |
 | `format/edition-2026` | canonical layout for all currently implemented syntax families |
 | `format/webhook` | canonical typed webhook and ordered duplicate-header layout |
+| `format/propagate` | postfix `?` stays attached to its operand and chains like a call |
 
 ## Adding a case
 
