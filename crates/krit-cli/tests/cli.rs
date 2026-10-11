@@ -2068,6 +2068,80 @@ fn sandbox_and_artifact_permissions_use_documented_usage_and_manifest_exits() {
 }
 
 #[test]
+fn every_manifest_command_refuses_declared_dependencies() {
+    let directory = TestDirectory::new("dependencies-fail-closed");
+    directory.file("main.krit", "println(1);\n");
+    let without_dependencies = r#"
+schema = 1
+
+[package]
+name = "test/program"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[dependencies]
+
+[capabilities]
+stdout = true
+"#;
+    let manifest = directory.file(
+        "krit.pkg",
+        &without_dependencies.replace(
+            "[dependencies]\n",
+            "[dependencies]\n\"krit/json\" = \"1.2.3\"\n",
+        ),
+    );
+    let manifest_arg = manifest.to_string_lossy().into_owned();
+    let request = directory
+        .path
+        .join("request.json")
+        .to_string_lossy()
+        .into_owned();
+    for arguments in [
+        vec!["package", "check", &manifest_arg],
+        vec!["build", "--manifest", &manifest_arg],
+        vec!["sandbox", "--manifest", &manifest_arg],
+        vec!["permissions", &manifest_arg],
+        vec!["permissions", "--json", &manifest_arg],
+        vec!["invoke", "--manifest", &manifest_arg, "--request", &request],
+        vec!["worker", "--manifest", &manifest_arg, "--queue", "jobs"],
+        vec![
+            "schedule",
+            "--manifest",
+            &manifest_arg,
+            "--schedule",
+            "hourly",
+        ],
+        vec!["serve", "--manifest", &manifest_arg, "--once"],
+    ] {
+        let output = krit_in(&directory)
+            .args(&arguments)
+            .output()
+            .expect("Krit should start");
+        assert_eq!(output.status.code(), Some(3), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("diagnostic should be UTF-8"),
+            format!(
+                "{manifest_arg}:1:1: error[K6003]: dependency resolution is not supported; remove [dependencies]\n"
+            ),
+            "{arguments:?}"
+        );
+    }
+    assert!(!directory.path.join("target").exists());
+
+    fs::write(&manifest, without_dependencies).expect("manifest should be rewritten");
+    let output = krit_in(&directory)
+        .args(["package", "check", &manifest_arg])
+        .output()
+        .expect("Krit should start");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn build_fails_closed_for_capabilities_and_unsupported_layouts() {
     let directory = TestDirectory::new("build-fail-closed");
     directory.file("main.krit", "println(1);\n");
@@ -2453,6 +2527,93 @@ license = "Apache-2.0"
     assert_eq!(malformed.status.code(), Some(1));
     assert!(malformed.stdout.is_empty());
     assert!(String::from_utf8_lossy(&malformed.stderr).contains("error[K7003]"));
+}
+
+#[test]
+fn underscored_configuration_keys_flow_from_manifest_to_guest() {
+    let directory = TestDirectory::new("config-underscore");
+    directory.file(
+        "main.krit",
+        r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match config_string("agent.timeout_ms") {
+        Ok(value) => record { status: 200, headers: [], body: value },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/config-underscore"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+config = ["agent.timeout_ms"]
+"#,
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let host = directory.file(
+        "host.json",
+        r#"{"schema":1,"config":{"agent.timeout_ms":"1500"},"secrets":{}}"#,
+    );
+    let request = directory.file(
+        "request.json",
+        r#"{"method":"GET","path":"/","query":"","headers":[],"body":""}"#,
+    );
+    let invoked = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--host-config")
+        .arg(&host)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should invoke");
+    assert!(
+        invoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&invoked.stderr)
+    );
+    assert_eq!(
+        invoked.stdout,
+        b"{\"status\":200,\"headers\":[],\"body\":\"1500\"}\n"
+    );
+
+    // The hyphenated spelling is a different key and is not granted.
+    fs::write(
+        &host,
+        r#"{"schema":1,"config":{"agent.timeout-ms":"1500"},"secrets":{}}"#,
+    )
+    .expect("host config should be replaced");
+    let denied = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--host-config")
+        .arg(&host)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should reject an ungranted key");
+    assert_eq!(denied.status.code(), Some(4));
+    assert!(denied.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("error[K5001]"));
 }
 
 #[test]
@@ -3054,22 +3215,18 @@ fn assert_valid_artifact(path: &Path) {
     validate_artifact(&bytes, &metadata).expect("CLI artifact should validate");
 }
 
+#[cfg(unix)]
 #[test]
 fn schema_three_state_survives_invoke_process_restarts_and_reports_permissions() {
-    let directory = TestDirectory::new("schema-three-state");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
-            .expect("test root should be owner-only");
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(directory.path.join("state"))
-            .expect("state directory should be owner-only");
-    }
-    #[cfg(not(unix))]
-    fs::create_dir(directory.path.join("state")).expect("state directory should exist");
+    let directory = TestDirectory::new("schema-three-state");
+    fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+        .expect("test root should be owner-only");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(directory.path.join("state"))
+        .expect("state directory should be owner-only");
     directory.file(
         "main.krit",
         r#"
@@ -3222,15 +3379,10 @@ state = ["agent-work"]
     assert_eq!(second["body"], "one");
     let database = directory.path.join("state/agent-work.db");
     assert!(database.is_file());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        assert_eq!(
-            fs::metadata(&database).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
+    assert_eq!(
+        fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 #[cfg(unix)]
@@ -3393,6 +3545,127 @@ license = "Apache-2.0"
     );
 }
 
+/// Secret files and durable stores rely on owner-only file permissions, which
+/// only Unix hosts enforce. Elsewhere every host-mode command refuses such a
+/// configuration before reading a secret or resolving a store; on Unix the same
+/// configurations reach those file checks and fail there instead.
+#[test]
+fn host_mode_refuses_secrets_and_durable_state_where_owner_only_files_are_unenforced() {
+    let directory = TestDirectory::new("owner-only-platform");
+    directory.file(
+        "main.krit",
+        r#"webhook fn handle(request: HttpRequest) -> HttpResponse {
+    record { status: 200, headers: [], body: request.body }
+}
+"#,
+    );
+    directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "example/owner-only-platform"
+version = "0.2.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+secrets = ["token"]
+state = ["agent-work"]
+"#,
+    );
+    // Neither the secret file nor the state directory exists, so Unix hosts
+    // fail on them; other hosts must refuse before looking for them.
+    directory.file(
+        "secrets.host.json",
+        r#"{"schema":1,"secrets":{"token":{"file":"token"}}}"#,
+    );
+    directory.file(
+        "state.host.json",
+        r#"{
+  "schema": 3,
+  "state": {
+    "stores": {
+      "agent-work": {
+        "path": "state/agent-work.db",
+        "durability": "full",
+        "busyTimeoutMs": 250,
+        "maxOperations": 128,
+        "maxKeyBytes": 256,
+        "maxValueBytes": 65536,
+        "maxTransactionBytes": 1048576,
+        "maxDatabaseBytes": 67108864,
+        "maxReplayEntries": 1024,
+        "maxReplayBytes": 16777216,
+        "replayTtlSeconds": 604800,
+        "leaseSeconds": 30
+      }
+    }
+  }
+}"#,
+    );
+    directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/","query":"","headers":[],"body":""}"#,
+    );
+    let build = krit_in(&directory)
+        .arg("build")
+        .output()
+        .expect("pure webhook should build");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    for config in ["secrets.host.json", "state.host.json"] {
+        for command in [
+            vec!["invoke", "--request", "request.json"],
+            vec!["worker", "--queue", "render-jobs", "--once"],
+            vec!["schedule", "--schedule", "hourly", "--once"],
+            vec!["serve", "--bind", "127.0.0.1:0", "--once"],
+        ] {
+            let output = krit_in(&directory)
+                .args(&command)
+                .args(["--host-config", config])
+                .output()
+                .expect("host mode should start");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.stdout.is_empty(), "{command:?} {config}");
+            if cfg!(unix) {
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "{command:?} {config}: {stderr}"
+                );
+                assert!(
+                    stderr.contains("error[K7003]") && !stderr.contains("cannot enforce"),
+                    "{command:?} {config}: {stderr}"
+                );
+            } else {
+                assert_eq!(
+                    output.status.code(),
+                    Some(4),
+                    "{command:?} {config}: {stderr}"
+                );
+                assert!(
+                    stderr.contains("error[K5001]")
+                        && stderr.contains(
+                            "owner-only file permissions that this platform cannot enforce"
+                        ),
+                    "{command:?} {config}: {stderr}"
+                );
+            }
+            assert!(
+                !directory.path.join("state").exists(),
+                "{command:?} {config}"
+            );
+        }
+    }
+}
+
 fn metadata_path(path: &Path) -> PathBuf {
     let mut metadata = path.as_os_str().to_os_string();
     metadata.push(".json");
@@ -3417,24 +3690,25 @@ stdout = {stdout}
     )
 }
 
+/// Host mode with durable state needs owner-only files, which only Unix hosts
+/// enforce; elsewhere it is refused (see
+/// `host_mode_refuses_secrets_and_durable_state_where_owner_only_files_are_unenforced`),
+/// so the durable host-mode tests are Unix-only.
+#[cfg(unix)]
 fn owner_only_directory(name: &str) -> TestDirectory {
-    let directory = TestDirectory::new(name);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
-            .expect("test root should be owner-only");
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(directory.path.join("state"))
-            .expect("state directory should be owner-only");
-    }
-    #[cfg(not(unix))]
-    fs::create_dir(directory.path.join("state")).expect("state directory should exist");
+    let directory = TestDirectory::new(name);
+    fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+        .expect("test root should be owner-only");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(directory.path.join("state"))
+        .expect("state directory should be owner-only");
     directory
 }
 
+#[cfg(unix)]
 const JOBS_STORE: &str = r#"
   "state": {
     "stores": {
@@ -3456,6 +3730,7 @@ const JOBS_STORE: &str = r#"
   }
 "#;
 
+#[cfg(unix)]
 const JOBS_QUEUE: &str = r#"
       "render-jobs": {
         "store": "agent-work",
@@ -3471,6 +3746,7 @@ const JOBS_QUEUE: &str = r#"
       }
 "#;
 
+#[cfg(unix)]
 const JOBS_BUCKET: &str = r#"
       "render-output": {
         "store": "agent-work",
@@ -3481,6 +3757,7 @@ const JOBS_BUCKET: &str = r#"
       }
 "#;
 
+#[cfg(unix)]
 #[test]
 fn worker_once_dispatches_one_durable_delivery_across_processes() {
     let directory = owner_only_directory("worker-once");
@@ -3665,6 +3942,7 @@ state = ["agent-work"]
     assert!(directory.path.join("state/jobs.db").is_file());
 }
 
+#[cfg(unix)]
 #[test]
 fn schedule_once_fires_exactly_once_per_host_supplied_instant() {
     let directory = owner_only_directory("schedule-once");
@@ -3772,6 +4050,7 @@ schedules = ["hourly-sweep"]
     assert_eq!(repeated["idle"], true);
 }
 
+#[cfg(unix)]
 #[test]
 fn delivery_commands_reject_unbounded_and_ungranted_requests() {
     let directory = owner_only_directory("delivery-guards");
@@ -3866,6 +4145,7 @@ consumes = ["render-jobs"]
 
 /// Finding 10: a worker artifact that also holds `io.stdout` must not corrupt
 /// the `--json` report stream.
+#[cfg(unix)]
 #[test]
 fn json_delivery_reports_stay_parseable_when_the_guest_writes_stdout() {
     let directory = owner_only_directory("json-stdout-worker");
@@ -4027,6 +4307,7 @@ stdout = true
 }
 
 /// Finding 10: the same guarantee for scheduled triggers.
+#[cfg(unix)]
 #[test]
 fn json_schedule_reports_stay_parseable_when_the_guest_writes_stdout() {
     let directory = owner_only_directory("json-stdout-schedule");
@@ -4118,6 +4399,7 @@ stdout = true
 
 /// Finding 8: an unrepresentable `--now` fails without moving the cursor, and a
 /// later ordinary tick still fires.
+#[cfg(unix)]
 #[test]
 fn extreme_schedule_instants_fail_without_disturbing_later_ticks() {
     let directory = owner_only_directory("extreme-now");
@@ -4228,6 +4510,7 @@ schedules = ["hourly-sweep"]
 
 /// Finding 5: an invalid or ungranted `jobs` section is rejected before any
 /// database is created, opened, or migrated.
+#[cfg(unix)]
 #[test]
 fn invalid_job_configuration_never_touches_a_store() {
     let directory = owner_only_directory("jobs-no-side-effects");
@@ -4461,16 +4744,14 @@ fn invoke_database(directory: &TestDirectory, config: &str, request: &str) -> st
         .expect("database invocation should run")
 }
 
+#[cfg(unix)]
 #[test]
 fn schema_five_database_transactions_commit_across_invoke_processes() {
-    let directory = TestDirectory::new("schema-five-database");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
-        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
-            .expect("test root should be owner-only");
-    }
+    let directory = TestDirectory::new("schema-five-database");
+    fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+        .expect("test root should be owner-only");
     let database = create_database_fixture(&directory);
     database_package(&directory, "databases");
     directory.file(
@@ -4815,6 +5096,7 @@ license = "Apache-2.0"
 
 /// Builds a schema-5 config with both a durable store and an application
 /// database, so ordering and aliasing rules can be exercised together.
+#[cfg(unix)]
 fn state_and_database_config(database_path: &str, extra: &str) -> String {
     format!(
         r#"{{
@@ -4856,28 +5138,19 @@ fn state_and_database_config(database_path: &str, extra: &str) -> String {
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn schema_five_validates_every_policy_before_creating_any_durable_store() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
     let directory = TestDirectory::new("schema-five-ordering");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
-            .expect("test root should be owner-only");
-    }
+    fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+        .expect("test root should be owner-only");
     create_database_fixture(&directory);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(directory.path.join("state"))
-            .expect("state directory should be owner-only");
-    }
-    #[cfg(not(unix))]
-    fs::create_dir(directory.path.join("state")).expect("state directory should exist");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(directory.path.join("state"))
+        .expect("state directory should be owner-only");
     directory.file(
         "main.krit",
         r#"

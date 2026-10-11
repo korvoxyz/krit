@@ -238,7 +238,7 @@ one unescaped JSON-string decode used by the reference source.
 An adjacent metadata document records:
 
 - WebAssembly Component Model version
-- compiler build identifier
+- compiler and language versions
 - language edition
 - target world and sorted imports/effects
 - sorted exact capability/resource requirements
@@ -616,6 +616,17 @@ command schemas are independent versions. A single compiler release records
 all supported versions.
 
 Unknown future versions are errors. Compatibility adapters are explicit.
+
+Artifacts load by membership, not by exact toolchain match. A runtime
+publishes supported sets of artifact metadata schemas, validation policy
+versions, `krit:runtime` WIT package versions, and editions, and loads an
+artifact only when every recorded fact is a member. The recorded compiler and
+language versions are compared with the runtime only by a window: the same
+major version and the runtime's own or one of the two previous minor
+versions, never newer, with unparsable versions refused. The artifact must
+still agree with itself exactly, and effects are always re-derived from its
+imports. `spec/WASM-SANDBOX.md` defines the rule, and
+`conformance/build/compat` keeps golden artifacts from released toolchains.
 
 ## Rejected baseline alternatives
 

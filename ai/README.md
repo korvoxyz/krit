@@ -189,7 +189,8 @@ Every prompt pack is tied to a compiler/language version. A change must:
 4. pass parsing tests for every embedded Krit block
 5. pass canonical formatting and idempotence tests for every embedded Krit
    block
-6. record compatibility in `prompt-pack.json`
+6. record compatibility in `prompt-pack.json`; `krit assist` advertises its
+   `promptVersion` directly, so bumping it there is the only version edit
 7. update the changelog
 
 Old packs remain available for projects pinned to an older language version.

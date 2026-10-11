@@ -1,0 +1,14 @@
+schema = 1
+
+[package]
+name = "conformance/dependencies"
+version = "0.1.0"
+edition = "2026"
+entry = "program.krit"
+license = "Apache-2.0"
+
+[dependencies]
+"krit/json" = "1.2.3"
+
+[capabilities]
+stdout = true

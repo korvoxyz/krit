@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "compiler": {
+    "name": "krit",
+    "version": "0.2.0"
+  },
+  "language": {
+    "name": "Krit",
+    "version": "0.2.0"
+  },
+  "edition": "2026",
+  "package": {
+    "name": "akshay/krit",
+    "version": "0.2.0"
+  },
+  "target": "wasm-component",
+  "world": "krit:runtime/program@0.2.0",
+  "entry": "examples/factorial.krit",
+  "digest": "blake3:6b3c8591c1e82b520f5551a9440405e2f3433864c9f43b04ebf9169e21e8001b",
+  "byteSize": 1393,
+  "effects": [
+    "io.stdout"
+  ],
+  "imports": [
+    "krit:runtime/stdout@0.2.0"
+  ],
+  "buildProfile": "default",
+  "policyVersion": 1
+}

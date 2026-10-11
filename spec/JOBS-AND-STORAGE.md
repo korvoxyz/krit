@@ -409,7 +409,9 @@ that backs only job resources is host-owned and needs no `state.transaction`
 grant, which keeps an ingress publisher free of state authority. Store paths
 keep the schema-3 filesystem policy: host-config-relative normal `.db` paths,
 no `.` or `..`, no symlink component, an existing owner-only directory, and
-owner-only `0600` files. No queue, schedule, or bucket has a default.
+owner-only `0600` files. No queue, schedule, or bucket has a default. Non-Unix
+hosts refuse any configured queue, schedule, or bucket with `K5001` (see
+[platform support](WASM-SANDBOX.md#platform-support)).
 
 ## Limits
 

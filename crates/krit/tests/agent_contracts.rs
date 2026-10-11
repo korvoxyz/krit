@@ -245,9 +245,44 @@ fn config_and_secret_resources_must_be_direct_valid_literals() {
         "secret(\"-github-token\");",
         "secret(\"github-token-\");",
         "secret(\"github--token\");",
+        "config_string(\"_agent.model\");",
+        "config_string(\"agent.model_\");",
+        "config_string(\"agent__model\");",
+        "config_string(\"AGENT_MODEL\");",
+        "secret(\"github_token\");",
     ] {
         assert_eq!(diagnostic_code(source), "K3008", "{source}");
     }
+}
+
+#[test]
+fn configuration_keys_alone_accept_underscores() {
+    let analysis = analyze_source("let timeout = config_string(\"agent.timeout_ms\");")
+        .expect("an underscored configuration key should analyze");
+    assert_eq!(
+        analysis
+            .requirements()
+            .iter()
+            .map(|requirement| (requirement.capability().as_str(), requirement.resource()))
+            .collect::<Vec<_>>(),
+        [("config.read", "agent.timeout_ms")]
+    );
+
+    let error = analyze_source("config_string(\"agent__model\");")
+        .expect_err("a doubled underscore should fail");
+    assert!(
+        error.message().starts_with("configuration key must use"),
+        "{}",
+        error.message()
+    );
+    // Secret names keep the narrower resource-name grammar.
+    let error = analyze_source("secret(\"github_token\");")
+        .expect_err("an underscored secret name should fail");
+    assert!(
+        error.message().starts_with("capability resource must use"),
+        "{}",
+        error.message()
+    );
 }
 
 #[test]

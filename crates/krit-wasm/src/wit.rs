@@ -10,6 +10,8 @@ use crate::BuildError;
 
 pub(crate) const WIT_SOURCE: &str = include_str!("../../../wit/runtime.wit");
 const WIT_PACKAGE: &str = "krit:runtime@0.2.0";
+/// The version of the checked-in `krit:runtime` WIT package new artifacts use.
+pub(crate) const RUNTIME_WIT_VERSION: &str = "0.2.0";
 pub(crate) const STDOUT_EFFECT: &str = "io.stdout";
 pub(crate) const AI_EFFECT: &str = "ai.invoke";
 pub(crate) const CONFIG_EFFECT: &str = "config.read";
@@ -657,5 +659,13 @@ mod tests {
         )
         .expect("AI plus state world should load");
         assert_eq!(state_ai.component_imports, [AI_INTERFACE, STATE_INTERFACE]);
+    }
+
+    #[test]
+    fn the_package_identity_carries_the_published_wit_version() {
+        assert_eq!(WIT_PACKAGE, format!("krit:runtime@{RUNTIME_WIT_VERSION}"));
+        let (_, _, contract) =
+            load_contract(ProgramKind::Module, &[]).expect("pure world should load");
+        assert!(contract.world.ends_with(&format!("@{RUNTIME_WIT_VERSION}")));
     }
 }

@@ -86,8 +86,9 @@ fn build_command(arguments: &[String]) -> u8 {
         Ok(manifest) => manifest,
         Err(error) => {
             eprintln!(
-                "{}:1:1: error[K6001]: {error}",
-                manifest_path.to_string_lossy()
+                "{}:1:1: error[{}]: {error}",
+                manifest_path.to_string_lossy(),
+                error.code()
             );
             return 3;
         }
@@ -96,8 +97,9 @@ fn build_command(arguments: &[String]) -> u8 {
         Ok(path) => path,
         Err(error) => {
             eprintln!(
-                "{}:1:1: error[K6001]: {error}",
-                manifest_path.to_string_lossy()
+                "{}:1:1: error[{}]: {error}",
+                manifest_path.to_string_lossy(),
+                error.code()
             );
             return 3;
         }
@@ -1328,7 +1330,11 @@ fn package_command(arguments: &[String]) -> u8 {
             0
         }
         Err(error) => {
-            eprintln!("{}:1:1: error[K6001]: {error}", path.to_string_lossy());
+            eprintln!(
+                "{}:1:1: error[{}]: {error}",
+                path.to_string_lossy(),
+                error.code()
+            );
             3
         }
     }
@@ -1384,8 +1390,9 @@ fn invoke_command(arguments: &[String]) -> u8 {
         Ok(manifest) => manifest,
         Err(error) => {
             eprintln!(
-                "{}:1:1: error[K6001]: {error}",
-                options.manifest.to_string_lossy()
+                "{}:1:1: error[{}]: {error}",
+                options.manifest.to_string_lossy(),
+                error.code()
             );
             return 3;
         }
@@ -1547,8 +1554,9 @@ fn delivery_command(arguments: &[String], kind: DeliveryKind) -> u8 {
         Ok(manifest) => manifest,
         Err(error) => {
             eprintln!(
-                "{}:1:1: error[K6001]: {error}",
-                options.manifest.to_string_lossy()
+                "{}:1:1: error[{}]: {error}",
+                options.manifest.to_string_lossy(),
+                error.code()
             );
             return 3;
         }
@@ -1864,8 +1872,9 @@ fn serve_command(arguments: &[String]) -> u8 {
         Ok(manifest) => manifest,
         Err(error) => {
             eprintln!(
-                "{}:1:1: error[K6001]: {error}",
-                options.manifest.to_string_lossy()
+                "{}:1:1: error[{}]: {error}",
+                options.manifest.to_string_lossy(),
+                error.code()
             );
             return 3;
         }
@@ -2236,8 +2245,9 @@ fn sandbox_command(arguments: &[String]) -> u8 {
         Ok(manifest) => manifest,
         Err(error) => {
             eprintln!(
-                "{}:1:1: error[K6001]: {error}",
-                manifest_path.to_string_lossy()
+                "{}:1:1: error[{}]: {error}",
+                manifest_path.to_string_lossy(),
+                error.code()
             );
             return 3;
         }
@@ -2355,7 +2365,11 @@ fn permissions_command(arguments: &[String]) -> u8 {
             0
         }
         Err(error) => {
-            eprintln!("{}:1:1: error[K6001]: {error}", path.to_string_lossy());
+            eprintln!(
+                "{}:1:1: error[{}]: {error}",
+                path.to_string_lossy(),
+                error.code()
+            );
             3
         }
     }

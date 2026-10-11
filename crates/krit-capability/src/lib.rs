@@ -2,15 +2,36 @@ use std::{error::Error, fmt, net::IpAddr};
 
 use url::{Host, Url};
 
+/// Returns whether `name` uses the canonical resource-name grammar: 1-64
+/// lowercase ASCII letters, digits, `.`, or `-`, with no leading or trailing
+/// punctuation and no `..` or `--`.
 pub fn is_valid_resource_name(name: &str) -> bool {
+    is_canonical_name(name, false)
+}
+
+/// Returns whether `name` is a canonical configuration key.
+///
+/// Configuration keys extend the resource-name grammar with `_`, which obeys
+/// the same separator rules as `-`: never leading, trailing, or doubled. Only
+/// configuration keys accept it; every other resource identity keeps the
+/// narrower grammar.
+pub fn is_valid_config_key(name: &str) -> bool {
+    is_canonical_name(name, true)
+}
+
+fn is_canonical_name(name: &str, allow_underscore: bool) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && !name.starts_with(['.', '-'])
-        && !name.ends_with(['.', '-'])
+        && !name.starts_with(['.', '-', '_'])
+        && !name.ends_with(['.', '-', '_'])
         && !name.contains("..")
         && !name.contains("--")
+        && !name.contains("__")
         && name.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'-')
+                || (allow_underscore && byte == b'_')
         })
 }
 
@@ -172,7 +193,7 @@ impl Error for HttpOriginError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpOrigin, HttpScheme, is_valid_resource_name};
+    use super::{HttpOrigin, HttpScheme, is_valid_config_key, is_valid_resource_name};
 
     #[test]
     fn accepts_only_canonical_resource_names() {
@@ -189,10 +210,52 @@ mod tests {
             "github--token",
             "Agent",
             "github/token",
+            "github_token",
+            "_token",
         ] {
             assert!(!is_valid_resource_name(invalid), "{invalid}");
         }
+        assert!(is_valid_resource_name(&"a".repeat(64)));
         assert!(!is_valid_resource_name(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn config_keys_extend_the_resource_grammar_with_underscore() {
+        for valid in [
+            "a",
+            "agent.model",
+            "agent.timeout-ms",
+            "agent.timeout_ms",
+            "max_retries",
+            "agent_1.base_url",
+            "a_b-c.d",
+        ] {
+            assert!(is_valid_config_key(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "_agent",
+            "agent_",
+            "agent__model",
+            ".agent",
+            "agent-",
+            "agent..model",
+            "agent--model",
+            "Agent_Model",
+            "AGENT_MODEL",
+            "agent model",
+            "agent/model",
+            "agent:model",
+            "agent\u{ff3f}model",
+        ] {
+            assert!(!is_valid_config_key(invalid), "{invalid}");
+        }
+        assert!(is_valid_config_key(&format!("a_{}", "b".repeat(62))));
+        assert!(!is_valid_config_key(&format!("a_{}", "b".repeat(63))));
+        // Every canonical resource name is also a canonical configuration key.
+        for name in ["a", "agent.model", "github-token", "model2"] {
+            assert!(is_valid_resource_name(name) && is_valid_config_key(name));
+        }
     }
 
     #[test]

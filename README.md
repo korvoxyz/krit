@@ -146,7 +146,10 @@ The macOS and Windows downloads are not developer-signed or notarized. Use
 your OS's per-application approval flow only after checking the download's
 source and checksum; do not disable system-wide protections. Guided-assistance
 acceptance still fails closed on platforms without the audited atomic-exchange
-primitive, including Windows.
+primitive, including Windows. On Windows, host mode (`invoke`, `worker`,
+`schedule`, `serve`) also refuses host configurations that grant secrets or
+durable state, because owner-only file checks exist only on Unix; see
+[Platform support](spec/WASM-SANDBOX.md#platform-support).
 
 ### GitHub Packages
 
@@ -294,7 +297,11 @@ metadata is attached. Pure programs select the
 zero-import `pure-program` world; programs with the checked `io.stdout` effect
 select `program` and its stdout interface. Unused manifest grants do not widen
 artifact imports, and validation derives the world and effects from the actual
-component/core import surface before accepting metadata claims.
+component/core import surface before accepting metadata claims. A runtime
+loads artifacts from its own and the two previous minor toolchains, never
+newer ones, when their metadata schema, policy, `krit:runtime` WIT version,
+and edition are supported; see
+[artifact compatibility](spec/WASM-SANDBOX.md#artifact-compatibility).
 
 Artifact policy 1 supports `Int`, `Bool`, `Unit`, recursive and higher-order
 non-capturing functions, blocks, conditionals/short circuit, checked integer
@@ -953,6 +960,13 @@ The next priority is consolidation: complete applications, reviewable authoring,
 recovery under failure, and measured performance before more service breadth.
 Completed implementation phases do not make Krit production-ready or remove
 the documented backend, package-system, and OS-isolation limitations.
+
+## Security
+
+Report suspected vulnerabilities privately through GitHub private
+vulnerability reporting (**Report a vulnerability** under the repository's
+**Security** tab), never in a public issue. [SECURITY.md](SECURITY.md) lists
+the supported versions, scope, response targets, and advisory process.
 
 ## License
 

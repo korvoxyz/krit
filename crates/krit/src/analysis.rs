@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use krit_capability::{HttpOrigin, is_valid_resource_name};
+use krit_capability::{HttpOrigin, is_valid_config_key, is_valid_resource_name};
 
 use crate::{
     Builtin, Diagnostic, Span,
@@ -1451,7 +1451,15 @@ impl Analyzer {
                             argument.span,
                         ));
                     };
-                    if !is_valid_resource_name(resource) {
+                    if builtin == Builtin::ConfigString {
+                        if !is_valid_config_key(resource) {
+                            return Err(Diagnostic::new(
+                                "K3008",
+                                "configuration key must use 1-64 lowercase letters, digits, `.`, `-`, or `_`, without leading/trailing punctuation or `..`/`--`/`__`",
+                                argument.span,
+                            ));
+                        }
+                    } else if !is_valid_resource_name(resource) {
                         return Err(Diagnostic::new(
                             "K3008",
                             "capability resource must use 1-64 lowercase letters, digits, `.` or `-`, without leading/trailing punctuation or `..`/`--`",

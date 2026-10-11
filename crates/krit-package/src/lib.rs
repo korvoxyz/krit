@@ -5,8 +5,8 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use krit_capability::{HttpOrigin, is_valid_resource_name};
-use semver::{Version, VersionReq};
+use krit_capability::{HttpOrigin, is_valid_config_key, is_valid_resource_name};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -14,8 +14,12 @@ use serde::{Deserialize, Serialize};
 pub struct Manifest {
     pub schema: u32,
     pub package: Package,
+    /// Declared dependencies. Resolution is not implemented, so validation
+    /// rejects any entry with `K6003`. Values are deliberately untyped so that
+    /// every entry shape (version string or table) reaches that diagnostic
+    /// rather than a TOML type error.
     #[serde(default)]
-    pub dependencies: BTreeMap<String, String>,
+    pub dependencies: BTreeMap<String, toml::Value>,
     #[serde(default)]
     pub capabilities: Capabilities,
 }
@@ -91,14 +95,29 @@ pub struct PermissionRequest {
 
 #[derive(Debug)]
 pub struct ManifestError {
+    code: &'static str,
     message: String,
 }
 
 impl ManifestError {
     fn new(message: impl Into<String>) -> Self {
         Self {
+            code: "K6001",
             message: message.into(),
         }
+    }
+
+    fn unsupported_dependencies() -> Self {
+        Self {
+            code: "K6003",
+            message: "dependency resolution is not supported; remove [dependencies]".to_owned(),
+        }
+    }
+
+    /// Stable diagnostic code: `K6001` for an invalid manifest or entry, and
+    /// `K6003` for a manifest that declares dependencies.
+    pub const fn code(&self) -> &'static str {
+        self.code
     }
 }
 
@@ -157,18 +176,15 @@ impl Manifest {
         if self.package.license.trim().is_empty() {
             return Err(ManifestError::new("package license cannot be empty"));
         }
-        for (name, requirement) in &self.dependencies {
-            validate_package_name(name)?;
-            VersionReq::parse(requirement).map_err(|error| {
-                ManifestError::new(format!(
-                    "invalid version requirement `{requirement}` for `{name}`: {error}"
-                ))
-            })?;
+        // Fail closed: a declared dependency would otherwise be silently
+        // ignored, so any entry is rejected until resolution and locking exist.
+        if !self.dependencies.is_empty() {
+            return Err(ManifestError::unsupported_dependencies());
         }
         validate_unique_names("configuration key", &self.capabilities.config)?;
         validate_capability_count("configuration key", &self.capabilities.config)?;
         for name in &self.capabilities.config {
-            validate_resource_name("configuration key", name)?;
+            validate_config_key(name)?;
         }
         validate_unique_names("HTTP origin", &self.capabilities.http)?;
         validate_capability_count("HTTP origin", &self.capabilities.http)?;
@@ -598,6 +614,15 @@ fn validate_resource_name(kind: &str, name: &str) -> Result<(), ManifestError> {
     Ok(())
 }
 
+fn validate_config_key(name: &str) -> Result<(), ManifestError> {
+    if !is_valid_config_key(name) {
+        return Err(ManifestError::new(format!(
+            "configuration key `{name}` must use 1-64 lowercase letters, digits, `.`, `-`, or `_`, without leading/trailing punctuation or `..`/`--`/`__`"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_http_origin(origin: &str) -> Result<(), ManifestError> {
     HttpOrigin::parse_exact(origin)
         .map(|_| ())
@@ -619,7 +644,6 @@ mod tests {
         license = "Apache-2.0"
 
         [dependencies]
-        "krit/json" = "1.2.3"
 
         [capabilities]
         stdout = true
@@ -646,7 +670,73 @@ mod tests {
     fn rejects_unknown_fields() {
         let error = Manifest::parse(&VALID.replace("stdout = true", "network = true"))
             .expect_err("unknown capabilities should fail");
+        assert_eq!(error.code(), "K6001");
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn accepts_an_absent_or_empty_dependency_table() {
+        let manifest = Manifest::parse(VALID).expect("an empty table should be accepted");
+        assert!(manifest.dependencies.is_empty());
+
+        let manifest = Manifest::parse(&VALID.replace("[dependencies]\n", ""))
+            .expect("an absent table should be accepted");
+        assert!(manifest.dependencies.is_empty());
+    }
+
+    #[test]
+    fn rejects_every_declared_dependency_shape_with_k6003() {
+        for entries in [
+            "\"krit/json\" = \"1.2.3\"",
+            "\"krit/json\" = \"^1\"\n\"krit/http\" = \"1.0.0\"",
+            "\"krit/json\" = { path = \"../json\" }",
+            "\"krit/json\" = { git = \"https://example.com/json.git\", rev = \"0123abc\" }",
+            // Unresolvable names and requirements are refused for the same
+            // reason rather than reaching name or semver validation.
+            "\"Not A Package\" = \"not semver\"",
+            "\"krit/json\" = 1",
+        ] {
+            let manifest =
+                VALID.replace("[dependencies]\n", &format!("[dependencies]\n{entries}\n"));
+            let error = Manifest::parse(&manifest).expect_err("dependencies should fail closed");
+            assert_eq!(error.code(), "K6003", "{entries}");
+            assert_eq!(
+                error.to_string(),
+                "dependency resolution is not supported; remove [dependencies]"
+            );
+        }
+
+        let manifest = VALID.replace(
+            "[dependencies]\n",
+            "[dependencies.\"krit/json\"]\npath = \"../json\"\n",
+        );
+        let error = Manifest::parse(&manifest).expect_err("dependency sub-tables should fail");
+        assert_eq!(error.code(), "K6003");
+    }
+
+    #[test]
+    fn dependency_refusal_has_a_fixed_validation_position() {
+        let declared = VALID.replace(
+            "[dependencies]\n",
+            "[dependencies]\n\"krit/json\" = \"1.2.3\"\n",
+        );
+
+        let error = Manifest::parse(&declared.replace("stdout = true", "network = true"))
+            .expect_err("unknown fields should fail");
+        assert_eq!(error.code(), "K6001");
+        assert!(error.to_string().contains("unknown field"));
+
+        let error = Manifest::parse(&declared.replace("edition = \"2026\"", "edition = \"2024\""))
+            .expect_err("unsupported edition should fail");
+        assert_eq!(error.code(), "K6001");
+        assert!(error.to_string().contains("unsupported Krit edition"));
+
+        let error = Manifest::parse(&declared.replace(
+            "secrets = [\"github-token\", \"slack-token\"]",
+            "secrets = [\"github-token\", \"github-token\"]",
+        ))
+        .expect_err("dependencies should fail before capability lists");
+        assert_eq!(error.code(), "K6003");
     }
 
     #[test]
@@ -695,6 +785,50 @@ mod tests {
             );
             let error = Manifest::parse(&manifest).expect_err("unsafe origin should fail");
             assert!(error.to_string().contains("HTTP origin"));
+        }
+    }
+
+    #[test]
+    fn configuration_keys_alone_accept_underscores() {
+        let manifest = Manifest::parse(&VALID.replace(
+            "config = [\"agent.model\", \"agent.timeout-ms\"]",
+            "config = [\"agent.model\", \"agent.timeout_ms\", \"max_retries\"]",
+        ))
+        .expect("underscored configuration keys should validate");
+        assert!(manifest.grants_permission("config.read", Some("agent.timeout_ms")));
+        assert!(manifest.grants_permission("config.read", Some("max_retries")));
+        assert!(!manifest.grants_permission("config.read", Some("agent.timeout-ms")));
+
+        for key in ["_agent", "agent_", "agent__model", "Agent_Model"] {
+            let error = Manifest::parse(&VALID.replace(
+                "config = [\"agent.model\", \"agent.timeout-ms\"]",
+                &format!("config = [\"{key}\"]"),
+            ))
+            .expect_err("a non-canonical configuration key should fail");
+            assert_eq!(error.code(), "K6001");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("configuration key `{key}` must use")),
+                "{error}"
+            );
+        }
+
+        // Every other resource identity keeps the narrower grammar.
+        for (field, value) in [
+            ("secrets", "[\"github_token\"]"),
+            ("ai", "[\"code_reviewer\"]"),
+            ("state", "[\"agent_work\"]"),
+            ("queues", "[\"render_jobs\"]"),
+            ("buckets", "[\"render_output\"]"),
+        ] {
+            let manifest = VALID.replace(
+                "secrets = [\"github-token\", \"slack-token\"]",
+                &format!("{field} = {value}"),
+            );
+            let error = Manifest::parse(&manifest).expect_err("underscored resource should fail");
+            assert_eq!(error.code(), "K6001");
+            assert!(error.to_string().contains("must use"), "{error}");
         }
     }
 

@@ -332,6 +332,47 @@ import surfaces: zero imports mean no effects and `pure-program`; the exact
 stdout component interface and canonical core imports mean `io.stdout` and
 `program`. Embedded and adjacent claims must match those derived facts.
 
+## Artifact compatibility
+
+A runtime loads an artifact only when every recorded compatibility fact is a
+member of the runtime's published supported sets
+(`krit_wasm::SUPPORTED_*`):
+
+| Fact | Recorded in | Supported |
+|---|---|---|
+| Metadata schema | embedded and adjacent `schema` | 1 |
+| Validation policy version | embedded and adjacent `policyVersion` | 1, 2 |
+| `krit:runtime` WIT package version | component import and export names | 0.2.0 |
+| Edition | embedded and adjacent `edition` | 2026 |
+
+The compiler version (embedded `compilerVersion`, adjacent `compiler.version`,
+and the producers `processed-by` entry) and the language version (adjacent
+`language.version` and the producers `language` entry) are recorded, never
+required to equal the running toolchain. Each is compared with the runtime's
+own compiler or language version only by the toolchain window: it must be a
+strict Semantic Versioning 2.0 version with the runtime's major version, and
+its minor version must be the runtime's own or one of the two before it. A 0.3 runtime therefore loads artifacts from
+0.1, 0.2, and 0.3 toolchains and refuses 0.4 and newer, any other major, and
+unparsable versions. Patch, pre-release, and build components never affect
+the outcome. The same rule applies after 1.0 until a release publishes a
+longer window.
+
+Self-consistency stays exact. The adjacent compiler version, language
+version, and edition must equal the ones the component records, and the
+embedded compiler version must equal the producers `processed-by` version.
+Compatibility never relaxes derivation: effects, the WIT world, and the policy
+version are always re-derived from the validated component and core import
+surfaces, and every recorded claim must match them. An unsupported fact fails
+closed before compilation, as K7004 for adjacent metadata and K7003 for the
+component's own records. Messages name the supported set or window and echo
+only parsed version numbers, never other artifact text.
+
+Loading an older WIT package version means linking its worlds, so when the
+checked-in package moves to a new version, the previous one stays in the
+supported set while the window still includes a toolchain that emitted it.
+`conformance/build/compat/<toolchain>/` keeps golden artifacts written by each
+released toolchain; the runtime must load and run every case there.
+
 ## Host runtime
 
 `krit-runtime` uses one reusable Wasmtime engine and creates a fresh Store,
@@ -585,14 +626,15 @@ schema 2 retains those fields and adds bounded AI adapters, retries, rates,
 idempotency, and explicit noninteractive approval allow entries. Unknown
 fields, inline values, environment inheritance, ungranted names, escaping
 paths, symlinks, oversized files, and group/other-readable Unix secret files
-fail closed.
+fail closed. Non-Unix hosts refuse secrets outright; see
+[Platform support](#platform-support).
 
 Schema 3 retains all schema-2 fields and adds manifest-narrowed durable stores,
 durability/limit policy, and an optional durable inbound-idempotency store.
 There is no default state path. Relative `.db` paths require existing
 owner-only directories on Unix; database/WAL/SHM files reject symlinks,
 non-files, oversize data, and group/other permissions. Schema 1 and 2 remain
-readable unchanged.
+readable unchanged. Non-Unix hosts refuse durable state outright.
 
 `invoke` response JSON remains exact on stdout. Structured application logs
 are emitted as JSON Lines on stderr only after completion. `serve` never
@@ -600,6 +642,26 @@ places them in an HTTP body. Validated redacted failure logs may publish with
 an explicit failure outcome while normal output/response remains rolled back.
 Artifact permissions list approval-required resources separately and keep
 deployment and approval evaluation `not-evaluated`.
+
+## Platform support
+
+Linux and macOS (Unix hosts) are supported for every command. Windows is
+supported for `check`, `build`, `fmt`, `lsp`, and `run`, and for host mode
+(`invoke`, `worker`, `schedule`, and `serve`) only without durable state or
+secrets.
+
+Host mode protects secret files, durable state stores, and application
+databases with owner-only file permissions, and only Unix hosts enforce them.
+On any non-Unix host, a host configuration with a non-empty `secrets`,
+`state` (a store or a durable idempotency store), `jobs` (queues, schedules,
+or object buckets), or `databases` section is refused with `K5001` and exit
+status 4. The refusal follows strict parsing and comes before any secret file
+is read and before any store or database is resolved, created, or opened. Its
+message names the offending sections only, never secret names, paths, or
+values. Config values; retry, rate, idempotency, and approval policy; AI
+adapters and search connectors that use no secret; and the process-local cache
+remain available. Windows can hold durable state or secrets only once
+owner-only access-control checks exist there.
 
 ## Instance lifecycle
 
@@ -660,7 +722,8 @@ manifest.
 
 Applications refer to secrets by manifest-approved logical name. The host
 acquires bounded owner-only files into a zeroizing store and returns only a
-WIT resource handle. The HTTP host borrows that resource and injects bearer
+WIT resource handle. Hosts that cannot enforce owner-only files refuse secrets
+(see [Platform support](#platform-support)). The HTTP host borrows that resource and injects bearer
 authentication without returning bytes to the component.
 
 Secret data is excluded from:

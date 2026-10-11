@@ -34,6 +34,43 @@ krit check --diagnostic-format json program.krit
 It compares status and diagnostic codes and requires that checking never
 execute program effects or emit program output.
 
+`conformance/package` contains manifest-validation cases. Each case
+directory holds `krit.pkg`, the entry it names, `expect.status`, and optional
+`expect.diagnostics`. That harness runs from the case directory and invokes the
+equivalent of:
+
+```text
+krit package check krit.pkg
+```
+
+It compares status and the ordered codes from the normative human diagnostic
+lines (`file:line:column: severity[CODE]: message`) on standard error.
+
+`conformance/build/compat` contains golden artifacts written by released
+toolchains. Each case directory `compat/<toolchain>/<case>/` holds the
+package exactly as it was built (`krit.pkg` and the entry it names), the
+component `artifact.wasm` and its adjacent metadata `artifact.wasm.json`
+exactly as that toolchain's `krit build --output artifact.wasm` wrote them,
+`expect.status`, and optional `expect.stdout`. The harness copies the case to
+a scratch directory, creates an owner-only parent directory for every durable
+store `host.json` names, and invokes the equivalent of:
+
+```text
+krit sandbox --manifest krit.pkg --artifact artifact.wasm
+```
+
+or, when the case has `request.json`:
+
+```text
+krit invoke --manifest krit.pkg --artifact artifact.wasm --request request.json [--host-config host.json]
+```
+
+It compares status and standard output exactly and requires the recorded
+compiler version to equal `<toolchain>`. These cases are frozen: they are
+never rebuilt or reformatted, and their sources need not be canonical under a
+later formatter. Cases with `host.json` run only on Unix hosts, where
+owner-only state directories can be enforced.
+
 `conformance/format` contains formatter input/output pairs. Each
 `input.krit` must parse, and formatting must exactly equal
 `formatted.krit`. Formatting the expected output again must produce identical
@@ -82,6 +119,11 @@ network service, or nondeterministic value.
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |
 | `check/valid/schedule-handler` | typed `ScheduleEvent` trigger facts and outcome |
+| `package/dependencies/declared` | a declared version dependency fails closed with `K6003` |
+| `package/dependencies/path-source` | a declared source-table dependency fails closed with `K6003` |
+| `package/dependencies/empty-table` | an empty `[dependencies]` table is accepted |
+| `build/compat/0.2.0/factorial` | a 0.2.0-built policy-1 module artifact runs in the sandbox |
+| `build/compat/0.2.0/stateful-webhook` | a 0.2.0-built policy-2 durable-state webhook artifact invokes |
 | `format/comments` | exact standalone and end-of-line comment preservation |
 | `format/edition-2026` | canonical layout for all currently implemented syntax families |
 | `format/webhook` | canonical typed webhook and ordered duplicate-header layout |

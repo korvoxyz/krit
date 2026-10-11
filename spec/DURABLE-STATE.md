@@ -272,7 +272,9 @@ No state path exists by default. Configured stores must be requested by the
 manifest. Paths are host-config-relative normal paths and cannot escape through
 symlinks. The containing directory must already exist, be owner-only on Unix,
 and contain no symlink component. Existing database/WAL/SHM files must be
-regular owner-only files; new database files are created mode `0600`.
+regular owner-only files; new database files are created mode `0600`. Non-Unix
+hosts cannot enforce this and refuse any configured store with `K5001` (see
+[platform support](WASM-SANDBOX.md#platform-support)).
 Credentials, state values, keys, checkpoint values, replay bodies, and paths
 never enter artifacts, metadata, permission output, diagnostics, logs, or
 stats.

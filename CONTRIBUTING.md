@@ -5,6 +5,12 @@ must preserve explicit semantics, deterministic behavior, and least authority.
 
 Krit and the Krit language are owned by Akshay Bhardwaj.
 
+## Security issues
+
+Do not report a suspected vulnerability in a public issue or pull request.
+Follow [SECURITY.md](SECURITY.md) to report it privately through GitHub
+private vulnerability reporting.
+
 ## Setup
 
 Install Rust 1.94 or newer, then run:
@@ -63,9 +69,11 @@ crate unit or integration tests.
 ## Release workflow
 
 CI runs the minimum-version formatting/Clippy/conformance gate and current-stable
-tests before building native Linux x86-64/ARM64, macOS Intel/Apple Silicon, and
-Windows x86-64 packages. Downloadable archives and per-archive SHA-256 files are
-attached to successful workflow runs for 14 days.
+tests on Linux, macOS, and Windows before building native Linux x86-64/ARM64,
+macOS Intel/Apple Silicon, and Windows x86-64 packages. The Windows test job is
+advisory (`continue-on-error`) until its suite is first green; then it becomes
+required like the others. Downloadable archives and per-archive SHA-256 files
+are attached to successful workflow runs for 14 days.
 
 The release packager uses Python 3.12's standard library. It includes dependency
 license notices and exercises the extracted archive's evaluator, compiler,

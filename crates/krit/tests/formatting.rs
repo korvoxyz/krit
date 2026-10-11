@@ -100,7 +100,10 @@ fn every_repository_source_round_trips_through_the_formatter() {
             (Ok(_), Ok(formatted)) => {
                 let is_noncanonical_fixture =
                     name.starts_with("conformance/format/") && name.ends_with("/input.krit");
-                if !is_noncanonical_fixture {
+                // Golden-artifact sources are frozen as their release built
+                // them, so a later canonical style must not require edits.
+                let is_frozen_source = name.starts_with("conformance/build/compat/");
+                if !is_noncanonical_fixture && !is_frozen_source {
                     assert_eq!(source.text(), formatted, "{name} should be canonical");
                 }
                 let formatted_source = Source::new(name.clone(), formatted.clone());
