@@ -12,7 +12,7 @@ use crate::{
     ast::{
         BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
         Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral,
-        VariantFamily, VariantName,
+        VariantArm, VariantFamily, VariantName, VariantPattern,
     },
     habits::{MethodReceiver, method_hint, undefined_name_note},
     limits::{MAX_NESTING_DEPTH, MAX_TREE_DEPTH, tree_depth_error},
@@ -892,6 +892,20 @@ struct Analyzer {
     /// What a postfix `?` may exit, one entry per enclosing function body,
     /// innermost last; empty at the top level.
     exits: Vec<ExitContext>,
+    /// Where a let-else may exit, one entry per enclosing function body,
+    /// innermost last; empty at the top level.
+    let_else_bodies: Vec<LetElseBody>,
+}
+
+/// Whether a let-else may return from the function whose body it is in.
+#[derive(Clone)]
+enum LetElseBody {
+    /// The body block at `block` of a named function (or entrypoint) whose
+    /// result type is `result`: a let-else that is a direct statement of
+    /// that block returns its arm's value from the function.
+    Named { block: Span, result: InferType },
+    /// The body of an anonymous function, which no let-else may exit.
+    Closure,
 }
 
 /// Whether a postfix `?` in a function body may return from that function.
@@ -960,13 +974,14 @@ impl Analyzer {
             warnings: Vec::new(),
             method_callee: None,
             exits: Vec::new(),
+            let_else_bodies: Vec::new(),
         }
     }
 
     fn program(&mut self, program: &Program) -> Result<Analysis, Diagnostic> {
         let mut effects = InferEffects::default();
         for statement in &program.statements {
-            effects.union(self.statement(statement)?);
+            effects.union(self.statement(statement, None)?);
         }
         self.validate_host_builtin_references()?;
         self.validate_constraints()?;
@@ -1142,7 +1157,13 @@ impl Analyzer {
         Ok(Some((symbol_kind, requirement)))
     }
 
-    fn statement(&mut self, statement: &Statement) -> Result<InferEffects, Diagnostic> {
+    /// Analyzes `statement`, a direct statement of the block at `block`, or
+    /// of the program when `block` is `None`.
+    fn statement(
+        &mut self,
+        statement: &Statement,
+        block: Option<Span>,
+    ) -> Result<InferEffects, Diagnostic> {
         match &statement.kind {
             StatementKind::Let {
                 name,
@@ -1182,6 +1203,20 @@ impl Analyzer {
                 });
                 Ok(value.effects)
             }
+            StatementKind::LetElse {
+                pattern,
+                annotation,
+                value,
+                arm,
+                ..
+            } => self.let_else(
+                statement.span,
+                block,
+                pattern,
+                annotation.as_ref(),
+                value,
+                arm,
+            ),
             StatementKind::Function {
                 name,
                 parameters,
@@ -1248,7 +1283,12 @@ impl Analyzer {
                 self.push_scope();
                 self.define_parameters(parameters, &parameter_types)?;
                 self.exits.push(exit);
+                self.let_else_bodies.push(LetElseBody::Named {
+                    block: body.span,
+                    result: declared_return.clone(),
+                });
                 let body_info = self.block(body);
+                self.let_else_bodies.pop();
                 self.exits.pop();
                 let body_info = body_info?;
                 self.pop_scope();
@@ -1277,6 +1317,176 @@ impl Analyzer {
         }
     }
 
+    /// Analyzes the let-else `let PATTERN (: TYPE)? = value else ARM;` at
+    /// `span`, a direct statement of the block at `block` (`None` at the top
+    /// level).
+    ///
+    /// It is valid only as a direct statement of a named function's body,
+    /// with the two complementary patterns of one family (`K3014`). The value
+    /// has the annotated type and belongs to the pattern's family. The arm's
+    /// binder is in scope only in the arm, whose value is the function's
+    /// return value and so has its result type. The pattern's binder is then
+    /// declared like a `let` binding for the rest of the block. The effects
+    /// are those of the value and the arm.
+    fn let_else(
+        &mut self,
+        span: Span,
+        block: Option<Span>,
+        pattern: &VariantPattern,
+        annotation: Option<&TypeAnnotation>,
+        value: &Expression,
+        arm: &VariantArm,
+    ) -> Result<InferEffects, Diagnostic> {
+        let head = Span::new(span.start, pattern.span.end);
+        let result = self.let_else_result(head, block)?;
+        let complement = pattern.variant.complement();
+        if arm.variant != complement {
+            return Err(Diagnostic::new(
+                "K3014",
+                format!(
+                    "the arm of a let-else on `{}` must match `{}`, found `{}`",
+                    pattern.variant.as_str(),
+                    complement.as_str(),
+                    arm.variant.as_str()
+                ),
+                arm.span,
+            )
+            .with_note(format!(
+                "the two patterns of a let-else are the two variants of one family, `Ok` and \
+                 `Err` or `Some` and `None`: write `else {} => ...`",
+                complement.example_pattern()
+            )));
+        }
+        for (variant, binding, at) in [
+            (pattern.variant, &pattern.binding, pattern.span),
+            (arm.variant, &arm.binding, arm.span),
+        ] {
+            if (variant != VariantName::None) != binding.is_some() {
+                return Err(Diagnostic::new(
+                    "K3005",
+                    format!("invalid `{}` let-else binding", variant.as_str()),
+                    at,
+                ));
+            }
+        }
+        if let Some(name) = &pattern.binding {
+            self.ensure_name_available(name, span)?;
+        }
+
+        let value_info = self.expression(value)?;
+        let subject = if let Some(annotation) = annotation {
+            let annotated = self.annotation(annotation);
+            self.unify(
+                annotated.clone(),
+                value_info.ty,
+                annotation.span,
+                "let-else annotation",
+            )?;
+            annotated
+        } else {
+            value_info.ty
+        };
+        let family = pattern.variant.family();
+        let family_name = match family {
+            VariantFamily::Option => "an `Option`",
+            VariantFamily::Result => "a `Result`",
+        };
+        let found = self.resolve_head(&subject);
+        if !matches!(
+            (&found, family),
+            (InferType::Variable(_), _)
+                | (InferType::Option(_), VariantFamily::Option)
+                | (InferType::Result(_, _), VariantFamily::Result)
+        ) {
+            return Err(Diagnostic::new(
+                "K3005",
+                format!(
+                    "let-else on `{}` requires {family_name} value, found `{}`",
+                    pattern.variant.as_str(),
+                    self.render_type(&found)
+                ),
+                value.span,
+            ));
+        }
+        let payload = self.fresh_type();
+        let error = self.fresh_type();
+        let expected = match family {
+            VariantFamily::Option => InferType::Option(Box::new(payload.clone())),
+            VariantFamily::Result => {
+                InferType::Result(Box::new(payload.clone()), Box::new(error.clone()))
+            }
+        };
+        self.unify(expected, subject, value.span, "let-else value")?;
+        let payload_of = |variant| match variant {
+            VariantName::Err => error.clone(),
+            _ => payload.clone(),
+        };
+
+        self.push_scope();
+        if let Some(binding) = &arm.binding {
+            self.define_symbol(
+                binding,
+                payload_of(arm.variant),
+                arm.span,
+                SymbolKind::Match,
+                false,
+            );
+        }
+        let arm_info = self.expression(&arm.value)?;
+        self.pop_scope();
+        self.unify(result, arm_info.ty, arm.value.span, "let-else arm")?;
+
+        if let Some(name) = &pattern.binding {
+            let binding_type = self.fresh_type();
+            self.unify(
+                binding_type.clone(),
+                payload_of(pattern.variant),
+                span,
+                "let-else binding",
+            )?;
+            let id = self.define_symbol(name, binding_type.clone(), span, SymbolKind::Let, false);
+            self.bindings.push(PendingBinding {
+                id,
+                name: name.clone(),
+                ty: binding_type,
+                span,
+                top_level: false,
+            });
+        }
+        let mut effects = value_info.effects;
+        effects.union(arm_info.effects);
+        Ok(effects)
+    }
+
+    /// The result type of the function a let-else whose `let` and pattern
+    /// are at `head` returns from, when it is a direct statement of that
+    /// function's body block; `block` is the block it is a statement of.
+    fn let_else_result(&self, head: Span, block: Option<Span>) -> Result<InferType, Diagnostic> {
+        let (message, note) = match self.let_else_bodies.last() {
+            Some(LetElseBody::Named {
+                block: body,
+                result,
+            }) if block == Some(*body) => return Ok(result.clone()),
+            Some(LetElseBody::Named { .. }) => (
+                "let-else must be a statement of the function body itself, not of a nested \
+                 block",
+                "let-else returns from the enclosing function, so it may only appear at the top \
+                 level of a named function's body; handle the value with `match` here",
+            ),
+            Some(LetElseBody::Closure) => (
+                "let-else is not allowed in an anonymous function",
+                "let-else returns only from a named function; handle the value with `match` \
+                 here, or move the code into a named `fn`",
+            ),
+            None => (
+                "let-else is not allowed at the top level",
+                "let-else returns early from the enclosing named function; at the top level, \
+                 handle the value with `match`",
+            ),
+        };
+        Err(Diagnostic::new("K3014", message, head).with_note(note))
+    }
+
     /// Counts one level of analyzer recursion.
     ///
     /// The parser's structural limit keeps every source program within
@@ -1302,7 +1512,7 @@ impl Analyzer {
         self.push_scope();
         let mut effects = InferEffects::default();
         for statement in &block.statements {
-            effects.union(self.statement(statement)?);
+            effects.union(self.statement(statement, Some(block.span))?);
         }
         let ty = if let Some(tail) = block.tail.as_deref() {
             let tail = self.expression(tail)?;
@@ -1602,7 +1812,9 @@ impl Analyzer {
         self.push_scope();
         self.define_parameters(parameters, &parameter_types)?;
         self.exits.push(ExitContext::Refused(Refusal::Closure));
+        self.let_else_bodies.push(LetElseBody::Closure);
         let body_info = self.block(body);
+        self.let_else_bodies.pop();
         self.exits.pop();
         let body_info = body_info?;
         self.pop_scope();
@@ -4064,9 +4276,9 @@ fn propagation_refused(refusal: &Refusal, question: Span) -> Diagnostic {
         ),
         Refusal::Webhook => (
             "`?` is not allowed in a webhook entrypoint, which returns `HttpResponse`".to_owned(),
-            "move the fallible steps into a helper `fn` that returns \
-             `Result<HttpResponse, String>`, use `?` there, and `match` its result here; \
-             let-else, arriving in Krit 0.3, also fits"
+            "bind each fallible step with let-else here, as in \
+             `let Ok(value) = step else Err(error) => response;`, or move the steps into a \
+             helper `fn` that returns `Result<HttpResponse, String>` and use `?` there"
                 .to_owned(),
         ),
         Refusal::Undeclared { name } => (
@@ -5574,5 +5786,204 @@ mod tests {
         // The operand is checked before the `?`.
         let error = check("let x = missing?;").expect_err("undefined operand");
         assert_eq!(error.code(), "K2001");
+    }
+
+    /// The span of `snippet`, which occurs once in `text`.
+    fn span_of(text: &str, snippet: &str) -> Span {
+        let start = text
+            .find(snippet)
+            .expect("snippet should occur in the text");
+        assert_eq!(
+            text.rfind(snippet),
+            Some(start),
+            "snippet should occur once"
+        );
+        Span::new(start, start + snippet.len())
+    }
+
+    #[test]
+    fn let_else_binds_the_payload_and_types_its_arm_as_the_function_result() {
+        let statement = "let Ok(value) = digit(text) else Err(error) => 0;";
+        let text = format!(
+            "fn digit(text: String) -> Result<Int, String> {{ Err(text) }}\n\
+             fn total(text: String) -> Int {{\n    {statement}\n    value + 1\n}}"
+        );
+        let analysis = check(&text).expect("let-else should check");
+        // The pattern's binder is a `let` binding at the statement, and the
+        // arm's binder a match binding at the arm.
+        let value = analysis
+            .symbol(span_of(&text, statement), "value", SymbolKind::Let)
+            .expect("the binder should be a let symbol");
+        assert_eq!(value.ty().to_string(), "Int");
+        assert!(!value.is_top_level());
+        let error = analysis
+            .symbol(
+                span_of(&text, "Err(error) => 0"),
+                "error",
+                SymbolKind::Match,
+            )
+            .expect("the arm binder should be a match symbol");
+        assert_eq!(error.ty().to_string(), "String");
+        assert!(
+            analysis
+                .bindings()
+                .iter()
+                .any(|binding| binding.name() == "value" && binding.ty().to_string() == "Int")
+        );
+
+        // The arm's value is the function's return value, so it decides an
+        // undeclared result type, and the annotation types the value.
+        let function_type = |text: &str, name: &str| {
+            check(text)
+                .unwrap_or_else(|error| panic!("{text} should check: {error:?}"))
+                .bindings()
+                .iter()
+                .find(|binding| binding.name() == name)
+                .expect("the function should have a binding")
+                .ty()
+                .to_string()
+        };
+        let text =
+            "fn pick(value) {\n    let Some(found) = value else None => \"none\";\n    found\n}";
+        assert_eq!(
+            function_type(text, "pick"),
+            "fn(Option<String>) -> String effects {}"
+        );
+        let text = "fn decode(raw: String) -> String {\n    \
+                    let Ok(text): Result<String, String> = json_decode(raw) else Err(e) => e;\n    \
+                    text\n}";
+        check(text).expect("an annotated value should check");
+
+        // The effects of the value and the arm are the statement's effects.
+        let text = "fn noisy(x: Option<Int>) -> Int {\n    \
+                    let Some(v) = x else None => { println(0); 0 };\n    v\n}";
+        assert_eq!(
+            function_type(text, "noisy"),
+            "fn(Option<Int>) -> Int effects {io.stdout}"
+        );
+
+        // Either variant may come first, `_` binds nothing, and every named
+        // function body accepts let-else, including entrypoints and nested
+        // named functions.
+        for text in [
+            "fn f(r: Result<Int, String>) -> String {\n    let Err(e) = r else Ok(v) => \"ok\";\n    e\n}",
+            "fn f(o: Option<Int>) -> Int {\n    let None = o else Some(v) => v;\n    0\n}",
+            "fn f(r: Result<Int, String>) -> Int {\n    let Ok(_) = r else Err(_) => 0;\n    let Ok(_) = r else Err(_) => 1;\n    2\n}",
+            "webhook fn handle(request: HttpRequest) -> HttpResponse {\n    \
+             let Ok(model) = config_string(\"agent.model\") else\n        \
+             Err(error) => record { status: 500, headers: [], body: error };\n    \
+             record { status: 200, headers: [], body: model }\n}",
+            "queue \"jobs\" fn work(job: QueueJob) -> Result<String, String> {\n    \
+             let Ok(model) = config_string(\"agent.model\") else Err(error) => Err(error);\n    \
+             Ok(model + job.body)\n}",
+            "fn outer() -> Int {\n    fn inner(o: Option<Int>) -> Int {\n        \
+             let Some(v) = o else None => 0;\n        v\n    }\n    inner(Some(1))\n}",
+            "fn f(x: Option<Int>) -> Int {\n    let Some(x) = x else None => 0;\n    x\n}",
+        ] {
+            let report = analyze_with_warnings(
+                &parse_source(&Source::new("test.krit", text)).expect("text should parse"),
+            );
+            report
+                .result
+                .unwrap_or_else(|error| panic!("{text} should check: {error:?}"));
+            assert!(report.warnings.is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn let_else_is_a_direct_statement_of_a_named_function_body() {
+        for (text, head, message) in [
+            (
+                "let Ok(x) = Ok(1) else Err(e) => 0;",
+                "let Ok(x)",
+                "let-else is not allowed at the top level",
+            ),
+            (
+                "let v = {\n    let Some(x) = Some(1) else None => 0;\n    x\n};",
+                "let Some(x)",
+                "let-else is not allowed at the top level",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let g = fn() -> Int {\n        \
+                 let Ok(x) = r else Err(e) => 0;\n        x\n    };\n    g()\n}",
+                "let Ok(x)",
+                "let-else is not allowed in an anonymous function",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let y = {\n        \
+                 let Ok(x) = r else Err(e) => 0;\n        x\n    };\n    y\n}",
+                "let Ok(x)",
+                "let-else must be a statement of the function body itself, not of a nested block",
+            ),
+            (
+                "fn f(r: Result<Int, String>, c: Bool) -> Int {\n    if c {\n        \
+                 let Ok(x) = r else Err(e) => 0;\n        x\n    } else {\n        1\n    }\n}",
+                "let Ok(x)",
+                "let-else must be a statement of the function body itself, not of a nested block",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let Ok(x) = r else None => 0;\n    x\n}",
+                "None => 0",
+                "the arm of a let-else on `Ok` must match `Err`, found `None`",
+            ),
+            (
+                "fn f(o: Option<Int>) -> Int {\n    let Some(x) = o else Some(y) => y;\n    x\n}",
+                "Some(y) => y",
+                "the arm of a let-else on `Some` must match `None`, found `Some`",
+            ),
+        ] {
+            let error = check(text).expect_err("misplaced let-else should not check");
+            assert_eq!(error.code(), "K3014", "{text}");
+            assert_eq!(error.message(), message, "{text}");
+            assert_eq!(error.notes().len(), 1, "{text}");
+            assert_eq!(error.span(), span_of(text, head), "{text}");
+        }
+
+        for (text, code, at) in [
+            // The value belongs to the pattern's family.
+            (
+                "fn f(r: Int) -> Int {\n    let Ok(x) = r else Err(e) => 0;\n    x\n}",
+                "K3005",
+                "r else",
+            ),
+            (
+                "fn f(r: Option<Int>) -> Int {\n    let Ok(x) = r else Err(e) => 0;\n    x\n}",
+                "K3005",
+                "r else",
+            ),
+            // The arm has the function's result type.
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let Ok(x) = r else Err(e) => e;\n    x\n}",
+                "K3001",
+                "e;",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    \
+                 let Ok(x): Option<Int> = r else Err(e) => 0;\n    x\n}",
+                "K3001",
+                "Option<Int>",
+            ),
+            // The pattern's binder is declared in the body's scope, after the arm.
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let x = 1;\n    \
+                 let Ok(x) = r else Err(e) => 0;\n    x\n}",
+                "K2002",
+                "let Ok(x)",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let Ok(x) = r else Err(e) => x;\n    x\n}",
+                "K2001",
+                "x;\n    x",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> String {\n    let Ok(x) = r else Err(e) => e;\n    e\n}",
+                "K2001",
+                "e\n}",
+            ),
+        ] {
+            let error = check(text).expect_err("ill-typed let-else should not check");
+            assert_eq!(error.code(), code, "{text}");
+            assert_eq!(error.span().start, span_of(text, at).start, "{text}");
+        }
     }
 }

@@ -21,7 +21,7 @@ pub use analysis::{
 pub use ast::{
     BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program, RecordField,
     RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator,
-    ValueLiteral, VariantArm, VariantFamily, VariantName,
+    ValueLiteral, VariantArm, VariantFamily, VariantName, VariantPattern,
 };
 pub use builtin::{Builtin, BuiltinCategory};
 pub use core::{

@@ -20,6 +20,21 @@ pub enum StatementKind {
         annotation: Option<TypeAnnotation>,
         value: Expression,
     },
+    /// `let PATTERN (: TYPE)? = value else ARM;`: binds the payload of
+    /// `value` when it matches `pattern`, and otherwise makes the enclosing
+    /// function return the value of `arm`, whose pattern is the other
+    /// variant of the same family.
+    ///
+    /// `annotation` states the type of `value`. Analysis accepts a let-else
+    /// only as a direct statement of a named function's body.
+    LetElse {
+        pattern: VariantPattern,
+        annotation: Option<TypeAnnotation>,
+        value: Expression,
+        /// The `else` keyword.
+        else_span: Span,
+        arm: Box<VariantArm>,
+    },
     Function {
         name: String,
         parameters: Vec<Parameter>,
@@ -150,6 +165,16 @@ pub struct VariantArm {
     pub span: Span,
 }
 
+/// A variant pattern outside a `match`: `Some(name)`, `Ok(name)`,
+/// `Err(name)`, or `None`, as written after `let` in a let-else.
+#[derive(Clone, Debug)]
+pub struct VariantPattern {
+    pub variant: VariantName,
+    /// The binder of `Some`, `Ok`, or `Err`; `None` binds nothing.
+    pub binding: Option<String>,
+    pub span: Span,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum VariantName {
     Some,
@@ -165,6 +190,35 @@ impl VariantName {
             Self::None => "None",
             Self::Ok => "Ok",
             Self::Err => "Err",
+        }
+    }
+
+    /// The family the variant belongs to.
+    pub const fn family(self) -> VariantFamily {
+        match self {
+            Self::Some | Self::None => VariantFamily::Option,
+            Self::Ok | Self::Err => VariantFamily::Result,
+        }
+    }
+
+    /// The other variant of the same family.
+    pub const fn complement(self) -> Self {
+        match self {
+            Self::Some => Self::None,
+            Self::None => Self::Some,
+            Self::Ok => Self::Err,
+            Self::Err => Self::Ok,
+        }
+    }
+
+    /// The variant as a pattern, with an example binder when it binds one:
+    /// `Ok(value)`, `Err(error)`, `Some(value)`, or `None`.
+    pub const fn example_pattern(self) -> &'static str {
+        match self {
+            Self::Some => "Some(value)",
+            Self::None => "None",
+            Self::Ok => "Ok(value)",
+            Self::Err => "Err(error)",
         }
     }
 }

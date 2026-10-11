@@ -1444,6 +1444,18 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
                 }
                 expression_fields(value, fields);
             }
+            StatementKind::LetElse {
+                annotation,
+                value,
+                arm,
+                ..
+            } => {
+                if let Some(annotation) = annotation {
+                    annotation_fields(annotation, fields);
+                }
+                expression_fields(value, fields);
+                expression_fields(&arm.value, fields);
+            }
             StatementKind::Function {
                 parameters,
                 return_type,
@@ -1967,6 +1979,37 @@ impl<'a> DeclarationCollector<'a> {
                     annotation.as_ref().map(ToString::to_string),
                 );
                 self.expression(value);
+            }
+            StatementKind::LetElse {
+                pattern,
+                value,
+                arm,
+                ..
+            } => {
+                self.expression(value);
+                if let Some(binding) = &arm.binding {
+                    self.add(
+                        binding,
+                        CompilerSymbolKind::Match,
+                        arm.span,
+                        find_identifier_span(self.text, arm.span, binding),
+                        arm.value.span,
+                        None,
+                    );
+                }
+                self.expression(&arm.value);
+                // The annotation states the type of the value, not of the
+                // binder, so the binder shows its analyzed type.
+                if let Some(binding) = &pattern.binding {
+                    self.add(
+                        binding,
+                        CompilerSymbolKind::Let,
+                        statement.span,
+                        find_identifier_span(self.text, pattern.span, binding),
+                        Span::new(statement.span.end, scope_end),
+                        None,
+                    );
+                }
             }
             StatementKind::Function {
                 name,
@@ -2798,6 +2841,96 @@ mod tests {
                 .starts_with("`?` is not allowed at the top level\nhelp: ")
         );
         assert_eq!(diagnostic.range.start, Position::new(0, 19));
+    }
+
+    #[test]
+    fn walks_let_else_without_losing_symbols() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let source = "fn describe(input: Result<Record { inner_field: Int }, String>) -> String {\n    \
+                      let Ok(parsed) = input else Err(problem) => problem;\n    \
+                      json_encode(parsed.inner_field)\n}\n";
+        let diagnostics = state.open(uri.clone(), 1, source.to_owned());
+        assert!(diagnostics.diagnostics.is_empty());
+
+        let completions = |state: &ServerState, position| {
+            let CompletionResponse::List(list) = state
+                .completion(&uri, position)
+                .expect("completion should succeed")
+            else {
+                panic!("completion should return a bounded list")
+            };
+            list.items
+                .into_iter()
+                .map(|item| item.label)
+                .collect::<BTreeSet<_>>()
+        };
+        // The arm sees its own binder, and the rest of the body sees the
+        // pattern's binder; neither sees the other.
+        let in_arm = completions(&state, Position::new(1, 48));
+        assert!(in_arm.contains("problem") && !in_arm.contains("parsed"));
+        let after = completions(&state, Position::new(2, 16));
+        assert!(after.contains("parsed") && !after.contains("problem"));
+
+        for (position, expected) in [
+            (Position::new(1, 12), "parsed: Record { inner_field: Int }"),
+            (Position::new(1, 38), "problem: String"),
+        ] {
+            let hover = state
+                .hover(&uri, position)
+                .expect("hover should succeed")
+                .expect("the binder should have hover facts");
+            let HoverContents::Markup(markup) = hover.contents else {
+                panic!("hover should use markdown")
+            };
+            assert!(markup.value.contains(expected), "{}", markup.value);
+        }
+
+        // A binding unwrapped by let-else completes its fields.
+        state
+            .change(
+                &uri,
+                2,
+                "fn describe(input: Result<Record { inner_field: Int }, String>) -> String {\n    \
+                 let Ok(parsed) = input else Err(problem) => problem;\n    \
+                 json_encode(parsed.)\n}\n"
+                    .to_owned(),
+            )
+            .expect("the document should change");
+        let CompletionResponse::List(fields) = state
+            .completion(&uri, Position::new(2, 23))
+            .expect("completion should succeed")
+        else {
+            panic!("completion should return a bounded list")
+        };
+        assert_eq!(
+            fields
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["inner_field"]
+        );
+
+        let changed = state
+            .change(
+                &uri,
+                3,
+                "let Some(value) = Some(1) else None => 0;\n".to_owned(),
+            )
+            .expect("change should succeed");
+        let diagnostic = &changed.diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("K3014".to_owned()))
+        );
+        assert!(
+            diagnostic
+                .message
+                .starts_with("let-else is not allowed at the top level\nhelp: ")
+        );
+        assert_eq!(diagnostic.range.start, Position::new(0, 0));
     }
 
     #[test]

@@ -20,8 +20,8 @@ blocks, conditionals/short circuit, checked integer operators, primitive equalit
 and print/println of Int, Bool, or Unit. Webhook policy 2 additionally supports \
 String values with concatenation, equality, and byte-lexicographic ordering, \
 the closed HttpHeader/HttpRequest/HttpResponse records, header lists, \
-LogField records and field lists, Result/Option matching and postfix `?` exits \
-(a core `return` of the function result), exact config/secret/http/AI \
+LogField records and field lists, Result/Option matching, postfix `?` and let-else \
+exits (a core `return` of the function result), exact config/secret/http/AI \
 host calls, structured logging, json_decode into String (every RFC 8259 escape), \
 and static non-capturing helper references. Helpers unreachable from the selected \
 entrypoint are eliminated before layout checks. Other composites, general JSON, data \

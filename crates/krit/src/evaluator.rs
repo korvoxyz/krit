@@ -4,7 +4,8 @@ use crate::{
     Diagnostic, Span,
     ast::{
         BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
-        Statement, StatementKind, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+        Statement, StatementKind, UnaryOperator, ValueLiteral, VariantArm, VariantFamily,
+        VariantName, VariantPattern,
     },
     limits::{MAX_CALL_DEPTH, MAX_EVALUATION_DEPTH, MAX_VALUE_DEPTH},
 };
@@ -413,9 +414,19 @@ pub fn execute(program: &Program, output: &mut dyn Write) -> Result<Value, Diagn
 enum Interrupt {
     /// Evaluation failed.
     Error(Diagnostic),
-    /// The postfix `?` at `question` met an `Err` or `None` value, which the
-    /// innermost enclosing function call returns.
-    Exit { value: Value, question: Span },
+    /// The innermost enclosing function call returns `value` at once.
+    Exit { value: Value, exit: Exit },
+}
+
+/// The construct that makes a function return early.
+#[derive(Clone, Copy)]
+enum Exit {
+    /// A postfix `?` at this span met an `Err` or `None` value, which is
+    /// returned.
+    Question(Span),
+    /// A let-else whose `let` and pattern are at this span met the variant
+    /// of its arm, whose value is returned.
+    LetElse(Span),
 }
 
 impl From<Diagnostic> for Interrupt {
@@ -442,13 +453,27 @@ impl Evaluator<'_> {
             environment = match self.statement(statement, &environment) {
                 Ok(environment) => environment,
                 Err(Interrupt::Error(diagnostic)) => return Err(diagnostic),
-                // Analysis accepts `?` only inside a named function, so only
-                // a program evaluated without analysis gets here.
-                Err(Interrupt::Exit { question, .. }) => {
+                // Analysis accepts `?` and let-else only inside a named
+                // function, so only a program evaluated without analysis gets
+                // here.
+                Err(Interrupt::Exit {
+                    exit: Exit::Question(question),
+                    ..
+                }) => {
                     return Err(Diagnostic::new(
                         "K3012",
                         "`?` is not allowed at the top level",
                         question,
+                    ));
+                }
+                Err(Interrupt::Exit {
+                    exit: Exit::LetElse(head),
+                    ..
+                }) => {
+                    return Err(Diagnostic::new(
+                        "K3014",
+                        "let-else is not allowed at the top level",
+                        head,
                     ));
                 }
             };
@@ -461,6 +486,15 @@ impl Evaluator<'_> {
             StatementKind::Let { name, value, .. } => {
                 let value = self.expression(value, environment)?;
                 Ok(environment.extend(name.clone(), value))
+            }
+            StatementKind::LetElse {
+                pattern,
+                value,
+                arm,
+                ..
+            } => {
+                let head = Span::new(statement.span.start, pattern.span.end);
+                self.let_else(head, pattern, value, arm, environment)
             }
             StatementKind::Function {
                 name,
@@ -494,6 +528,61 @@ impl Evaluator<'_> {
                 Ok(environment.clone())
             }
         }
+    }
+
+    /// Evaluates the let-else whose `let` and pattern are at `head`: `value`
+    /// evaluates first. When it is the variant of `pattern`, the pattern's
+    /// binder names its payload for the rest of the block; when it is the
+    /// arm's variant, the arm's value evaluates with the arm's binder and the
+    /// innermost enclosing function call returns it.
+    fn let_else(
+        &mut self,
+        head: Span,
+        pattern: &VariantPattern,
+        value: &Expression,
+        arm: &VariantArm,
+        environment: &Environment,
+    ) -> Flow<Environment> {
+        let subject = self.expression(value, environment)?;
+        let family = pattern.variant.family();
+        let Value::Variant { name, payload } = subject else {
+            return Err(Diagnostic::new(
+                "K4001",
+                format!(
+                    "expected {} for let-else, found {}",
+                    variant_family_name(family),
+                    subject.kind()
+                ),
+                value.span,
+            )
+            .into());
+        };
+        let bind = |binding: &Option<String>| match (binding, &payload) {
+            (Some(binding), Some(payload)) => {
+                environment.extend(binding.clone(), Value::clone(payload))
+            }
+            _ => environment.clone(),
+        };
+        if name == pattern.variant {
+            return Ok(bind(&pattern.binding));
+        }
+        if name != arm.variant {
+            let message = if variant_family(name) == family {
+                format!("no let-else pattern matches `{}`", name.as_str())
+            } else {
+                format!(
+                    "expected {} for let-else, found {}",
+                    variant_family_name(family),
+                    variant_family_name(variant_family(name))
+                )
+            };
+            return Err(Diagnostic::new("K4001", message, value.span).into());
+        }
+        let value = self.expression(&arm.value, &bind(&arm.binding))?;
+        Err(Interrupt::Exit {
+            value,
+            exit: Exit::LetElse(head),
+        })
     }
 
     fn enter(&mut self, span: Span) -> Result<(), Diagnostic> {
@@ -708,8 +797,9 @@ impl Evaluator<'_> {
         self.calls += 1;
         let value = self.block(&function.body, &call_environment);
         self.calls -= 1;
-        // A `?` in the body that met `Err` or `None` returns it from this
-        // call; one in an argument above belongs to the caller.
+        // A `?` in the body that met `Err` or `None`, or a let-else in it
+        // that met its arm's variant, returns from this call; a `?` in an
+        // argument above belongs to the caller.
         match value {
             Err(Interrupt::Exit { value, .. }) => Ok(value),
             value => value,
@@ -1223,7 +1313,10 @@ fn propagate(value: Value, question: Span) -> Flow<Value> {
         Value::Variant {
             name: VariantName::Err | VariantName::None,
             ..
-        } => Err(Interrupt::Exit { value, question }),
+        } => Err(Interrupt::Exit {
+            value,
+            exit: Exit::Question(question),
+        }),
         value => Err(Diagnostic::new(
             "K4001",
             format!("expected result or option for `?`, found {}", value.kind()),
@@ -1865,6 +1958,84 @@ mod tests {
         let (output, _) = run_unchecked("let g = fn() { Err(1)?; 2 };\nprintln(g());")
             .expect("a closure call returns the failure");
         assert_eq!(output, "Err(1)\n");
+    }
+
+    #[test]
+    fn let_else_binds_the_payload_or_returns_its_arm_from_the_function() {
+        let (output, _) = run(r#"
+            fn digit(text: String) -> Result<Int, String> {
+                if text == "1" { Ok(1) } else { Err("bad " + text) }
+            }
+            fn describe(text: String) -> String {
+                let Ok(value) = digit(text) else Err(error) => "failed: " + error;
+                println("parsed " + text);
+                json_encode(value + 1)
+            }
+            fn first(items: List<Int>) -> Option<Int> {
+                match items { [] => None, [head, .._] => Some(head) }
+            }
+            fn absent(items: List<Int>) -> String {
+                let None = first(items) else Some(found) => "found " + json_encode(found);
+                "absent"
+            }
+            fn problem(text: String) -> String {
+                let Err(error) = digit(text) else Ok(_) => "fine";
+                error
+            }
+            println(describe("1"));
+            println(describe("x"));
+            println(absent([]));
+            println(absent([7]));
+            println(problem("1"));
+            println(problem("z"));
+            "#)
+        .expect("let-else should run");
+        assert_eq!(
+            output,
+            "parsed 1\n2\nfailed: bad x\nabsent\nfound 7\nfine\nbad z\n"
+        );
+    }
+
+    #[test]
+    fn let_else_evaluates_its_value_then_its_arm_and_keeps_performed_effects() {
+        let (output, _) = run(r#"
+            fn failing(label: String) -> Result<Int, String> {
+                println(label);
+                Err(label)
+            }
+            fn order() -> Int {
+                println("a");
+                let Ok(value) = failing("b") else Err(error) => { println("arm " + error); 0 };
+                println("never");
+                value
+            }
+            println(order());
+            "#)
+        .expect("let-else should run");
+        assert_eq!(output, "a\nb\narm b\n0\n");
+    }
+
+    #[test]
+    fn a_let_else_arm_outside_every_function_is_an_error_without_analysis() {
+        let error = run_unchecked("println(1);\nlet Ok(x) = Err(2) else Err(e) => e;\nprintln(3);")
+            .expect_err("an unchecked top-level let-else should fail");
+        assert_eq!(error.code(), "K3014");
+        assert_eq!(error.span(), crate::Span::new(12, 21));
+        let (output, _) = run_unchecked("let Ok(x) = Ok(2) else Err(e) => e;\nprintln(x);")
+            .expect("`Ok` binds its payload");
+        assert_eq!(output, "2\n");
+        // A let-else in a nested block returns from the enclosing call.
+        let (output, _) = run_unchecked(
+            "fn f() { let y = { let Some(x) = None else None => 5; x }; y + 1 }\nprintln(f());",
+        )
+        .expect("the call returns the arm's value");
+        assert_eq!(output, "5\n");
+        let error = run_unchecked("fn f() { let Some(x) = Ok(1) else None => 0; x }\nf();")
+            .expect_err("a value of the other family");
+        assert_eq!(error.code(), "K4001");
+        let error = run_unchecked("fn f() { let Some(x) = None else Some(y) => y; x }\nf();")
+            .expect_err("no arm matches");
+        assert_eq!(error.code(), "K4001");
     }
 
     #[test]

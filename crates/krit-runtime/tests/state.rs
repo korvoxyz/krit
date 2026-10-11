@@ -307,6 +307,73 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
 }
 
 #[test]
+fn let_else_binds_durable_state_options_in_a_webhook_body() {
+    let directory = TestDirectory::new("let-else");
+    let database = directory.database();
+    let artifact = compile(
+        r#"
+fn failure(error: String) -> HttpResponse {
+    record { status: 500, headers: [], body: error }
+}
+
+fn create(request: HttpRequest, stored: Option<String>) -> HttpResponse {
+    let None = stored else
+        Some(existing) => record { status: 409, headers: [], body: "exists: " + existing };
+    let Ok(_) = state_put("agent-work", request.path, request.body) else
+        Err(error) => failure(error);
+    record { status: 201, headers: [], body: "created" }
+}
+
+fn read(request: HttpRequest, stored: Option<String>) -> HttpResponse {
+    let Some(value) = stored else
+        None => record { status: 404, headers: [], body: "missing " + request.path };
+    record { status: 200, headers: [], body: "found " + value }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let Ok(stored) = state_get("agent-work", request.path) else Err(error) => failure(error);
+    if request.method == "PUT" {
+        create(request, stored)
+    } else {
+        read(request, stored)
+    }
+}
+"#,
+        &["state.transaction"],
+    );
+    let grants = GrantSet::from_manifest(&manifest("state = [\"agent-work\"]"));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default()).unwrap();
+    let state_host = host(inputs, durable(database, false));
+    let send = |method: &str, path: &str, body: &str| {
+        let response = Runtime::default()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &state_host,
+                HttpRequest {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    query: String::new(),
+                    headers: Vec::new(),
+                    body: body.to_owned(),
+                },
+            )
+            .expect("the webhook should run")
+            .response;
+        (response.status, response.body)
+    };
+
+    assert_eq!(send("GET", "/a", ""), (404, "missing /a".to_owned()));
+    assert_eq!(send("PUT", "/a", "one"), (201, "created".to_owned()));
+    assert_eq!(send("GET", "/a", ""), (200, "found one".to_owned()));
+    // `let None = stored` meets `Some`: the arm's conflict is returned and
+    // nothing is overwritten.
+    assert_eq!(send("PUT", "/a", "two"), (409, "exists: one".to_owned()));
+    assert_eq!(send("GET", "/a", ""), (200, "found one".to_owned()));
+}
+
+#[test]
 fn checkpoint_resume_replays_completed_http_without_repeating_the_mock_call() {
     let directory = TestDirectory::new("checkpoint-replay");
     let database = directory.database();

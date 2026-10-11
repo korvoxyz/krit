@@ -17,8 +17,8 @@ Each directory contains:
   means no warnings
 - `expect.notes` — optional decimal number of notes (fix hints) the error
   carries, plus line feed, for `conformance/check` cases; absent means one
-  for a habit code (`K1101`-`K1112`), `K3011`, `K3012`, or `K3013` and none
-  for any other error
+  for a habit code (`K1101`-`K1112`), `K3011`, `K3012`, `K3013`, or `K3014`
+  and none for any other error
 
 `conformance/cases` contains runtime cases. The harness invokes the
 equivalent of:
@@ -131,6 +131,8 @@ network service, or nondeterministic value.
 | `propagate/result`, `propagate/option` | postfix `?` unwraps `Ok` and `Some` and returns `Err` and `None` from the enclosing function |
 | `propagate/order` | arguments evaluate left to right; effects before a `?` exit stay performed and nothing after it evaluates |
 | `propagate/positions` | `?` in `if` conditions, `match` subjects, list and record elements, and nested blocks |
+| `let-else/result`, `let-else/option` | let-else binds the payload of either variant for the rest of the body and otherwise returns its arm's value from the function; `_` and `None` bind nothing |
+| `let-else/order` | the value evaluates before the arm; effects before the exit stay performed and nothing after it evaluates; consecutive let-else statements |
 | `json/round-trip` | deterministic JSON conversion |
 | `json/string-escapes` | every JSON string escape, surrogate pairs, and surrounding whitespace decode |
 | `types/annotations` | parsed binding, parameter, return, and generic types |
@@ -150,6 +152,8 @@ network service, or nondeterministic value.
 | `check/syntax/question-before-operand` | a `?` followed on its line by an operand, without a `:`, is an unexpected token (`K1001`) with one note |
 | `check/propagate/*` | postfix `?` where it cannot return (`K3012`: top level, anonymous function, webhook, missing or non-`Result`/`Option` return type), with another family or error type (`K3013`), and with an opaque `Secret` error type (`K3009`) |
 | `check/valid/propagate-queue` | a queue entrypoint returns its failures with `?` and builds |
+| `check/let-else/*` | let-else at the top level, in a nested block or branch, or in an anonymous function, with patterns that are not the two variants of one family, or with a value ending in `}` (`K3014`); a missing `else` arm (`K1002`) or a block arm (`K1003`), each with one note; an arm of another type (`K3001`), a value of another family (`K3005`), a binder declared twice (`K2002`), and a binder read in the arm (`K2001`) |
+| `check/valid/let-else-queue` | a queue entrypoint binds an object read and returns early with let-else, including a `None` pattern, and builds |
 | `check/valid/habit-words-as-names` | habit words stay ordinary identifiers outside foreign constructs |
 | `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings and a method call on a string (`K3011`) |
 | `check/match/*` | unique, exhaustive, single-family Option and Result arms (`K1003`) |
@@ -157,7 +161,7 @@ network service, or nondeterministic value.
 | `check/capability/*` | literal-resource host capability contracts |
 | `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, types that grow after they are bound, and types that grow when two solved types unify |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
-| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook helper chaining config, secret, and HTTP calls with `?` builds |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook helper chaining config, secret, and HTTP calls with `?` builds; a webhook binding config, secret, HTTP, and AI results with let-else in its own body builds, and so does one committing or rolling back a database transaction |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |
@@ -171,6 +175,7 @@ network service, or nondeterministic value.
 | `format/edition-2026` | canonical layout for all currently implemented syntax families |
 | `format/webhook` | canonical typed webhook and ordered duplicate-header layout |
 | `format/propagate` | postfix `?` stays attached to its operand and chains like a call |
+| `format/let-else` | a let-else stays on one line when it fits, otherwise breaks after `else` with its arm indented one level; a block or comment in the arm always breaks |
 
 ## Adding a case
 

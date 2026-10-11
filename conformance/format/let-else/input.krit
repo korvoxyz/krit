@@ -1,0 +1,11 @@
+fn failure(error:String)->HttpResponse{record{status:500,headers:[],body:error}}
+webhook fn handle(request:HttpRequest)->HttpResponse{
+let Ok ( model ) =config_string("agent.model")else Err(error)=>failure(error);
+let Ok(token):Result<Secret,String> = secret("upstream-token") else Err(error)=>failure("could not read the upstream token for this request: "+error);
+let Ok(response)=http_request("https://api.example.com",record{method:"POST",path:"/v1/review",query:"",headers:[record{name:"x-model",value:model}],body:request.body},Some(token))else Err(error)=>failure(error);
+let Ok(_)=log_info("review.finished",[])else Err(error)=>{
+// a failed log stops the review
+failure(error)};
+record{status:200,headers:[],body:response.body}}
+fn first(items:List<Option<Option<Int>>>)->Option<Int>{let Some(head)=(match items{[]=>None,[head,..rest]=>Some(head)})else None=>None;
+let Some(value)=head?else None=>Some(0);Some(value)}

@@ -1,0 +1,1 @@
+let Ok(value) = Ok(1) else Err(error) => 0;

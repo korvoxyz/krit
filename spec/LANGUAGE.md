@@ -77,11 +77,18 @@ Other escapes and invalid Unicode scalar values are lexical errors.
 program         = item* ;
 
 item            = let-declaration
+                | let-else
                 | function-declaration
                 | webhook-declaration
                 | expression, ";" ;
 
 let-declaration = "let", identifier, (":", type)?, "=", expression, ";" ;
+
+let-else        = "let", variant-pattern, (":", type)?, "=", expression,
+                  "else", let-else-arm, ";" ;
+let-else-arm    = variant-pattern, "=>", expression ;
+variant-pattern = ("Some" | "Ok" | "Err"), "(", identifier, ")"
+                | "None" ;
 
 function-declaration
                 = "fn", identifier, "(", parameters?, ")",
@@ -97,6 +104,7 @@ parameter       = identifier, (":", type)? ;
 block           = "{", statement*, expression?, "}" ;
 
 statement       = let-declaration
+                | let-else
                 | function-declaration
                 | expression, ";" ;
 
@@ -170,7 +178,10 @@ record-type-field
 Assignments and mutable bindings do not exist in edition 2026. Neither do
 `return`, loops, classes, modules, `async`, exceptions, indexing, arrow
 functions, the conditional operator, or `switch`; section 4.2 specifies how
-the parser reports them. The one early exit is postfix `?` (section 8.2).
+the parser reports them. The two early exits are postfix `?` (section 8.2)
+and let-else (section 8.3), which the grammar accepts wherever a `let`
+declaration may appear and checking accepts only as a statement of a named
+function's body.
 
 A `webhook` declaration is valid only as a direct program item. A source
 module contains zero or one webhook. Nested or duplicate webhook declarations
@@ -196,7 +207,8 @@ following opens one level for what it contains:
 - the argument list of a call, and each call, field-access, or `?` link of a
   postfix chain (`a.b(c)?.d` opens four levels for what follows `a`)
 - the operand of a unary operator
-- the condition of an `if`, and the subject and the arm list of a `match`
+- the condition of an `if`, the subject and the arm list of a `match`, and
+  the arm of a let-else (section 8.3)
 - the argument list of `List<…>`, `Option<…>`, or `Result<…, …>`, and the
   field list of `Record { … }`
 
@@ -424,6 +436,11 @@ environment where it is created, not where it is called.
 
 Duplicate parameters are a compile error, except for the discard name `_`.
 
+A let-else (section 8.3) declares its pattern's binder exactly as `let`
+declares its name: in the scope of the enclosing block, from the following
+statement to the end of that block, under the same one-declaration rule. The
+binder of its arm is visible only in the arm.
+
 ## 8. Functions and calls
 
 ```krit
@@ -517,9 +534,10 @@ a `Result` operand) or `Option<U>` (for an `Option` operand); `U` need not be
 - at the top level;
 - in an anonymous function `fn(...) { ... }`, even one with a declared
   `Result` or `Option` return type;
-- in a `webhook` entrypoint, which returns `HttpResponse`: move the fallible
-  steps into a helper that returns `Result<HttpResponse, String>`, use `?`
-  there, and `match` the helper's result in the webhook;
+- in a `webhook` entrypoint, which returns `HttpResponse`: bind each
+  fallible step with let-else (section 8.3), or move the steps into a helper
+  that returns `Result<HttpResponse, String>`, use `?` there, and `match` the
+  helper's result in the webhook;
 - in a named function without a declared return type, or whose declared
   return type is neither a `Result` nor an `Option`.
 
@@ -546,6 +564,83 @@ the payload; the `Err` or `None` arm rebuilds the failure at the function's
 return type and ends with a verified function exit (`TYPES-AND-EFFECTS.md`,
 "Error propagation"), which components lower to a WebAssembly `return`
 (`WASM-SANDBOX.md`).
+
+## 8.3 Let-else
+
+A let-else binds the payload of one variant and makes the enclosing function
+return when the value is the other variant:
+
+```krit
+fn failure(error: String) -> HttpResponse {
+    record { status: 502, headers: [], body: error }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let Ok(repository) = config_string("reference.repository") else Err(error) => failure(error);
+    let Ok(stored) = state_get("agent-work", request.path) else Err(error) => failure(error);
+    let Some(summary) = stored else None => record { status: 404, headers: [], body: "" };
+    record { status: 200, headers: [], body: repository + ": " + summary }
+}
+```
+
+A let-else is `let PATTERN (: TYPE)? = value else ARM;`, where the arm is a
+pattern, `=>`, and an expression, as in a `match`. Its two patterns are the
+two variants of one built-in family, in either order: `Ok(p)` and `Err(q)`, or
+`Some(p)` and `None`. A pattern's payload binder is an identifier or the
+discard name `_`; `None` binds nothing. A `Some`, `Ok`, or `Err` written after
+`let` without `(` is still a binding of that reserved name (`K2002`), and a
+variant pattern without an `else` arm is `K1002`.
+
+It is exactly
+
+```text
+match value { PATTERN => { rest of the block }, ARM }
+```
+
+where the rest of the block is every statement after the let-else and the
+block's final expression, except that the pattern's binder is declared in
+the enclosing block as a `let` binding is (section 7). The value evaluates
+first. If it is the pattern's variant, the binder names its payload for the
+rest of the block. If it is the arm's variant, the arm's binder names its
+payload, the arm's expression evaluates, and the enclosing function returns
+its value immediately: nothing after the let-else in that function call
+evaluates, while effects that already happened stay performed.
+
+The annotation, when present, is the type of the value, as it is in a `let`
+declaration; the value must be an `Option` (for `Some` and `None`) or a
+`Result` (for `Ok` and `Err`), otherwise checking reports `K3005`. Because the
+arm's value is the function's return value, it must have the function's
+return type, declared or inferred (`K3001` otherwise). A let-else adds the
+effects and capability requirements of its value and its arm, and nothing of
+its own.
+
+`K3014` reports a let-else that cannot work this way, with one note naming
+the fix:
+
+- it is not a direct statement of the body block of a named function
+  (including a `webhook`, `queue`, or `schedule` entrypoint): at the top level,
+  in an anonymous function, or in a nested block such as a block expression,
+  an `if` branch, or a `match` arm, it would leave an expression rather than
+  return from a function;
+- its two patterns are not the two variants of one family;
+- its value ends in `}`, such as an `if`, `match`, block, `record`, or
+  anonymous function: in `let Ok(x) = if c { a } else { b } else Err(e) =>
+  ...`, the first `else` would read as part of the let-else. Bind the value
+  with `let` first, or wrap it in parentheses.
+
+Unlike `?`, a let-else works in a webhook entrypoint, which returns
+`HttpResponse`, and in any named function whatever its return type. An
+`else` followed by another language's guard clause, `else { return value; }`,
+is `K1112` (section 4.2), and any other block after `else` is `K1003`, with a
+note showing the arm to write instead.
+
+Core IR lowers a let-else to a variant match on the value in the enclosing
+block, followed by the binding of its result. The pattern's arm yields the
+payload (unit for `None`); the other arm binds the arm's binder, evaluates its
+expression, and ends with a verified function exit (`TYPES-AND-EFFECTS.md`,
+"Let-else"), which components lower to a WebAssembly `return`
+(`WASM-SANDBOX.md`). A body of many let-else statements therefore nests no
+deeper than one of them.
 
 ## 9. Operators
 
@@ -890,6 +985,9 @@ Checking reports these, so a program containing one is never evaluated:
 - printing, comparing, encoding, or structurally storing an opaque secret
 - `?` outside a named function that returns its operand's family, or with a
   different error type (section 8.2)
+- a let-else that is not a direct statement of a named function's body, whose
+  patterns are not the two variants of one family, or whose value ends in `}`
+  (section 8.3)
 
 Evaluation reports these:
 
@@ -909,7 +1007,8 @@ evaluator keeps its own kind, callee, arity, comparison, and encoding checks
 decoded JSON value can fail one of them; otherwise they make a program
 evaluated without checking, which `krit run` never does, fail with a
 diagnostic. Such a program also fails with `K3012` when a `?` outside every
-function meets `Err` or `None`.
+function meets `Err` or `None`, and with `K3014` when a let-else outside every
+function meets its arm's variant.
 
 The direct-evaluation limits count active frames, not total work: sequential
 calls that each recurse 9,000 levels deep are valid. A typical recursive
@@ -949,8 +1048,16 @@ grammar-permitted trailing commas, not expression order or program semantics.
   contains no tabs or trailing spaces.
 - Output uses LF line endings and exactly one final line feed.
 - Binary operators, `=`, `=>`, `->`, and type/value colons use stable spacing.
-  Calls, field access, postfix `?`, unary operators, and generic type
-  brackets remain compact (`load(id)?.body`, `-count? - 1`).
+  Calls, field access, postfix `?`, unary operators, generic type brackets,
+  and variant patterns remain compact (`load(id)?.body`, `-count? - 1`,
+  `let Ok(value) =`).
+- A let-else stays on one line when the rest of the statement, from `else`
+  through `;`, fits on the line where `else` ends without wrapping:
+  `let Ok(x) = load(id) else Err(e) => handle(e);`. Otherwise the line breaks
+  after `else` and the arm continues on the next line, indented one level. An
+  arm that holds a block, a `match`, or a comment always breaks. A value that
+  wraps on its own keeps a fitting arm after its closing delimiter
+  (`) else Err(e) => handle(e);`).
 - Non-empty blocks and every match are multiline. Short lists, records,
   parameter lists, argument lists, and record types remain on one line when
   readable.

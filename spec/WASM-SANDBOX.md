@@ -294,6 +294,9 @@ Policy 2 adds a deliberately bounded webhook ABI:
   `schedule` entrypoints, whenever the function's declared result has a
   layout (for example `Result<HttpResponse, String>`, `Result<String, String>`,
   or `Option<String>`); see [Function exits](#function-exits)
+- let-else on those Result/Option shapes in the body of any helper or
+  entrypoint whose result has a layout, including a webhook entrypoint
+  returning `HttpResponse`; see [Function exits](#function-exits)
 - a typed webhook export plus exact stdout/config/secrets/HTTP imports
 - neutral AI string results and ordered structured logging fields
 - transactional string state, named checkpoints, anonymous HTTP replay, and AI
@@ -323,6 +326,18 @@ treats an `exit` like any other operation: its value has the function's
 result type, which is checked with the function signature, and a `?` whose
 `Result` or `Option` shape has no policy-2 layout fails at that shape with
 `K7002`.
+
+A let-else (`LANGUAGE.md` section 8.3) lowers the same way: a variant match
+on its value whose arm for the pattern yields the payload and whose other arm
+evaluates the source arm's expression and ends with an `exit` of that value
+(`TYPES-AND-EFFECTS.md`, "Let-else"). The exited value has the function's
+result type, whatever it is, so a webhook entrypoint returns the arm's
+`HttpResponse` through the same `return` as its normal end, and the entry
+adapter sees one result representation. The match and the binding of its
+payload are ordinary policy-2 operations, so a let-else builds exactly where
+the equivalent `match` builds; its value's shape, like a `match` subject's,
+fails with `K7002` when it has no layout, which is always the case in
+policy 1.
 
 ### Guest string runtime
 

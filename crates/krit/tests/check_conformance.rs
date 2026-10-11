@@ -149,11 +149,12 @@ fn run_case(case: &Path, root: &Path) {
 
 /// The error carries the number of notes in `expect.notes`, which defaults to
 /// exactly one fix for habit codes (`K1101`-`K1112`), method calls (`K3011`),
-/// and misplaced or mismatched `?` (`K3012`, `K3013`) and to none otherwise
-/// (`spec/DIAGNOSTICS.md`). Every note is one line; its wording may vary.
+/// misplaced or mismatched `?` (`K3012`, `K3013`), and misplaced or mismatched
+/// let-else (`K3014`) and to none otherwise (`spec/DIAGNOSTICS.md`). Every
+/// note is one line; its wording may vary.
 fn assert_notes(diagnostic: &Diagnostic, case: &Path, case_name: &str) {
     let code = diagnostic.code();
-    let requires_hint = matches!(code, "K3011" | "K3012" | "K3013")
+    let requires_hint = matches!(code, "K3011" | "K3012" | "K3013" | "K3014")
         || code
             .strip_prefix("K11")
             .and_then(|number| number.parse::<u8>().ok())

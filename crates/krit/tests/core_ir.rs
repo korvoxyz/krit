@@ -422,6 +422,10 @@ fn assert_statement_names_resolved(statement: &krit::Statement, analysis: &Analy
         StatementKind::Let { value, .. } | StatementKind::Expression(value) => {
             assert_expression_names_resolved(value, analysis);
         }
+        StatementKind::LetElse { value, arm, .. } => {
+            assert_expression_names_resolved(value, analysis);
+            assert_expression_names_resolved(&arm.value, analysis);
+        }
         StatementKind::Function { body, .. }
         | StatementKind::Webhook { body, .. }
         | StatementKind::QueueConsumer { body, .. }

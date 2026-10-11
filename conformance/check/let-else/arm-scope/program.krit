@@ -1,0 +1,4 @@
+fn describe(input: Result<String, String>) -> String {
+    let Ok(text) = input else Err(error) => text;
+    text
+}

@@ -9,7 +9,7 @@ use std::{
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use krit::{
     Block, Expression, ExpressionKind, MatchKind, Program, Source, Statement, StatementKind,
-    ValueLiteral,
+    ValueLiteral, VariantPattern,
 };
 use krit_package::Manifest;
 use serde::Serialize;
@@ -721,6 +721,10 @@ fn ast_sensitive_literal_spans(
         }
         match &statement.kind {
             StatementKind::Let { value, .. } => expression_spans(source, value, scopes, spans),
+            StatementKind::LetElse { value, arm, .. } => {
+                expression_spans(source, value, scopes, spans);
+                expression_spans(source, &arm.value, scopes, spans);
+            }
             StatementKind::Function {
                 parameters, body, ..
             }
@@ -749,10 +753,21 @@ fn ast_sensitive_literal_spans(
         }
     }
 
-    /// Records one `let` binding as a snapshot of what its value contributes.
+    /// Records one `let` binding, or the binder of a let-else pattern, as a
+    /// snapshot of what its value contributes.
     fn declare<'a>(source: &str, statement: &'a Statement, scopes: &mut Vec<Bindings<'a>>) {
-        let StatementKind::Let { name, value, .. } = &statement.kind else {
-            return;
+        let (name, value) = match &statement.kind {
+            StatementKind::Let { name, value, .. } => (name, value),
+            StatementKind::LetElse {
+                pattern:
+                    VariantPattern {
+                        binding: Some(name),
+                        ..
+                    },
+                value,
+                ..
+            } => (name, value),
+            _ => return,
         };
         let targets = snapshot(source, value, scopes);
         if let Some(frame) = scopes.last_mut() {
@@ -928,6 +943,10 @@ fn ast_sensitive_literal_spans(
             match &statement.kind {
                 StatementKind::Let { value, .. } => {
                     collect(source, value, scopes, visited, targets);
+                }
+                StatementKind::LetElse { value, arm, .. } => {
+                    collect(source, value, scopes, visited, targets);
+                    collect(source, &arm.value, scopes, visited, targets);
                 }
                 StatementKind::Expression(expression) => {
                     collect(source, expression, scopes, visited, targets);
@@ -1349,6 +1368,11 @@ fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static
     // bindings, and every enclosing binding also receives their contributions.
     let mut pending: Vec<PendingBinding<'_>> = Vec::new();
     let mut expect_binding_name = false;
+    // After `let Ok(`, `let Err(`, or `let Some(` of a let-else: the call
+    // depth outside that parenthesis, where the binder that follows is
+    // declared. Its `)` is not part of the binding's value.
+    let mut pattern_binder_depth: Option<usize> = None;
+    let mut closing_pattern = false;
     // Parameter names collected from a `fn (...)` list, installed as
     // untraceable shadows when the body block opens.
     let mut parameters: Vec<&str> = Vec::new();
@@ -1391,16 +1415,38 @@ fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static
                 binding.value_start.get_or_insert(start);
                 binding.value_end = cursor;
             }
+            closing_pattern = false;
             if identifier == "let" {
                 expect_binding_name = true;
             } else if identifier == "fn" {
                 saw_function_keyword = true;
                 parameters.clear();
+            } else if expect_binding_name
+                && pattern_binder_depth.is_none()
+                && matches!(identifier, "Ok" | "Err" | "Some")
+                && bytes[cursor..]
+                    .iter()
+                    .find(|byte| !byte.is_ascii_whitespace())
+                    == Some(&b'(')
+            {
+                // `let Ok(name) = ...`: the binder follows the parenthesis.
+                pattern_binder_depth = Some(frames.len());
+            } else if expect_binding_name && pattern_binder_depth.is_none() && identifier == "None"
+            {
+                // `let None = ...` binds nothing.
+                expect_binding_name = false;
             } else if expect_binding_name {
                 expect_binding_name = false;
+                let depth = match pattern_binder_depth.take() {
+                    Some(depth) => {
+                        closing_pattern = true;
+                        depth
+                    }
+                    None => frames.len(),
+                };
                 pending.push(PendingBinding::new(
                     identifier,
-                    frames.len(),
+                    depth,
                     scopes.len().saturating_sub(1),
                 ));
             } else if collecting_parameters && expect_parameter_name {
@@ -1468,7 +1514,10 @@ fn tolerant_sensitive_literal_spans(source: &str) -> Vec<(usize, usize, &'static
             tokens.push(TolerantToken::Identifier(identifier));
             continue;
         }
-        if !bytes[cursor].is_ascii_whitespace() && bytes[cursor] != b'=' {
+        if closing_pattern && bytes[cursor] == b')' {
+            closing_pattern = false;
+        } else if !bytes[cursor].is_ascii_whitespace() && bytes[cursor] != b'=' {
+            closing_pattern = false;
             for binding in &mut pending {
                 binding.value_start.get_or_insert(cursor);
                 binding.value_end = cursor + 1;
@@ -2257,6 +2306,42 @@ fn lookup(request: HttpRequest) -> Result<String, String> {
                     "{content} leaked: {spans:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn let_else_binders_in_sensitive_arguments_are_redacted() {
+        let source = r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let Ok(value) = wrap("private-payload") else Err(error) => failure(error);
+    let Ok(_) = cache_put("lookups", "k", value, 60) else Err(error) => failure(error);
+    let Some(question) = pick(
+        "private-question",
+    ) else None => failure("none");
+    let Ok(hits) = search_query("docs", question, 3) else Err(error) => failure(error);
+    let None = lookup("unrelated-text") else Some(found) => failure(found);
+    record { status: 200, headers: [], body: hits }
+}
+"#;
+
+        for spans in [redacted(source), redacted_tolerant(source)] {
+            for (content, expected) in [
+                ("private-payload", "cache-value"),
+                ("private-question", "search-query"),
+                ("lookups", "capability-resource"),
+                ("docs", "capability-resource"),
+            ] {
+                assert!(
+                    spans
+                        .iter()
+                        .any(|(actual, category)| actual == content && *category == expected),
+                    "{content} leaked: {spans:?}"
+                );
+            }
+            assert!(
+                spans.iter().all(|(actual, _)| actual != "unrelated-text"),
+                "an unrelated literal was redacted: {spans:?}"
+            );
         }
     }
 

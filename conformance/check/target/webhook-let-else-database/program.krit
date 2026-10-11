@@ -1,0 +1,19 @@
+fn failure(status: Int, error: String) -> HttpResponse {
+    record { status: status, headers: [], body: error }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let Ok(transaction) = db_begin_write("catalog") else Err(error) => failure(503, error);
+    let Ok(_) = db_execute(transaction, "record-visit", [request.path]) else
+        Err(error) => match db_rollback(transaction) {
+            Ok(_) => failure(500, error),
+            Err(fatal) => failure(500, fatal),
+        };
+    let Ok(rows) = db_query(transaction, "count-visits", []) else
+        Err(error) => match db_rollback(transaction) {
+            Ok(_) => failure(500, error),
+            Err(fatal) => failure(500, fatal),
+        };
+    let Ok(_) = db_commit(transaction) else Err(error) => failure(500, error);
+    record { status: 200, headers: [], body: rows }
+}

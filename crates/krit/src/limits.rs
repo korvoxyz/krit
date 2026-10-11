@@ -14,7 +14,8 @@ use crate::{Diagnostic, Span};
 ///
 /// Parenthesized expressions, blocks, list and record literals, call argument
 /// lists, field-access, call, and `?` links, unary operands, `if` conditions,
-/// `match` subjects and arms, and type argument lists each open one level.
+/// `match` subjects and arms, let-else arms, and type argument lists each open
+/// one level.
 /// An `else if` continuation and a chained binary operator do not.
 ///
 /// Analysis applies the same bound to the resolved type of every type

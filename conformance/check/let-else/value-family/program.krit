@@ -1,0 +1,4 @@
+fn describe(input: Option<String>) -> String {
+    let Ok(text) = input else Err(error) => error;
+    text
+}

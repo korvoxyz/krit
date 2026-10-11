@@ -8,7 +8,8 @@ use std::{
 use crate::{
     Analysis, BinaryOperator, Block, Builtin, EffectSet, Expression, ExpressionKind, FunctionType,
     MatchKind, Parameter, Program, RequirementSet, ResolvedName, Span, Statement, StatementKind,
-    SymbolId, SymbolKind, Type, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+    SymbolId, SymbolKind, Type, UnaryOperator, ValueLiteral, VariantArm, VariantFamily,
+    VariantName, VariantPattern,
     limits::{MAX_CORE_BLOCK_DEPTH, MAX_TREE_DEPTH},
 };
 
@@ -761,6 +762,12 @@ impl<'a> Lowerer<'a> {
                 );
                 self.current_context_mut().define(binding, value);
             }
+            StatementKind::LetElse {
+                pattern,
+                value,
+                arm,
+                ..
+            } => self.lower_let_else(statement.span, pattern, value, arm, operations)?,
             StatementKind::Function {
                 name,
                 parameters,
@@ -1223,6 +1230,188 @@ impl<'a> Lowerer<'a> {
                 ],
             },
         ))
+    }
+
+    /// Lowers the let-else at `span` to a variant match on its value,
+    /// followed by the binding of the pattern's payload.
+    ///
+    /// The pattern's arm yields the payload (unit for `None`) through a
+    /// Core-only match binding. The other arm binds the source arm's binder,
+    /// evaluates the arm's value, which analysis gave the function's result
+    /// type, and exits the function with it. The match itself is therefore
+    /// flat in the enclosing block, as the `let` binding of its result is, so
+    /// a body of many let-else statements nests no deeper than one.
+    fn lower_let_else(
+        &mut self,
+        span: Span,
+        pattern: &VariantPattern,
+        value: &Expression,
+        arm: &VariantArm,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<(), IrError> {
+        let subject = self.lower_expression(value, operations)?;
+        if self
+            .contexts
+            .last()
+            .is_none_or(|context| context.exit.is_none())
+        {
+            return Err(IrError::new(format!(
+                "let-else at {span:?} has no enclosing function to return from"
+            )));
+        }
+        let subject_type = self.expression_fact(value)?.shared_type();
+        let payloads = match subject_type.as_ref() {
+            Type::Option(payload) if pattern.variant.family() == VariantFamily::Option => [
+                (VariantName::Some, Some(Arc::clone(payload))),
+                (VariantName::None, None),
+            ],
+            Type::Result(payload, error) if pattern.variant.family() == VariantFamily::Result => [
+                (VariantName::Ok, Some(Arc::clone(payload))),
+                (VariantName::Err, Some(Arc::clone(error))),
+            ],
+            other => {
+                return Err(IrError::new(format!(
+                    "let-else at {span:?} on `{}` has a value of type `{other}`",
+                    pattern.variant.as_str()
+                )));
+            }
+        };
+        let payload_of = |variant| {
+            payloads
+                .iter()
+                .find(|(candidate, _)| *candidate == variant)
+                .and_then(|(_, payload)| payload.clone())
+        };
+
+        let (success_binding, success_block) = match payload_of(pattern.variant) {
+            Some(payload) => {
+                let binding = self.synthetic_match_binding("$value", payload, pattern.span);
+                let parameter = self.block_parameter(binding)?;
+                let match_binding = parameter.match_binding;
+                let block = CoreBlock {
+                    id: self.allocate_block(),
+                    result: parameter.value,
+                    ty: Arc::clone(&parameter.ty),
+                    parameters: vec![parameter],
+                    operations: Vec::new(),
+                    effects: EffectSet::default(),
+                    requirements: RequirementSet::default(),
+                    source: Some(pattern.span),
+                };
+                (Some(match_binding), block)
+            }
+            None => {
+                let id = self.allocate_block();
+                let mut unit_operations = Vec::new();
+                let result = self.emit(
+                    &mut unit_operations,
+                    Arc::new(Type::Unit),
+                    EffectSet::default(),
+                    Some(pattern.span),
+                    OperationKind::Unit,
+                );
+                let block = CoreBlock {
+                    id,
+                    parameters: Vec::new(),
+                    operations: unit_operations,
+                    result,
+                    ty: Arc::new(Type::Unit),
+                    effects: EffectSet::default(),
+                    requirements: RequirementSet::default(),
+                    source: Some(pattern.span),
+                };
+                (None, block)
+            }
+        };
+        let ty = Arc::clone(&success_block.ty);
+
+        let (failure_binding, failure_parameters) = match &arm.binding {
+            Some(name) => {
+                let binding = self.declaration_binding(arm.span, name, SymbolKind::Match)?;
+                let parameter = self.block_parameter(binding)?;
+                (Some(parameter.match_binding), vec![parameter])
+            }
+            None => (None, Vec::new()),
+        };
+        let arm_fact = self.expression_fact(&arm.value)?;
+        let effects = arm_fact.effects().clone();
+        let requirements = arm_fact.requirements().clone();
+        let failure_id = self.allocate_block();
+        self.push_scope();
+        for parameter in &failure_parameters {
+            self.current_context_mut()
+                .define(parameter.binding, parameter.value);
+        }
+        let mut failure_operations = Vec::new();
+        let returned = self.lower_expression(&arm.value, &mut failure_operations)?;
+        self.pop_scope();
+        let exited = self.emit(
+            &mut failure_operations,
+            Arc::clone(&ty),
+            EffectSet::default(),
+            Some(arm.span),
+            OperationKind::Exit { value: returned },
+        );
+        let failure_block = CoreBlock {
+            id: failure_id,
+            parameters: failure_parameters,
+            operations: failure_operations,
+            result: exited,
+            ty: Arc::clone(&ty),
+            effects: effects.clone(),
+            requirements: requirements.clone(),
+            source: Some(arm.span),
+        };
+
+        let matched = self.emit_with_requirements(
+            operations,
+            ty,
+            effects,
+            requirements,
+            Some(span),
+            OperationKind::MatchVariant {
+                subject,
+                family: pattern.variant.family(),
+                arms: vec![
+                    VariantArmBlock {
+                        variant: pattern.variant,
+                        binding: success_binding,
+                        block: success_block,
+                    },
+                    VariantArmBlock {
+                        variant: arm.variant,
+                        binding: failure_binding,
+                        block: failure_block,
+                    },
+                ],
+            },
+        );
+        match &pattern.binding {
+            Some(name) => {
+                let binding = self.declaration_binding(span, name, SymbolKind::Let)?;
+                self.emit(
+                    operations,
+                    Arc::new(Type::Unit),
+                    EffectSet::default(),
+                    Some(span),
+                    OperationKind::Bind {
+                        binding,
+                        value: matched,
+                    },
+                );
+                self.current_context_mut().define(binding, matched);
+            }
+            None => {
+                self.emit(
+                    operations,
+                    Arc::new(Type::Unit),
+                    EffectSet::default(),
+                    Some(span),
+                    OperationKind::Discard { value: matched },
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Lowers an `if` expression and its whole `else if` chain.
@@ -4218,6 +4407,96 @@ mod tests {
             .filter(|operation| matches!(operation.kind, OperationKind::MatchVariant { .. }))
             .count();
         assert_eq!(matches, LINKS);
+        assert_eq!(module.deepest_block().0, 2);
+    }
+
+    #[test]
+    fn lowers_let_else_to_a_flat_match_whose_arm_exits_and_a_binding() {
+        let mut module = lowered(
+            "fn digit(text: String) -> Result<Int, String> { Err(text) }\n\
+             fn total(text: String) -> String {\n\
+             let Ok(value) = digit(text) else Err(error) => \"failed: \" + error;\n\
+             json_encode(value)\n\
+             }",
+        );
+        let body = function_body(&mut module, "total");
+        let matched = body
+            .operations
+            .iter()
+            .position(|operation| matches!(operation.kind, OperationKind::MatchVariant { .. }))
+            .expect("the let-else should lower to a variant match");
+        let bound = &body.operations[matched + 1];
+        assert!(matches!(
+            bound.kind,
+            OperationKind::Bind { value, .. } if value == body.operations[matched].result
+        ));
+        assert_eq!(body.operations[matched].ty.to_string(), "Int");
+        let arms = match_arms(&mut body.operations);
+        assert_eq!(arms[0].variant, VariantName::Ok);
+        assert!(arms[0].block.operations.is_empty());
+        assert_eq!(arms[0].block.result, arms[0].block.parameters[0].value);
+        assert_eq!(arms[1].variant, VariantName::Err);
+        let failure = &arms[1].block;
+        let exit = failure
+            .operations
+            .last()
+            .expect("the arm should end with an exit");
+        let OperationKind::Exit { value } = exit.kind else {
+            panic!("the arm should end with an exit");
+        };
+        let returned = failure
+            .operations
+            .iter()
+            .find(|operation| operation.result == value)
+            .expect("the exit should return the arm's value");
+        assert_eq!(returned.ty.to_string(), "String");
+        assert_eq!(exit.ty.to_string(), "Int");
+        assert_eq!(failure.result, exit.result);
+        let rendered = module.render_text();
+        assert!(rendered.contains("let value: Int"), "{rendered}");
+        assert!(rendered.contains("match error: String"), "{rendered}");
+        assert!(rendered.contains("match $value: Int"), "{rendered}");
+
+        // A `None` pattern yields unit, which is discarded, and its `Some` arm
+        // binds the source binder.
+        let mut module = lowered(
+            "fn absent(value: Option<Int>) -> Int {\n    let None = value else Some(found) => found;\n    0\n}",
+        );
+        let body = function_body(&mut module, "absent");
+        assert!(
+            body.operations
+                .iter()
+                .any(|operation| matches!(operation.kind, OperationKind::Discard { .. }))
+        );
+        let arms = match_arms(&mut body.operations);
+        assert_eq!(arms[0].variant, VariantName::None);
+        assert!(arms[0].binding.is_none() && arms[0].block.parameters.is_empty());
+        assert_eq!(arms[0].block.ty.to_string(), "Unit");
+        assert_eq!(arms[1].variant, VariantName::Some);
+        assert_eq!(
+            arms[1].block.parameters[0].debug_name.as_deref(),
+            Some("found")
+        );
+    }
+
+    #[test]
+    fn lowers_many_let_else_statements_without_nesting_core_blocks() {
+        const STATEMENTS: usize = 300;
+        let mut text = String::from("fn f(o: Option<Int>) -> Int {\n");
+        for index in 0..STATEMENTS {
+            text.push_str(&format!(
+                "    let Some(v{index}) = o else None => {index};\n"
+            ));
+        }
+        text.push_str("    v0\n}\n");
+        let mut module = lowered(&text);
+        let body = function_body(&mut module, "f");
+        let matches = body
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation.kind, OperationKind::MatchVariant { .. }))
+            .count();
+        assert_eq!(matches, STATEMENTS);
         assert_eq!(module.deepest_block().0, 2);
     }
 

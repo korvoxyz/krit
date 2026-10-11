@@ -1,0 +1,4 @@
+fn describe(input: Option<String>) -> String {
+    let Some(text) = input;
+    text
+}

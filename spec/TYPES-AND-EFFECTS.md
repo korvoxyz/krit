@@ -93,8 +93,9 @@ declared return type is `Result<_, E>` or `Option<_>` may be exited; an
 anonymous function, a webhook entrypoint, a named function without a declared
 return type or with another declared return type, and the top level may not
 (`K3012`). The decision uses the declared annotation, never an inferred
-return type, so a function's signature alone shows whether its body can exit
-early.
+return type, so a function's signature alone shows whether `?` can exit its
+body early. A let-else, whose arm supplies the returned value itself, may
+exit any named function's body ("Let-else" below).
 
 For `e?` in a body that may be exited:
 
@@ -120,6 +121,48 @@ value to have the enclosing function's result type, the `exit` to be the last
 operation of its block and that block's result, and no `exit` in module
 initialization; the exit's own type is whatever its block requires, since
 control never continues past it.
+
+## Let-else
+
+A let-else (`LANGUAGE.md` section 8.3), `let P (: A)? = e else Q => r;`, is
+typed against the innermost enclosing function body, like `?`, but it may
+appear only as a direct statement of that body's block, and only when the
+body is a named function's (including a `webhook`, `queue`, or `schedule`
+entrypoint). Analysis records, for each body, its block and its return type;
+a let-else anywhere else is `K3014` at its `let` and pattern: at the top
+level, in an anonymous function's body, or in any nested block. The patterns
+`P` and `Q` must be the two variants of one family (`K3014` at the arm
+otherwise).
+
+The checks run in source order:
+
+1. `P`'s binder must be free in the body's scope (`K2002`), as for `let`.
+2. `e` is analyzed; an annotation `A` is the type of `e` and is unified with
+   it (`K3001`).
+3. The type of `e` must be `Option<T>` for `Some`/`None` or `Result<T, E>` for
+   `Ok`/`Err`, for fresh `T` and `E` when it is unresolved (`K3005` for any
+   other type).
+4. `Q`'s binder (the `T` of `Some`, or the `T` or `E` of `Ok` or `Err`) is
+   declared in a scope of the arm alone, and `r` is analyzed there.
+5. The type of `r` is unified with the function's return type: the declared
+   one, or the type variable that stands for an undeclared one (`K3001`).
+6. `P`'s binder is declared in the body's scope with its payload type, as a
+   `let` binding at the let-else statement, visible to the following
+   statements and the body's final expression.
+
+The statement's effects and requirements are those of `e` and `r`; let-else
+adds none of its own. Nothing is rebuilt, so no structural constraint applies
+to the payload types: binding an opaque `Secret` or `DatabaseTransaction`
+payload is allowed exactly as matching it is.
+
+Core IR lowers a let-else to a variant match on `e` in the enclosing block,
+followed by `bind` of the match's result to `P`'s binder (or `discard` of the
+unit result of a `None` pattern). The arm of `P` binds the payload through a
+Core-only match binding (debug name `$value`) and yields it; the arm of `Q`
+binds `Q`'s source binder, evaluates `r`, and ends with an `exit` of its
+value, verified like every `exit` to have the function's result type. The
+match has `P`'s payload type, so successive let-else statements stay flat in
+the body block.
 
 ## Effects
 

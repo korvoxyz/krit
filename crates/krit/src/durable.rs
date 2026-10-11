@@ -127,6 +127,10 @@ fn collect_program(program: &Program, facts: &mut Vec<DurableOperationFact>) {
         match node {
             Pending::Statement(statement) => match &statement.kind {
                 StatementKind::Let { value, .. } => pending.push(Pending::Expression(value)),
+                StatementKind::LetElse { value, arm, .. } => {
+                    pending.push(Pending::Expression(value));
+                    pending.push(Pending::Expression(&arm.value));
+                }
                 StatementKind::Function { body, .. }
                 | StatementKind::Webhook { body, .. }
                 | StatementKind::QueueConsumer { body, .. }

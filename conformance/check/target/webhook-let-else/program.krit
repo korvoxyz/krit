@@ -1,0 +1,19 @@
+fn failure(error: String) -> HttpResponse {
+    record { status: 502, headers: [], body: error }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let Ok(repository) = config_string("reference.repository") else Err(error) => failure(error);
+    let Ok(token) = secret("github-token") else Err(error) => failure(error);
+    let outbound: HttpRequest = record {
+        method: "GET",
+        path: "/repos/example/issues/1",
+        query: "",
+        headers: [record { name: "x-reference-repository", value: repository }],
+        body: "",
+    };
+    let Ok(issue) = http_request("https://api.example.com", outbound, Some(token)) else
+        Err(error) => failure(error);
+    let Ok(summary) = ai_invoke("reviewer", issue.body) else Err(error) => failure(error);
+    record { status: 200, headers: [], body: summary }
+}

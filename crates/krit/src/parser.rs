@@ -5,7 +5,7 @@ use crate::{
     ast::{
         BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
         RecordField, RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind,
-        UnaryOperator, ValueLiteral, VariantArm, VariantFamily, VariantName,
+        UnaryOperator, ValueLiteral, VariantArm, VariantFamily, VariantName, VariantPattern,
     },
     habits::Habit,
     limits::{MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, nesting_error, structural_error},
@@ -129,6 +129,9 @@ impl<'source> Parser<'source> {
 
     fn let_declaration(&mut self) -> Result<Statement, Diagnostic> {
         let start = self.expect(TokenKind::Let)?.span;
+        if self.at_variant_pattern() {
+            return self.let_else(start);
+        }
         let (name, _) = self.binding_name()?;
         let annotation = if self.consume(&TokenKind::Colon) {
             Some(self.type_annotation()?)
@@ -146,6 +149,111 @@ impl<'source> Parser<'source> {
                 name,
                 annotation,
                 value,
+            },
+            span: start.join(end),
+        })
+    }
+
+    /// Whether a variant pattern starts at the current token: `None`, or
+    /// `Some`, `Ok`, or `Err` followed by `(`.
+    ///
+    /// The four names are reserved, so no `let` binding starts this way.
+    fn at_variant_pattern(&self) -> bool {
+        let TokenKind::Identifier(name) = &self.current().kind else {
+            return false;
+        };
+        match name.as_str() {
+            "None" => true,
+            "Some" | "Ok" | "Err" => matches!(
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                Some(TokenKind::LeftParen)
+            ),
+            _ => false,
+        }
+    }
+
+    /// Parses the rest of a let-else after its `let` at `start`:
+    /// `PATTERN (: TYPE)? = value else ARM;`.
+    ///
+    /// The value may not end in `}` (`K3014`): `if c { a } else { b } else
+    /// ...` would read as one `if` with two `else` keywords. The arm opens one
+    /// nesting level, as the arms of a `match` do.
+    fn let_else(&mut self, start: Span) -> Result<Statement, Diagnostic> {
+        let pattern = self.variant_pattern()?;
+        let annotation = if self.consume(&TokenKind::Colon) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::Equal)?;
+        let value = self.expression()?;
+        if let Some(assignment) = self.assignment_after(&value) {
+            return Err(assignment);
+        }
+        let complement = pattern.variant.complement().example_pattern();
+        if !self.check(&TokenKind::Else) {
+            let written = match &pattern.binding {
+                Some(binding) => format!("{}({binding})", pattern.variant.as_str()),
+                None => pattern.variant.as_str().to_owned(),
+            };
+            return Err(Diagnostic::new(
+                "K1002",
+                format!(
+                    "expected `else` after the value of `let {written}`, found {}",
+                    self.current().kind.description()
+                ),
+                self.current().span,
+            )
+            .with_note(format!(
+                "a `let` with a variant pattern names what happens otherwise: \
+                 `let {written} = value else {complement} => fallback;`"
+            )));
+        }
+        if self.previous().kind == TokenKind::RightBrace {
+            return Err(Diagnostic::new(
+                "K3014",
+                "the value of a let-else cannot end in `}`",
+                value.span,
+            )
+            .with_note(
+                "bind the value with `let` first and use its name here, or wrap the value in \
+                 parentheses, so its `}` cannot be read as part of the `else`",
+            ));
+        }
+        let else_span = self.advance().span;
+        if let Some(habit) = self.else_return(else_span) {
+            return Err(habit);
+        }
+        if self.check(&TokenKind::LeftBrace) {
+            return Err(Diagnostic::new(
+                "K1003",
+                "expected a let-else arm after `else`, found `{`",
+                self.current().span,
+            )
+            .with_note(format!(
+                "a let-else names its other variant like a `match` arm: \
+                 `else {complement} => fallback;`"
+            )));
+        }
+        let arm = self.nested(else_span, |parser| {
+            let arm_pattern = parser.variant_pattern()?;
+            parser.expect(TokenKind::FatArrow)?;
+            let value = parser.expression()?;
+            Ok(VariantArm {
+                variant: arm_pattern.variant,
+                binding: arm_pattern.binding,
+                span: arm_pattern.span.join(value.span),
+                value,
+            })
+        })?;
+        let end = self.expect(TokenKind::Semicolon)?.span;
+        Ok(Statement {
+            kind: StatementKind::LetElse {
+                pattern,
+                annotation,
+                value,
+                else_span,
+                arm: Box::new(arm),
             },
             span: start.join(end),
         })
@@ -1117,55 +1225,15 @@ impl<'source> Parser<'source> {
                 return Err(self.expected("variant match arm or `}`"));
             }
             let pattern_start = self.current().span;
-            let token = self.advance().clone();
-            let TokenKind::Identifier(name) = token.kind else {
-                return Err(Diagnostic::new(
-                    "K1003",
-                    "expected `Some(name)`, `None`, `Ok(name)`, or `Err(name)`",
-                    token.span,
-                ));
-            };
-            let variant = match name.as_str() {
-                "Some" => VariantName::Some,
-                "None" => VariantName::None,
-                "Ok" => VariantName::Ok,
-                "Err" => VariantName::Err,
-                _ => {
-                    return Err(Diagnostic::new(
-                        "K1003",
-                        format!("unknown match variant `{name}`"),
-                        token.span,
-                    ));
-                }
-            };
+            let (variant, name_span) = self.variant_name()?;
             if !seen.insert(variant) {
                 return Err(Diagnostic::new(
                     "K1003",
                     format!("duplicate `{}` match arm", variant.as_str()),
-                    token.span,
+                    name_span,
                 ));
             }
-            let binding = if variant == VariantName::None {
-                if self.check(&TokenKind::LeftParen) {
-                    return Err(Diagnostic::new(
-                        "K1003",
-                        "`None` does not bind a value",
-                        self.current().span,
-                    ));
-                }
-                None
-            } else {
-                if !self.consume(&TokenKind::LeftParen) {
-                    return Err(Diagnostic::new(
-                        "K1003",
-                        format!("`{}` must bind one value", variant.as_str()),
-                        token.span.join(self.current().span),
-                    ));
-                }
-                let (binding, _) = self.binding_name()?;
-                self.expect(TokenKind::RightParen)?;
-                Some(binding)
-            };
+            let binding = self.variant_binding(variant, name_span)?;
             self.expect(TokenKind::FatArrow)?;
             let value = self.expression()?;
             let arm_span = pattern_start.join(value.span);
@@ -1205,6 +1273,73 @@ impl<'source> Parser<'source> {
             },
             span: start.join(end),
         })
+    }
+
+    /// Parses a variant pattern: `Some(name)`, `Ok(name)`, `Err(name)`, or
+    /// `None`.
+    fn variant_pattern(&mut self) -> Result<VariantPattern, Diagnostic> {
+        let (variant, name_span) = self.variant_name()?;
+        let binding = self.variant_binding(variant, name_span)?;
+        Ok(VariantPattern {
+            variant,
+            binding,
+            span: name_span.join(self.previous().span),
+        })
+    }
+
+    /// Parses the variant name that starts a variant pattern.
+    fn variant_name(&mut self) -> Result<(VariantName, Span), Diagnostic> {
+        let token = self.advance().clone();
+        let TokenKind::Identifier(name) = token.kind else {
+            return Err(Diagnostic::new(
+                "K1003",
+                "expected `Some(name)`, `None`, `Ok(name)`, or `Err(name)`",
+                token.span,
+            ));
+        };
+        let variant = match name.as_str() {
+            "Some" => VariantName::Some,
+            "None" => VariantName::None,
+            "Ok" => VariantName::Ok,
+            "Err" => VariantName::Err,
+            _ => {
+                return Err(Diagnostic::new(
+                    "K1003",
+                    format!("unknown match variant `{name}`"),
+                    token.span,
+                ));
+            }
+        };
+        Ok((variant, token.span))
+    }
+
+    /// Parses the `(name)` binder that follows `variant`, written at
+    /// `name_span`; `None` binds nothing.
+    fn variant_binding(
+        &mut self,
+        variant: VariantName,
+        name_span: Span,
+    ) -> Result<Option<String>, Diagnostic> {
+        if variant == VariantName::None {
+            if self.check(&TokenKind::LeftParen) {
+                return Err(Diagnostic::new(
+                    "K1003",
+                    "`None` does not bind a value",
+                    self.current().span,
+                ));
+            }
+            return Ok(None);
+        }
+        if !self.consume(&TokenKind::LeftParen) {
+            return Err(Diagnostic::new(
+                "K1003",
+                format!("`{}` must bind one value", variant.as_str()),
+                name_span.join(self.current().span),
+            ));
+        }
+        let (binding, _) = self.binding_name()?;
+        self.expect(TokenKind::RightParen)?;
+        Ok(Some(binding))
     }
 
     fn type_annotation(&mut self) -> Result<TypeAnnotation, Diagnostic> {
@@ -2335,5 +2470,156 @@ mod tests {
         let mixed = parse_text("match Some(1) { Some(value) => value, Err(error) => error };")
             .expect_err("mixed variant families should fail");
         assert_eq!(mixed.code(), "K1003");
+    }
+
+    #[test]
+    fn parses_let_else_with_either_variant_first() {
+        let text = "fn f(r, o) {\n    let Ok(value): Result<Int, String> = r else Err(error) => 0;\n    \
+                    let None = o else Some(found) => found;\n    value\n}\n";
+        let program = parse_text(text).expect("let-else should parse");
+        let StatementKind::Function { body, .. } = &program.statements[0].kind else {
+            panic!("the function should parse");
+        };
+        let StatementKind::LetElse {
+            pattern,
+            annotation: Some(annotation),
+            value,
+            else_span,
+            arm,
+        } = &body.statements[0].kind
+        else {
+            panic!("the first statement should be a let-else");
+        };
+        assert_eq!(pattern.variant, VariantName::Ok);
+        assert_eq!(pattern.binding.as_deref(), Some("value"));
+        assert_eq!(&text[pattern.span.start..pattern.span.end], "Ok(value)");
+        assert_eq!(annotation.to_string(), "Result<Int, String>");
+        assert_eq!(&text[value.span.start..value.span.end], "r");
+        assert_eq!(&text[else_span.start..else_span.end], "else");
+        assert_eq!(arm.variant, VariantName::Err);
+        assert_eq!(arm.binding.as_deref(), Some("error"));
+        assert_eq!(&text[arm.span.start..arm.span.end], "Err(error) => 0");
+        assert_eq!(
+            &text[body.statements[0].span.start..body.statements[0].span.end],
+            "let Ok(value): Result<Int, String> = r else Err(error) => 0;"
+        );
+        let StatementKind::LetElse { pattern, arm, .. } = &body.statements[1].kind else {
+            panic!("the second statement should be a let-else");
+        };
+        assert_eq!(
+            (pattern.variant, pattern.binding.as_deref()),
+            (VariantName::None, None)
+        );
+        assert_eq!(arm.variant, VariantName::Some);
+
+        // Mismatched patterns parse; analysis reports them (`K3014`).
+        parse_text("fn f(r) { let Ok(v) = r else None => 0; v }")
+            .expect("non-complementary patterns should parse");
+        // `Ok` without a binder is still a reserved name, not a pattern.
+        let error = parse_text("let Ok = 1;").expect_err("a reserved name");
+        assert_eq!(error.code(), "K2002");
+    }
+
+    #[test]
+    fn reports_malformed_let_else_statements() {
+        for (text, code, at, notes) in [
+            // A variant pattern needs a failure arm.
+            ("fn f(o) { let Some(x) = o; x }", "K1002", ";", 1),
+            // The value may not end in `}`.
+            (
+                "fn f(c) { let Ok(x) = if c { Ok(1) } else { Err(2) } else Err(e) => e; x }",
+                "K3014",
+                "if c { Ok(1) } else { Err(2) }",
+                1,
+            ),
+            (
+                "fn f(o) { let Some(x) = { o } else None => 0; x }",
+                "K3014",
+                "{ o }",
+                1,
+            ),
+            // Another language's guard clause.
+            (
+                "fn f(o) { let Some(x) = o else { return 0; }; x }",
+                "K1112",
+                "else { return",
+                1,
+            ),
+            (
+                "fn f(o) { let Some(x) = o else { 0 }; x }",
+                "K1003",
+                "{ 0 }",
+                1,
+            ),
+            (
+                "fn f(o) { let Some(x) = o else _ => 0; x }",
+                "K1003",
+                "_",
+                0,
+            ),
+            (
+                "fn f(o) { let Some(x) = o else None(y) => 0; x }",
+                "K1003",
+                "(y)",
+                0,
+            ),
+            (
+                "fn f(o) { let Some(x) = o else Some => 0; x }",
+                "K1003",
+                "Some =>",
+                0,
+            ),
+            (
+                "fn f(o) { let None(x) = o else Some(y) => y; 0 }",
+                "K1003",
+                "(x)",
+                0,
+            ),
+            (
+                "fn f(o) { let Some(mut x) = o else None => 0; x }",
+                "K1103",
+                "mut",
+                1,
+            ),
+            (
+                "fn f(o) { let Some(x) = o else None => 0 }",
+                "K1002",
+                "}",
+                0,
+            ),
+        ] {
+            let error = parse_text(text).expect_err("malformed let-else should not parse");
+            assert_eq!(error.code(), code, "{text}");
+            let start = text.find(at).expect("the span text should occur");
+            assert_eq!(error.span().start, start, "{text}");
+            assert_eq!(error.notes().len(), notes, "{text}");
+        }
+        // Parentheses keep a value ending in `}` apart from the `else`.
+        parse_text("fn f(c) { let Ok(x) = (if c { Ok(1) } else { Err(2) }) else Err(e) => e; x }")
+            .expect("a parenthesized value should parse");
+    }
+
+    #[test]
+    fn let_else_arms_open_one_nesting_level() {
+        let at_limit = format!(
+            "fn f(o) {{ let Some(x) = o else None => {}0{}; x }}\n",
+            "(".repeat(MAX_NESTING_DEPTH - 2),
+            ")".repeat(MAX_NESTING_DEPTH - 2)
+        );
+        parse_on_compiler_stack(at_limit).expect("the arm at the limit should parse");
+        let past = format!(
+            "fn f(o) {{ let Some(x) = o else None => {}0{}; x }}\n",
+            "(".repeat(MAX_NESTING_DEPTH - 1),
+            ")".repeat(MAX_NESTING_DEPTH - 1)
+        );
+        let error = parse_on_compiler_stack(past).expect_err("one level too deep");
+        assert_eq!(error.code(), "K1005");
+        // The value does not open a level.
+        let value = format!(
+            "fn f(o) {{ let Some(x) = {}o{} else None => 0; x }}\n",
+            "(".repeat(MAX_NESTING_DEPTH - 1),
+            ")".repeat(MAX_NESTING_DEPTH - 1)
+        );
+        parse_on_compiler_stack(value).expect("the value at the limit should parse");
     }
 }
