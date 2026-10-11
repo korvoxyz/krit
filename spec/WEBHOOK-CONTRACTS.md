@@ -54,40 +54,58 @@ absolute path. It starts with `/` but not `//`, and it contains no `://`, no
 space, no backslash, no `?` or `#`, and no ASCII control byte.
 
 Before routing, servers and proxies commonly resolve dot segments, strip `;`
-path parameters, and percent-decode the path, sometimes twice when a proxy
-decodes in front of a backend that decodes again. The rule refuses every path
-whose segment structure one of those transforms could change. Each
-`/`-separated segment is percent-decoded once, and the path is refused when:
+path parameters, trim whitespace, and percent-decode the path, sometimes twice
+when a proxy decodes in front of a backend that decodes again, or once before
+parsing the decoded target again. The rule refuses every path whose segment
+structure one of those transforms could change. Each `/`-separated segment is
+percent-decoded once, and the path is refused when:
 
-- a segment is a dot segment: once decoded, its part before the first `;` is
-  exactly `.` or `..`. This covers `/a/./b`, `/a/../b`, `/..`, `/a/..;/b`,
-  `/a/.;x=1/b`, and `/a/..%3B/b`;
-- an escape decodes to `.`, `/`, `\`, or NUL, in either case (`%2E`, `%2F`,
-  `%5C`, `%00`, `%2e`, `%2f`, `%5c`), so `%2e%2e` and `.%2e` cannot spell a dot
-  segment, `%2f` cannot split one segment into two, and `%00` cannot truncate
-  `..%00` to `..`;
-- a decoded segment still contains a `%` followed by a hex digit or `u`
+- a segment is a dot segment: once decoded, its part before the first `;`, `?`,
+  or `#`, with spaces trimmed from both ends, is exactly `.` or `..`. This
+  covers `/a/./b`, `/a/../b`, `/..`, `/a/..;/b`, `/a/.;x=1/b`, `/a/..%3B/b`,
+  `/a/..%3F/b` and `/a/..%23/b` (a server that parses the decoded target again
+  reads the rest as a query or fragment), and `/a/..%20/b` and `/a/%20../b` (a
+  server that trims the segment reads `..`);
+- an escape decodes to `.`, `/`, `\`, or an ASCII control byte, in either case
+  (`%2E`, `%2F`, `%5C`, `%00`-`%1F`, `%7F`), so `%2e%2e` and `.%2e` cannot spell
+  a dot segment, `%2f` cannot split one segment into two, `%00` cannot truncate
+  `..%00` to `..`, a trimming server cannot strip `..%09` or `..%0A` to `..`,
+  and a decoded CR or LF cannot split a request line or header that a proxy
+  rebuilds from the path. A raw control byte already breaks the shape rule;
+- a decoded segment still contains a `%` followed by a hex digit, `u`, or `U`
   (`%252e`, `%2541`, `%25%32%65`, `%25u002e`), so a second decoding pass cannot
   produce another escaped byte at any depth;
-- escapes begin an overlong UTF-8 sequence: `%C0` or `%C1` before a
-  continuation byte, `%E0` before `%80`-`%9F`, `%F0` before `%80`-`%8F`, or the
-  five- and six-byte forms `%F8` before `%80`-`%87` and `%FC` before
-  `%80`-`%83`. A lenient decoder reads `%C0%AE` as `.` and `%C0%AF` as `/`;
+- escapes spell an overlong UTF-8 sequence, which a lenient decoder reads as a
+  shorter character: `%C0%AE` as `.` and `%C0%AF` as `/`. Lenient decoders
+  often take the low six bits of each byte after a lead byte without checking
+  that it is a continuation byte (the IIS 4 and 5 class), so `%C1%DC` reads as
+  `\` and `%E0@n` as `.`. The rule therefore reads the byte after a lead the
+  same way. It refuses `%C0` and `%C1` wherever they appear, because they begin
+  only overlong forms and never occur in UTF-8. It also refuses `%E0`, `%F0`,
+  and the five- and six-byte leads `%F8` and `%FC` when the low six bits of the
+  next byte, raw or escaped, are below `20`, `10`, `08`, and `04` hex
+  respectively, which makes the sequence overlong. A well-formed sequence such
+  as `%E0%A4%85` or `%F0%9F%98%80` never trips the check;
 - a `%` does not begin a well-formed `%HH` escape (`%`, `%2`, `%zz`,
   `%u002e`), because servers decode it in different ways.
 
 Dots inside a segment (`/.well-known`, `/v1.2`, `/a..b`), `;` parameters on any
-other segment (`/files;v=2`), and every other well-formed escape remain valid:
-`%20`, `%7E`, escaped UTF-8 such as `%C3%A9`, a lone escaped byte that is not
-UTF-8 such as `%E9`, and a `%25` that no hex digit or `u` follows (`/100%25`,
-`/50%25off`). Raw non-ASCII text such as `/café` is valid as well.
+other segment (`/files;v=2`), a `%3F` or `%23` that does not end a dot segment
+(`/C%23`, `/a%3Fb`), and every other well-formed escape remain valid: `%20`
+beside other text, `%7E`, escaped UTF-8 such as `%C3%A9`, a lone escaped byte
+that is not UTF-8 such as `%E9` (any byte but `%C0` and `%C1`, when the byte
+after it does not make it overlong as described above), and a `%25` that no hex
+digit, `u`, or `U` follows (`/100%25`, `/50%25off`). Raw non-ASCII text such as
+`/café` is valid as well.
 
 The rule does not model transforms that belong to one server, framework, or
 platform: Unicode compatibility normalization (NFKC turns a fullwidth `．．`,
-raw or escaped as `%EF%BC%8E%EF%BC%8E`, into `..`), case folding, or the Windows
-trimming of trailing dots and spaces from a segment. A path that relies on
-such a transform is accepted. An origin that applies one must enforce its own
-confinement, because the host cannot.
+raw or escaped as `%EF%BC%8E%EF%BC%8E`, into `..`), case folding, trimming of
+non-ASCII whitespace such as an escaped no-break space (`%C2%A0`), the Windows
+trimming of trailing dots from a segment, and lenient UTF-8 decoders that
+misread bytes in ways other than the six-bit reading above. A path that relies
+on such a transform is accepted. An origin that applies one must enforce its
+own confinement, because the host cannot.
 
 The query may not start with `?` and may not contain a fragment, a space, a
 control byte, or a backslash. Encoded separators in a query are ordinary data.

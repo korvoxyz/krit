@@ -730,6 +730,8 @@ mod tests {
             "/v1/..;/admin",              // dot segment behind a path parameter
             "/v1/%252e%252e/admin",       // double-encoded dot segment
             "/v1/%c0%ae%c0%ae/admin",     // overlong UTF-8 dot segment
+            "/v1/..%3F/admin",            // dot segment behind a decoded `?`
+            "/v1/..%0a/admin",            // escaped control byte
             "/v1/search all",             // raw space
         ] {
             assert!(

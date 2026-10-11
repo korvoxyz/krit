@@ -956,16 +956,21 @@ fn bound_secrets_reach_their_origin_and_legacy_secrets_stay_unbound() {
 }
 
 /// One spelling of every traversal form the host refuses in a request path:
-/// dot segments (bare and behind `;` path parameters), percent-encoded `.`,
-/// `/`, `\`, and NUL in either case, double-encoded and overlong UTF-8 escapes,
-/// and a malformed escape.
-const TRAVERSAL_PATHS: [&str; 18] = [
+/// dot segments (bare, behind `;` path parameters or a decoded `?` or `#`, and
+/// padded with escaped spaces), percent-encoded `.`, `/`, `\`, and control
+/// bytes in either case, double-encoded and overlong UTF-8 escapes (including
+/// those only a lenient decoder reads), and a malformed escape.
+const TRAVERSAL_PATHS: [&str; 26] = [
     "/api/../admin",
     "/api/./admin",
     "/api/..;/admin",
     "/api/.;/admin",
     "/api/..;x=1/admin",
     "/api/..%3B/admin",
+    "/api/..%3F/admin",
+    "/api/.%3f/admin",
+    "/api/..%23/admin",
+    "/api/..%20/admin",
     "/api/%2e%2e/admin",
     "/api/.%2E/admin",
     "/api%2fadmin",
@@ -973,14 +978,18 @@ const TRAVERSAL_PATHS: [&str; 18] = [
     "/api%5c..%5cadmin",
     "/api%5C..%5Cadmin",
     "/api/..%00/admin",
+    "/api/..%0a/admin",
+    "/api/..%09/admin",
     "/api/%252e%252e/admin",
     "/api%252fadmin",
     "/api/%c0%ae%c0%ae/admin",
     "/api/%e0%80%ae",
+    "/api/..%c1%dc..%c1%dcadmin",
+    "/api/%c0n%c0n/admin",
     "/api/50%",
 ];
 
-const TRAVERSAL_MESSAGE: &str = "HTTP request path must not contain a dot segment, a percent-encoded `.`, `/`, `\\`, or NUL, a double-encoded or overlong UTF-8 escape, or a malformed percent escape";
+const TRAVERSAL_MESSAGE: &str = "HTTP request path must not contain a dot segment, a percent-encoded `.`, `/`, `\\`, or control byte, a double-encoded or overlong UTF-8 escape, or a malformed percent escape";
 
 #[test]
 fn inbound_paths_refuse_traversal_forms_before_guest_execution() {
@@ -1020,6 +1029,8 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
         "/hooks/v1.2/a%20b",
         "/hooks/100%25",
         "/hooks/files;v=2",
+        "/hooks/C%23",
+        "/hooks/caf%E9",
     ] {
         let result = Runtime::default()
             .invoke_webhook(

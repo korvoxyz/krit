@@ -1318,6 +1318,8 @@ fn ai_adapter_paths_refuse_traversal_forms_at_setup() {
         "/v1%5cinvoke",
         "/v1/%252e%252e/admin",
         "/v1/%c0%ae%c0%ae/admin",
+        "/v1/..%3F/admin",
+        "/v1/..%0a/admin",
         "/v1/invoke%",
         "/v1/chat completions",
     ] {

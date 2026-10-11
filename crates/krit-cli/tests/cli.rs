@@ -2320,6 +2320,10 @@ license = "Apache-2.0"
         ("double-encoded.json", "/hooks/hidden-seg/%252e%252e/admin"),
         ("overlong.json", "/hooks/hidden-seg/%c0%ae%c0%ae/admin"),
         ("encoded-nul.json", "/hooks/hidden-seg/..%00/admin"),
+        ("encoded-query.json", "/hooks/hidden-seg/..%3F/admin"),
+        ("encoded-newline.json", "/hooks/hidden-seg/..%0a/admin"),
+        ("padded.json", "/hooks/hidden-seg/..%20/admin"),
+        ("lenient-overlong.json", "/hooks/hidden-seg/%c0n%c0n/admin"),
     ] {
         let request = directory.file(
             name,

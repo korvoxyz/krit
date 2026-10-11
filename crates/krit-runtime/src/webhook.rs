@@ -137,22 +137,26 @@ fn has_origin_form_shape(path: &str) -> bool {
 /// untrusted text could otherwise climb out of the prefix the program meant to
 /// address. Each segment is decoded once, and the path is refused when:
 ///
-/// - a segment is a dot segment: once decoded, the part before its first `;`
-///   is exactly `.` or `..` (`..`, `..;`, `.;x=1`, `..%3B`);
-/// - an escape decodes to `.`, `/`, `\`, or NUL (`%2E`, `%2F`, `%5C`, `%00`,
-///   either case), so `%2e%2e` or `.%2e` cannot spell a dot segment, `%2f`
-///   cannot split one segment into two, and `%00` cannot truncate one;
-/// - a decoded segment still holds a `%` followed by a hex digit or `u`
+/// - a segment is a dot segment: once decoded, the part before its first `;`,
+///   `?`, or `#`, with ASCII spaces trimmed from both ends, is exactly `.` or
+///   `..` (`..`, `..;`, `.;x=1`, `..%3B`, `..%3F`, `..%23`, `..%20`);
+/// - an escape decodes to `.`, `/`, `\`, or an ASCII control byte (`%2E`,
+///   `%2F`, `%5C`, `%00`-`%1F`, `%7F`, either case), so `%2e%2e` or `.%2e`
+///   cannot spell a dot segment, `%2f` cannot split one segment into two, and
+///   `%00` or `%0A` cannot truncate a segment or be trimmed from one;
+/// - a decoded segment still holds a `%` followed by a hex digit, `u`, or `U`
 ///   (`%252e`, `%2541`, `%25%32%65`), so a second decoding pass cannot produce
 ///   another escaped byte;
-/// - escapes begin an overlong UTF-8 sequence (`%C0%AE`), which a lenient
-///   decoder reads as `.`, `/`, or another ASCII byte;
+/// - escapes spell overlong UTF-8 (`%C0%AE`, `%C1%DC`, `%E0%80%AE`), which a
+///   lenient decoder reads as `.`, `/`, `\`, or another shorter character (see
+///   [`holds_overlong_utf8`]);
 /// - a `%` does not begin a well-formed `%HH` escape, because how a server
 ///   decodes it is implementation-defined and so unknown.
 ///
-/// Every other form stays allowed, such as dots inside a segment, `%20`, or a
-/// `%25` that no hex digit or `u` follows. Transforms specific to one server,
-/// such as Unicode compatibility normalization, are not modelled
+/// Every other form stays allowed, such as dots inside a segment, `%20` beside
+/// other text, `%3F` or `%23` after a segment's name, or a `%25` that no hex
+/// digit, `u`, or `U` follows. Transforms specific to one server, such as
+/// Unicode compatibility normalization, are not modelled
 /// (WEBHOOK-CONTRACTS.md, "Request paths and queries"). The outbound transfer
 /// never resolves or decodes the path: libcurl's own dot-segment normalization
 /// is disabled.
@@ -171,7 +175,7 @@ fn has_traversal_form(path: &str) -> bool {
 
 /// Percent-decodes `segment` once into `decoded`, or returns `false` for a `%`
 /// that does not begin a well-formed `%HH` escape or for an escape of `.`, `/`,
-/// `\`, or NUL.
+/// `\`, or an ASCII control byte.
 fn decode_segment(segment: &str, decoded: &mut Vec<u8>) -> bool {
     let mut bytes = segment.bytes();
     while let Some(byte) = bytes.next() {
@@ -185,7 +189,11 @@ fn decode_segment(segment: &str, decoded: &mut Vec<u8>) -> bool {
             return false;
         };
         let byte = (high << 4) | low;
-        if matches!(byte, b'.' | b'/' | b'\\' | 0) {
+        // A raw control byte breaks the shape rule. Its escape is refused as
+        // well: servers truncate a decoded segment at NUL, trim whitespace such
+        // as `%09` or `%0A` from it, and can split a request line or header
+        // they rebuild from a decoded CR or LF.
+        if matches!(byte, b'.' | b'/' | b'\\') || byte.is_ascii_control() {
             return false;
         }
         decoded.push(byte);
@@ -193,13 +201,21 @@ fn decode_segment(segment: &str, decoded: &mut Vec<u8>) -> bool {
     true
 }
 
-/// Whether a decoded segment names `.` or `..` once a server strips its `;`
-/// path parameters, as Tomcat, Jetty, and Spring do before resolving it.
+/// Whether a decoded segment names `.` or `..` once a server cuts it short
+/// and trims it.
+///
+/// Tomcat, Jetty, and Spring strip `;` path parameters before resolving a
+/// segment. A decoded `?` or `#` ends the segment in the same way for a server
+/// or proxy that decodes the target once and then parses it again, so
+/// `..%3F` reads as `..` followed by a query. Servers and frameworks that trim
+/// a segment (Java `String.trim`, for one) read `..%20` as `..`. Control bytes
+/// never reach this check: [`decode_segment`] refuses their escapes.
 fn is_dot_segment(decoded: &[u8]) -> bool {
-    matches!(
-        decoded.split(|byte| *byte == b';').next(),
-        Some(b"." | b"..")
-    )
+    let name = decoded
+        .split(|byte| matches!(byte, b';' | b'?' | b'#'))
+        .next()
+        .unwrap_or_default();
+    matches!(name.trim_ascii(), b"." | b"..")
 }
 
 /// Whether a decoded segment would hold another escape (`%HH`, or IIS-style
@@ -210,21 +226,33 @@ fn holds_escape(decoded: &[u8]) -> bool {
     })
 }
 
-/// Whether decoded bytes begin an overlong UTF-8 sequence, which a lenient
+/// Whether decoded bytes spell an overlong UTF-8 sequence, which a lenient
 /// decoder reads as a shorter character such as `.` (`C0 AE`) or `/` (`C0 AF`).
 ///
-/// Only escapes can produce one: the raw path is a Rust string and so valid
-/// UTF-8, and a raw character's bytes always sit together.
+/// A lenient decoder often takes the low six bits of each byte after a lead
+/// byte without checking that it is a continuation byte (the IIS 4/5 class),
+/// so `C1 DC` reads as `\` and `E0 40 6E` as `.`. Each check therefore reads
+/// the byte after a lead the same way. `C0` and `C1` begin only overlong forms
+/// and never occur in UTF-8, so either is refused whatever follows, including
+/// the `/` after a segment's last byte. After any other lead, that `/` (`2F`)
+/// makes no sequence overlong, so each segment can be checked on its own.
+///
+/// Valid UTF-8 never trips a check, so raw text (the path is a Rust string)
+/// can only trip one beside an escaped byte.
 fn holds_overlong_utf8(decoded: &[u8]) -> bool {
-    decoded.windows(2).any(|pair| match pair[0] {
-        0xC0 | 0xC1 => (0x80..=0xBF).contains(&pair[1]),
-        0xE0 => (0x80..=0x9F).contains(&pair[1]),
-        0xF0 => (0x80..=0x8F).contains(&pair[1]),
-        // Five- and six-byte forms, which only pre-RFC 3629 decoders accept.
-        0xF8 => (0x80..=0x87).contains(&pair[1]),
-        0xFC => (0x80..=0x83).contains(&pair[1]),
-        _ => false,
-    })
+    decoded.iter().any(|byte| matches!(byte, 0xC0 | 0xC1))
+        || decoded.windows(2).any(|pair| {
+            let bits = pair[1] & 0x3F;
+            match pair[0] {
+                0xE0 => bits < 0x20,
+                0xF0 => bits < 0x10,
+                // Five- and six-byte forms, which only pre-RFC 3629 decoders
+                // accept.
+                0xF8 => bits < 0x08,
+                0xFC => bits < 0x04,
+                _ => false,
+            }
+        })
 }
 
 fn hex_digit(byte: u8) -> Option<u8> {
@@ -236,7 +264,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-const TRAVERSAL_MESSAGE: &str = "HTTP request path must not contain a dot segment, a percent-encoded `.`, `/`, `\\`, or NUL, a double-encoded or overlong UTF-8 escape, or a malformed percent escape";
+const TRAVERSAL_MESSAGE: &str = "HTTP request path must not contain a dot segment, a percent-encoded `.`, `/`, `\\`, or control byte, a double-encoded or overlong UTF-8 escape, or a malformed percent escape";
 
 fn validate_path_query(path: &str, query: &str) -> Result<(), RuntimeError> {
     if !has_origin_form_shape(path) {
@@ -319,6 +347,21 @@ mod tests {
         "/..;",
         "/a/..%3b/b",
         "/a/.%3B/b",
+        // Dot segments behind a decoded `?` or `#`, which a server that decodes
+        // and then parses the target again reads as the end of the path.
+        "/a/..%3F/b",
+        "/a/..%3f",
+        "/a/..%3F",
+        "/a/..%3Fx=1/b",
+        "/a/.%3f/b",
+        "/a/..%23/b",
+        "/a/.%23frag",
+        // Dot segments padded with escaped spaces, which a trimming server
+        // strips.
+        "/a/..%20/b",
+        "/a/%20../b",
+        "/a/%20.%20",
+        "/a/..%20%20;x/b",
         // Percent-encoded `.` in either case, alone or completing a dot segment.
         "/%2e",
         "/%2E",
@@ -333,9 +376,17 @@ mod tests {
         // Percent-encoded `\` in either case.
         "/a%5cb",
         "/a%5C..%5Cb",
-        // Percent-encoded NUL, which can truncate `..%00` to `..`.
+        // Percent-encoded control bytes: NUL can truncate `..%00` to `..`, and
+        // a trimming server strips `..%09` or `..%0a` to `..`.
         "/a%00",
         "/a/..%00/b",
+        "/a/..%09/b",
+        "/a/..%0a/b",
+        "/a/..%0D%0AX-Injected:1/b",
+        "/a%01",
+        "/a%1F",
+        "/a%7f",
+        "/a%7F",
         // Escapes that survive one decoding pass, at any depth.
         "/a/%252e%252e/b",
         "/a/%252E",
@@ -358,6 +409,24 @@ mod tests {
         "/a/%f0%80%80%ae",
         "/a/%f8%80%80%80%ae",
         "/a/%fc%80%80%80%80%ae",
+        // The same forms for a decoder that reads the low six bits of each
+        // byte after a lead without checking it, as IIS 4 and 5 did. `C0` and
+        // `C1` never occur in UTF-8, so either is refused whatever follows.
+        "/a/..%c1%1c..",
+        "/a/..%c1%dc..",
+        "/a/%c1%1c",
+        "/a/%c0%6e%c0%6e/b",
+        "/a/%c0n%c0n/b",
+        "/a/%c0%ee",
+        "/a/..%C0/b",
+        "/%C0",
+        "/%c1",
+        "/a/%e0%40%6e",
+        "/a/%e0@n%e0@n/b",
+        "/a/%E0A%9C",
+        "/a/%f0%40%80%ae",
+        "/a/%f8%40",
+        "/a/%fc%40",
         // Malformed escapes, whose decoding is implementation-defined.
         "/%",
         "/a%2",
@@ -380,7 +449,7 @@ mod tests {
         }
         assert_eq!(
             TRAVERSAL_MESSAGE,
-            "HTTP request path must not contain a dot segment, a percent-encoded `.`, `/`, `\\`, or NUL, a double-encoded or overlong UTF-8 escape, or a malformed percent escape"
+            "HTTP request path must not contain a dot segment, a percent-encoded `.`, `/`, `\\`, or control byte, a double-encoded or overlong UTF-8 escape, or a malformed percent escape"
         );
     }
 
@@ -416,8 +485,18 @@ mod tests {
             "/a/..b;c",
             "/a/...;x",
             "/a/;../b",
-            // Well-formed escapes of anything but `.`, `/`, `\`, or NUL, and a
-            // `%25` that no hex digit or `u` follows.
+            // An escaped `?` or `#` that does not end a dot segment.
+            "/C%23",
+            "/a%3Fb",
+            "/a/x%3F../b",
+            "/a/%3F..",
+            "/a/%23",
+            // Escaped spaces that do not pad a dot segment.
+            "/a/%20",
+            "/a/.%20./b",
+            "/a/...%20",
+            // Well-formed escapes of anything but `.`, `/`, `\`, or a control
+            // byte, and a `%25` that no hex digit, `u`, or `U` follows.
             "/a%20b",
             "/search/caf%C3%A9",
             "/search/caf%c3%a9",
@@ -428,10 +507,16 @@ mod tests {
             "/a%3a%3Ab",
             "/%7Euser",
             "/a%3Bb",
-            // A lone Latin-1 byte is invalid UTF-8 but not overlong.
+            // A lone Latin-1 byte other than `C0` or `C1` is invalid UTF-8 but
+            // not overlong, even read leniently.
             "/caf%E9",
-            "/%C0",
+            "/d%E9j%E0-vu",
+            "/voil%E0",
+            "/%E0la",
+            "/%F0x",
+            "/%C2",
             "/%E0%A4%85",
+            "/%F0%9F%98%80",
             // Raw non-ASCII text.
             "/caf\u{e9}",
             // Unicode compatibility forms are server-specific and out of scope
@@ -504,6 +589,19 @@ mod tests {
                 "HTTP request path must be a safe origin-form absolute path",
                 "`{path}`"
             );
+        }
+    }
+
+    #[test]
+    fn escaped_and_raw_control_bytes_are_both_refused() {
+        // A raw control byte breaks the shape rule; its escape breaks the
+        // traversal rule. Neither form of any control byte is accepted.
+        for byte in (0u8..0x20).chain([0x7F]) {
+            let raw = format!("/a{}b", char::from(byte));
+            assert!(!is_origin_form_path(&raw), "raw {byte:#04x}");
+            for escaped in [format!("/a%{byte:02x}b"), format!("/a%{byte:02X}b")] {
+                assert!(!is_origin_form_path(&escaped), "`{escaped}`");
+            }
         }
     }
 

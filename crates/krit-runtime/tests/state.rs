@@ -751,6 +751,7 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
         "/work/..;/admin",
         "/work/%2e%2e/admin",
         "/work/%252e%252e/admin",
+        "/work/..%3F/admin",
     ];
     let refuse_all = || {
         for path in traversal_paths {
@@ -770,7 +771,9 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
         }
     };
 
-    // With no journal entry, a refused path reserves nothing.
+    // With no journal entry, a refused path records no completion. It leaves no
+    // pending reservation either: one under this operation key with another
+    // request digest would make the ordinary call below conflict (`K5203`).
     refuse_all();
     assert_never_contacted(&listener);
     let store = DurableStore::open(&database, Durability::Full, store_limits()).unwrap();

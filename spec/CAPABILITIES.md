@@ -185,8 +185,10 @@ No host value is read during checking or explanation.
 An HTTP grant names an origin, never a path. The host holds every request path
 to the rule in [WEBHOOK-CONTRACTS.md](WEBHOOK-CONTRACTS.md) ("Request paths and
 queries"). That rule refuses dot segments, including those behind `;` path
-parameters, and escapes that decode, once or repeatedly, into `.`, `/`, `\`, or
-NUL. It also refuses overlong UTF-8 escapes and malformed escapes. A guest
+parameters or a decoded `?` or `#` and those padded with escaped spaces, and
+escapes that decode, once or repeatedly, into `.`, `/`, `\`, or an ASCII control
+byte. It also refuses overlong UTF-8 escapes, including those only a lenient
+decoder reads as overlong, and malformed escapes. A guest
 `http_request` or `replay_http` that breaks the rule traps with `K4001` before
 any connection. The host never resolves or decodes an accepted path, and
 libcurl only respells it (uppercase escape hex, non-ASCII bytes
