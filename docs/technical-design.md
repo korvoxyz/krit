@@ -89,9 +89,10 @@ but does not own language semantics.
 - Release binaries use link-time optimization and stripped symbols
 - Reproducible source archives include `Cargo.lock`
 
-The initial minimum supported version is Rust 1.94 because that toolchain is
-available in the development baseline. CI should also test current stable
-Rust. Raising the minimum requires a changelog entry.
+The minimum supported version started at Rust 1.94 and is now Rust 1.95, the
+version Wasmtime 48 LTS requires; `Cargo.toml` records it as the workspace
+`rust-version`. CI should also test current stable Rust. Raising the minimum
+requires a changelog entry.
 
 ## Source and syntax
 
@@ -257,10 +258,12 @@ bounded standard/custom metadata without source text or machine paths.
 The reference host uses Wasmtime with only the component-model, Cranelift,
 runtime, and std features. One Engine is reusable, while every invocation gets
 a fresh Store, StoreLimits, host state, component instance, fuel budget, epoch
-deadline, and output buffer. Validation derives the exact scalar or webhook
-surface from component shape before linking. A runtime binding can register
-extra typed definitions, but an artifact cannot name or call an interface it
-did not import. The linker never adds WASI.
+deadline, and output buffer. Instantiation draws on the invocation's fuel
+budget; `spec/WASM-SANDBOX.md` defines the cost model, including the
+host-dependent charge for copying literal data images. Validation derives the
+exact scalar or webhook surface from component shape before linking. A runtime
+binding can register extra typed definitions, but an artifact cannot name or
+call an interface it did not import. The linker never adds WASI.
 
 Validation, digest checking, authorization, input-size checks, and static
 component resource inspection precede Wasmtime compilation. Component

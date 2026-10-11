@@ -374,8 +374,10 @@ fn restrictive_validation_rejects_forbidden_core_features() {
 fn restrictive_validation_rejects_operand_sized_bulk_operators() {
     // Wasmtime charges these operators fuel per byte or element on top of
     // their flat cost and checks the epoch deadline only once per operation.
-    // The feature policy admits none of them, so every accepted artifact keeps
-    // the flat per-operator fuel model and loop-header epoch checks.
+    // The feature policy admits none of them, so the guest code of every
+    // accepted artifact keeps the flat per-operator fuel model and loop-header
+    // epoch checks. (Instantiation charges are separate; krit-runtime's
+    // engine_contract_tests pin them.)
     // The memory, table, and function scaffolding alone is policy-valid, so a
     // rejection below is caused by the operator or the passive segment it
     // needs.

@@ -3209,17 +3209,22 @@ mod phase4_policy_tests {
 #[cfg(test)]
 mod engine_contract_tests {
     //! Pins the reference engine's fuel model for the operators policy
-    //! validation admits, independent of the Krit compiler. A Wasmtime upgrade
-    //! that changes per-operator costs, adds a size-dependent charge to an
-    //! admitted operator, or remaps fuel exhaustion fails here instead of
-    //! silently shifting every artifact's budget.
+    //! validation admits and for the instantiation work Krit artifacts
+    //! trigger, independent of the Krit compiler. A Wasmtime upgrade that
+    //! changes per-operator costs, adds a size-dependent charge to an admitted
+    //! operator, changes what instantiation charges on a platform, or remaps
+    //! fuel exhaustion fails here instead of silently shifting every
+    //! artifact's budget.
 
     use super::*;
+    use std::borrow::Cow;
     use wasm_encoder::{
-        BlockType, CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
-        MemorySection, MemoryType, Module as ModuleEncoder, TypeSection, ValType,
+        BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, ExportKind,
+        ExportSection, Function, FunctionSection, ImportSection, Instruction, MemorySection,
+        MemoryType, Module as ModuleEncoder, RefType, TableSection, TableType, TypeSection,
+        ValType,
     };
-    use wasmtime::{Instance, Module};
+    use wasmtime::{Instance, Module, Ref, Table};
 
     /// Exports `sum(n) -> n + (n - 1) + ... + 1` as a counted loop and
     /// `grow(pages) -> previous_pages` over a 0..4 page memory, using only
@@ -3341,5 +3346,169 @@ mod engine_contract_tests {
         );
         assert_eq!(error.kind(), RuntimeErrorKind::FuelExhausted);
         assert_eq!(error.code(), "K5101");
+    }
+
+    /// Linear-memory offset of the test data segment, matching the static
+    /// base above which krit-wasm places literals, so the image starts inside
+    /// the first page.
+    const DATA_OFFSET: u64 = 1_024;
+
+    /// Wasmtime merges a module's active data segments into one image padded
+    /// to the compilation target's page alignment (Cranelift's
+    /// `page_size_align_log2`), whatever page size the host later uses.
+    const DATA_IMAGE_ALIGN: u64 = if cfg!(all(target_arch = "aarch64", target_vendor = "apple")) {
+        16 << 10
+    } else if cfg!(target_arch = "aarch64") {
+        64 << 10
+    } else {
+        4 << 10
+    };
+
+    /// Whether Wasmtime can map a data image copy-on-write for an in-memory
+    /// compiled module. Only Linux can, through `memfd`; every other host
+    /// copies the image during instantiation.
+    const MAPS_DATA_IMAGES: bool = cfg!(target_os = "linux");
+
+    /// A fixed four-page memory with one active segment of `bytes` nonzero
+    /// bytes at `DATA_OFFSET`. A zero-byte segment is still emitted.
+    fn data_segment_module(bytes: u64) -> Vec<u8> {
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 4,
+            maximum: Some(4),
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut data = DataSection::new();
+        data.active(
+            0,
+            &ConstExpr::i32_const(i32::try_from(DATA_OFFSET).expect("offset fits in i32")),
+            std::iter::repeat_n(0x2a, usize::try_from(bytes).expect("segment fits in usize")),
+        );
+
+        let mut module = ModuleEncoder::new();
+        module.section(&memories).section(&data);
+        module.finish()
+    }
+
+    /// One no-op function written into elements 1..=3 of a four-element
+    /// funcref table by an active segment. With `imported_table` the table is
+    /// the module's only import, the shape of a wit-component fixup module;
+    /// otherwise the module defines it, like Krit's core module.
+    fn element_segment_module(imported_table: bool) -> Vec<u8> {
+        let table = TableType {
+            element_type: RefType::FUNCREF,
+            table64: false,
+            minimum: 4,
+            maximum: Some(4),
+            shared: false,
+        };
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        let mut imports = ImportSection::new();
+        let mut tables = TableSection::new();
+        if imported_table {
+            imports.import("host", "table", table);
+        } else {
+            tables.table(table);
+        }
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        let mut elements = ElementSection::new();
+        elements.active(
+            None,
+            &ConstExpr::i32_const(1),
+            Elements::Functions(Cow::Borrowed(&[0, 0, 0])),
+        );
+        let mut noop = Function::new([]);
+        noop.instruction(&Instruction::End);
+        let mut code = CodeSection::new();
+        code.function(&noop);
+
+        let mut module = ModuleEncoder::new();
+        module.section(&types);
+        if imported_table {
+            module.section(&imports);
+        }
+        module.section(&functions);
+        if !imported_table {
+            module.section(&tables);
+        }
+        module.section(&elements).section(&code);
+        module.finish()
+    }
+
+    #[test]
+    fn instantiation_charges_data_images_the_host_cannot_map() {
+        let runtime = Runtime::new(RuntimeLimits::default()).expect("default engine");
+        let budget = runtime.limits.fuel();
+
+        // (segment bytes, pages in the padded image)
+        let cases = [
+            (0, 0),
+            (1, 1),
+            (DATA_IMAGE_ALIGN - DATA_OFFSET, 1),
+            (DATA_IMAGE_ALIGN - DATA_OFFSET + 1, 2),
+        ];
+        for (bytes, pages) in cases {
+            let module =
+                Module::new(&runtime.engine, data_segment_module(bytes)).expect("valid module");
+            let mut store = fresh_store(&runtime, budget);
+            Instance::new(&mut store, &module, &[]).expect("instantiates");
+            let consumed = budget - store.get_fuel().expect("fuel is enabled");
+            // A mapped image needs no startup function at all. Otherwise the
+            // startup function costs one unit to enter and copies the padded
+            // image like `memory.init`, one unit per byte.
+            let expected = if pages == 0 || MAPS_DATA_IMAGES {
+                0
+            } else {
+                1 + pages * DATA_IMAGE_ALIGN
+            };
+            assert_eq!(consumed, expected, "{bytes}-byte data segment");
+        }
+
+        // The copy draws on the invocation's budget, so a budget smaller than
+        // the image fails instantiation with the ordinary fuel diagnostic.
+        let module = Module::new(&runtime.engine, data_segment_module(1)).expect("valid module");
+        let mut store = fresh_store(&runtime, DATA_IMAGE_ALIGN);
+        let instantiated = Instance::new(&mut store, &module, &[]);
+        if MAPS_DATA_IMAGES {
+            instantiated.expect("a mapped image costs no fuel");
+            assert_eq!(store.get_fuel().expect("fuel is enabled"), DATA_IMAGE_ALIGN);
+        } else {
+            let error = map_wasmtime_error(instantiated.expect_err("budget must run out"));
+            assert_eq!(error.kind(), RuntimeErrorKind::FuelExhausted);
+            assert_eq!(error.code(), "K5101");
+        }
+    }
+
+    #[test]
+    fn instantiation_charges_element_segments_on_imported_tables() {
+        let runtime = Runtime::new(RuntimeLimits::default()).expect("default engine");
+        let budget = runtime.limits.fuel();
+
+        // A defined table is precomputed and initialized lazily, outside fuel.
+        let module =
+            Module::new(&runtime.engine, element_segment_module(false)).expect("valid module");
+        let mut store = fresh_store(&runtime, budget);
+        Instance::new(&mut store, &module, &[]).expect("instantiates");
+        assert_eq!(budget - store.get_fuel().expect("fuel is enabled"), 0);
+
+        // An imported table is written by the startup function, which draws
+        // one unit on entry. Wasmtime buffers the offset-expression and
+        // per-element charges when they total at most 128 units, as here, and
+        // returns without flushing them, so only the entry unit is drawn.
+        let module =
+            Module::new(&runtime.engine, element_segment_module(true)).expect("valid module");
+        let mut store = fresh_store(&runtime, budget);
+        let table = Table::new(
+            &mut store,
+            wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 4, Some(4)),
+            Ref::Func(None),
+        )
+        .expect("host table");
+        Instance::new(&mut store, &module, &[table.into()]).expect("instantiates");
+        assert_eq!(budget - store.get_fuel().expect("fuel is enabled"), 1);
     }
 }

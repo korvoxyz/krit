@@ -557,14 +557,35 @@ recursion from reaching the caller thread's native guard page before Wasmtime
 converts the configured Wasm stack limit into `K5103`. The runtime joins this
 thread before returning, including after traps and deadline interruption.
 
-Fuel uses Wasmtime's default cost model. Each function invocation costs one
-unit, and each executed operator costs one unit except `nop`, `drop`, `block`,
-`loop`, `else`, `end`, `return`, and `unreachable`, which are free.
-`memory.grow` costs one unit however many pages it requests. Wasmtime also
-charges bulk memory, table, and GC array operators per byte or element, and
-checks the epoch deadline only once per such operator; the feature policy
-rejects all of them, so neither behavior reaches an accepted artifact. Host
-tests pin this model so a runtime upgrade that changes it fails before release.
+Fuel uses Wasmtime's default cost model. The runtime sets the budget before it
+instantiates the component, so instantiation and the call draw on one budget.
+Each function invocation costs one unit, and each executed operator costs one
+unit except `nop`, `drop`, `block`, `loop`, `else`, `end`, `return`, and
+`unreachable`, which are free. `memory.grow` costs one unit however many pages
+it requests. Wasmtime charges bulk memory, table, and GC array operators per
+byte or element and checks the epoch deadline only once per such operation;
+the feature policy rejects all of them in guest code.
+
+Instantiation also consumes fuel, and part of that cost depends on the host.
+A core module runs a startup function when it has initialization Wasmtime can
+neither precompute nor map, such as the active element segment with which a
+generated canonical adapter module fills an imported table. Entering that
+function costs one unit, and Wasmtime may add small charges for the constant
+expressions and elements it evaluates. Active data segments dominate. Every
+Krit core module with linear memory places its literal data in one active
+segment at a constant offset. Wasmtime merges such segments into one image
+padded to the compilation target's page alignment: 4 KiB on x86-64, 16 KiB on
+Apple aarch64, and 64 KiB on other aarch64 targets. Where Wasmtime maps that
+image copy-on-write, which today means Linux through `memfd`, initializing it
+costs nothing. On every other host, including macOS and Windows, the startup
+function copies the image like `memory.init` at one unit per byte of the
+padded image. `fuel_consumed` for those artifacts is therefore host-dependent:
+on an Apple aarch64 host a one-page image costs 16,384 units beyond the
+startup unit, which a Linux host never pays. A narrowed fuel budget must be
+sized for the most expensive host that will run the artifact, and running out
+during instantiation is `K5101` like any other fuel exhaustion. Host tests pin
+the operator costs and these instantiation charges with per-platform
+expectations, so a runtime upgrade that changes either fails before release.
 
 Exhaustion produces a stable resource diagnostic distinct from capability
 denial and application failure.
