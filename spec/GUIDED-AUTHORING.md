@@ -253,7 +253,9 @@ configuration is `K8101`.
 Requests and responses are strict JSON with unknown fields rejected. A request
 contains:
 
-- schema, authoring protocol, prompt-pack, language, and edition versions
+- schema, authoring protocol, prompt-pack, language, and edition versions;
+  the prompt-pack version is the `promptVersion` of the shipped
+  `ai/prompt-pack.json`, read at compile time so it cannot drift from the pack
 - a deterministic BLAKE3 request identity
 - completion, diagnostic-repair, or semantic-cleanup intent
 - the fixed authoring instruction
