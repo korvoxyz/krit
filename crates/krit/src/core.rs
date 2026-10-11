@@ -2695,8 +2695,8 @@ impl<'a> Verifier<'a> {
             | BinaryOperator::LessEqual
             | BinaryOperator::Greater
             | BinaryOperator::GreaterEqual => {
-                if left_type != &Type::Int
-                    || right_type != &Type::Int
+                if left_type != right_type
+                    || !matches!(left_type, Type::Int | Type::String | Type::Variable(_))
                     || operation.ty.as_ref() != &Type::Bool
                 {
                     return Err(IrError::new(format!(

@@ -327,7 +327,8 @@ Operators evaluate left to right.
 | `+` | two strings | concatenation |
 | `-`, `*` | two integers | checked arithmetic |
 | `/`, `%` | two integers | checked division or remainder |
-| `<`, `<=`, `>`, `>=` | two integers | boolean |
+| `<`, `<=`, `>`, `>=` | two integers | boolean (numeric order) |
+| `<`, `<=`, `>`, `>=` | two strings | boolean (byte-lexicographic order) |
 | `==`, `!=` | comparable values | boolean |
 | `!` | boolean | boolean |
 | `&&`, `||` | booleans | boolean |
@@ -338,6 +339,16 @@ operands.
 Equality is structural for integers, booleans, strings, unit, lists, records,
 `Option`, and `Result`. Comparing a function directly or inside any composite
 value is a runtime error.
+
+Strings are ordered byte-lexicographically over their UTF-8 encoding: the
+first differing byte, compared as an unsigned value, decides, and a proper
+prefix orders before every longer string it begins. The order therefore
+follows Unicode scalar values, not UTF-16 code units, locale collation, or
+normalization (`"e\u{301}"` and `"é"` are different strings and
+`"e\u{301}" < "é"`). Ordering any other operand kind, or mixing kinds, is
+rejected statically (`K3001`, or `K3009`/`K3010` for opaque values) and is a
+`K4001` runtime error in direct execution. String equality is byte equality,
+so `a == b` exactly when neither `a < b` nor `b < a`.
 
 No implicit conversions occur. In particular, integers and strings are not
 automatically converted for `+`, and non-booleans are not truthy.

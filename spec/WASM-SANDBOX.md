@@ -283,6 +283,8 @@ K4005.
 Policy 2 adds a deliberately bounded webhook ABI:
 
 - canonical UTF-8 strings and checked linear-memory allocation/reallocation
+- String concatenation (`+`), equality (`==`, `!=`), and byte-lexicographic
+  ordering (`<`, `<=`, `>`, `>=`) through the guest string runtime below
 - fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` records
 - ordered lists of headers
 - the Result/Option shapes returned by config, secrets, and HTTP
@@ -296,15 +298,53 @@ The core uses guest linear-memory offsets, never host pointers. Canonical
 parameters/results, list elements, records, variants, UTF-8, and allocation
 bounds are checked by the component adapter and host.
 
+### Guest string runtime
+
+A policy-2 `String` value is an `i32` guest offset of an 8-byte canonical
+`(ptr, len)` pair describing immutable UTF-8 bytes, whether the bytes are a
+static literal, were written by the host when lifting a canonical argument
+or result, or were produced by concatenation. String operators lower to calls
+of two generated core functions:
+
+- `compare(left, right) -> i32` returns `-1`, `0`, or `1`. It compares the
+  shared prefix eight bytes at a time until a word differs, then byte by
+  byte as unsigned values; an equal shared prefix orders the shorter string
+  first. `==`, `!=`, `<`, `<=`, `>`, and `>=` test that result against zero,
+  so the guest order is exactly the byte-lexicographic UTF-8 order the
+  direct evaluator uses (see `LANGUAGE.md` section 9).
+- `concat(left, right) -> pair` returns the other operand's pair unchanged
+  when one operand is empty (pairs are never mutated). Otherwise it checks
+  the 32-bit length sum, allocates the joined bytes and a fresh pair through
+  the module's bounded `realloc`, and copies both operands into the new
+  allocation.
+
+Each helper is a plain loop over MVP instructions (no bulk-memory or other
+proposal), so the core validator keeps its empty feature set. A helper is
+emitted at most once per module and only when a live function uses it; the
+helpers follow every other function definition, so a module without String
+operators contains no helper, no helper type, and unchanged function
+indices. Allocation never frees: the bump allocator is bounded by the
+16 MiB memory maximum and the host's memory limit. A 32-bit length overflow
+traps (`K4001`) and a memory growth the host refuses traps (`K5103`), both
+before any byte of the result is written; copies only ever target the fresh
+allocation, and a trapping invocation publishes no response. Fuel bounds the
+copy and compare loops like any other guest code.
+
+### Support checking
+
 Builds fail with `K7001` for residual parametric layouts and `K7002` for
 unsupported semantics. Policy 1 rejects strings, lists, records, options,
 results, JSON conversion, lexical captures, matches, unsupported print
 values, and any operation without a correct lowering. It never substitutes a
-trapping placeholder or direct-evaluator fallback.
+trapping placeholder or direct-evaluator fallback. Policy 1 has no linear
+memory, so a String operator in a module program is reported where the
+String value is produced (the literal, parameter, or field), with the
+"String has no concrete guest layout in WebAssembly policy 1" message.
 
 Policy 2 does not generalize these layouts to arbitrary records/lists,
-capturing closures, JSON, composite equality, or string operators. Those
-shapes continue to fail closed rather than receiving fake values.
+capturing closures, JSON, or composite equality (`==` over options, results,
+records, or lists). Those shapes continue to fail closed rather than
+receiving fake values.
 
 Before any layout is chosen, dead-function elimination keeps only the
 functions reachable from module initialization and the selected entrypoint.
@@ -613,7 +653,10 @@ converts the configured Wasm stack limit into `K5103`. The runtime joins this
 thread before returning, including after traps and deadline interruption.
 
 Exhaustion produces a stable resource diagnostic distinct from capability
-denial and application failure.
+denial and application failure. A memory or table growth that the limits
+refuse traps the guest and is reported as `K5103`, including when the
+refusal arrives wrapped in a guest backtrace, as it does when the guest's
+bounded allocator grows memory for a string.
 
 ## CLI execution and inspection
 

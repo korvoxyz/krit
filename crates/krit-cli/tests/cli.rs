@@ -2274,6 +2274,111 @@ license = "Apache-2.0"
     );
 }
 
+#[test]
+fn invoke_routes_on_strings_and_composes_responses() {
+    let directory = TestDirectory::new("invoke-string-routing");
+    let source = r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    if request.method == "POST" && request.path == "/x" {
+        record { status: 200, headers: [], body: "hi " + request.path }
+    } else {
+        if request.method != "POST" {
+            record { status: 405, headers: [], body: "use POST, not " + request.method }
+        } else {
+            record { status: 404, headers: [], body: "no route for " + request.path }
+        }
+    }
+}
+"#;
+    let program = directory.file("main.krit", source);
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/routing"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+"#,
+    );
+    let checked = krit()
+        .arg("check")
+        .arg(&program)
+        .output()
+        .expect("Krit should check");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    for (name, method, path, expected) in [
+        (
+            "routed",
+            "POST",
+            "/x",
+            r#"{"status":200,"headers":[],"body":"hi /x"}"#,
+        ),
+        (
+            "method",
+            "GET",
+            "/x",
+            r#"{"status":405,"headers":[],"body":"use POST, not GET"}"#,
+        ),
+        (
+            "prefix",
+            "POST",
+            "/x/y",
+            r#"{"status":404,"headers":[],"body":"no route for /x/y"}"#,
+        ),
+        (
+            "multibyte",
+            "POST",
+            "/é",
+            r#"{"status":404,"headers":[],"body":"no route for /é"}"#,
+        ),
+    ] {
+        let request = directory.file(
+            &format!("{name}.json"),
+            &format!(
+                r#"{{"method":"{method}","path":"{path}","query":"","headers":[],"body":""}}"#
+            ),
+        );
+        let invoked = krit_in(&directory)
+            .args(["invoke", "--manifest"])
+            .arg(&manifest)
+            .arg("--request")
+            .arg(&request)
+            .output()
+            .expect("Krit should invoke");
+        assert!(
+            invoked.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&invoked.stderr)
+        );
+        assert!(invoked.stderr.is_empty(), "{name}");
+        assert_eq!(
+            String::from_utf8(invoked.stdout).expect("response should be UTF-8"),
+            format!("{expected}\n"),
+            "{name}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn invoke_loads_owner_only_secret_files_without_disclosure() {

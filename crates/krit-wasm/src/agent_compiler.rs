@@ -19,6 +19,7 @@ use wasm_encoder::{
 use crate::{
     BuildError,
     compiler::{EncodedCore, eliminated_function},
+    strings::{self, StringHelper},
     support::LiveFunctions,
     wit::{ProgramKind, Scalar, Signature, WitContract},
 };
@@ -118,6 +119,7 @@ pub(crate) fn encode_webhook_core(
         })
         .collect::<Result<BTreeMap<_, _>, BuildError>>()?;
     let static_functions = static_function_bindings(module);
+    let string_helpers = strings::used_helpers(module, live);
 
     let mut signatures = BTreeSet::new();
     signatures.extend(
@@ -137,6 +139,9 @@ pub(crate) fn encode_webhook_core(
         results: vec![Scalar::I32],
     };
     signatures.insert(realloc_signature.clone());
+    if !string_helpers.is_empty() {
+        signatures.insert(StringHelper::signature());
+    }
 
     let signature_indices = signatures
         .into_iter()
@@ -173,6 +178,20 @@ pub(crate) fn encode_webhook_core(
     let adapter_index = import_count + core_count + wrapper_count;
     let realloc_index = adapter_index + 1;
     let post_index = realloc_index + 1;
+    // String runtime helpers follow every other definition, so modules that
+    // use no String operator keep their function indices and bytes.
+    let string_helper_indices = string_helpers
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(offset, helper)| {
+            u32::try_from(offset)
+                .ok()
+                .and_then(|offset| post_index.checked_add(1)?.checked_add(offset))
+                .map(|index| (helper, index))
+                .ok_or_else(|| BuildError::artifact("too many WebAssembly functions"))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
 
     let mut functions = FunctionSection::new();
     for function in module.functions() {
@@ -184,6 +203,9 @@ pub(crate) fn encode_webhook_core(
     functions.function(signature_indices[&contract.entry_signature]);
     functions.function(signature_indices[&realloc_signature]);
     functions.function(signature_indices[&contract.post_entry_signature]);
+    for _ in &string_helpers {
+        functions.function(signature_indices[&StringHelper::signature()]);
+    }
 
     let table_size = core_count
         .checked_add(wrapper_count)
@@ -254,6 +276,7 @@ pub(crate) fn encode_webhook_core(
             .iter()
             .any(|interface| interface == crate::HTTP_INTERFACE),
         realloc_index,
+        string_helpers: &string_helper_indices,
         live,
     };
     let mut code = CodeSection::new();
@@ -277,6 +300,9 @@ pub(crate) fn encode_webhook_core(
     )?);
     code.function(&encode_realloc());
     code.function(&encode_post_return(&contract.post_entry_signature));
+    for helper in &string_helpers {
+        code.function(&helper.encode(realloc_index));
+    }
 
     let mut data = DataSection::new();
     data.active(
@@ -430,6 +456,7 @@ struct EncodeContext<'a> {
     import_indices: &'a BTreeMap<String, u32>,
     http_bearer: bool,
     realloc_index: u32,
+    string_helpers: &'a BTreeMap<StringHelper, u32>,
     live: &'a LiveFunctions,
 }
 
@@ -1985,9 +2012,29 @@ fn encode_binary(
     operator: BinaryOperator,
     right: ValueId,
 ) -> Result<(), BuildError> {
+    let operand_type = context
+        .value_types
+        .get(&left)
+        .ok_or_else(|| BuildError::invalid_core(format!("missing type for {left}")))?;
+    if operand_type.as_ref() == &Type::String
+        && let Some(helper) = StringHelper::for_operator(operator)
+    {
+        let index = context
+            .shared
+            .string_helpers
+            .get(&helper)
+            .copied()
+            .ok_or_else(|| BuildError::invalid_core("string runtime helper was not emitted"))?;
+        load_pair(function, context, left, right)?;
+        function.instruction(&Instruction::Call(index));
+        if helper == StringHelper::Compare {
+            strings::emit_comparison_result(function, operator);
+        }
+        return store_value(function, context, result);
+    }
     match operator {
         BinaryOperator::Add => {
-            require_int_operand(context, left, operator)?;
+            require_int_operand(operand_type, operator)?;
             load_pair(function, context, left, right)?;
             function.instruction(&Instruction::I64Add);
             store_value(function, context, result)?;
@@ -2052,10 +2099,6 @@ fn encode_binary(
             store_value(function, context, result)?;
         }
         BinaryOperator::Equal | BinaryOperator::NotEqual => {
-            let operand_type = context
-                .value_types
-                .get(&left)
-                .ok_or_else(|| BuildError::invalid_core(format!("missing type for {left}")))?;
             match operand_type.as_ref() {
                 Type::Int => {
                     load_pair(function, context, left, right)?;
@@ -2091,6 +2134,7 @@ fn encode_binary(
         | BinaryOperator::LessEqual
         | BinaryOperator::Greater
         | BinaryOperator::GreaterEqual => {
+            require_int_operand(operand_type, operator)?;
             load_pair(function, context, left, right)?;
             function.instruction(match operator {
                 BinaryOperator::Less => &Instruction::I64LtS,
@@ -2111,16 +2155,12 @@ fn encode_binary(
     Ok(())
 }
 
-fn require_int_operand(
-    context: &FunctionContext<'_>,
-    value: ValueId,
-    operator: BinaryOperator,
-) -> Result<(), BuildError> {
-    if context.value_types.get(&value).map(Arc::as_ref) == Some(&Type::Int) {
+fn require_int_operand(operand: &Type, operator: BinaryOperator) -> Result<(), BuildError> {
+    if operand == &Type::Int {
         Ok(())
     } else {
         Err(BuildError::unsupported(
-            format!("`{operator:?}` on String is outside the bounded webhook ABI"),
+            format!("`{operator:?}` on `{operand}` is outside the bounded webhook ABI"),
             None,
         ))
     }

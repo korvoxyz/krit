@@ -56,6 +56,7 @@ network service, or nondeterministic value.
 | `core/arithmetic` | checked integer operators and precedence |
 | `core/booleans` | strict booleans and short-circuiting |
 | `core/strings` | UTF-8 strings and concatenation |
+| `core/string-ordering` | byte-lexicographic UTF-8 string ordering and string equality |
 | `scope/closures` | immutable lexical capture and shadowing |
 | `functions/recursion` | recursive declaration and calls |
 | `lists/match` | list construction and exhaustive decomposition |
@@ -84,7 +85,7 @@ network service, or nondeterministic value.
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
-| `check/target/*` | entrypoint files report every build-target diagnostic at check time; unused helpers are eliminated first |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time; unused helpers are eliminated first; String routing and composition build |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |

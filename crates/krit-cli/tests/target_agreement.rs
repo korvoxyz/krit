@@ -360,9 +360,30 @@ fn dead_helpers_no_longer_fail_entrypoint_builds() {
 }
 
 #[test]
+fn string_routing_builds_and_checks_as_a_component() {
+    let probe = repository_root()
+        .join("crates/krit-cli/tests/target-probes/webhook-routing-strings-builds.krit");
+    let directory = ScratchDirectory::new("string-routing");
+    let built = build(&probe, &directory);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(directory.path.join("artifact.wasm").is_file());
+    let checked = krit()
+        .args(["check", "--diagnostic-format", "json"])
+        .arg(&probe)
+        .output()
+        .expect("check should start");
+    assert!(checked.status.success());
+    assert!(checked.stderr.is_empty());
+}
+
+#[test]
 fn build_reports_every_diagnostic_in_json() {
     let probe =
-        repository_root().join("crates/krit-cli/tests/target-probes/webhook-routing-strings.krit");
+        repository_root().join("crates/krit-cli/tests/target-probes/webhook-unsupported-mix.krit");
     let directory = ScratchDirectory::new("build-json");
     let text = fs::read_to_string(&probe).expect("probe should be readable");
     let manifest = package_for(&probe, &text, &directory);
@@ -377,15 +398,13 @@ fn build_reports_every_diagnostic_in_json() {
         .arg(&manifest)
         .output()
         .expect("build should start");
-    if json.status.success() {
-        // Once the guest string runtime lands this probe builds; both formats
-        // must then agree on success.
-        assert!(human.status.success());
-        return;
-    }
+    assert_eq!(json.status.code(), Some(1));
     assert_eq!(json.status.code(), human.status.code());
     let diagnostics = json_lines(&json);
-    assert!(!diagnostics.is_empty());
+    assert!(
+        diagnostics.len() >= 5,
+        "every unsupported construct should be reported: {diagnostics:?}"
+    );
     for diagnostic in &diagnostics {
         assert_eq!(diagnostic["schema"], 1);
         assert_eq!(diagnostic["file"], "main.krit");

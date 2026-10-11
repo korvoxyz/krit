@@ -2,6 +2,7 @@ mod agent_compiler;
 mod compiler;
 mod error;
 mod metadata;
+mod strings;
 mod support;
 mod validation;
 mod wit;

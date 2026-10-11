@@ -2983,14 +2983,16 @@ fn map_wasmtime_error(error: wasmtime::Error) -> RuntimeError {
             _ => RuntimeError::guest("K4001", format!("guest trapped: {trap}")),
         };
     }
-    let message = error.to_string();
-    if message.starts_with("resource limit exceeded:")
-        || message.starts_with("forcing trap when growing ")
-    {
-        RuntimeError::resource(message)
-    } else {
-        RuntimeError::guest("K4001", format!("component execution failed: {message}"))
+    // A growth the store limiter denies arrives as a message, usually wrapped
+    // in a guest backtrace context (as when the guest's bounded allocator
+    // grows memory for a string), so the whole cause chain is inspected.
+    if let Some(limit) = error.chain().map(ToString::to_string).find(|message| {
+        message.starts_with("resource limit exceeded:")
+            || message.starts_with("forcing trap when growing ")
+    }) {
+        return RuntimeError::resource(limit);
     }
+    RuntimeError::guest("K4001", format!("component execution failed: {error}"))
 }
 
 fn replay_safe_http(request: &HttpRequest, max_key_bytes: usize) -> bool {

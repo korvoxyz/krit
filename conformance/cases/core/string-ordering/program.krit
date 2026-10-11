@@ -1,0 +1,10 @@
+println("" < "a");
+println("abc" < "abcd");
+println("abd" > "abcd");
+println("Zebra" < "apple");
+println("~" < "é");
+println("ｚ" < "😀");
+println("same" == "sa" + "me");
+println("same" != "same");
+println("same" <= "same" && "same" >= "same");
+println("hi " + "there" > "hi ");

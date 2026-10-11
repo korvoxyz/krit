@@ -544,6 +544,76 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
     assert_eq!(error.code(), "K7002");
 }
 
+#[test]
+fn string_operators_build_with_runtime_helpers_emitted_once_when_used() {
+    let webhook = |body: &str| {
+        format!(
+            "webhook fn handle(request: HttpRequest) -> HttpResponse {{\n    \
+             record {{ status: 200, headers: [], body: {body} }}\n}}\n"
+        )
+    };
+    let baseline = compile("plain.krit", &webhook("request.path"), false)
+        .expect("a webhook without String operators should build");
+    let every_operator = webhook(
+        "if request.method == \"POST\" && request.path != \"/\" && request.path < \"/z\" \
+         && request.path <= request.body && request.body > \"\" && request.body >= \"a\" { \
+         request.path + \"!\" + request.body } else { \"hi \" + request.path }",
+    );
+    let first = compile("operators.krit", &every_operator, false)
+        .expect("String concatenation, equality, and ordering should build");
+    let second = compile("operators.krit", &every_operator, false)
+        .expect("String operators should build again");
+    assert_eq!(
+        first.bytes, second.bytes,
+        "string lowering must be deterministic"
+    );
+    validate_artifact(&first.bytes, &first.metadata).expect("string artifact should validate");
+    assert_eq!(first.metadata.world, baseline.metadata.world);
+    assert!(first.metadata.effects.is_empty());
+
+    let comparisons = compile(
+        "comparisons.krit",
+        &webhook(
+            "if request.path == \"/\" || request.path > request.body { \"a\" } else { \"b\" }",
+        ),
+        false,
+    )
+    .expect("String comparisons should build");
+    let concatenation = compile(
+        "concatenation.krit",
+        &webhook("request.path + request.body + request.query"),
+        false,
+    )
+    .expect("String concatenation should build");
+
+    // One comparison helper serves all six operators and one concatenation
+    // helper serves every `+`; a module without String operators has neither.
+    let functions = count_core_functions(&baseline.bytes);
+    assert_eq!(count_core_functions(&first.bytes), functions + 2);
+    assert_eq!(count_core_functions(&comparisons.bytes), functions + 1);
+    assert_eq!(count_core_functions(&concatenation.bytes), functions + 1);
+}
+
+#[test]
+fn policy_one_rejects_string_operators_where_the_string_is_produced() {
+    for (operator, source) in [
+        ("==", "println(\"a\" == \"b\");\n"),
+        ("<", "println(\"a\" < \"b\");\n"),
+        ("+", "let joined = \"a\" + \"b\";\nprintln(1);\n"),
+    ] {
+        let error = compile("module.krit", source, true)
+            .expect_err("module programs have no String layout");
+        assert_eq!(error.code(), "K7002", "{operator}: {error}");
+        assert!(
+            error.message().contains("WebAssembly policy 1"),
+            "{operator}: {error}"
+        );
+        let span = error.span().expect("the diagnostic should carry a span");
+        let literal = source.find("\"a\"").expect("literal should exist");
+        assert_eq!(span.start, literal, "{operator}: {error}");
+    }
+}
+
 fn replace_all_equal_length(bytes: &mut [u8], from: &[u8], to: &[u8]) {
     assert_eq!(from.len(), to.len());
     let mut replaced = 0;
@@ -561,6 +631,17 @@ fn count_core_imports(bytes: &[u8]) -> usize {
         .parse_all(bytes)
         .filter_map(|payload| match payload.expect("component should parse") {
             Payload::ImportSection(section) => Some(section.into_imports().count()),
+            _ => None,
+        })
+        .sum()
+}
+
+/// Counts defined functions across every core module in a component.
+fn count_core_functions(bytes: &[u8]) -> u32 {
+    Parser::new(0)
+        .parse_all(bytes)
+        .filter_map(|payload| match payload.expect("component should parse") {
+            Payload::CodeSectionStart { count, .. } => Some(count),
             _ => None,
         })
         .sum()

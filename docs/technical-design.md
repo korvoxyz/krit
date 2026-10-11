@@ -229,9 +229,10 @@ and higher-order calls, Core blocks/conditionals, checked integer operations,
 primitive comparisons, and scalar stdout. The bounded webhook path adds
 guest-memory canonical strings, fixed HTTP records, header lists, selected
 Result/Option layouts and matching, static helper references, config,
-resource secrets, and HTTP. It still rejects residual types, data captures,
-general composites, general JSON conversion, dynamic string operators, and
-unknown built-ins before emission. Phase 4 additionally lowers neutral AI
+resource secrets, and HTTP. A generated guest string runtime lowers String
+concatenation, equality, and byte-lexicographic ordering. It still rejects
+residual types, data captures, general composites, general JSON conversion,
+and unknown built-ins before emission. Phase 4 additionally lowers neutral AI
 string results, ordered `LogField` lists, fallible structured logging, and the
 one unescaped JSON-string decode used by the reference source.
 

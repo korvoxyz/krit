@@ -10,7 +10,7 @@ use krit::{
 
 use crate::{
     ApprovalRequirementMetadata, BuildError, ResourceRequirementMetadata, error::normalize,
-    wit::ProgramKind,
+    strings::StringHelper, wit::ProgramKind,
 };
 
 pub const SUPPORTED_BACKEND_SEMANTICS: &str = "\
@@ -18,7 +18,8 @@ Krit Wasm policy 1 supports Int (i64), Bool (i32), zero-width Unit, \
 non-capturing function values (i32 table slots), recursive and higher-order calls, \
 blocks, conditionals/short circuit, checked integer operators, primitive equality, \
 and print/println of Int, Bool, or Unit. Webhook policy 2 additionally supports \
-String values, the closed HttpHeader/HttpRequest/HttpResponse records, header lists, \
+String values with concatenation, equality, and byte-lexicographic ordering, \
+the closed HttpHeader/HttpRequest/HttpResponse records, header lists, \
 LogField records and field lists, Result/Option matching, exact config/secret/http/AI \
 host calls, structured logging, unescaped JSON string decoding, and static \
 non-capturing helper references. Helpers unreachable from the selected entrypoint \
@@ -182,7 +183,7 @@ fn collect_used_functions(
 }
 
 /// Calls `visit` for every block nested directly inside `operation`.
-fn for_each_nested_block(operation: &CoreOperation, mut visit: impl FnMut(&CoreBlock)) {
+pub(crate) fn for_each_nested_block(operation: &CoreOperation, mut visit: impl FnMut(&CoreBlock)) {
     match &operation.kind {
         OperationKind::Block { block } => visit(block),
         OperationKind::If {
@@ -743,7 +744,10 @@ impl SupportChecker<'_> {
 /// Explains why a binary operator has no lowering, or returns `None`.
 ///
 /// Policy 1 only admits scalar operands, which the operand definitions
-/// already enforce, so only the policy-2 operand shapes need inspection here.
+/// already enforce (a String operand is reported where the String value is
+/// produced), so only the policy-2 operand shapes need inspection here.
+/// Policy 2 lowers String concatenation, equality, and ordering through the
+/// guest string runtime.
 fn unsupported_binary(
     operator: BinaryOperator,
     operand: Option<&Arc<Type>>,
@@ -755,11 +759,11 @@ fn unsupported_binary(
             Some("short-circuit operators must be lowered to Core conditionals".to_owned())
         }
         _ if !webhook => None,
-        _ if operand == Some(&Type::String) => Some(format!(
-            "String operator `{}` is outside {}",
-            operator_symbol(operator),
-            policy_name(webhook)
-        )),
+        // The residual pass reports an unspecialized operand as K7001.
+        _ if operand.is_some_and(contains_residual) => None,
+        _ if operand == Some(&Type::String) && StringHelper::for_operator(operator).is_some() => {
+            None
+        }
         BinaryOperator::Equal | BinaryOperator::NotEqual => match operand {
             Some(Type::Int | Type::Bool | Type::Unit | Type::Function(_)) => None,
             _ => Some(format!(
@@ -769,8 +773,9 @@ fn unsupported_binary(
         },
         _ if operand == Some(&Type::Int) => None,
         _ => Some(format!(
-            "operator `{}` requires Int operands in {}",
+            "operator `{}` has no lowering for `{}` operands in {}",
             operator_symbol(operator),
+            operand.map_or_else(|| "unknown".to_owned(), ToString::to_string),
             policy_name(webhook)
         )),
     }
@@ -795,7 +800,7 @@ const fn operator_symbol(operator: BinaryOperator) -> &'static str {
 }
 
 /// Types of every value a function body can name, as emission sees them.
-fn function_value_types(function: &CoreFunction) -> BTreeMap<krit::ValueId, Arc<Type>> {
+pub(crate) fn function_value_types(function: &CoreFunction) -> BTreeMap<krit::ValueId, Arc<Type>> {
     let mut types = BTreeMap::new();
     for parameter in &function.parameters {
         types.insert(parameter.value, Arc::clone(&parameter.ty));
