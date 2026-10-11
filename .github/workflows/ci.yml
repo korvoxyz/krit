@@ -54,9 +54,20 @@ jobs:
         run: cargo test --workspace --doc --locked
 
   current-stable:
-    name: Current stable Rust
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    name: Current stable Rust (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.continue-on-error == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+          - runner: macos-15
+          # Advisory until the Windows suite is first green; then drop
+          # continue-on-error so it becomes required like the others.
+          - runner: windows-2022
+            continue-on-error: true
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -71,7 +82,7 @@ jobs:
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: quality-stable
+          shared-key: stable-${{ matrix.runner }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run tests

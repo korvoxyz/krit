@@ -588,10 +588,27 @@ impl HostConfigError {
     }
 }
 
+/// Loads the host configuration for `invoke`, `worker`, `schedule`, and `serve`.
+///
+/// On a host that cannot enforce owner-only file permissions, a configuration
+/// that grants secrets or durable state is refused with K5001 straight after
+/// strict parsing, before any secret file is read or any store is resolved.
 pub(crate) fn load(
     path: Option<&Path>,
     manifest: &Manifest,
     limits: RuntimeLimits,
+) -> Result<AgentHost, HostConfigError> {
+    load_for_platform(path, manifest, limits, OWNER_ONLY_FILES_ENFORCED)
+}
+
+/// [`load`] as a host that does, or does not, enforce owner-only file
+/// permissions. Taking the platform as a value keeps both paths testable on
+/// every platform.
+fn load_for_platform(
+    path: Option<&Path>,
+    manifest: &Manifest,
+    limits: RuntimeLimits,
+    owner_only_files: bool,
 ) -> Result<AgentHost, HostConfigError> {
     let Some(path) = path else {
         let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default())
@@ -620,6 +637,13 @@ pub(crate) fn load(
                 ))
             })?;
             debug_assert_eq!(file.schema, 1);
+            require_enforced_owner_only_files(
+                owner_only_files,
+                OwnerOnlyGrants {
+                    secrets: !file.secrets.is_empty(),
+                    ..OwnerOnlyGrants::default()
+                },
+            )?;
             let inputs = load_inputs(path, manifest, limits, file.config, file.secrets)?;
             AgentHost::from_inputs(inputs)
                 .map_err(|error| HostConfigError::input(error.message().to_owned()))
@@ -632,6 +656,13 @@ pub(crate) fn load(
                 ))
             })?;
             debug_assert_eq!(file.schema, 2);
+            require_enforced_owner_only_files(
+                owner_only_files,
+                OwnerOnlyGrants {
+                    secrets: !file.secrets.is_empty(),
+                    ..OwnerOnlyGrants::default()
+                },
+            )?;
             load_configured_host(path, manifest, limits, file, || {
                 Ok((DurableState::default(), DatabaseCatalog::default()))
             })
@@ -644,6 +675,14 @@ pub(crate) fn load(
                 ))
             })?;
             debug_assert_eq!(file.schema, 3);
+            require_enforced_owner_only_files(
+                owner_only_files,
+                OwnerOnlyGrants {
+                    secrets: !file.secrets.is_empty(),
+                    state: !file.state.is_empty(),
+                    ..OwnerOnlyGrants::default()
+                },
+            )?;
             let resolved = resolve_durable_state(path, manifest, file.state, &BTreeSet::new())?;
             resolved.validate_for_runtime(&PreparedJobs::default(), limits)?;
             let compatible = HostConfigV2 {
@@ -671,6 +710,15 @@ pub(crate) fn load(
                 ))
             })?;
             debug_assert_eq!(file.schema, 4);
+            require_enforced_owner_only_files(
+                owner_only_files,
+                OwnerOnlyGrants {
+                    secrets: !file.secrets.is_empty(),
+                    state: !file.state.is_empty(),
+                    jobs: !file.jobs.is_empty(),
+                    ..OwnerOnlyGrants::default()
+                },
+            )?;
             let configured_stores = file.state.stores.keys().cloned().collect();
             let jobs = validate_jobs(manifest, file.jobs, &configured_stores)?;
             let host_owned = jobs.store_names();
@@ -699,6 +747,15 @@ pub(crate) fn load(
                 ))
             })?;
             debug_assert_eq!(file.schema, 5);
+            require_enforced_owner_only_files(
+                owner_only_files,
+                OwnerOnlyGrants {
+                    secrets: !file.secrets.is_empty(),
+                    state: !file.state.is_empty(),
+                    jobs: !file.jobs.is_empty(),
+                    databases: !file.databases.is_empty(),
+                },
+            )?;
             // Every database and job definition is resolved and validated
             // before any store or application database is created or opened.
             let prepared = validate_databases(manifest, &file.databases)?;
@@ -737,6 +794,15 @@ pub(crate) fn load(
                 ))
             })?;
             debug_assert_eq!(file.schema, 6);
+            require_enforced_owner_only_files(
+                owner_only_files,
+                OwnerOnlyGrants {
+                    secrets: !file.secrets.is_empty(),
+                    state: !file.state.is_empty(),
+                    jobs: !file.jobs.is_empty(),
+                    databases: !file.databases.is_empty(),
+                },
+            )?;
             // Phase one: everything below is pure validation and resolution.
             let cache = validate_cache(manifest, &file.cache)?;
             let connectors = validate_search(manifest, &file.search)?;
@@ -1665,6 +1731,9 @@ fn validate_owner_only_directory(path: &Path) -> Result<(), HostConfigError> {
     Ok(())
 }
 
+/// No permission check exists here, so `load` refuses durable state on
+/// non-Unix hosts before reaching this (see
+/// [`require_enforced_owner_only_files`]).
 #[cfg(not(unix))]
 fn validate_owner_only_directory(_path: &Path) -> Result<(), HostConfigError> {
     Ok(())
@@ -1712,6 +1781,77 @@ fn create_owner_only_state_file(path: &Path) -> Result<(), HostConfigError> {
         .open(path)
         .map(|_| ())
         .map_err(|_| HostConfigError::input("could not create durable state file"))
+}
+
+/// Whether this host enforces the owner-only permissions that secret files and
+/// durable store files rely on. Only Unix hosts do; elsewhere the checks above
+/// are no-ops, so host configurations that need them are refused instead.
+#[cfg(unix)]
+const OWNER_ONLY_FILES_ENFORCED: bool = true;
+#[cfg(not(unix))]
+const OWNER_ONLY_FILES_ENFORCED: bool = false;
+
+/// Host configuration sections whose safety rests on owner-only files.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OwnerOnlyGrants {
+    /// `secrets`: secret files read into the host secret store.
+    secrets: bool,
+    /// `state`: durable stores, including the durable idempotency store.
+    state: bool,
+    /// `jobs`: queues, schedules, and object buckets kept in durable stores.
+    jobs: bool,
+    /// `databases`: application database files.
+    databases: bool,
+}
+
+impl OwnerOnlyGrants {
+    /// Granted section names, always in the same order.
+    fn sections(self) -> Vec<&'static str> {
+        [
+            (self.secrets, "`secrets`"),
+            (self.state, "`state`"),
+            (self.jobs, "`jobs`"),
+            (self.databases, "`databases`"),
+        ]
+        .into_iter()
+        .filter_map(|(granted, section)| granted.then_some(section))
+        .collect()
+    }
+}
+
+impl StateFile {
+    fn is_empty(&self) -> bool {
+        self.stores.is_empty() && self.durable_idempotency_store.is_none()
+    }
+}
+
+impl JobsFile {
+    fn is_empty(&self) -> bool {
+        self.queues.is_empty() && self.schedules.is_empty() && self.buckets.is_empty()
+    }
+}
+
+/// Refuses secrets and durable state on a host that cannot enforce owner-only
+/// file permissions, since their files could otherwise be readable or
+/// writable by other local users.
+///
+/// The decision is pure and takes the platform as `enforced`, so it is tested
+/// on every platform. The message names configuration sections only, never
+/// secret names, paths, or values.
+fn require_enforced_owner_only_files(
+    enforced: bool,
+    grants: OwnerOnlyGrants,
+) -> Result<(), HostConfigError> {
+    let sections = grants.sections();
+    if enforced || sections.is_empty() {
+        return Ok(());
+    }
+    Err(HostConfigError::authorization(format!(
+        "host configuration grants {}, which need owner-only file permissions that this \
+         platform cannot enforce; on non-Unix hosts, host mode runs only without durable \
+         state or secrets",
+        sections.join(", ")
+    )))
 }
 
 fn load_inputs(
@@ -1943,6 +2083,8 @@ fn read_secret_bounded(path: &Path, limit: usize, name: &str) -> Result<Vec<u8>,
     read_file_bounded(file, limit)
 }
 
+/// No permission check exists here, so `load` refuses secrets on non-Unix
+/// hosts before reaching this (see [`require_enforced_owner_only_files`]).
 #[cfg(not(unix))]
 fn read_secret_bounded(path: &Path, limit: usize, _name: &str) -> Result<Vec<u8>, String> {
     let file = fs::File::open(path).map_err(|error| error.to_string())?;
@@ -2062,6 +2204,12 @@ mod tests {
 
     #[cfg(not(unix))]
     fn owner_only(_path: &Path, _mode: u32) {}
+
+    /// Loads as a host that enforces owner-only files, so the full loading
+    /// path runs on every platform; the platform gate has its own tests.
+    fn load_enforced(path: &Path) -> Result<AgentHost, HostConfigError> {
+        load_for_platform(Some(path), &manifest(), RuntimeLimits::default(), true)
+    }
 
     fn manifest() -> Manifest {
         Manifest::parse(
@@ -2371,12 +2519,8 @@ searchIndexes = ["search"]
         for schema in 1..=6 {
             let directory = TestDirectory::new();
             fs::write(directory.config(), document(schema).to_string()).unwrap();
-            let host = load(
-                Some(&directory.config()),
-                &manifest(),
-                RuntimeLimits::default(),
-            )
-            .unwrap_or_else(|error| panic!("schema {schema}: {error:?}"));
+            let host = load_enforced(&directory.config())
+                .unwrap_or_else(|error| panic!("schema {schema}: {error:?}"));
             if schema == 6 {
                 assert_eq!(host.cache().namespace_names(), ["cached"]);
                 assert_eq!(
@@ -2428,16 +2572,151 @@ searchIndexes = ["search"]
             let mut document = document(6);
             *document.pointer_mut(pointer).unwrap() = value;
             fs::write(directory.config(), document.to_string()).unwrap();
-            assert!(
-                load(
-                    Some(&directory.config()),
-                    &manifest(),
-                    RuntimeLimits::default()
-                )
-                .is_err(),
-                "{pointer}"
-            );
+            assert!(load_enforced(&directory.config()).is_err(), "{pointer}");
             assert_eq!(directory.snapshot(), before, "{pointer}");
+        }
+    }
+
+    #[test]
+    fn owner_only_grants_are_refused_only_where_permissions_are_unenforced() {
+        assert_eq!(OWNER_ONLY_FILES_ENFORCED, cfg!(unix));
+        let none = OwnerOnlyGrants::default();
+        let every = OwnerOnlyGrants {
+            secrets: true,
+            state: true,
+            jobs: true,
+            databases: true,
+        };
+        assert!(require_enforced_owner_only_files(true, none).is_ok());
+        assert!(require_enforced_owner_only_files(false, none).is_ok());
+        for (grants, sections) in [
+            (
+                OwnerOnlyGrants {
+                    secrets: true,
+                    ..none
+                },
+                "`secrets`",
+            ),
+            (
+                OwnerOnlyGrants {
+                    state: true,
+                    ..none
+                },
+                "`state`",
+            ),
+            (OwnerOnlyGrants { jobs: true, ..none }, "`jobs`"),
+            (
+                OwnerOnlyGrants {
+                    databases: true,
+                    ..none
+                },
+                "`databases`",
+            ),
+            (every, "`secrets`, `state`, `jobs`, `databases`"),
+        ] {
+            assert!(require_enforced_owner_only_files(true, grants).is_ok());
+            let error = require_enforced_owner_only_files(false, grants).unwrap_err();
+            assert_eq!(error.kind(), HostConfigErrorKind::Authorization);
+            assert_eq!(error.code(), "K5001");
+            assert_eq!(
+                error.message(),
+                format!(
+                    "host configuration grants {sections}, which need owner-only file \
+                     permissions that this platform cannot enforce; on non-Unix hosts, host \
+                     mode runs only without durable state or secrets"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn unenforced_owner_only_files_refuse_secrets_and_durable_state_before_any_file_access() {
+        let directory = TestDirectory::new();
+        let before = directory.snapshot();
+        let load_unenforced = |document: &Value| {
+            fs::write(directory.config(), document.to_string()).unwrap();
+            SERVICE_OPENS.with(|opens| opens.set(0));
+            load_for_platform(
+                Some(&directory.config()),
+                &manifest(),
+                RuntimeLimits::default(),
+                false,
+            )
+        };
+        let refuse = |document: &Value, sections: &str| {
+            let error = load_unenforced(document).unwrap_err();
+            assert_eq!(error.kind(), HostConfigErrorKind::Authorization);
+            assert_eq!(error.code(), "K5001");
+            assert!(
+                error
+                    .message()
+                    .starts_with(&format!("host configuration grants {sections}, ")),
+                "{sections}: {error:?}"
+            );
+            assert!(!error.message().contains("fixture-token"));
+            assert_eq!(
+                SERVICE_OPENS.with(Cell::get),
+                0,
+                "{sections} must be refused before any store, database, or cache opens"
+            );
+            assert_eq!(directory.snapshot(), before, "{sections}");
+        };
+
+        // Every full document grants a secret; later schemas add durable state.
+        for (schema, sections) in [
+            (1, "`secrets`"),
+            (2, "`secrets`"),
+            (3, "`secrets`, `state`"),
+            (4, "`secrets`, `state`, `jobs`"),
+            (5, "`secrets`, `state`, `jobs`, `databases`"),
+            (6, "`secrets`, `state`, `jobs`, `databases`"),
+        ] {
+            refuse(&document(schema), sections);
+        }
+
+        // Config, policy, secretless AI adapters, the process-local cache, and
+        // local search rely on no owner-only file, so they still load.
+        for schema in 1..=6 {
+            let minimal = if schema >= 3 {
+                json!({"schema": schema, "state": {}})
+            } else {
+                json!({"schema": schema})
+            };
+            drop(
+                load_unenforced(&minimal)
+                    .unwrap_or_else(|error| panic!("schema {schema}: {error:?}")),
+            );
+        }
+        let mut allowed = document(6);
+        for section in ["secrets", "jobs", "databases"] {
+            allowed.as_object_mut().unwrap().remove(section);
+        }
+        allowed["aiAdapters"]["reviewer"]
+            .as_object_mut()
+            .unwrap()
+            .remove("secret");
+        allowed["state"] = json!({});
+        let host = load_unenforced(&allowed).unwrap();
+        assert_eq!(host.cache().namespace_names(), ["cached"]);
+        drop(host);
+        assert_eq!(directory.snapshot(), before);
+
+        // Each section is refused on its own, ahead of its own validation.
+        let full = document(6);
+        for (section, value, name) in [
+            ("secrets", full["secrets"].clone(), "`secrets`"),
+            ("state", full["state"].clone(), "`state`"),
+            (
+                "state",
+                json!({"durableIdempotencyStore": "existing"}),
+                "`state`",
+            ),
+            ("jobs", full["jobs"].clone(), "`jobs`"),
+            ("databases", full["databases"].clone(), "`databases`"),
+        ] {
+            let mut document = allowed.clone();
+            document[section] = value;
+            refuse(&document, name);
         }
     }
 }

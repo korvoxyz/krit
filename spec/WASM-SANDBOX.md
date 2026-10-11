@@ -626,14 +626,15 @@ schema 2 retains those fields and adds bounded AI adapters, retries, rates,
 idempotency, and explicit noninteractive approval allow entries. Unknown
 fields, inline values, environment inheritance, ungranted names, escaping
 paths, symlinks, oversized files, and group/other-readable Unix secret files
-fail closed.
+fail closed. Non-Unix hosts refuse secrets outright; see
+[Platform support](#platform-support).
 
 Schema 3 retains all schema-2 fields and adds manifest-narrowed durable stores,
 durability/limit policy, and an optional durable inbound-idempotency store.
 There is no default state path. Relative `.db` paths require existing
 owner-only directories on Unix; database/WAL/SHM files reject symlinks,
 non-files, oversize data, and group/other permissions. Schema 1 and 2 remain
-readable unchanged.
+readable unchanged. Non-Unix hosts refuse durable state outright.
 
 `invoke` response JSON remains exact on stdout. Structured application logs
 are emitted as JSON Lines on stderr only after completion. `serve` never
@@ -641,6 +642,26 @@ places them in an HTTP body. Validated redacted failure logs may publish with
 an explicit failure outcome while normal output/response remains rolled back.
 Artifact permissions list approval-required resources separately and keep
 deployment and approval evaluation `not-evaluated`.
+
+## Platform support
+
+Linux and macOS (Unix hosts) are supported for every command. Windows is
+supported for `check`, `build`, `fmt`, `lsp`, and `run`, and for host mode
+(`invoke`, `worker`, `schedule`, and `serve`) only without durable state or
+secrets.
+
+Host mode protects secret files, durable state stores, and application
+databases with owner-only file permissions, and only Unix hosts enforce them.
+On any non-Unix host, a host configuration with a non-empty `secrets`,
+`state` (a store or a durable idempotency store), `jobs` (queues, schedules,
+or object buckets), or `databases` section is refused with `K5001` and exit
+status 4. The refusal follows strict parsing and comes before any secret file
+is read and before any store or database is resolved, created, or opened. Its
+message names the offending sections only, never secret names, paths, or
+values. Config values; retry, rate, idempotency, and approval policy; AI
+adapters and search connectors that use no secret; and the process-local cache
+remain available. Windows can hold durable state or secrets only once
+owner-only access-control checks exist there.
 
 ## Instance lifecycle
 
@@ -701,7 +722,8 @@ manifest.
 
 Applications refer to secrets by manifest-approved logical name. The host
 acquires bounded owner-only files into a zeroizing store and returns only a
-WIT resource handle. The HTTP host borrows that resource and injects bearer
+WIT resource handle. Hosts that cannot enforce owner-only files refuse secrets
+(see [Platform support](#platform-support)). The HTTP host borrows that resource and injects bearer
 authentication without returning bytes to the component.
 
 Secret data is excluded from:

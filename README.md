@@ -146,7 +146,10 @@ The macOS and Windows downloads are not developer-signed or notarized. Use
 your OS's per-application approval flow only after checking the download's
 source and checksum; do not disable system-wide protections. Guided-assistance
 acceptance still fails closed on platforms without the audited atomic-exchange
-primitive, including Windows.
+primitive, including Windows. On Windows, host mode (`invoke`, `worker`,
+`schedule`, `serve`) also refuses host configurations that grant secrets or
+durable state, because owner-only file checks exist only on Unix; see
+[Platform support](spec/WASM-SANDBOX.md#platform-support).
 
 ### GitHub Packages
 

@@ -261,7 +261,9 @@ internal schema.
   symlink component, and no escape from the host config root, exactly like
   durable state paths.
 - The containing directory must already exist and be owner-only on Unix; the
-  database file must already exist and be an owner-only regular file.
+  database file must already exist and be an owner-only regular file. Non-Unix
+  hosts cannot enforce this and refuse any configured database with `K5001`
+  (see [platform support](WASM-SANDBOX.md#platform-support)).
 - The connection is opened without `SQLITE_OPEN_CREATE` and without URI
   handling, so a path can never carry driver options.
 - Extension loading is compiled out of the bundled build; defensive mode,
