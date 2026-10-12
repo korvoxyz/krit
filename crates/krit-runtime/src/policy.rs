@@ -481,6 +481,9 @@ impl AgentHost {
     }
 
     pub(crate) fn next_ai_idempotency_key(&self, adapter: &str) -> Result<String, RuntimeError> {
+        // Newer toolchains rename `fetch_update` to `try_update`; keep the name
+        // the 1.95 MSRV provides.
+        #[allow(deprecated)]
         let sequence = self
             .inner
             .operation_sequence

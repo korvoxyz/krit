@@ -1058,16 +1058,15 @@ impl Runtime {
         // contradicts the artifact - fails closed here.
         for requirement in &metadata.requirements {
             match requirement.capability.as_str() {
-                "cache.write" => {
+                "cache.write"
                     if agent_host
                         .cache()
                         .mode(&requirement.resource)
-                        .is_some_and(|mode| mode != cache::NamespaceMode::ReadWrite)
-                    {
-                        return Err(RuntimeError::authorization(
-                            "artifact requires write authority on a read-only cache namespace",
-                        ));
-                    }
+                        .is_some_and(|mode| mode != cache::NamespaceMode::ReadWrite) =>
+                {
+                    return Err(RuntimeError::authorization(
+                        "artifact requires write authority on a read-only cache namespace",
+                    ));
                 }
                 "search.query" | "search.vector" => {
                     let expected = if requirement.capability == "search.query" {

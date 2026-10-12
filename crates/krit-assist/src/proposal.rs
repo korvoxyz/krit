@@ -16,7 +16,7 @@ use crate::{
         LoadedPackage, MAX_CONTEXT_BYTES, MAX_CONTEXT_SLICE_BYTES, MAX_CONTEXTS,
         MAX_MANIFEST_BYTES, MAX_REQUEST_BYTES, PreparedAssistance, digest_bytes,
         document_precondition, load_package, provider_compiler_facts, read_bounded_utf8,
-        read_resolved_source, read_source, request_id, resolve_source_path, validate_intent,
+        read_resolved_source, request_id, resolve_source_path, validate_intent,
         validate_text_range, verify_context_slice,
     },
     error::AssistError,
@@ -1183,6 +1183,7 @@ fn install_checked_exchange(
     staged: &Path,
     expected_digest: &str,
 ) -> Result<(), AssistError> {
+    use crate::context::read_source;
     use rustix::fs::{CWD, RenameFlags, renameat_with};
 
     if renameat_with(CWD, staged, CWD, path, RenameFlags::EXCHANGE).is_err() {

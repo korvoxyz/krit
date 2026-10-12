@@ -741,9 +741,10 @@ secrets = ["token"]
         "outbound HTTP request failed",
     ];
 
-    /// Builds a real `curl::Error` for one libcurl code.
-    fn curl_error(code: u32) -> curl::Error {
-        curl::Error::new(code)
+    /// Builds a real `curl::Error` for one libcurl code. `CURLcode` is `u32`
+    /// on Unix and `i32` on Windows; every code tested fits in a `u8`.
+    fn curl_error(code: u8) -> curl::Error {
+        curl::Error::new(code.into())
     }
 
     #[test]

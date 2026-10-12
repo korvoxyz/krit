@@ -389,6 +389,7 @@ fn load_ignore(root: &Path) -> Result<Gitignore, AssistError> {
         .map_err(|_| AssistError::context("could not compile `.kritignore`"))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn read_source(path: &Path) -> Result<String, AssistError> {
     read_bounded_utf8(path, MAX_SOURCE_BYTES, "source file")
 }
@@ -400,8 +401,12 @@ pub(crate) fn read_resolved_source(
     #[cfg(unix)]
     let file = open_package_file_no_follow(&package.root, Path::new(&source.relative))?;
     #[cfg(not(unix))]
-    let file = fs::File::open(&source.canonical)
-        .map_err(|_| AssistError::io("could not read source file"))?;
+    let file = {
+        // Without no-follow opens the canonical path is read directly.
+        let _ = package;
+        fs::File::open(&source.canonical)
+            .map_err(|_| AssistError::io("could not read source file"))?
+    };
     read_bounded_utf8_file(file, MAX_SOURCE_BYTES, "source file")
 }
 
