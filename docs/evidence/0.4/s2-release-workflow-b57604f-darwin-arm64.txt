@@ -1,0 +1,200 @@
+Release workflow evidence: 0.3.1 item S2 (R1.2 attestation and immutability, R0.4)
+
+Commit:   b57604f, track/0.3.1-supply
+Date:     2026-10-12
+Host:     macOS (Darwin 27.0.0), arm64; actionlint 1.7.12 with shellcheck
+          0.11.0; Ruby 4.0.6 (Psych 5.3.1); GNU bash 5.3.15; gh 2.102.0
+Limits:   GitHub Actions cannot run locally. OIDC signing, the attestation
+          API, the GHCR push, and the release API are exercised only by the
+          owner's v0.3.1 release run (P0). What can be checked here is below.
+
+1. actionlint (runs shellcheck on every `run:` script)
+
+$ actionlint .github/workflows/release.yml .github/workflows/ci.yml
+(no findings; exit 0)
+
+Before, on 4d222e8 (release.yml only), exit 1:
+  .github/workflows/release.yml:37:9: shellcheck reported issue in this script: SC2129:style:16:1: Consider using { cmd1; cmd2; } >> file instead of individual redirects [shellcheck]
+  .github/workflows/release.yml:227:9: shellcheck reported issue in this script: SC2129:style:11:1: Consider using { cmd1; cmd2; } >> file instead of individual redirects [shellcheck]
+
+2. Job graph and token permissions (parsed with Ruby's YAML.safe_load)
+
+  job         needs                      permissions
+  version                                workflow default (contents: read)
+  ci          version                    workflow default (contents: read)
+  containers  version, ci                contents: read, packages: write
+  image       version, containers        packages: write, id-token: write, attestations: write
+  release     version, ci, image         contents: write, id-token: write, attestations: write
+  tags        version, image, release    packages: write
+
+Only image and release hold id-token: write and attestations: write. The
+tags job runs after release succeeds, so latest and the series tag cannot
+move before the GitHub release is published.
+
+3. Action pin
+
+$ gh api repos/actions/attest-build-provenance/git/ref/tags/v4.2.2
+  -> lightweight tag, commit 4d101475d8b20a2381f78447822ac1eab6504dd8
+     (published 2026-08-06). At that commit the action is a composite
+     wrapper over actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d
+     (v4.2.1).
+
+4. Release-script branches against fake gh, docker, and cargo commands
+
+The harness extracts four `run:` scripts from release.yml with Ruby, runs
+each under bash 5 with `-e` against stub commands that answer from
+environment variables, and prints each case's exit status, the
+release-changing gh calls it made (create, upload, edit), and its first
+::error:: line. Fixtures: four .tar.gz archives, one .zip, and SHA256SUMS
+for version 0.3.1; this run's draft title is
+"Krit 0.3.1 (draft, release run 42)".
+
+  -- version job: published-release check
+  no release                         exit=0
+  draft only                         exit=0
+  published                          exit=1 ::error::This release is already published. Never move a published tag.
+  draft and published                exit=1 ::error::This release is already published. Never move a published tag.
+  -- release job: upload to this run's draft
+  no release                         exit=0 [gh release create]
+  this run's draft                   exit=0 [gh release upload --clobber]
+  published release                  exit=1 ::error::Release v0.3.1 is already published, and published releases are never modified. Ship changes as a new patch release.
+  draft from run 41                  exit=1 ::error::A draft release for v0.3.1 exists that this run did not create. A maintainer must review and delete it before the release is retried.
+  hand-made draft                    exit=1 ::error::A draft release for v0.3.1 exists that this run did not create. A maintainer must review and delete it before the release is retried.
+  this run's draft and published     exit=1 ::error::Release v0.3.1 is already published, and published releases are never modified. Ship changes as a new patch release.
+  this run's draft twice             exit=1 ::error::A draft release for v0.3.1 exists that this run did not create. A maintainer must review and delete it before the release is retried.
+  -- release job: verify the draft before publishing
+  exact assets                       exit=0
+  already published                  exit=1 ::error::Release v0.3.1 is no longer this run's draft.
+  extra asset                        exit=1 ::error::The draft's assets are not exactly the attested downloads.
+  missing SHA256SUMS                 exit=1 ::error::The draft's assets are not exactly the attested downloads.
+  changed archive bytes              exit=1 ::error::The draft's krit-0.3.1-aarch64-apple-darwin.tar.gz differs from the attested file.
+  -- tags job: move series and latest to the attested index
+  all tags on the index              exit=0
+  latest on another digest           exit=1 ::error::ghcr.io/korvoxyz/krit:latest resolves to sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, not the attested index sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.
+  malformed digest output            exit=1 ::error::The image job did not report the attested index digest.
+
+5. Facts checked against upstream sources
+
+- docker buildx imagetools create with a single index source and no
+  annotations re-pushes the source bytes unchanged
+  (util/imagetools/create.go, "on single source, return original bytes";
+  filterPlatforms returns the index as-is when every platform matches), so
+  moving the series and latest tags keeps the attested digest. The tags job
+  still checks the digest of all three tags and fails if any differs.
+- `imagetools inspect --format '{{json .Manifest}}'` prints a top-level
+  "digest" for an index (util/imagetools/printers.go; checked live against
+  ghcr.io/actions/actions-runner:latest).
+- actions/attest skips the registry storage record without failing when
+  create-storage-record is false; with it true and no
+  artifact-metadata: write it only warns (src/attest.ts).
+- The repository is korvoxyz/krit (akshay-bhardwaj/krit redirects there),
+  and the 0.2.0 release run published ghcr.io/korvoxyz/krit, so the
+  verification commands in README.md and SECURITY.md use those names.
+- An anonymous pull of ghcr.io/korvoxyz/krit:0.2.0 returns 401: the
+  package is still private, so anonymous `gh attestation verify oci://...`
+  needs a registry login until the owner makes the package Public.
+
+Appendix: the harness, indented by two spaces (remove them before
+running it as `harness.sh <repository root>`; it needs Ruby, GNU
+coreutils' sha256sum, and bash 5 at /opt/homebrew/bin/bash)
+
+  #!/opt/homebrew/bin/bash
+  # Runs release.yml's release and tag scripts against fake gh and docker
+  # commands. Usage: harness.sh REPO_ROOT
+  set -euo pipefail
+  repo="$1"
+  work="$(mktemp -d)"
+  trap 'rm -rf -- "$work"' EXIT
+  mkdir "$work/bin" "$work/steps" "$work/dist"
+
+  ruby -ryaml -e '
+  w = YAML.safe_load(File.read(ARGV[0]), aliases: false)
+  { "upload" => ["release", "Upload the downloads to this run'"'"'s draft release"],
+    "verify" => ["release", "Verify the draft release"],
+    "tags" => ["tags", "Point the series and latest tags at the attested index"],
+    "identity" => ["version", "Require a matching stable version tag"] }.each do |file, (job, name)|
+    step = w["jobs"][job]["steps"].find { |s| s["name"] == name } or abort "missing step #{name}"
+    File.write("#{ARGV[1]}/#{file}.sh", step["run"])
+  end' "$repo/.github/workflows/release.yml" "$work/steps"
+
+  cat > "$work/bin/gh" <<'EOF'
+  #!/opt/homebrew/bin/bash
+  { printf 'gh'; printf ' %s' "$1" "$2"; for a in "$@"; do [[ "$a" == --clobber ]] && printf ' --clobber'; done; printf '\n'; } >> "$FAKE_LOG"
+  case "$1 $2" in
+    "api repos/"*) printf '%b' "$FAKE_RELEASES" ;;
+    "release view") printf '%b' "$FAKE_STATE" ;;
+    "release download")
+      dir=""; while [[ $# -gt 0 ]]; do [[ "$1" == --dir ]] && dir="$2"; shift; done
+      cp -- "$FAKE_ASSETS"/* "$dir"/ ;;
+  esac
+  EOF
+  cat > "$work/bin/docker" <<'EOF'
+  #!/opt/homebrew/bin/bash
+  if [[ "$3" == inspect ]]; then
+    case "$4" in *:latest) d="$FAKE_LATEST" ;; *) d="$DIGEST" ;; esac
+    printf '{"schemaVersion":2,"digest":"%s","manifests":[]}\n' "$d"
+  fi
+  EOF
+  cat > "$work/bin/cargo" <<'EOF'
+  #!/opt/homebrew/bin/bash
+  printf '{"packages":[{"name":"krit-cli","version":"0.3.1"}]}\n'
+  EOF
+  chmod +x "$work/bin/"*
+
+  cd "$work/dist"
+  for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+    echo "$t" > "krit-0.3.1-$t.tar.gz"
+  done
+  echo windows > krit-0.3.1-x86_64-pc-windows-msvc.zip
+  sha256sum -- *.tar.gz *.zip | LC_ALL=C sort -k2 > SHA256SUMS
+
+  export PATH="$work/bin:$PATH" FAKE_LOG="$work/log" RUNNER_TEMP="$work/tmp"
+  export VERSION=0.3.1 SERIES=0.3 IMAGE=ghcr.io/korvoxyz/krit GITHUB_REPOSITORY=korvoxyz/krit
+  export GITHUB_REF_NAME=v0.3.1 GITHUB_REF_TYPE=tag GITHUB_SERVER_URL=https://github.com
+  export GITHUB_OUTPUT="$work/output" GITHUB_STEP_SUMMARY="$work/summary"
+  export DRAFT_TITLE="Krit 0.3.1 (draft, release run 42)"
+  own='true\tKrit 0.3.1 (draft, release run 42)\n'
+  good="sha256:$(printf 'a%.0s' {1..64})"
+  other="sha256:$(printf 'b%.0s' {1..64})"
+
+  case_() {
+    local label="$1" step="$2"; shift 2
+    : > "$FAKE_LOG"; rm -rf -- "$RUNNER_TEMP"; mkdir "$RUNNER_TEMP"
+    local rc=0
+    env "$@" /opt/homebrew/bin/bash -e "$work/steps/$step.sh" > "$work/out" 2>&1 || rc=$?
+    local calls error
+    calls="$(grep -E 'create|upload|edit' "$FAKE_LOG" | paste -sd ';' - || true)"
+    error="$(grep -o '::error::.*' "$work/out" | head -1 || true)"
+    printf '%-34s exit=%s %s%s\n' "$label" "$rc" "${calls:+[$calls] }" "$error"
+  }
+  assets() { rm -rf -- "$work/assets"; mkdir "$work/assets"; cp -- *.tar.gz *.zip SHA256SUMS "$work/assets/"; }
+
+  echo "-- version job: published-release check"
+  case_ "no release" identity FAKE_RELEASES=''
+  case_ "draft only" identity FAKE_RELEASES='true\n'
+  case_ "published" identity FAKE_RELEASES='false\n'
+  case_ "draft and published" identity FAKE_RELEASES='true\nfalse\n'
+
+  echo "-- release job: upload to this run's draft"
+  case_ "no release" upload FAKE_RELEASES=''
+  case_ "this run's draft" upload FAKE_RELEASES="$own"
+  case_ "published release" upload FAKE_RELEASES='false\tKrit 0.3.1\n'
+  case_ "draft from run 41" upload FAKE_RELEASES='true\tKrit 0.3.1 (draft, release run 41)\n'
+  case_ "hand-made draft" upload FAKE_RELEASES='true\tKrit 0.3.1\n'
+  case_ "this run's draft and published" upload FAKE_RELEASES="${own}false\\tKrit 0.3.1\\n"
+  case_ "this run's draft twice" upload FAKE_RELEASES="${own}${own}"
+
+  echo "-- release job: verify the draft before publishing"
+  assets; case_ "exact assets" verify FAKE_STATE="$own" FAKE_ASSETS="$work/assets"
+  assets; case_ "already published" verify FAKE_STATE='false\tKrit 0.3.1\n' FAKE_ASSETS="$work/assets"
+  assets; echo x > "$work/assets/extra.txt"
+  case_ "extra asset" verify FAKE_STATE="$own" FAKE_ASSETS="$work/assets"
+  assets; rm "$work/assets/SHA256SUMS"
+  case_ "missing SHA256SUMS" verify FAKE_STATE="$own" FAKE_ASSETS="$work/assets"
+  assets; echo tampered > "$work/assets/krit-0.3.1-aarch64-apple-darwin.tar.gz"
+  case_ "changed archive bytes" verify FAKE_STATE="$own" FAKE_ASSETS="$work/assets"
+
+  echo "-- tags job: move series and latest to the attested index"
+  case_ "all tags on the index" tags DIGEST="$good" FAKE_LATEST="$good"
+  case_ "latest on another digest" tags DIGEST="$good" FAKE_LATEST="$other"
+  case_ "malformed digest output" tags DIGEST=bogus FAKE_LATEST="$good"
