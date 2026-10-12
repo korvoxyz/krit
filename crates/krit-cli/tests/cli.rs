@@ -2146,7 +2146,7 @@ fn run_refuses_every_check_failure_with_checks_diagnostic_and_status() {
             let expected_errors = conformance_codes(&case, "expect.diagnostics");
             let target_only = !expected_errors.is_empty()
                 && expected_errors.iter().all(|code| code.starts_with("K7"));
-            if check.status.success() || target_only {
+            if check.status.success() {
                 // A valid program runs, or is refused only because direct
                 // execution has no entrypoint or host to offer (K5003).
                 assert!(
@@ -2155,6 +2155,14 @@ fn run_refuses_every_check_failure_with_checks_diagnostic_and_status() {
                     case.display(),
                     String::from_utf8_lossy(&run.stderr)
                 );
+                continue;
+            }
+            if target_only {
+                // Plain `check` adds the target check only for entrypoint
+                // files, so a target-only failure is an entrypoint file, and
+                // `run` refuses it exactly as the CHANGELOG upgrade notes say:
+                // with K5003 and status 4, check's warnings, and no output.
+                assert_target_only_failure_is_refused_with_k5003(&case, format, &run);
                 continue;
             }
             assert_eq!(
@@ -2171,6 +2179,48 @@ fn run_refuses_every_check_failure_with_checks_diagnostic_and_status() {
             );
             assert!(run.stdout.is_empty(), "{} {format}", case.display());
         }
+    }
+}
+
+fn assert_target_only_failure_is_refused_with_k5003(
+    case: &Path,
+    format: &str,
+    run: &std::process::Output,
+) {
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(
+        run.status.code(),
+        Some(4),
+        "{} {format}: {stderr}",
+        case.display()
+    );
+    assert!(run.stdout.is_empty(), "{} {format}", case.display());
+    if format == "json" {
+        let diagnostics = parse_json_lines(&run.stderr);
+        assert_eq!(
+            diagnostic_codes(&diagnostics, "error"),
+            ["K5003"],
+            "{}",
+            case.display()
+        );
+        assert_eq!(
+            diagnostic_codes(&diagnostics, "warning"),
+            conformance_codes(case, "expect.warnings"),
+            "{}",
+            case.display()
+        );
+    } else {
+        let errors: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.contains(": error["))
+            .collect();
+        assert_eq!(errors.len(), 1, "{} {format}: {stderr}", case.display());
+        assert!(
+            errors[0].contains(": error[K5003]: ")
+                && errors[0].contains("entrypoints are unavailable in direct source execution"),
+            "{} {format}: {stderr}",
+            case.display()
+        );
     }
 }
 

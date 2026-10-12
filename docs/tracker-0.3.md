@@ -129,3 +129,14 @@ documentation, examples, and the release gate.
   pass. D6 stays in review until the owner records the gate-8 decision in
   PRD §5. Then D6 closes, and `docs/agent-roadmap.md` moves 0.3 from
   implemented to delivered before the tag.
+- 2026-10-12 — Second release-gate audit, of `aa417b4`: gates 1–7 and the
+  docs and packaging checks pass again; gate 8 is unchanged (5/8 counting
+  reduced scope, 2/8 with full behavior) and still waits on the owner. Each
+  remaining full-behavior failure (01: 6, 04: 23, 08: 90 × K7002) needs guest
+  record or list layouts, list matching, or typed `json_decode` into records
+  (08 also `String` in policy 1), all 0.4 scope (PRD §5). Minor fixes: the
+  CHANGELOG upgrade note and PRD R1.2 now say that `run` refuses an
+  entrypoint file failing only the target check with `K5003` and status 4,
+  and the CLI refusal test pins exactly that instead of accepting any status
+  0 or 4; PRD R4.1 lists the `/` and `\` refusals of `url_path_segment` and
+  defers to the spec table. D6 stays in review.

@@ -255,7 +255,11 @@ into 0.3; scope and gates are in [docs/prd-0.3.md](docs/prd-0.3.md).
   `schedule`, and `serve`. 0.2 ignored it silently; an empty table is still
   accepted
 - `krit run` now refuses programs that fail checking, with check's diagnostic
-  and exit status and no partial output; 0.2 evaluated some of them
+  and exit status and no partial output; 0.2 evaluated some of them. The one
+  exception is an entrypoint file that fails only the build-target check
+  (`K7001`/`K7002`): `run` performs no target check because it builds no
+  artifact, and refuses such a file with `K5003` and exit status 4, as it
+  refuses every entrypoint file
 - Reading `_` as a value still works in edition 2026 but warns (`K2003`)
 - Method calls such as `s.len()` now report `K3011` instead of `K3004`
 - Request paths that 0.2 accepted, such as dot segments, encoded separators,

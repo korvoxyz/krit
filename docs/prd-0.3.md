@@ -79,7 +79,7 @@ single allocation (roadmap §9.2).
 | ID | Requirement | Acceptance |
 |---|---|---|
 | R1.1 | **Depth guards.** Parser, analyzer, Core lowering, formatter, and both Wasm compilers stop at a nesting limit (256 syntactic levels; an `else if` continuation does not add a level) with **K1005** and a span. The direct evaluator limits call depth (10,000 frames) with **K4010** and runs on a stack sized so the limit is always reached before a native overflow. | 2,000-deep nesting → K1005 in every stage; 100,000-deep recursion → K4010; no exit 134 anywhere; a 1,000-branch `else if` chain still checks. |
-| R1.2 | **`run` is gated on analysis.** `krit run` performs the same analysis as `krit check` and refuses on any error with check's diagnostic and exit status. Ill-typed runtime conformance cases move to `conformance/check`. | `run` refuses every `conformance/check` failure. |
+| R1.2 | **`run` is gated on analysis.** `krit run` performs the same analysis as `krit check` and refuses on any error with check's diagnostic and exit status. It builds no artifact, so it skips the build-target check; an entrypoint file that fails only that check is refused with K5003, as every entrypoint file is (spec/LANGUAGE.md section 14). Ill-typed runtime conformance cases move to `conformance/check`. | `run` refuses every `conformance/check` failure. |
 | R1.3 | **Dependencies fail closed.** A manifest with a non-empty `[dependencies]` table is rejected with **K6003** by `package check`, `build`, `sandbox`, `permissions`. | New conformance/package case. |
 | R1.4 | **Artifact compatibility window.** Load by membership in supported sets (metadata schema, policy version, `krit:runtime` WIT version, edition); the compiler version is recorded, not compared; effects are still re-derived from imports. Runtime N supports artifacts of the same and two previous minor toolchains, never newer. | A checked-in 0.2.0-built artifact loads and runs on 0.3. |
 | R1.5 | **Secret→origin binding.** Manifest form `[secrets.<name>] origins = ["https://…"]` (`inject = "bearer"` default). The host refuses injection to an unbound origin with **K5006** before any bytes leave. The legacy flat `secrets = [...]` form still parses and is reported `UNBOUND (any granted origin)` by `krit permissions`. | The swapped-token probe (webhook-agent sending `github-token` to the message origin) is refused once bindings are declared. |
@@ -112,7 +112,7 @@ single allocation (roadmap §9.2).
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| R4.1 | **Stdlib v0** (pure, no effects, deterministic, flat prefixed names): `int_to_string(Int) -> String`; `url_path_segment(String) -> Result<String, String>` (percent-encodes all but RFC 3986 unreserved; `Err` for text the host path rule would refuse — empty, `.`/`..` after the host's `;?#` cut and space trim, ASCII control characters, or `%` followed by a hex digit or `u`/`U` — so untrusted text fails recoverably instead of trapping the invocation; every `Ok` output is accepted by the host path rule); `url_query(List<{name, value}>) -> String` (`k=v&…`, percent-encoded, no leading `?`); `string_byte_len(String) -> Int`; `string_is_empty(String) -> Bool`; `string_contains(String, String) -> Bool`; `string_starts_with(String, String) -> Bool`; `string_ends_with(String, String) -> Bool`. Each works in `check`, `run`, LSP, and Wasm. | Per-function conformance and evaluator/Wasm agreement. |
+| R4.1 | **Stdlib v0** (pure, no effects, deterministic, flat prefixed names): `int_to_string(Int) -> String`; `url_path_segment(String) -> Result<String, String>` (percent-encodes all but RFC 3986 unreserved; `Err` for text the host path rule would refuse — empty, `/`, `\`, ASCII control characters, `%` followed by a hex digit or `u`/`U`, or `.`/`..` after the host's `;?#` cut and space trim; the `Err` table in spec/LANGUAGE.md section 12.1 is normative — so untrusted text fails recoverably instead of trapping the invocation; every `Ok` output is accepted by the host path rule); `url_query(List<{name, value}>) -> String` (`k=v&…`, percent-encoded, no leading `?`); `string_byte_len(String) -> Int`; `string_is_empty(String) -> Bool`; `string_contains(String, String) -> Bool`; `string_starts_with(String, String) -> Bool`; `string_ends_with(String, String) -> Bool`. Each works in `check`, `run`, LSP, and Wasm. | Per-function conformance and evaluator/Wasm agreement. |
 | R4.2 | **K9013 lint** (warning): a non-literal piece of an `HttpRequest` `path` or `query` (interpolation hole or `+` operand) that is not a call to `url_path_segment`, `url_query`, or `int_to_string`. | Lint fires on the injection probe, not on the examples. |
 | R4.3 | **Warnings channel.** Diagnostics carry severity; `check`, `run`, `build`, LSP print warnings (human: `warning[K…]`; JSON: `"severity": "warning"`) without changing the exit status. | K2003/K9013 shown, exit 0. |
 | R4.4 | **Habit codes** K1101–K1112 with a one-line fix hint in `notes`: `return`; `for`/`while`; assignment/`mut`/`var`/`const`; `struct`/`class`/`impl`/`trait`; `import`; `async`/`await`; `try`/`catch`/`throw`; `a[i]`; `(x) => e`; ternary; `switch`/`case`; `else { return … }`. **K2001** gains did-you-mean (and `null` → `None`); **K3011** method-call `s.len()` → stdlib function hint. | One conformance case per code. |
@@ -147,8 +147,9 @@ single allocation (roadmap §9.2).
    owner's release decision.
    The corpus is in [benchmarks/sketches](../benchmarks/sketches/README.md),
    and `cargo test -p krit-cli --test sketches` measures it again. The
-   release-gate audit of `6a862f0` reproduced both figures. Counting the
-   roadmap's corpus instead (03b in place of 02) gives the same 2/8 and 5/8.
+   release-gate audits of `6a862f0` and `aa417b4` reproduced both figures.
+   Counting the roadmap's corpus instead (03b in place of 02) gives the same
+   2/8 and 5/8.
    **Owner decision on counting reduced scope:** not yet recorded.
 
 ## 6. Metrics
