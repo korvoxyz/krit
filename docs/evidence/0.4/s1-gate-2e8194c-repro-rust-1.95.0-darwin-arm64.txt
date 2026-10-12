@@ -1,0 +1,53 @@
+scripts/gate.sh evidence: 0.3.1 item S1 (R0.2), reproducing 0.3.0's failures
+
+Command:  scripts/gate.sh --target-dir <scratch target dir>, run from a
+          `git archive 2e8194c` extract (v0.3.0) with scripts/gate.sh and
+          deny.toml from 75643f6 copied in; the extract has no .git, so the
+          gate reports "unknown commit"
+Tree:     2e8194c (v0.3.0), the commit of CI run 38215808398
+Date:     2026-10-12
+Host:     macOS (Darwin 27.0.0), arm64; Rust 1.95.0, cargo-deny 0.20.2,
+          cargo-audit 0.22.2
+
+Result: the gate fails as CI did. Clippy on Rust 1.95.0 reports the
+collapsible_match at crates/krit-runtime/src/lib.rs:1062 that failed CI's
+"Rust 1.95 quality" job (local Rust 1.98 runs had not reported it), and
+cargo deny and cargo audit both report RUSTSEC-2026-0285 in rustls 0.23.39.
+cargo deny's bans check also fails because 2e8194c's workspace path
+dependencies have no version requirement, which the new deny.toml denies
+as wildcards. The run's other CI failure, the windows-2022 E0308 at
+crates/krit-runtime/src/network.rs:746, is Windows-only code and cannot
+reproduce on macOS.
+
+Excerpt of the gate's output:
+
+gate: toolchain  rustc 1.95.0 (59807616e 2026-04-14) (+1.95.0)
+gate: os         Darwin 27.0.0 arm64
+gate: commit     unknown commit
+gate: target dir <scratch target dir>
+
+error: this `if` can be collapsed into the outer `match`
+    --> crates/krit-runtime/src/lib.rs:1062:21
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_match
+     = note: `-D clippy::collapsible-match` implied by `-D warnings`
+
+error[vulnerability]: TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries
+    ├ ID: RUSTSEC-2026-0285
+advisories FAILED, bans FAILED, licenses ok, sources ok
+
+Crate:     rustls
+Version:   0.23.39
+Title:     TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries
+ID:        RUSTSEC-2026-0285
+error: 1 vulnerability found!
+
+gate: summary
+gate:   Check formatting                       ok          0s
+gate:   Check example metrics                  ok          0s
+gate:   Run Clippy                             FAILED     20s
+gate:   Run tests and conformance              ok        123s
+gate:   Run documentation tests                ok          1s
+gate:   Check dependencies with cargo deny     FAILED      3s
+gate:   Audit dependencies with cargo audit    FAILED      2s
+gate: FAIL (3 of 7 steps failed) | rustc 1.95.0 (59807616e 2026-04-14) | Darwin 27.0.0 arm64 | unknown commit

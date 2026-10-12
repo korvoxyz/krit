@@ -1,0 +1,49 @@
+scripts/gate.sh evidence: 0.3.1 item S1 (R0.2, R1.1, R1.2)
+
+Command:  scripts/gate.sh --target-dir target/rust-1.95
+Commit:   75643f64d524 (clean tree), track/0.3.1-supply
+Date:     2026-10-12
+Host:     macOS (Darwin 27.0.0), arm64; Rust 1.95.0, cargo-deny 0.20.2,
+          cargo-audit 0.22.2
+Note:     --target-dir only reuses a warm 1.95.0 cache in this worktree; the
+          commands and environment are the gate's defaults.
+
+Excerpt of the gate's output: the header, every command it ran, the test
+totals (summed from the "test result:" lines), the cargo deny and cargo
+audit results, and the summary. cargo deny's ten multiple-versions
+warnings (bitflags, cpufeatures, hashbrown, syn, wasm-encoder,
+wasm-metadata, wasmparser, winnow, wit-component, wit-parser) are omitted;
+deny.toml sets multiple-versions = "warn".
+
+gate: toolchain  rustc 1.95.0 (59807616e 2026-04-14) (+1.95.0)
+gate: os         Darwin 27.0.0 arm64
+gate: commit     75643f64d524
+gate: target dir target/rust-1.95
+
+$ cargo +1.95.0 fmt --all --check
+$ python3 -I scripts/metrics.py --check-depth 3 examples
+$ python3 -I scripts/metrics.py --check-lines 50 examples/webhook-agent.krit
+$ cargo +1.95.0 clippy --workspace --all-targets --locked -- -D warnings
+$ cargo +1.95.0 test --workspace --all-targets --locked
+$ cargo +1.95.0 test --workspace --doc --locked
+$ cargo +1.95.0 deny --locked check
+$ cargo +1.95.0 audit
+
+tests: 68 "test result" lines (58 all-targets, 10 doc), 1023 passed, 0 failed,
+       1 ignored (network::tests::trusted_public_https_smoke_test, which
+       needs public DNS and network access, and is ignored in CI too)
+cargo-deny 0.20.2
+advisories ok, bans ok, licenses ok, sources ok
+cargo-audit 0.22.2
+Loaded 1299 security advisories (from ~/.cargo/advisory-db)
+Scanning Cargo.lock for vulnerabilities (251 crate dependencies)
+
+gate: summary
+gate:   Check formatting                       ok          1s
+gate:   Check example metrics                  ok          0s
+gate:   Run Clippy                             ok          0s
+gate:   Run tests and conformance              ok         46s
+gate:   Run documentation tests                ok          2s
+gate:   Check dependencies with cargo deny     ok          7s
+gate:   Audit dependencies with cargo audit    ok          3s
+gate: PASS | rustc 1.95.0 (59807616e 2026-04-14) | Darwin 27.0.0 arm64 | 75643f64d524
