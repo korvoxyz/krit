@@ -20,14 +20,50 @@ cargo build --workspace --locked
 cargo test --workspace --all-targets --locked
 ```
 
-Before submitting a change:
+## Before you push
+
+Run `scripts/gate.sh` before pushing or opening a pull request. It runs what
+CI runs, with the same commands and flags: formatting, the example metrics
+checks, Clippy with `-D warnings`, the workspace tests and conformance, the
+documentation tests, `cargo deny`, and `cargo audit`. It uses Rust 1.95.0,
+CI's quality toolchain, and `--locked`, so a newer local compiler cannot hide
+a lint that CI's toolchain reports. Install the toolchain and CI's versions
+of the supply-chain tools once:
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets --locked
-cargo build --workspace --release --locked
+rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
+cargo install --locked --version 0.20.2 cargo-deny
+cargo install --locked --version 0.22.2 cargo-audit
 ```
+
+Then run the gate. It always runs at the repository root, wherever it is
+started from:
+
+```sh
+scripts/gate.sh                     # what CI runs, on Rust 1.95.0
+scripts/gate.sh --skip-supply       # offline: skip cargo deny and cargo audit
+scripts/gate.sh --toolchain stable  # the current-stable test toolchain
+scripts/gate.sh --help              # every option
+```
+
+Every step runs even after one fails. The output names the toolchain, OS, and
+commit it ran on, gives a result per step, and ends with a `gate: PASS` or
+`gate: FAIL` line. The script exits non-zero on any failure, on a missing
+toolchain, and on a cargo-deny or cargo-audit version other than CI's. A run
+with `--skip-supply` is partial and says so in its final line. Builds go to
+`target/gate-<toolchain>` (change it with `--target-dir`), so the gate does
+not disturb your everyday build cache. The gate does not build the release
+profile, which CI's package jobs do; a change to build settings or to the
+release profile should also pass
+`cargo +1.95.0 build -p krit-cli --release --locked`.
+
+`deny.toml` holds the supply-chain policy: RustSec advisories, including
+unmaintained, unsound, and yanked crates, are errors; version requirements
+may not be wildcards; the license allow-list names exactly the licenses the
+dependency graph needs; and crates come only from crates.io. A new
+dependency whose license is not on the list needs a reviewed change to
+`deny.toml`, and an advisory may be ignored only with a stated reason and an
+expiry release.
 
 ## Language changes
 
@@ -102,19 +138,23 @@ scripts/clean.sh --help             # list every category
 
 The categories are `debug` (`target/debug`), `intermediates` (release build
 intermediates, keeping the `krit` binary), `release`, `dist` (packaged
-archives), `scratch` (other entries at the top of `target/`), `examples`
+archives), `scratch` (other entries at the top of `target/`, including the
+`target/gate-<toolchain>` build caches of `scripts/gate.sh`), `examples`
 (`examples/target`, `examples/state`, and `examples/data`), `worktrees` (the
 `target/` of every other git worktree of this repository), and `all`. Do not
 clean `worktrees` while builds are running in them.
 
 ## Release workflow
 
-CI runs the minimum-version formatting/Clippy/conformance gate and current-stable
-tests on Linux, macOS, and Windows before building native Linux x86-64/ARM64,
-macOS Intel/Apple Silicon, and Windows x86-64 packages. The Windows test job is
-advisory (`continue-on-error`) until its suite is first green; then it becomes
-required like the others. Downloadable archives and per-archive SHA-256 files
-are attached to successful workflow runs for 14 days.
+CI runs on pull requests and on pushes to `main` and to `release/**`
+branches. It runs the minimum-version formatting/Clippy/conformance gate, the
+supply-chain job (`cargo deny` and `cargo audit` at pinned versions), and
+current-stable tests on Linux, macOS, and Windows before building native Linux
+x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x86-64 packages.
+`scripts/gate.sh` runs the same quality and supply-chain steps locally. The
+Windows test job is advisory (`continue-on-error`) until its suite is first
+green; then it becomes required like the others. Downloadable archives and
+per-archive SHA-256 files are attached to successful workflow runs for 14 days.
 
 The release packager uses Python 3.12's standard library. It includes dependency
 license notices and exercises the extracted archive's evaluator, compiler,
@@ -126,7 +166,9 @@ license and exact source revision match.
 To publish a stable release:
 
 1. Update the workspace version in `Cargo.toml` and move the completed changelog
-   entries into a dated release section. Commit and push to `main`.
+   entries into a dated release section. On a minor or major release, also
+   raise the `version` requirement of the workspace's own crates under
+   `[workspace.dependencies]`. Commit and push to `main`.
 2. Wait for CI, including every native package, to succeed.
 3. Create and push an annotated `vMAJOR.MINOR.PATCH` tag on that exact commit.
    The tag must match the CLI's Cargo version. For this release, use `v0.3.0`,
