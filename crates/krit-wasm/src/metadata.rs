@@ -7,7 +7,7 @@ pub const ARTIFACT_POLICY_VERSION: u32 = 1;
 pub const STATE_ARTIFACT_POLICY_VERSION: u32 = 2;
 pub const COMPILER_NAME: &str = "krit";
 pub const LANGUAGE_NAME: &str = "Krit";
-pub const LANGUAGE_VERSION: &str = "0.2.0";
+pub const LANGUAGE_VERSION: &str = "0.3.0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

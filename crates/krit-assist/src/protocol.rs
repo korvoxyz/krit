@@ -7,7 +7,7 @@ pub const PROPOSAL_SCHEMA_VERSION: u32 = 1;
 /// The `promptVersion` of the shipped `ai/prompt-pack.json`, read at compile
 /// time so the advertised version cannot drift from the pack.
 pub const PROMPT_PACK_VERSION: &str = prompt_pack_version(PROMPT_PACK_METADATA);
-pub const LANGUAGE_VERSION: &str = "0.2.0";
+pub const LANGUAGE_VERSION: &str = "0.3.0";
 pub const LANGUAGE_EDITION: &str = "2026";
 pub const AUTHORING_INSTRUCTION: &str = include_str!("../assets/KRIT-AUTHORING-1.md");
 

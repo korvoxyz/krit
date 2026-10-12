@@ -190,22 +190,22 @@ The archives are self-contained: **no Rust, Python, or Node.js installation is
 required**. Each includes the CLI, runnable examples, `BUILD.json` with the source
 commit and binary digest, and dependency license notices.
 
-| Platform | Archive for release 0.2.0 |
+| Platform | Archive for release 0.3.0 |
 | --- | --- |
-| Linux x86-64, glibc 2.35+ | `krit-0.2.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux ARM64, glibc 2.35+ | `krit-0.2.0-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS 12+, Intel | `krit-0.2.0-x86_64-apple-darwin.tar.gz` |
-| macOS 12+, Apple Silicon | `krit-0.2.0-aarch64-apple-darwin.tar.gz` |
-| Windows x86-64 | `krit-0.2.0-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64, glibc 2.35+ | `krit-0.3.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64, glibc 2.35+ | `krit-0.3.0-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS 12+, Intel | `krit-0.3.0-x86_64-apple-darwin.tar.gz` |
+| macOS 12+, Apple Silicon | `krit-0.3.0-aarch64-apple-darwin.tar.gz` |
+| Windows x86-64 | `krit-0.3.0-x86_64-pc-windows-msvc.zip` |
 
 Download `SHA256SUMS` alongside your archive. On Linux, verify the downloaded
 archive with `sha256sum --check --ignore-missing SHA256SUMS`. On macOS, select
 its checksum entry, for example:
 
 ```sh
-grep '  krit-0.2.0-aarch64-apple-darwin.tar.gz$' SHA256SUMS | shasum -a 256 -c -
-tar -xzf krit-0.2.0-aarch64-apple-darwin.tar.gz
-cd krit-0.2.0-aarch64-apple-darwin
+grep '  krit-0.3.0-aarch64-apple-darwin.tar.gz$' SHA256SUMS | shasum -a 256 -c -
+tar -xzf krit-0.3.0-aarch64-apple-darwin.tar.gz
+cd krit-0.3.0-aarch64-apple-darwin
 ./krit --version
 ./krit run examples/factorial.krit
 ```
@@ -230,8 +230,8 @@ Krit is also published to
 with native Linux AMD64 and ARM64 images:
 
 ```sh
-docker run --rm ghcr.io/korvoxyz/krit:0.2.0 --version
-docker run --rm ghcr.io/korvoxyz/krit:0.2.0 run examples/factorial.krit
+docker run --rm ghcr.io/korvoxyz/krit:0.3.0 --version
+docker run --rm ghcr.io/korvoxyz/krit:0.3.0 run examples/factorial.krit
 ```
 
 The image runs as a non-root user. To use a local project on Linux or macOS,
@@ -240,10 +240,10 @@ yours:
 
 ```sh
 docker run --rm --user "$(id -u):$(id -g)" \
-  --volume "$PWD:/work" ghcr.io/korvoxyz/krit:0.2.0 check main.krit
+  --volume "$PWD:/work" ghcr.io/korvoxyz/krit:0.3.0 check main.krit
 ```
 
-The `0.2` tag tracks the 0.2 series; `latest` tracks the latest stable release.
+The `0.3` tag tracks the 0.3 series; `latest` tracks the latest stable release.
 Pin a full version or image digest for reproducible use. GitHub Packages hosts
 the container; standalone native archives are GitHub Release assets.
 
@@ -1041,7 +1041,7 @@ schema = 1
 
 [package]
 name = "akshay/krit"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2026"
 entry = "examples/factorial.krit"
 license = "Apache-2.0"
@@ -1088,8 +1088,9 @@ The specification is the semantic authority:
   provider-neutral connectors
 - [Narrow product MVP](docs/mvp.md)
 - [Agent platform roadmap](docs/agent-roadmap.md) — delivered phases
-- [Krit master plan](docs/roadmap.md) and the
-  [0.3 requirements](docs/prd-0.3.md) — what comes next
+- [Krit master plan](docs/roadmap.md) — what comes next
+- [0.3 requirements](docs/prd-0.3.md) and [changelog](CHANGELOG.md) — what
+  0.3 delivers
 - [Rust technical design](docs/technical-design.md)
 - [Performance methodology](docs/performance.md)
 - [Initial measured baseline](benchmarks/baseline.json)

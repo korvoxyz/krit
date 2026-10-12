@@ -1004,7 +1004,7 @@ impl Document {
         Ok(CompilerFacts {
             schema: 1,
             authoring_protocol: 1,
-            language_version: "0.2.0",
+            language_version: "0.3.0",
             edition: "2026",
             document_version: self.version,
             valid: self.analysis.is_some() && !self.oversized,
