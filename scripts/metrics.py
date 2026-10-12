@@ -5,7 +5,8 @@ Usage:
     python3 -I scripts/metrics.py [--json] [--check-depth N] [--check-lines N] PATH...
 
 Each PATH is a `.krit` file or a directory whose `.krit` files (not those of
-subdirectories) are measured. For every file the report gives:
+subdirectories) are measured. Paths are reported with `/` separators on every
+platform. For every file the report gives:
 
     lines      physical lines
     code       lines that hold code: not blank and not only a comment
@@ -343,6 +344,14 @@ COLUMNS = [
 ]
 
 
+def portable(path):
+    """`path` with `/` separators, so a report reads the same on every platform."""
+    for separator in (os.sep, os.altsep):
+        if separator and separator != "/":
+            path = path.replace(separator, "/")
+    return path
+
+
 def expand(paths):
     files = []
     for path in paths:
@@ -356,7 +365,7 @@ def expand(paths):
             )
         else:
             files.append(path)
-    return files
+    return [portable(path) for path in files]
 
 
 def render_table(reports):
