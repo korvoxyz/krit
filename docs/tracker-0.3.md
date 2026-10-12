@@ -61,7 +61,7 @@ documentation, examples, and the release gate.
 | D3 | Conformance ≥ 40 run / 60 check / 8 format | R5.3 | done | counts |
 | D4 | Prompt pack 0.3 with checked examples | R4.5 | done | examples check |
 | D5 | `docs/roadmap.md`, RFC-0007 resource handles (draft), CHANGELOG, README, version 0.3.0 | R5.4 | done | checklist |
-| D6 | Release gate (PRD §5) and grounded-sketch re-measure | §5 | doing | all gates |
+| D6 | Release gate (PRD §5) and grounded-sketch re-measure | §5 | review | all gates |
 
 ## Log
 
@@ -117,3 +117,15 @@ documentation, examples, and the release gate.
   strings; README install references, root `krit.pkg`, and CONTRIBUTING's tag
   example moved to 0.3.0; CHANGELOG 0.3.0 section with upgrade notes and
   metrics. fmt and clippy clean, 1,017 tests pass, 1 ignored.
+- 2026-10-12 — Independent release-gate audit of `6a862f0`: gates 1–7 and
+  the docs and packaging checks pass with evidence. Gate 8 is met only when
+  reduced-scope rewrites count (5/8; 2/8 with full behavior), and PRD §5
+  leaves that to the owner. Audit fixes: the sketch corpus (the 0.3 rewrites,
+  recreated by the audit because the wave-3 copies were lost with their
+  worktree, plus the 0.2 variant 03b) is now in `benchmarks/sketches/`, with a
+  test that measures it again and invokes the reduced payment sketch; and
+  doctests for `run_source` and `format_source` give the doctest gate real
+  coverage. fmt and clippy clean, 1,021 tests pass, 1 ignored; 2 doctests
+  pass. D6 stays in review until the owner records the gate-8 decision in
+  PRD §5. Then D6 closes, and `docs/agent-roadmap.md` moves 0.3 from
+  implemented to delivered before the tag.

@@ -230,6 +230,9 @@ into 0.3; scope and gates are in [docs/prd-0.3.md](docs/prd-0.3.md).
   a floor of 40 run, 60 check, and 8 format cases
 - Added `docs/roadmap.md` (the plan to 1.0), an RFC template, and draft
   RFC-0007 on resource handles
+- The grounded use-case sketches behind release gate 8 are kept in
+  `benchmarks/sketches/`, and a test measures them again on every run, so the
+  sketch figures below can be reproduced
 
 ### Compatibility and upgrade notes
 
@@ -293,7 +296,7 @@ into 0.3; scope and gates are in [docs/prd-0.3.md](docs/prd-0.3.md).
 
 | Metric | 0.2.0 | 0.3.0 |
 | --- | --- | --- |
-| Workspace tests (`cargo test --workspace --all-targets`) | 629 | 1,017 |
+| Workspace tests (`cargo test --workspace --all-targets`) | 629 | 1,021 |
 | Conformance run / check / format cases | 25 / 29 / 3 | 50 / 174 / 18 |
 | Conformance package / build-compatibility cases | 0 / 0 | 6 / 2 |
 | `webhook-agent.krit` lines / maximum depth | 79 / 15 | 47 / 3 |
@@ -307,12 +310,13 @@ into 0.3; scope and gates are in [docs/prd-0.3.md](docs/prd-0.3.md).
 The grounded sketches are eight realistic agent programs (issue triage, chat
 summaries, a payment webhook, a ticket router, a retrying worker, RAG answers,
 and more) used to measure fit, as described in the release gate of
-[docs/prd-0.3.md](docs/prd-0.3.md). In 0.2.0 a reduced-scope payment sketch
-also built but was not counted, so the like-for-like comparison is 1/8 to 2/8
-with full behavior and 2/8 to 5/8 when reduced-scope rewrites count. Three of
-the five that build in 0.3 (chat summaries, the payment webhook, and the ticket
-router) do so only with reduced scope; full behavior waits on typed decoding,
-record and list layouts, header lookup, and HMAC.
+[docs/prd-0.3.md](docs/prd-0.3.md) and kept in
+[benchmarks/sketches](benchmarks/sketches/README.md). In 0.2.0 a reduced-scope
+payment sketch also built but was not counted, so the like-for-like comparison
+is 1/8 to 2/8 with full behavior and 2/8 to 5/8 when reduced-scope rewrites
+count. Three of the five that build in 0.3 (chat summaries, the payment
+webhook, and the ticket router) do so only with reduced scope; full behavior
+waits on typed decoding, record and list layouts, header lookup, and HMAC.
 
 ## [0.2.0] - 2026-09-05
 

@@ -145,6 +145,11 @@ single allocation (roadmap §9.2).
    record/list layouts, header lookup via list matching, HMAC) are 0.4
    scope. The gate is met only when reduced-scope rewrites count; that is the
    owner's release decision.
+   The corpus is in [benchmarks/sketches](../benchmarks/sketches/README.md),
+   and `cargo test -p krit-cli --test sketches` measures it again. The
+   release-gate audit of `6a862f0` reproduced both figures. Counting the
+   roadmap's corpus instead (03b in place of 02) gives the same 2/8 and 5/8.
+   **Owner decision on counting reduced scope:** not yet recorded.
 
 ## 6. Metrics
 

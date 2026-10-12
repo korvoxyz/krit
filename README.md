@@ -1095,6 +1095,8 @@ The specification is the semantic authority:
 - [Performance methodology](docs/performance.md)
 - [Initial measured baseline](benchmarks/baseline.json)
 - [Policy-1 Wasm host baseline](benchmarks/phase3-wasm-host.json)
+- [Grounded use-case sketches](benchmarks/sketches/README.md) — the programs
+  behind the 0.3 fit measurement
 - [Conformance suite](conformance/README.md)
 
 The Racket prototype is preserved only in Git history at tag
