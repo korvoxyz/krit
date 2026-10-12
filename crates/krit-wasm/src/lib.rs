@@ -3,6 +3,7 @@ mod compatibility;
 mod compiler;
 mod error;
 mod metadata;
+mod stdlib;
 mod strings;
 mod support;
 mod validation;

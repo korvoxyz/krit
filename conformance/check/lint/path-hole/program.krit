@@ -1,0 +1,4 @@
+/// Builds an issue request from untrusted text: K9013 at the hole.
+fn fetch(owner: String) -> HttpRequest {
+    HttpRequest { method: "GET", path: "/repos/\(owner)/issues" }
+}

@@ -2,6 +2,8 @@ use std::{error::Error, fmt, net::IpAddr};
 
 use url::{Host, Url};
 
+pub mod request_target;
+
 /// Returns whether `name` uses the canonical resource-name grammar: 1-64
 /// lowercase ASCII letters, digits, `.`, or `-`, with no leading or trailing
 /// punctuation and no `..` or `--`.

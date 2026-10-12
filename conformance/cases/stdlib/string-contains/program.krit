@@ -1,0 +1,14 @@
+// `string_contains` compares UTF-8 bytes; the empty string occurs in every
+// string, and there is no case folding or normalization.
+println(string_contains("hello", "ell"));
+println(string_contains("hello", "hello"));
+println(string_contains("hello", ""));
+println(string_contains("", ""));
+println(string_contains("", "a"));
+println(string_contains("hello", "olleh"));
+println(string_contains("hel", "hello"));
+println(string_contains("café", "é"));
+println(string_contains("café", "e"));
+println(string_contains("日本語", "本"));
+println(string_contains("aaaaaaaaab", "aaab"));
+println(string_contains("Hello", "hello"));

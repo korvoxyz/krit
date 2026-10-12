@@ -1,0 +1,17 @@
+// Pieces produced by `url_path_segment`, `url_query`, or `int_to_string`,
+// directly or through a binding of the call, are never K9013.
+fn fetch(owner: String, number: Int, label: String) -> Result<HttpRequest, String> {
+    let issue = int_to_string(number);
+    let labels = url_query(["label": label]);
+    let size = int_to_string(100);
+    match url_path_segment(owner) {
+        Ok(segment) => Ok(
+            HttpRequest {
+                method: "POST",
+                path: "/repos/\(segment)/issues/\(issue)/labels/" + int_to_string(number),
+                query: labels + "&" + url_query(["page": "1"]) + "&per_page=" + size,
+            },
+        ),
+        Err(reason) => Err(reason),
+    }
+}

@@ -136,6 +136,11 @@ network service, or nondeterministic value.
 | `json/round-trip` | deterministic JSON conversion |
 | `json/string-escapes` | every JSON string escape, surrogate pairs, and surrounding whitespace decode |
 | `types/annotations` | parsed binding, parameter, return, and generic types |
+| `stdlib/int-to-string` | `int_to_string` in base ten: zero, negative values, and both `Int` bounds |
+| `stdlib/url-path-segment` | `url_path_segment`: RFC 3986 unreserved bytes kept, every other byte escaped in uppercase hex, and each refusal of the host path rule with its message, in order |
+| `stdlib/url-query` | `url_query`: encoded `name=value` pairs joined by `&` from entry, header, and log-field lists; the empty list and empty names |
+| `stdlib/string-byte-len`, `stdlib/string-is-empty` | UTF-8 byte length and emptiness |
+| `stdlib/string-contains`, `stdlib/string-starts-with`, `stdlib/string-ends-with` | byte-wise searches: the empty part, a part longer than the text, multibyte text, and no case folding or normalization |
 | `errors/division-zero` | checked division |
 | `errors/overflow` | checked signed 64-bit arithmetic |
 | `errors/json-invalid` | invalid JSON input |
@@ -150,13 +155,14 @@ network service, or nondeterministic value.
 | `check/syntax/unit-type` | `()` written as a type is `K1002` with a note to write `Unit` |
 | `check/syntax/hole-*` | an interpolation hole that is not a name path (a call, an operator, a literal, whitespace, an empty or unclosed hole) is `K3015` at the hole with one note |
 | `check/syntax/text-block-*` | a text block with text after its opening `"""`, a line indented less than its closing `"""`, or a closing `"""` inside a line is `K0004`; an unclosed one is `K0002`; each with one note |
-| `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
+| `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields and a binding that reuses a standard-library name |
 | `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, and an unbound `_` is undefined |
 | `check/name/did-you-mean`, `check/name/null` | undefined names (`K2001`) that carry a did-you-mean or `None` note |
 | `check/name/hole-undefined`, `check/name/discard-hole` | a hole's name resolves like any other: an undefined one is `K2001` with a did-you-mean note, and reading `_` warns (`K2003`) |
 | `check/habit/*` | one case per construct from another language (`K1101`-`K1112`): `return`, loops, assignment, `struct`, `import`, `await`, `throw`, indexing, arrow functions, the conditional operator, `switch`, and `else { return ... }`; plus a conditional operator whose first branch does not parse |
 | `check/valid/habit-words-as-names` | habit words stay ordinary identifiers outside foreign constructs |
-| `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings and a method call on a string (`K3011`) |
+| `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings, a method call on a string (`K3011`), and a `url_query` argument that is not a list of name/value records |
+| `check/lint/*` | `K9013`: an unencoded hole or `+` operand of an `HttpRequest` path or query warns, in a named construction or a record literal, without failing the check or the build; pieces from `url_path_segment`, `url_query`, or `int_to_string` (direct or bound), literal paths, and forwarded values do not warn |
 | `check/type/construction-*` | named construction with an unknown, repeated, or missing required field (`K3016`, one note) or a value of the wrong type (`K3001`) |
 | `check/valid/named-construction` | named constructions flow wherever contract records do: helper results, list annotations, parenthesized conditions, and equality with records |
 | `check/type/entry-list-*` | entry-list keys and values must be `String`, and an entry list is not a list of another element type (`K3001`) |
@@ -169,7 +175,7 @@ network service, or nondeterministic value.
 | `check/capability/interpolated-resource`, `check/capability/text-block-resource` | an interpolated string or a text block is never a resource literal (`K3008`) |
 | `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, types that grow after they are bound, and types that grow when two solved types unify |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
-| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook built from named constructions builds; a webhook writing headers and log fields as entry lists and returning `Ok(())` from a helper builds; a webhook composing its model prompt from a text block with holes builds |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook built from named constructions builds; a webhook writing headers and log fields as entry lists and returning `Ok(())` from a helper builds; a webhook composing its model prompt from a text block with holes builds; a webhook calling every standard-library function builds |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |

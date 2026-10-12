@@ -1,0 +1,15 @@
+// A record literal typed as an `HttpRequest` is linted like a construction,
+// and the warning never stops the webhook from building.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let outbound = record {
+        method: "GET",
+        path: "/mirror/\(request.body)",
+        query: "",
+        headers: [],
+        body: "",
+    };
+    match http_request("https://api.example.com", outbound, None) {
+        Ok(response) => response,
+        Err(error) => HttpResponse { status: 502, body: error },
+    }
+}

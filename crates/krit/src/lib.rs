@@ -9,6 +9,7 @@ mod formatter;
 mod habits;
 mod lexer;
 mod limits;
+mod lint;
 mod parser;
 mod source;
 mod token;

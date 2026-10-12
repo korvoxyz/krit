@@ -2,11 +2,13 @@
 //!
 //! A Krit `String` value is an `i32` guest offset of an 8-byte canonical
 //! `(ptr, len)` pair that describes immutable UTF-8 bytes. The helpers here
-//! lower String concatenation, equality, ordering, and `json_decode` into
-//! `String` as plain-loop core functions that use only the MVP instructions
-//! the core validator admits. Each helper is emitted at most once per
-//! module, and only when a live function uses it, so a module without String
-//! operators or JSON decoding is unchanged.
+//! lower String concatenation, equality, ordering, `json_decode` into
+//! `String`, and the string functions of the standard library
+//! ([`crate::stdlib`]) as plain-loop core functions that use only the MVP
+//! instructions the core validator admits. Each helper is emitted at most
+//! once per module, and only when a live function uses it, so a module
+//! without String operators, JSON decoding, or standard-library calls is
+//! unchanged.
 //!
 //! Ordering is byte-lexicographic over UTF-8, exactly as the direct
 //! evaluator orders `str` bytes: the first differing byte decides, and a
@@ -29,6 +31,7 @@ use krit::{BinaryOperator, Builtin, CoreBlock, CoreModule, OperationKind, Type, 
 use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 use crate::{
+    stdlib::{self, Search},
     support::{LiveFunctions, for_each_nested_block, function_value_types},
     wit::{Scalar, Signature},
 };
@@ -50,6 +53,19 @@ pub(crate) enum StringHelper {
     Concat,
     /// Decoding of one JSON string text into a pair of its UTF-8 contents.
     JsonDecode,
+    /// `int_to_string`: the base-ten text of an `i64` as a fresh pair.
+    IntToString,
+    /// `string_starts_with`: whether the first pair begins with the second.
+    StartsWith,
+    /// `string_ends_with`: whether the first pair ends with the second.
+    EndsWith,
+    /// `string_contains`: whether the second pair occurs in the first.
+    Contains,
+    /// `url_path_segment`: a `Result<String, String>` of the encoded segment
+    /// or the reason the host path rule would refuse it.
+    PathSegment,
+    /// `url_query`: the encoded query of a list of name/value records.
+    Query,
 }
 
 impl StringHelper {
@@ -72,12 +88,33 @@ impl StringHelper {
         }
     }
 
-    /// The operators take two String pairs and the decoder takes one; every
-    /// helper returns one `i32`.
+    /// The helper that lowers a call of `builtin` whose result has type
+    /// `result`, or `None` when the call needs no helper: `string_byte_len`
+    /// and `string_is_empty` read the pair's length inline, and every other
+    /// built-in lowers to a host import or not at all.
+    pub(crate) fn for_call(builtin: Builtin, result: &Type) -> Option<Self> {
+        match builtin {
+            Builtin::JsonDecode if result == &Type::String => Some(Self::JsonDecode),
+            Builtin::IntToString => Some(Self::IntToString),
+            Builtin::StringStartsWith => Some(Self::StartsWith),
+            Builtin::StringEndsWith => Some(Self::EndsWith),
+            Builtin::StringContains => Some(Self::Contains),
+            Builtin::UrlPathSegment => Some(Self::PathSegment),
+            Builtin::UrlQuery => Some(Self::Query),
+            _ => None,
+        }
+    }
+
+    /// The operators and searches take two String pairs, `int_to_string`
+    /// takes an `i64`, and the other helpers take one `i32`; every helper
+    /// returns one `i32`.
     pub(crate) fn signature(self) -> Signature {
         let params = match self {
-            Self::Compare | Self::Concat => vec![Scalar::I32, Scalar::I32],
-            Self::JsonDecode => vec![Scalar::I32],
+            Self::Compare | Self::Concat | Self::StartsWith | Self::EndsWith | Self::Contains => {
+                vec![Scalar::I32, Scalar::I32]
+            }
+            Self::JsonDecode | Self::PathSegment | Self::Query => vec![Scalar::I32],
+            Self::IntToString => vec![Scalar::I64],
         };
         Signature {
             params,
@@ -91,8 +128,15 @@ impl StringHelper {
     /// they had before the decoder existed.
     pub(crate) const fn name(self) -> Option<&'static str> {
         match self {
-            Self::Compare | Self::Concat => None,
             Self::JsonDecode => Some(JSON_DECODE_FUNCTION_NAME),
+            Self::Compare
+            | Self::Concat
+            | Self::IntToString
+            | Self::StartsWith
+            | Self::EndsWith
+            | Self::Contains
+            | Self::PathSegment
+            | Self::Query => None,
         }
     }
 
@@ -103,32 +147,40 @@ impl StringHelper {
             Self::Compare => encode_compare(),
             Self::Concat => encode_concat(realloc_index),
             Self::JsonDecode => encode_json_decode(realloc_index),
+            Self::IntToString => stdlib::encode_int_to_string(realloc_index),
+            Self::StartsWith => stdlib::encode_search(Search::Prefix),
+            Self::EndsWith => stdlib::encode_search(Search::Suffix),
+            Self::Contains => stdlib::encode_search(Search::Anywhere),
+            Self::PathSegment => stdlib::encode_path_segment(realloc_index),
+            Self::Query => stdlib::encode_query(realloc_index),
         }
     }
 }
 
 /// Collects the string helpers that live functions use, in index order.
 pub(crate) fn used_helpers(module: &CoreModule, live: &LiveFunctions) -> BTreeSet<StringHelper> {
-    let mut decoders = BTreeSet::new();
+    let mut builtins = BTreeMap::new();
     for function in live.functions(module) {
-        collect_block_decoders(&function.body, &mut decoders);
+        collect_block_builtins(&function.body, &mut builtins);
     }
     let mut helpers = BTreeSet::new();
     for function in live.functions(module) {
         let types = function_value_types(function);
-        collect_block_helpers(&function.body, &types, &decoders, &mut helpers);
+        collect_block_helpers(&function.body, &types, &builtins, &mut helpers);
     }
     helpers
 }
 
-/// Collects the values that name the `json_decode` built-in.
-fn collect_block_decoders(block: &CoreBlock, decoders: &mut BTreeSet<ValueId>) {
+/// Collects the values that name a built-in. Every built-in a helper lowers
+/// is only ever called directly (support checking enforces it), so a call
+/// whose callee is one of these values is a call of that built-in.
+fn collect_block_builtins(block: &CoreBlock, builtins: &mut BTreeMap<ValueId, Builtin>) {
     for operation in &block.operations {
-        if matches!(operation.kind, OperationKind::Builtin(Builtin::JsonDecode)) {
-            decoders.insert(operation.result);
+        if let OperationKind::Builtin(builtin) = operation.kind {
+            builtins.insert(operation.result, builtin);
         }
         for_each_nested_block(operation, |nested| {
-            collect_block_decoders(nested, decoders);
+            collect_block_builtins(nested, builtins);
         });
     }
 }
@@ -136,7 +188,7 @@ fn collect_block_decoders(block: &CoreBlock, decoders: &mut BTreeSet<ValueId>) {
 fn collect_block_helpers(
     block: &CoreBlock,
     types: &BTreeMap<ValueId, Arc<Type>>,
-    decoders: &BTreeSet<ValueId>,
+    builtins: &BTreeMap<ValueId, Builtin>,
     helpers: &mut BTreeSet<StringHelper>,
 ) {
     for operation in &block.operations {
@@ -148,15 +200,18 @@ fn collect_block_helpers(
                     helpers.insert(helper);
                 }
             }
-            OperationKind::Call { callee, .. }
-                if decoders.contains(callee) && operation.ty.as_ref() == &Type::String =>
-            {
-                helpers.insert(StringHelper::JsonDecode);
+            OperationKind::Call { callee, .. } => {
+                if let Some(helper) = builtins
+                    .get(callee)
+                    .and_then(|builtin| StringHelper::for_call(*builtin, &operation.ty))
+                {
+                    helpers.insert(helper);
+                }
             }
             _ => {}
         }
         for_each_nested_block(operation, |nested| {
-            collect_block_helpers(nested, types, decoders, helpers);
+            collect_block_helpers(nested, types, builtins, helpers);
         });
     }
 }
@@ -180,7 +235,7 @@ pub(crate) fn emit_comparison_result(function: &mut Function, operator: BinaryOp
     function.instruction(&instruction);
 }
 
-const fn pair_word(offset: u64) -> MemArg {
+pub(crate) const fn pair_word(offset: u64) -> MemArg {
     MemArg {
         offset,
         align: 2,
@@ -189,10 +244,10 @@ const fn pair_word(offset: u64) -> MemArg {
 }
 
 /// Byte-aligned access: string bytes have no alignment guarantee.
-const BYTES: MemArg = byte_at(0);
+pub(crate) const BYTES: MemArg = byte_at(0);
 
 /// Byte-aligned access `offset` bytes past the address on the stack.
-const fn byte_at(offset: u64) -> MemArg {
+pub(crate) const fn byte_at(offset: u64) -> MemArg {
     MemArg {
         offset,
         align: 0,
@@ -912,7 +967,7 @@ fn decode_hex4(f: &mut Function) {
 }
 
 /// Pushes whether `start <= local < start + length` (unsigned).
-fn push_in_range(f: &mut Function, local: u32, start: i32, length: i32) {
+pub(crate) fn push_in_range(f: &mut Function, local: u32, start: i32, length: i32) {
     f.instruction(&Instruction::LocalGet(local));
     f.instruction(&Instruction::I32Const(start));
     f.instruction(&Instruction::I32Sub);
@@ -993,13 +1048,13 @@ fn reject_if(f: &mut Function) {
     f.instruction(&Instruction::End);
 }
 
-enum Allocation {
+pub(crate) enum Allocation {
     Constant(i32),
     Local(u32),
 }
 
 /// Pushes `realloc(0, 0, align, size)`: a fresh allocation, or a trap.
-fn allocate(function: &mut Function, realloc_index: u32, align: i32, size: Allocation) {
+pub(crate) fn allocate(function: &mut Function, realloc_index: u32, align: i32, size: Allocation) {
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::I32Const(align));
@@ -1049,13 +1104,13 @@ fn copy_bytes(function: &mut Function, destination: u32, source: u32, length: u3
     function.instruction(&Instruction::End);
 }
 
-fn offset_address(function: &mut Function, base: u32, index: u32) {
+pub(crate) fn offset_address(function: &mut Function, base: u32, index: u32) {
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(index));
     function.instruction(&Instruction::I32Add);
 }
 
-fn increment(function: &mut Function, local: u32, amount: i32) {
+pub(crate) fn increment(function: &mut Function, local: u32, amount: i32) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I32Const(amount));
     function.instruction(&Instruction::I32Add);

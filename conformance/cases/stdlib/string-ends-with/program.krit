@@ -1,0 +1,11 @@
+// `string_ends_with` compares UTF-8 bytes; every string ends with the empty
+// string. `"€"` (E2 82 AC) does not end with `"¬"` (C2 AC): only whole byte
+// sequences match.
+println(string_ends_with("report.json", ".json"));
+println(string_ends_with("report.json", ""));
+println(string_ends_with("", ""));
+println(string_ends_with("", "x"));
+println(string_ends_with("json", "report.json"));
+println(string_ends_with("café", "é"));
+println(string_ends_with("€", "¬"));
+println(string_ends_with("abc", "ab"));

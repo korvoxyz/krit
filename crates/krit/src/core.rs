@@ -2683,7 +2683,15 @@ impl<'a> Verifier<'a> {
             | Builtin::JsonEncode
             | Builtin::JsonDecode
             | Builtin::LogInfo
-            | Builtin::LogError => Ok(Vec::new()),
+            | Builtin::LogError
+            | Builtin::IntToString
+            | Builtin::UrlPathSegment
+            | Builtin::UrlQuery
+            | Builtin::StringByteLen
+            | Builtin::StringIsEmpty
+            | Builtin::StringContains
+            | Builtin::StringStartsWith
+            | Builtin::StringEndsWith => Ok(Vec::new()),
         }
     }
 
@@ -2831,6 +2839,26 @@ impl<'a> Verifier<'a> {
                 } else {
                     Err(IrError::new(format!("{builtin} has invalid signature")))
                 }
+            }
+            Builtin::IntToString => verify_pure_builtin(builtin, ty, &[Type::Int], &Type::String),
+            Builtin::UrlPathSegment => verify_pure_builtin(
+                builtin,
+                ty,
+                &[Type::String],
+                &Type::Result(Arc::new(Type::String), Arc::new(Type::String)),
+            ),
+            Builtin::UrlQuery => verify_pure_builtin(
+                builtin,
+                ty,
+                &[Type::List(Arc::new(Type::HttpHeader))],
+                &Type::String,
+            ),
+            Builtin::StringByteLen => verify_pure_builtin(builtin, ty, &[Type::String], &Type::Int),
+            Builtin::StringIsEmpty => {
+                verify_pure_builtin(builtin, ty, &[Type::String], &Type::Bool)
+            }
+            Builtin::StringContains | Builtin::StringStartsWith | Builtin::StringEndsWith => {
+                verify_pure_builtin(builtin, ty, &[Type::String, Type::String], &Type::Bool)
             }
             Builtin::Some => verify_constructor_function(ty, VariantFamily::Option, true),
             Builtin::Ok => verify_constructor_function(ty, VariantFamily::Result, true),
@@ -3496,6 +3524,35 @@ fn verify_host_builtin(
     if function.parameters() == expected.as_slice()
         && function.return_type() == result
         && effect.is_none_or(|effect| function.effects().contains(&effect))
+    {
+        Ok(())
+    } else {
+        Err(IrError::new(format!("{builtin} has invalid signature")))
+    }
+}
+
+/// Verifies a standard-library function: exactly these parameters and this
+/// result, up to the structural equivalence of the contract records (so the
+/// `url_query` parameter is any list of name/value records), and no direct
+/// requirement. Its effect set is not checked: a pure built-in used as a
+/// value can share an effect variable with a callback it is unified with,
+/// and its call operations carry their own verified effects.
+fn verify_pure_builtin(
+    builtin: Builtin,
+    ty: &Type,
+    parameters: &[Type],
+    result: &Type,
+) -> Result<(), IrError> {
+    let Type::Function(function) = ty else {
+        return Err(IrError::new(format!("{builtin} has non-function type")));
+    };
+    if function.parameters().len() == parameters.len()
+        && function
+            .parameters()
+            .iter()
+            .zip(parameters)
+            .all(|(actual, expected)| type_equivalent(actual, expected))
+        && type_equivalent(function.return_type(), result)
     {
         Ok(())
     } else {
@@ -4445,5 +4502,76 @@ mod tests {
             rendered.contains("    v0: String = string \"\"\n    v1: Unit = bind b0 = v0\n"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn lowers_and_verifies_standard_library_calls_as_pure_builtins() {
+        let module = lowered(
+            "let a = int_to_string(1);\nlet b = url_path_segment(a);\n\
+             let c = url_query([\"q\": a]);\nlet d = url_query([HttpHeader { name: a, value: a }]);\n\
+             let e = string_byte_len(a);\nlet f = string_is_empty(a);\n\
+             let g = string_contains(a, a) && string_starts_with(a, a) && string_ends_with(a, a);\n",
+        );
+        let rendered = module.render_text();
+        for builtin in Builtin::STANDARD_LIBRARY {
+            assert!(
+                rendered.contains(&format!("builtin {builtin} [standard-library]")),
+                "{builtin}: {rendered}"
+            );
+        }
+        assert!(module.entrypoint_function().signature.effects.is_empty());
+        assert!(
+            module
+                .entrypoint_function()
+                .signature
+                .requirements
+                .is_empty()
+        );
+
+        let function = |parameters: Vec<Type>, result: Type| {
+            Type::Function(FunctionType::new(
+                parameters.into_iter().map(Arc::new).collect(),
+                Arc::new(result),
+                EffectSet::default(),
+                RequirementSet::default(),
+            ))
+        };
+        let pairs = Type::List(Arc::new(Type::HttpHeader));
+        for (builtin, ty, parameters, result) in [
+            (
+                Builtin::IntToString,
+                function(vec![Type::String], Type::String),
+                vec![Type::Int],
+                Type::String,
+            ),
+            (
+                Builtin::StringByteLen,
+                function(vec![Type::String], Type::Bool),
+                vec![Type::String],
+                Type::Int,
+            ),
+            (
+                Builtin::StringContains,
+                function(vec![Type::String], Type::Bool),
+                vec![Type::String, Type::String],
+                Type::Bool,
+            ),
+            (
+                Builtin::UrlQuery,
+                function(vec![Type::List(Arc::new(Type::String))], Type::String),
+                vec![pairs.clone()],
+                Type::String,
+            ),
+            (
+                Builtin::StringIsEmpty,
+                Type::String,
+                vec![Type::String],
+                Type::Bool,
+            ),
+        ] {
+            let error = verify_pure_builtin(builtin, &ty, &parameters, &result)
+                .expect_err("a mismatched signature must be refused");
+            assert!(error.to_string().contains(builtin.as_str()), "{error}");
+        }
     }
 }

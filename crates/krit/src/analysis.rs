@@ -743,11 +743,16 @@ pub struct AnalysisReport {
 }
 
 /// Analyzes `program` exactly as [`analyze`] does and also returns the
-/// warnings found, whether analysis succeeds or fails.
+/// warnings found, whether analysis succeeds or fails. The lints
+/// (`K9000`-`K9999`) need the complete analysis, so they run only when
+/// analysis succeeds.
 pub fn analyze_with_warnings(program: &Program) -> AnalysisReport {
     let mut analyzer = Analyzer::new();
     let result = analyzer.program(program);
     let mut warnings = analyzer.warnings;
+    if let Ok(analysis) = &result {
+        warnings.extend(crate::lint::lint(program, analysis));
+    }
     warnings.sort_by(|left, right| {
         left.span()
             .cmp(&right.span())
@@ -1645,16 +1650,10 @@ impl Analyzer {
             InferType::Int => {
                 let path = path.as_deref().unwrap_or("value");
                 let name = path.rsplit('.').next().unwrap_or(path);
-                if int_to_string_available() {
-                    format!(
-                        "convert it first, as in `let {name}_text = int_to_string({path});`, \
-                         then write `\\({name}_text)`"
-                    )
-                } else {
-                    "an `Int` never converts to text implicitly: bind a `String` to a name \
-                     and interpolate that name"
-                        .to_owned()
-                }
+                format!(
+                    "convert it first, as in `let {name}_text = int_to_string({path});`, then \
+                     write `\\({name}_text)`"
+                )
             }
             InferType::Secret => "a `Secret` is opaque and never becomes text".to_owned(),
             InferType::Option(_) | InferType::Result(_, _) => {
@@ -3325,7 +3324,7 @@ impl Analyzer {
     ///
     /// Krit values have no methods; `value.name(...)` is valid only as a call
     /// of a function stored in a record field. The note names the standard
-    /// library function that does the job when one exists or is planned.
+    /// library function that does the job when one exists.
     fn method_call_error(
         &self,
         receiver_type: &InferType,
@@ -3787,6 +3786,48 @@ impl Analyzer {
                     effect,
                 }
             }
+            // The standard library is pure: no effect and no requirement.
+            Builtin::IntToString => InferType::Function {
+                parameters: vec![InferType::Int],
+                return_type: Box::new(InferType::String),
+                effect: self.fresh_effect(),
+            },
+            Builtin::UrlPathSegment => InferType::Function {
+                parameters: vec![InferType::String],
+                return_type: Box::new(InferType::Result(
+                    Box::new(InferType::String),
+                    Box::new(InferType::String),
+                )),
+                effect: self.fresh_effect(),
+            },
+            Builtin::UrlQuery => InferType::Function {
+                parameters: vec![InferType::List(Box::new(InferType::Record {
+                    fields: BTreeMap::from([
+                        ("name".to_owned(), InferType::String),
+                        ("value".to_owned(), InferType::String),
+                    ]),
+                    open: false,
+                }))],
+                return_type: Box::new(InferType::String),
+                effect: self.fresh_effect(),
+            },
+            Builtin::StringByteLen => InferType::Function {
+                parameters: vec![InferType::String],
+                return_type: Box::new(InferType::Int),
+                effect: self.fresh_effect(),
+            },
+            Builtin::StringIsEmpty => InferType::Function {
+                parameters: vec![InferType::String],
+                return_type: Box::new(InferType::Bool),
+                effect: self.fresh_effect(),
+            },
+            Builtin::StringContains | Builtin::StringStartsWith | Builtin::StringEndsWith => {
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Bool),
+                    effect: self.fresh_effect(),
+                }
+            }
         };
         Some((ty, ResolvedName::Builtin(builtin)))
     }
@@ -4022,12 +4063,6 @@ impl<'a> TypeNormalizer<'a> {
             }
         }
     }
-}
-
-/// Whether the standard library provides `int_to_string`, which the
-/// `K3015` note for an `Int` hole then names.
-fn int_to_string_available() -> bool {
-    Builtin::from_name("int_to_string").is_some()
 }
 
 /// The source spelling of a method call's receiver when it is a name or a
@@ -5688,26 +5723,17 @@ mod tests {
 
     #[test]
     fn a_hole_that_is_not_a_string_is_k3015_with_one_note() {
-        let int_note = if int_to_string_available() {
-            "int_to_string(count)"
-        } else {
-            "never converts to text implicitly"
-        };
         for (text, message, note, hole) in [
             (
                 "let count = 3;\nlet s = \"n=\\(count)\";",
                 "interpolation hole `count` has type `Int`",
-                int_note,
+                "let count_text = int_to_string(count);",
                 "\\(count)",
             ),
             (
                 "let issue = record { number: 7 };\nlet s = \"\\(issue.number)\";",
                 "interpolation hole `issue.number` has type `Int`",
-                if int_to_string_available() {
-                    "let number_text = int_to_string(issue.number);"
-                } else {
-                    "never converts to text implicitly"
-                },
+                "let number_text = int_to_string(issue.number);",
                 "\\(issue.number)",
             ),
             (
@@ -5743,7 +5769,7 @@ mod tests {
             (
                 "fn f(n) { let a = n + 1; \"\\(n)\" }",
                 "interpolation hole `n` has type `Int`",
-                int_note,
+                "let n_text = int_to_string(n);",
                 "\\(n)",
             ),
         ] {
@@ -5791,5 +5817,93 @@ mod tests {
             assert_eq!(error.span().start, template, "{text}");
         }
         check("let v = config_string(\"agent.model\");").expect("a literal resource is valid");
+    }
+
+    #[test]
+    fn types_the_standard_library_as_pure_functions() {
+        let analysis = check(
+            r#"
+            let text = int_to_string(-7);
+            let segment = url_path_segment(text);
+            let query = url_query(["q": text]);
+            let headers: List<HttpHeader> = [HttpHeader { name: "a", value: "b" }];
+            let from_headers = url_query(headers);
+            let fields = url_query([LogField { name: "k", value: "v" }]);
+            let length = string_byte_len(text);
+            let empty = string_is_empty(text);
+            let found = string_contains(text, "7") && string_starts_with(text, "-")
+                && string_ends_with(text, "7");
+            let search = string_contains;
+            "#,
+        )
+        .expect("standard library calls should check");
+        let binding = |name: &str| {
+            analysis
+                .bindings()
+                .iter()
+                .find(|binding| binding.name() == name)
+                .unwrap_or_else(|| panic!("binding `{name}`"))
+                .ty()
+                .to_string()
+        };
+        for (name, ty) in [
+            ("text", "String"),
+            ("segment", "Result<String, String>"),
+            ("query", "String"),
+            ("from_headers", "String"),
+            ("fields", "String"),
+            ("length", "Int"),
+            ("empty", "Bool"),
+            ("found", "Bool"),
+            ("search", "fn(String, String) -> Bool effects {}"),
+        ] {
+            assert_eq!(binding(name), ty, "{name}");
+        }
+        assert!(analysis.effects().is_empty());
+        assert!(analysis.requirements().is_empty());
+        for builtin in Builtin::STANDARD_LIBRARY {
+            assert_eq!(builtin.category(), crate::BuiltinCategory::StandardLibrary);
+        }
+    }
+
+    #[test]
+    fn standard_library_arguments_must_have_their_types() {
+        for (text, code) in [
+            ("int_to_string(\"1\");", "K3001"),
+            ("url_path_segment(1);", "K3001"),
+            ("url_query([\"a\"]);", "K3001"),
+            ("url_query([record { name: \"a\" }]);", "K3001"),
+            ("url_query([record { name: \"a\", value: 1 }]);", "K3001"),
+            ("string_byte_len([]);", "K3001"),
+            ("string_contains(\"a\", 1);", "K3001"),
+            ("let n: String = string_byte_len(\"a\");", "K3001"),
+            ("string_starts_with(\"a\");", "K3003"),
+            (
+                "let secret_text = match secret(\"token\") { Ok(value) => string_byte_len(value), Err(error) => 0 };",
+                "K3001",
+            ),
+        ] {
+            let error = check(text).expect_err("a mistyped call should fail");
+            assert_eq!(error.code(), code, "{text}");
+        }
+    }
+
+    #[test]
+    fn standard_library_names_are_built_in() {
+        for text in [
+            "let int_to_string = 1;",
+            "fn url_query(items) { items }",
+            "fn f(string_contains) { string_contains }",
+        ] {
+            let error = check(text).expect_err("a built-in name cannot be declared");
+            assert_eq!(error.code(), "K2002", "{text}");
+        }
+        // As for every built-in the parser does not reserve, a match binder
+        // may reuse the name within its arm.
+        check("let n = match Some(1) { Some(string_byte_len) => string_byte_len, None => 0 };")
+            .expect("a match binder may shadow a standard-library name");
+        let error = check("let n = string_byte_lenn(\"a\");").expect_err("a typo is undefined");
+        assert_eq!(error.code(), "K2001");
+        assert_eq!(error.notes(), ["did you mean `string_byte_len`?"]);
     }
 }

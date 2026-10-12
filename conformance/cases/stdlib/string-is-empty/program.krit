@@ -1,0 +1,7 @@
+// `string_is_empty` is true exactly for the string with no bytes.
+println(string_is_empty(""));
+println(string_is_empty(" "));
+println(string_is_empty("\0"));
+println(string_is_empty("" + ""));
+println(string_is_empty("""
+    """));

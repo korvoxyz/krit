@@ -1173,6 +1173,11 @@ fn sensitive_arguments(name: &str) -> &'static [(usize, &'static str)] {
         ],
         "search_query" => &[(0, "capability-resource"), (1, "search-query")],
         "vector_search" => &[(0, "capability-resource"), (1, "search-vector")],
+        // The standard library is pure: its arguments name no host resource
+        // and are ordinary program data, as any other string is. Its calls
+        // are still redacted wherever they stand in a sensitive argument.
+        "int_to_string" | "url_path_segment" | "url_query" | "string_byte_len"
+        | "string_is_empty" | "string_contains" | "string_starts_with" | "string_ends_with" => &[],
         _ => &[],
     }
 }
@@ -2396,6 +2401,43 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
                     .any(|(content, category)| content == "private-payload"
                         && *category == "cache-value"),
                 "a nested payload leaked: {spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_library_calls_inside_a_sensitive_argument_are_redacted() {
+        let source = r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let key = url_query(["tenant": "private-tenant"]);
+    match cache_put("lookups", key, int_to_string(string_byte_len("private-size")), 60) {
+        Ok(stored) => match search_query("docs", url_query(["q": "private-question"]), 3) {
+            Ok(hits) => record { status: 200, headers: [], body: hits },
+            Err(problem) => record { status: 500, headers: [], body: problem },
+        },
+        Err(problem) => record { status: 500, headers: [], body: problem },
+    }
+}
+"#;
+
+        for spans in [redacted(source), redacted_tolerant(source)] {
+            for (content, category) in [
+                ("private-tenant", "cache-key"),
+                ("private-size", "cache-value"),
+                ("private-question", "search-query"),
+            ] {
+                assert!(
+                    spans
+                        .iter()
+                        .any(|(redacted, kind)| redacted == content && *kind == category),
+                    "`{content}` leaked: {spans:?}"
+                );
+            }
+        }
+        for builtin in krit::Builtin::STANDARD_LIBRARY {
+            assert!(
+                sensitive_arguments(builtin.as_str()).is_empty(),
+                "{builtin}"
             );
         }
     }

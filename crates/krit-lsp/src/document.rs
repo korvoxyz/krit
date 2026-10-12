@@ -1665,9 +1665,9 @@ fn builtin_completions() -> Vec<CompletionItem> {
             label: builtin.as_str().to_owned(),
             kind: Some(match builtin.category() {
                 krit::BuiltinCategory::Constructor => CompletionItemKind::CONSTRUCTOR,
-                krit::BuiltinCategory::Conversion | krit::BuiltinCategory::HostEffect => {
-                    CompletionItemKind::FUNCTION
-                }
+                krit::BuiltinCategory::Conversion
+                | krit::BuiltinCategory::HostEffect
+                | krit::BuiltinCategory::StandardLibrary => CompletionItemKind::FUNCTION,
             }),
             detail: Some(builtin.signature().to_owned()),
             documentation: Some(Documentation::MarkupContent(MarkupContent {
@@ -3388,6 +3388,67 @@ origins = ["https://api.github.com"]
             ),
             "completion should return a bounded list"
         );
+    }
+
+    #[test]
+    fn completes_hovers_and_lints_the_standard_library() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let source = "fn fetch(owner: String) -> HttpRequest {\n    \
+                      HttpRequest { method: \"GET\", path: \"/repos/\\(owner)\" }\n}\n\
+                      let size = string_byte_len(\"é\");\n";
+        let opened = state.open(uri.clone(), 1, source.to_owned());
+        assert_eq!(opened.diagnostics.len(), 1);
+        let warning = &opened.diagnostics[0];
+        assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(
+            warning.code,
+            Some(NumberOrString::String("K9013".to_owned()))
+        );
+        assert_eq!(warning.range.start, Position::new(1, 47));
+        assert_eq!(warning.range.end, Position::new(1, 55));
+        assert!(
+            warning
+                .message
+                .contains("help: encode untrusted text with `url_path_segment`")
+        );
+
+        let hover = state
+            .hover(&uri, Position::new(3, 12))
+            .expect("hover should succeed")
+            .expect("a standard-library call should have hover facts");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("hover should use markdown")
+        };
+        assert!(
+            markup
+                .value
+                .contains("string_byte_len: fn(String) -> Int effects {}"),
+            "{}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("`standard-library`"),
+            "{}",
+            markup.value
+        );
+
+        let CompletionResponse::List(list) = state
+            .completion(&uri, Position::new(3, 11))
+            .expect("completion should succeed")
+        else {
+            panic!("completion should return a bounded list")
+        };
+        for builtin in krit::Builtin::STANDARD_LIBRARY {
+            let item = list
+                .items
+                .iter()
+                .find(|item| item.label == builtin.as_str())
+                .unwrap_or_else(|| panic!("`{builtin}` should be completed"));
+            assert_eq!(item.kind, Some(CompletionItemKind::FUNCTION));
+            assert_eq!(item.detail.as_deref(), Some(builtin.signature()));
+        }
     }
 
     #[test]

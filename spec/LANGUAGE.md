@@ -41,7 +41,7 @@ else false fn if let match record true webhook
 Reserved built-in names:
 
 ```text
-Err None Ok Some ai_invoke checkpoint_get checkpoint_put config_string db_begin_read db_begin_write db_commit db_execute db_query db_rollback http_request json_decode json_encode log_error log_info object_delete object_get object_put print println queue_publish replay_ai replay_http secret state_delete state_get state_put
+Err None Ok Some ai_invoke cache_delete cache_get cache_put checkpoint_get checkpoint_put config_string db_begin_read db_begin_write db_commit db_execute db_query db_rollback http_request int_to_string json_decode json_encode log_error log_info object_delete object_get object_put print println queue_publish replay_ai replay_http search_query secret state_delete state_get state_put string_byte_len string_contains string_ends_with string_is_empty string_starts_with url_path_segment url_query vector_search
 ```
 
 A binding cannot use a keyword or reserved built-in name.
@@ -694,9 +694,9 @@ text block with holes means the same concatenation of its dedented lines.
 
 - Each hole names a value in scope, optionally followed by field accesses,
   and that value must be a `String`. Any other type is `K3015` at the hole,
-  with one note; for an `Int`, the note shows how to convert it into a name
-  first when the standard library provides `int_to_string`. There are no
-  implicit conversions (section 9).
+  with one note; for an `Int`, the note shows how to convert it with
+  `int_to_string` (section 12.1) into a name first. There are no implicit
+  conversions (section 9).
 - A hole that names an undefined value is `K2001` at the name, and reading
   `_` in a hole is the `K2003` warning, as anywhere else.
 - Holes are names, so evaluating one has no effect and the parts' order is
@@ -738,8 +738,9 @@ that field.
 Values have no methods. `value.name(arguments)` reads field `name` of the
 record `value` and calls the function stored there. When `value` has no such
 field, because it is not a record or is a record without that field, checking
-reports the method call (`K3011`) with the standard-library function to use
-instead when there is one, such as `string_byte_len(s)` for `s.len()`.
+reports the method call (`K3011`) with the standard-library function
+(section 12.1) to use instead when there is one, such as `string_byte_len(s)`
+for `s.len()`.
 
 List literal:
 
@@ -835,6 +836,98 @@ interfaces plus `state.transaction`, `queue.publish`, `object.read`,
 `object.write`, `database.read`, `database.write`, `cache.read`, `cache.write`,
 `search.query`, and `search.vector` to typed webhook, queue,
 and schedule artifacts.
+
+## 12.1 Standard library
+
+The standard library is a fixed set of built-in functions. Each is pure: it
+has no effect, needs no capability, and returns the same result for the same
+arguments in every implementation and target. Names are flat, prefixed by the
+kind of value they work on:
+
+| Function | Type |
+|---|---|
+| `int_to_string` | `fn(Int) -> String` |
+| `url_path_segment` | `fn(String) -> Result<String, String>` |
+| `url_query` | `fn(List<Record { name: String, value: String }>) -> String` |
+| `string_byte_len` | `fn(String) -> Int` |
+| `string_is_empty` | `fn(String) -> Bool` |
+| `string_contains` | `fn(String, String) -> Bool` |
+| `string_starts_with` | `fn(String, String) -> Bool` |
+| `string_ends_with` | `fn(String, String) -> Bool` |
+
+They are built-in names (section 2): a `let`, function, or parameter cannot
+reuse one (`K2002`), and a match binder may shadow one (section 7). Like
+every built-in, each is a function value that can be bound and passed;
+component targets require a direct call (`WASM-SANDBOX.md`). Checking
+reports a wrong argument type as `K3001` and a wrong argument count as
+`K3003`. In a checked program no standard-library call ever fails.
+
+- `int_to_string(n)` writes `n` in base ten exactly as `print` does: ASCII
+  digits without separators or leading zeros, preceded by `-` when `n` is
+  negative and by nothing otherwise. `int_to_string(-9223372036854775808)`
+  is `"-9223372036854775808"`.
+- `string_byte_len(s)` is the number of bytes of `s`'s UTF-8 encoding
+  (`string_byte_len("é")` is `2`), and `string_is_empty(s)` is
+  `string_byte_len(s) == 0`.
+- `string_contains(s, part)`, `string_starts_with(s, part)`, and
+  `string_ends_with(s, part)` are true when the UTF-8 bytes of `part` occur
+  contiguously in those of `s`: anywhere, at its start, or at its end. The
+  empty `part` occurs in every string, and a `part` longer than `s` in none.
+  Comparison is byte equality, with no case folding or Unicode
+  normalization (`string_ends_with("e\u{301}", "é")` is `false`). Both
+  strings are valid UTF-8, so a match always begins and ends at character
+  boundaries of `s`.
+- `url_path_segment(text)` percent-encodes `text` as one URL path segment:
+  every byte that is not an RFC 3986 unreserved character (`A`-`Z`, `a`-`z`,
+  `0`-`9`, `-`, `.`, `_`, `~`) is written `%HH` with uppercase hex digits,
+  each byte of a multibyte character on its own (`"octo cat"` gives
+  `"octo%20cat"`, `"café"` gives `"caf%C3%A9"`). It returns `Err` with the
+  first of these messages that applies, and `Ok` with the encoded segment
+  otherwise:
+
+  | Text | `Err` message |
+  |---|---|
+  | empty | `path segment is empty` |
+  | contains `/`, `\`, or an ASCII control character (U+0000-U+001F, U+007F) | ``path segment contains `/`, `\`, or an ASCII control character`` |
+  | contains `%` followed by a hex digit, `u`, or `U` | ``path segment contains `%` followed by a hex digit, `u`, or `U` `` |
+  | its part before the first `;`, `?`, or `#`, with spaces trimmed from both ends, is `.` or `..` | ``path segment reads as `.` or `..` `` |
+
+  These are exactly the texts whose encoding the host path rule refuses
+  (`WEBHOOK-CONTRACTS.md`, "Request paths and queries"), plus the empty
+  text, whose segment would vanish and leave `//` in a path. So every `Ok`
+  segment is accepted by the host wherever it stands between two `/`, and
+  decoding it once gives back `text`; untrusted text fails recoverably,
+  as a value the program handles, instead of making the host refuse the
+  request and trap the invocation. Messages never contain the text. Forms
+  the host rule does not model, such as a fullwidth `．．`, are encoded and
+  accepted.
+- `url_query(entries)` builds a query string: `name=value` for each entry
+  in list order, joined by `&`, with every name and value percent-encoded
+  exactly as `url_path_segment` encodes (a space is `%20`, never `+`), no
+  leading `?`, and `""` for the empty list. Entries may be written as an
+  entry list (`url_query(["q": term, "page": "2"])`, section 11) or be any
+  list of `HttpHeader` or `LogField` records. The result holds only
+  unreserved characters, `%`, hex digits, `=`, and `&`, so the host query
+  rule accepts every result and `url_query` cannot fail.
+
+```krit
+fn issue_request(owner: String, number: Int) -> Result<HttpRequest, String> {
+    let issue = int_to_string(number);
+    match url_path_segment(owner) {
+        Ok(segment) => Ok(
+            HttpRequest {
+                method: "GET",
+                path: "/repos/\(segment)/issues/\(issue)",
+                query: url_query(["state": "open"]),
+            },
+        ),
+        Err(reason) => Err(reason),
+    }
+}
+```
+
+A path or query built from text that none of these functions encoded is
+warning `K9013` (`DIAGNOSTICS.md`).
 
 ## 13. JSON conversion
 
@@ -1037,7 +1130,8 @@ Checking reports these, so a program containing one is never evaluated:
   state-store, checkpoint, or replay-operation resource
 - printing, comparing, encoding, or structurally storing an opaque secret
 
-Evaluation reports these:
+Evaluation reports these (standard-library calls in a checked program
+never fail, section 12.1):
 
 - integer literal outside signed 64-bit range
 - integer overflow

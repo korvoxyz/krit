@@ -1,0 +1,10 @@
+// `int_to_string` writes base ten, with a leading `-` for negative values.
+println(int_to_string(0));
+println(int_to_string(7));
+println(int_to_string(-7));
+println(int_to_string(10));
+println(int_to_string(1000000));
+println(int_to_string(9223372036854775807));
+println(int_to_string(-9223372036854775808));
+println(int_to_string(-9223372036854775807 - 1) == "-9223372036854775808");
+println("issue " + int_to_string(6 * 7));

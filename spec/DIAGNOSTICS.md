@@ -211,6 +211,7 @@ Initial required codes:
 | `K8105` | Proposed source failed canonical formatting or compiler checking |
 | `K8106` | Required authority expansion lacks exact review approval or a manifest grant |
 | `K8107` | Proposal or accepted-source atomic I/O failed |
+| `K9013` | Warning (lint): a piece of an `HttpRequest` `path` or `query` built by interpolation or `+` is not a literal, a direct call of `url_path_segment`, `url_query`, or `int_to_string`, or a name bound to such a result |
 
 ## Build-target diagnostics
 
@@ -269,14 +270,16 @@ may improve, but which diagnostics carry one is part of each code's contract:
   a name first (or to remove the whitespace, or to name a value); a hole whose
   value is not a `String` names the hole's path and type, and its note says
   how to obtain a `String`: for an `Int`, a `let` that converts it with
-  `int_to_string` when the standard library provides it, and otherwise that
-  integers never convert to text implicitly.
+  `int_to_string` (`LANGUAGE.md` section 12.1).
 
 ```text
 main.krit:2:16: error[K3015]: interpolation hole `count` has type `Int`, but a hole must be a `String`
-help: an `Int` never converts to text implicitly: bind a `String` to a name and interpolate that name
+help: convert it first, as in `let count_text = int_to_string(count);`, then write `\(count_text)`
 ```
 
+- `K9013` always carries exactly one note: for a path, to encode text with
+  `url_path_segment` and numbers with `int_to_string`, binding each result
+  to a name; for a query, to build it with `url_query`.
 - `K3016` always carries exactly one note. For an unknown field it lists the
   contract's fields, preceded by `did you mean `name`?` when one of them is
   close by the rule for undefined names below; for a repeated field it lists
@@ -359,11 +362,34 @@ standard-library function that does the job when there is one:
 | other | any | passing the value to a function |
 
 The note spells the receiver as written when it is a name or a short field
-path (`string_byte_len(request.body)`), and as `value` otherwise.
+path (`string_byte_len(request.body)`), and as `value` otherwise. The string
+and integer functions it names are the standard library (`LANGUAGE.md`
+section 12.1).
 
 ```text
 main.krit:2:9: error[K3011]: cannot call `.len()` on a value of type `String`: Krit values have no methods
-help: call `string_byte_len(name)` instead; it counts UTF-8 bytes (standard library, arriving in Krit 0.3)
+help: call `string_byte_len(name)` instead; it counts UTF-8 bytes
+```
+
+### Request path and query lints
+
+`K9013` reports text that reaches the path or query of an outbound
+`HttpRequest` without percent-encoding, where untrusted text could add `/`,
+`..`, `?`, `#`, or an escape and so address a different resource than the
+program meant. In a named construction or a record literal typed as
+`HttpRequest`, a `path` or `query` value written as an interpolated string or
+a `+` chain is split into pieces: each hole and each operand. A piece that is
+a literal, a direct call of `url_path_segment`, `url_query`, or
+`int_to_string`, or a name bound to the result of one (by `let x = <call>;`,
+or as the `Ok` binder of a match on a direct `url_path_segment` call or a name
+bound to one) is encoded; every other piece is reported at its hole or
+operand. A literal-only path, and a value that is not split, such as
+`request.path` forwarded unchanged, never warn (`TYPES-AND-EFFECTS.md`,
+Lints).
+
+```text
+main.krit:2:51: warning[K9013]: this value is inserted into an `HttpRequest` path without percent-encoding
+help: encode untrusted text with `url_path_segment` and numbers with `int_to_string`, binding each result to a name, so the value cannot add `/`, `..`, `?`, or `#` to the path
 ```
 
 ## Exit statuses

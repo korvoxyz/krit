@@ -1,0 +1,24 @@
+// Every standard-library function builds into a webhook component.
+fn bit(value: Bool) -> String {
+    if value {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let number = int_to_string(string_byte_len(request.body));
+    let query = url_query(["q": request.query, "page": number]);
+    let empty = bit(string_is_empty(request.body));
+    let marked = bit(string_contains(request.body, "x"));
+    let rooted = bit(string_starts_with(request.path, "/"));
+    let trailing = bit(string_ends_with(request.path, "/"));
+    match url_path_segment(request.body) {
+        Ok(segment) => HttpResponse {
+            status: 200,
+            body: "/a/\(segment)?\(query) \(empty)\(marked)\(rooted)\(trailing)",
+        },
+        Err(reason) => HttpResponse { status: 400, body: reason },
+    }
+}

@@ -88,6 +88,17 @@ string literal, and one that is a single hole is that hole's value. No
 operation or Core form is specific to interpolation, so every backend that
 lowers string literals and string `+` lowers it.
 
+The standard-library functions (`LANGUAGE.md` section 12.1) have the fixed
+function types listed there and no effect or literal requirement. Each use of
+one gets a fresh function type, so a use checks its arguments exactly as a
+call of any function does: a mismatch is `K3001` at the argument, a wrong
+count `K3003`. The `url_query` parameter is the closed structural
+`List<Record { name: String, value: String }>`, so an entry list, a
+`List<HttpHeader>`, and a `List<LogField>` all unify with it. Core lowering
+emits an ordinary built-in operation and call, which the verifier checks
+against the same signature (up to the structural equivalence of the contract
+records), with no requirement.
+
 There are no implicit numeric, string, boolean, or collection conversions.
 Union types, subtyping, null, exceptions, and user-defined mutable objects are
 out of scope for the first static checker.
@@ -170,7 +181,7 @@ Implemented analysis recognizes `io.stdout`, `config.read`, `secret.read`,
 empty
 effect set. Calling a function adds its effects to the caller,
 including recursive and higher-order propagation. Branch and match effects
-are conservative unions. JSON conversion is pure.
+are conservative unions. JSON conversion and the standard library are pure.
 
 The Rust API returns effects in sorted deterministic order through
 `Analysis::effects`; function types expose their inferred latent effects.
@@ -306,6 +317,30 @@ error is a method call (`K3011`) rather than a field-access error (`K3004`),
 and its note names the standard-library function to use instead where there
 is one (`DIAGNOSTICS.md`, Fix hints). An undefined name (`K2001`) carries a
 did-you-mean note chosen from the names visible at the reference.
+
+## Lints
+
+After analysis accepts a program, lints (`K9000`-`K9999`, `DIAGNOSTICS.md`)
+examine its syntax with the analysis facts: resolved names and inferred
+types. They report warnings only, never change the analysis, and do not run
+when analysis rejects the program.
+
+`K9013` guards the path and query of an outbound request. It examines the
+`path` and `query` values of every `HttpRequest` the program builds, written
+as a named construction or as a record literal whose analyzed type is the
+`HttpRequest` record (its five fields, each with its contract type or a type
+still unknown, as `headers: []` has). Only a value that is an interpolated
+string or a `+` chain is split into pieces: each hole (also one in a string
+inside the chain) and each other operand of the chain. A literal piece is
+safe, and so is a direct call of `url_path_segment`, `url_query`, or
+`int_to_string` whose callee resolves to the built-in, or a name that resolves
+to a binding of one of these results: a `let` whose value is such a call, or
+the `Ok` binder of a match whose subject is a direct call of
+`url_path_segment` or a name bound to one. Bindings are immutable, so such a
+name always holds the encoded value, in the function that binds it or one
+nested inside it. Every other piece is `K9013` at its hole or operand. A value
+that is a literal, a name, a field access, or any other expression is not
+split and never warns, so forwarding `request.path` unchanged is allowed.
 
 ## Open decisions
 

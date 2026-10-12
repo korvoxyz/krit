@@ -1,0 +1,13 @@
+// Literal paths and queries, forwarded values, and other records are never
+// K9013: only interpolations and `+` chains are split into pieces.
+fn forward(request: HttpRequest) -> HttpRequest {
+    HttpRequest { method: "GET", path: request.path, query: request.query }
+}
+
+fn literal() -> HttpRequest {
+    HttpRequest { method: "GET", path: "/repos/" + "acme/app", query: "state=open" }
+}
+
+fn describe(owner: String) -> HttpResponse {
+    HttpResponse { status: 200, body: "owner " + owner + " at /repos/\(owner)" }
+}

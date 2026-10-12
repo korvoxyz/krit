@@ -22,9 +22,10 @@ String values with concatenation, equality, and byte-lexicographic ordering, \
 the closed HttpHeader/HttpRequest/HttpResponse records, header lists, \
 LogField records and field lists, Result/Option matching, exact config/secret/http/AI \
 host calls, structured logging, json_decode into String (every RFC 8259 escape), \
-and static non-capturing helper references. Helpers unreachable from the selected \
-entrypoint are eliminated before layout checks. Other composites, general JSON, data \
-captures, residual types, and list matching fail closed.";
+the standard library (int_to_string, url_path_segment, url_query, and the string \
+predicates), and static non-capturing helper references. Helpers unreachable from \
+the selected entrypoint are eliminated before layout checks. Other composites, general \
+JSON, data captures, residual types, and list matching fail closed.";
 
 pub(crate) struct CheckedModule {
     pub kind: ProgramKind,
@@ -1187,6 +1188,52 @@ fn check_builtin(
         Builtin::JsonDecode
             if function.parameters() == [std::sync::Arc::new(Type::String)]
                 && function.return_type() == &Type::String =>
+        {
+            Ok(())
+        }
+        Builtin::IntToString
+            if function.parameters() == [std::sync::Arc::new(Type::Int)]
+                && function.return_type() == &Type::String =>
+        {
+            Ok(())
+        }
+        Builtin::UrlPathSegment
+            if function.parameters() == [std::sync::Arc::new(Type::String)]
+                && matches!(
+                    function.return_type(),
+                    Type::Result(value, error)
+                        if value.as_ref() == &Type::String && error.as_ref() == &Type::String
+                ) =>
+        {
+            Ok(())
+        }
+        Builtin::UrlQuery
+            if function.parameters().len() == 1
+                && (is_header_list(&function.parameters()[0])
+                    || is_log_field_list(&function.parameters()[0]))
+                && function.return_type() == &Type::String =>
+        {
+            Ok(())
+        }
+        Builtin::StringByteLen
+            if function.parameters() == [std::sync::Arc::new(Type::String)]
+                && function.return_type() == &Type::Int =>
+        {
+            Ok(())
+        }
+        Builtin::StringIsEmpty
+            if function.parameters() == [std::sync::Arc::new(Type::String)]
+                && function.return_type() == &Type::Bool =>
+        {
+            Ok(())
+        }
+        Builtin::StringContains | Builtin::StringStartsWith | Builtin::StringEndsWith
+            if function.parameters()
+                == [
+                    std::sync::Arc::new(Type::String),
+                    std::sync::Arc::new(Type::String),
+                ]
+                && function.return_type() == &Type::Bool =>
         {
             Ok(())
         }

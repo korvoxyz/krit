@@ -1,5 +1,7 @@
 use std::{fmt, io::Write, ops::Deref, rc::Rc};
 
+use krit_capability::request_target;
+
 use crate::{
     Diagnostic, Span,
     analysis::check_construction_fields,
@@ -122,6 +124,14 @@ pub enum BuiltinFunction {
     DatabaseExecute,
     DatabaseCommit,
     DatabaseRollback,
+    IntToString,
+    UrlPathSegment,
+    UrlQuery,
+    StringByteLen,
+    StringIsEmpty,
+    StringContains,
+    StringStartsWith,
+    StringEndsWith,
 }
 
 impl fmt::Debug for Value {
@@ -203,6 +213,26 @@ impl Value {
             Self::Builtin(BuiltinFunction::DatabaseExecute) => "<function db_execute>".to_owned(),
             Self::Builtin(BuiltinFunction::DatabaseCommit) => "<function db_commit>".to_owned(),
             Self::Builtin(BuiltinFunction::DatabaseRollback) => "<function db_rollback>".to_owned(),
+            Self::Builtin(BuiltinFunction::IntToString) => "<function int_to_string>".to_owned(),
+            Self::Builtin(BuiltinFunction::UrlPathSegment) => {
+                "<function url_path_segment>".to_owned()
+            }
+            Self::Builtin(BuiltinFunction::UrlQuery) => "<function url_query>".to_owned(),
+            Self::Builtin(BuiltinFunction::StringByteLen) => {
+                "<function string_byte_len>".to_owned()
+            }
+            Self::Builtin(BuiltinFunction::StringIsEmpty) => {
+                "<function string_is_empty>".to_owned()
+            }
+            Self::Builtin(BuiltinFunction::StringContains) => {
+                "<function string_contains>".to_owned()
+            }
+            Self::Builtin(BuiltinFunction::StringStartsWith) => {
+                "<function string_starts_with>".to_owned()
+            }
+            Self::Builtin(BuiltinFunction::StringEndsWith) => {
+                "<function string_ends_with>".to_owned()
+            }
         }
     }
 
@@ -815,20 +845,30 @@ impl Evaluator<'_> {
             }
             return Err(Diagnostic::new("K5003", message, span));
         }
-        let value = self.expression(&arguments[0], environment)?;
-        self.apply_builtin(builtin, value, span)
+        let mut values = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            values.push(self.expression(argument, environment)?);
+        }
+        self.apply_builtin(builtin, values, span)
     }
 
-    /// Applies a pure or output built-in to its evaluated argument.
+    /// Applies a pure or output built-in to its evaluated arguments, whose
+    /// count [`builtin_arity`] has already checked.
     fn apply_builtin(
         &mut self,
         builtin: BuiltinFunction,
-        value: Value,
+        values: Vec<Value>,
         span: Span,
     ) -> Result<Value, Diagnostic> {
+        let mut values = values.into_iter();
+        let mut argument = || {
+            values
+                .next()
+                .expect("built-in arity is checked before application")
+        };
         match builtin {
             BuiltinFunction::Print | BuiltinFunction::Println => {
-                let rendered = value.render();
+                let rendered = argument().render();
                 self.output
                     .write_all(rendered.as_bytes())
                     .map_err(|error| {
@@ -841,11 +881,38 @@ impl Evaluator<'_> {
                 }
                 Ok(Value::Unit)
             }
-            BuiltinFunction::Some => Value::variant(VariantName::Some, value, span),
-            BuiltinFunction::Ok => Value::variant(VariantName::Ok, value, span),
-            BuiltinFunction::Err => Value::variant(VariantName::Err, value, span),
-            BuiltinFunction::JsonEncode => json_encode(&value, span),
-            BuiltinFunction::JsonDecode => json_decode(value, span),
+            BuiltinFunction::Some => Value::variant(VariantName::Some, argument(), span),
+            BuiltinFunction::Ok => Value::variant(VariantName::Ok, argument(), span),
+            BuiltinFunction::Err => Value::variant(VariantName::Err, argument(), span),
+            BuiltinFunction::JsonEncode => json_encode(&argument(), span),
+            BuiltinFunction::JsonDecode => json_decode(argument(), span),
+            BuiltinFunction::IntToString => Ok(Value::String(Rc::from(
+                expect_integer(argument(), span)?.to_string(),
+            ))),
+            BuiltinFunction::UrlPathSegment => url_path_segment(argument(), span),
+            BuiltinFunction::UrlQuery => url_query(argument(), span),
+            BuiltinFunction::StringByteLen => {
+                let text = expect_string(argument(), span)?;
+                i64::try_from(text.len())
+                    .map(Value::Integer)
+                    .map_err(|_| Diagnostic::new("K4005", "string byte length overflow", span))
+            }
+            BuiltinFunction::StringIsEmpty => {
+                Ok(Value::Boolean(expect_string(argument(), span)?.is_empty()))
+            }
+            BuiltinFunction::StringContains
+            | BuiltinFunction::StringStartsWith
+            | BuiltinFunction::StringEndsWith => {
+                let text = expect_string(argument(), span)?;
+                let part = expect_string(argument(), span)?;
+                // Valid UTF-8 is self-synchronizing, so these `str` tests are
+                // exactly the byte-wise tests the language specifies.
+                Ok(Value::Boolean(match builtin {
+                    BuiltinFunction::StringContains => text.contains(&*part),
+                    BuiltinFunction::StringStartsWith => text.starts_with(&*part),
+                    _ => text.ends_with(&*part),
+                }))
+            }
             BuiltinFunction::AiInvoke
             | BuiltinFunction::ConfigString
             | BuiltinFunction::Secret
@@ -968,6 +1035,14 @@ fn builtin_value(name: &str) -> Option<Value> {
         "db_execute" => Value::Builtin(BuiltinFunction::DatabaseExecute),
         "db_commit" => Value::Builtin(BuiltinFunction::DatabaseCommit),
         "db_rollback" => Value::Builtin(BuiltinFunction::DatabaseRollback),
+        "int_to_string" => Value::Builtin(BuiltinFunction::IntToString),
+        "url_path_segment" => Value::Builtin(BuiltinFunction::UrlPathSegment),
+        "url_query" => Value::Builtin(BuiltinFunction::UrlQuery),
+        "string_byte_len" => Value::Builtin(BuiltinFunction::StringByteLen),
+        "string_is_empty" => Value::Builtin(BuiltinFunction::StringIsEmpty),
+        "string_contains" => Value::Builtin(BuiltinFunction::StringContains),
+        "string_starts_with" => Value::Builtin(BuiltinFunction::StringStartsWith),
+        "string_ends_with" => Value::Builtin(BuiltinFunction::StringEndsWith),
         _ => return None,
     })
 }
@@ -993,7 +1068,10 @@ const fn builtin_arity(builtin: BuiltinFunction) -> usize {
         | BuiltinFunction::ObjectGet
         | BuiltinFunction::CacheGet
         | BuiltinFunction::CacheDelete
-        | BuiltinFunction::ObjectDelete => 2,
+        | BuiltinFunction::ObjectDelete
+        | BuiltinFunction::StringContains
+        | BuiltinFunction::StringStartsWith
+        | BuiltinFunction::StringEndsWith => 2,
         _ => 1,
     }
 }
@@ -1047,7 +1125,15 @@ const fn unavailable_builtin_message(builtin: BuiltinFunction) -> Option<&'stati
         | BuiltinFunction::Ok
         | BuiltinFunction::Err
         | BuiltinFunction::JsonEncode
-        | BuiltinFunction::JsonDecode => return None,
+        | BuiltinFunction::JsonDecode
+        | BuiltinFunction::IntToString
+        | BuiltinFunction::UrlPathSegment
+        | BuiltinFunction::UrlQuery
+        | BuiltinFunction::StringByteLen
+        | BuiltinFunction::StringIsEmpty
+        | BuiltinFunction::StringContains
+        | BuiltinFunction::StringStartsWith
+        | BuiltinFunction::StringEndsWith => return None,
     })
 }
 
@@ -1313,6 +1399,47 @@ fn expect_integer(value: Value, span: Span) -> Result<i64, Diagnostic> {
             span,
         )),
     }
+}
+
+fn expect_string(value: Value, span: Span) -> Result<Rc<str>, Diagnostic> {
+    match value {
+        Value::String(value) => Ok(value),
+        value => Err(Diagnostic::new(
+            "K4001",
+            format!("expected string, found {}", value.kind()),
+            span,
+        )),
+    }
+}
+
+/// `url_path_segment`: the percent-encoded segment, or the reason the host
+/// path rule would refuse it, as a `Result` value.
+fn url_path_segment(value: Value, span: Span) -> Result<Value, Diagnostic> {
+    let text = expect_string(value, span)?;
+    let (variant, payload) = match request_target::encode_path_segment(&text) {
+        Ok(segment) => (VariantName::Ok, Rc::from(segment)),
+        Err(error) => (VariantName::Err, Rc::from(error.message())),
+    };
+    Value::variant(variant, Value::String(payload), span)
+}
+
+/// `url_query`: `name=value&...` from a list of name/value records.
+fn url_query(value: Value, span: Span) -> Result<Value, Diagnostic> {
+    let Value::List(entries) = value else {
+        return Err(Diagnostic::new(
+            "K4001",
+            format!("expected list, found {}", value.kind()),
+            span,
+        ));
+    };
+    let mut pairs = Vec::with_capacity(entries.len());
+    for entry in entries.iter() {
+        let name = expect_string(field_value(entry.clone(), "name", span)?, span)?;
+        let value = expect_string(field_value(entry.clone(), "value", span)?, span)?;
+        pairs.push((name, value));
+    }
+    let query = request_target::encode_query(pairs.iter().map(|(name, value)| (&**name, &**value)));
+    Ok(Value::String(Rc::from(query)))
 }
 
 fn integer_pair(left: Value, right: Value, span: Span) -> Result<(i64, i64), Diagnostic> {
@@ -2066,5 +2193,70 @@ mod tests {
             error.message()
         );
         assert_eq!(error.span().start, "let count = 3;\nprint(\"n=".len());
+    }
+
+    #[test]
+    fn standard_library_functions_compute_their_documented_values() {
+        let (output, _) = run(r#"
+println(int_to_string(0));
+println(int_to_string(-42));
+println(int_to_string(9223372036854775807));
+println(int_to_string(-9223372036854775808));
+println(url_path_segment("octo cat;é~"));
+println(url_path_segment("issues"));
+println(url_path_segment(""));
+println(url_path_segment("a/b"));
+println(url_path_segment("%2e"));
+println(url_path_segment(" ..;x"));
+println(url_query([]));
+println(url_query(["q": "a b&c", "page": int_to_string(2)]));
+println(url_query([HttpHeader { name: "é", value: "" }]));
+println(string_byte_len(""));
+println(string_byte_len("é😀"));
+println(string_is_empty(""));
+println(string_is_empty(" "));
+println(string_contains("hello", ""));
+println(string_contains("hello", "ell"));
+println(string_contains("he", "hello"));
+println(string_starts_with("é", "\u{c3}"));
+println(string_starts_with("hello", "he"));
+println(string_ends_with("hello", "lo"));
+println(string_ends_with("hello", "he"));
+"#)
+        .expect("standard library calls should run");
+        assert_eq!(
+            output,
+            "0\n-42\n9223372036854775807\n-9223372036854775808\nOk(\"octo%20cat%3B%C3%A9~\")\n\
+             Ok(\"issues\")\nErr(\"path segment is empty\")\n\
+             Err(\"path segment contains `/`, `\\\\`, or an ASCII control character\")\n\
+             Err(\"path segment contains `%` followed by a hex digit, `u`, or `U`\")\n\
+             Err(\"path segment reads as `.` or `..`\")\n\nq=a%20b%26c&page=2\n%C3%A9=\n0\n6\n\
+             true\nfalse\ntrue\ntrue\nfalse\nfalse\ntrue\ntrue\nfalse\n"
+        );
+    }
+
+    #[test]
+    fn standard_library_functions_are_values_and_check_their_arguments_without_analysis() {
+        let (output, _) = run(
+            "let has = string_contains;\nprintln(has(\"abc\", \"b\"));\n\
+             println(string_ends_with);\nprintln([int_to_string(1)]);",
+        )
+        .expect("standard library functions are values");
+        assert_eq!(output, "true\n<function string_ends_with>\n[\"1\"]\n");
+
+        for (text, code) in [
+            ("int_to_string(\"1\");", "K4001"),
+            ("string_byte_len(1);", "K4001"),
+            ("string_contains(\"a\", 1);", "K4001"),
+            ("url_path_segment(true);", "K4001"),
+            ("url_query(\"q\");", "K4001"),
+            ("url_query([record { name: \"q\" }]);", "K4001"),
+            ("url_query([record { name: 1, value: \"v\" }]);", "K4001"),
+            ("string_contains(\"a\");", "K4003"),
+            ("int_to_string(1, 2);", "K4003"),
+        ] {
+            let error = run_unchecked(text).expect_err("an invalid argument should fail");
+            assert_eq!(error.code(), code, "{text}");
+        }
     }
 }

@@ -257,36 +257,30 @@ pub(crate) enum MethodReceiver {
 }
 
 /// The fix for calling `.method()` on `receiver`, a value written as `value`
-/// (`K3011`): the standard-library function that does the job when one exists
-/// or is planned, otherwise how to write the call without a method.
+/// (`K3011`): the standard-library function that does the job when one exists,
+/// otherwise how to write the call without a method.
 pub(crate) fn method_hint(receiver: MethodReceiver, method: &str, value: &str) -> String {
-    const STANDARD_LIBRARY: &str = "(standard library, arriving in Krit 0.3)";
     match receiver {
         MethodReceiver::String => match method {
-            "len" | "length" | "size" | "count" | "byte_len" => format!(
-                "call `string_byte_len({value})` instead; it counts UTF-8 bytes {STANDARD_LIBRARY}"
-            ),
-            "is_empty" | "isEmpty" | "empty" => {
-                format!("call `string_is_empty({value})` instead {STANDARD_LIBRARY}")
+            "len" | "length" | "size" | "count" | "byte_len" => {
+                format!("call `string_byte_len({value})` instead; it counts UTF-8 bytes")
             }
-            "contains" | "includes" => {
-                format!("call `string_contains({value}, part)` instead {STANDARD_LIBRARY}")
-            }
+            "is_empty" | "isEmpty" | "empty" => format!("call `string_is_empty({value})` instead"),
+            "contains" | "includes" => format!("call `string_contains({value}, part)` instead"),
             "starts_with" | "startsWith" | "startswith" | "hasPrefix" => {
-                format!("call `string_starts_with({value}, prefix)` instead {STANDARD_LIBRARY}")
+                format!("call `string_starts_with({value}, prefix)` instead")
             }
             "ends_with" | "endsWith" | "endswith" | "hasSuffix" => {
-                format!("call `string_ends_with({value}, suffix)` instead {STANDARD_LIBRARY}")
+                format!("call `string_ends_with({value}, suffix)` instead")
             }
-            _ => format!(
-                "pass the string to a function instead; the string functions are \
-                 `string_byte_len`, `string_is_empty`, `string_contains`, \
-                 `string_starts_with`, and `string_ends_with` {STANDARD_LIBRARY}"
-            ),
+            _ => "pass the string to a function instead; the string functions are \
+                  `string_byte_len`, `string_is_empty`, `string_contains`, \
+                  `string_starts_with`, and `string_ends_with`"
+                .to_owned(),
         },
         MethodReceiver::Int => match method {
             "to_string" | "toString" | "string" | "str" => {
-                format!("call `int_to_string({value})` instead {STANDARD_LIBRARY}")
+                format!("call `int_to_string({value})` instead")
             }
             _ => format!("pass the integer to a function instead, as in `f({value})`"),
         },
@@ -417,8 +411,7 @@ mod tests {
     fn names_the_standard_library_function_for_common_methods() {
         assert_eq!(
             method_hint(MethodReceiver::String, "len", "s"),
-            "call `string_byte_len(s)` instead; it counts UTF-8 bytes \
-             (standard library, arriving in Krit 0.3)"
+            "call `string_byte_len(s)` instead; it counts UTF-8 bytes"
         );
         assert!(
             method_hint(MethodReceiver::String, "startsWith", "path")

@@ -337,6 +337,68 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
 }
 
 #[test]
+fn the_standard_library_builds_in_webhooks_and_fails_at_its_span_in_modules() {
+    let webhook = lower_source(
+        r#"
+fn bit(value: Bool) -> String {
+    if value { "1" } else { "0" }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let number = int_to_string(string_byte_len(request.body));
+    let query = url_query(["q": request.query, "page": number]);
+    let echoed = url_query(request.headers);
+    let flags = bit(string_is_empty(request.body)) + bit(string_contains(request.body, "x"))
+        + bit(string_starts_with(request.path, "/")) + bit(string_ends_with(request.path, "/"));
+    match url_path_segment(request.body) {
+        Ok(segment) => HttpResponse { status: 200, body: "/a/\(segment)?\(query)&\(echoed)\(flags)" },
+        Err(reason) => HttpResponse { status: 400, body: reason },
+    }
+}
+"#,
+    );
+    assert!(check_target(&webhook, &options(&[]), CheckTarget::Component).is_empty());
+    let artifact = build_component(&webhook, &options(&[])).expect("a stdlib webhook builds");
+    validate_artifact(&artifact.bytes, &artifact.metadata).expect("a stdlib webhook validates");
+
+    // Policy 1 has no string layout, so no standard-library function lowers
+    // there; each call's built-in is reported at its name.
+    let text = "let size = string_byte_len(\"abc\");\nprintln(size);\n";
+    let errors = check_target(&lower_source(text), &options(&[]), CheckTarget::Module);
+    assert_sorted_unique_and_located(&errors);
+    assert!(
+        errors.iter().all(|error| error.code() == "K7002"),
+        "{errors:#?}"
+    );
+    assert!(
+        errors.iter().any(|error| {
+            error.span().map(|span| span.start) == Some(span_of(text, "string_byte_len").start)
+                && error.message().contains("`string_byte_len`")
+                && error.message().contains("policy 1")
+        }),
+        "{errors:#?}"
+    );
+
+    // Like every built-in but the stdout functions, a standard-library
+    // function must be called directly in a component.
+    let text = r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let search = string_contains;
+    HttpResponse { status: if search(request.path, "x") { 200 } else { 404 } }
+}
+"#;
+    let errors = check_target(&lower_source(text), &options(&[]), CheckTarget::Component);
+    assert_sorted_unique_and_located(&errors);
+    assert!(
+        errors.iter().any(|error| {
+            error.span().map(|span| span.start) == Some(span_of(text, "string_contains").start)
+                && error.message().contains("must remain a direct call")
+        }),
+        "{errors:#?}"
+    );
+}
+
+#[test]
 fn target_checks_ignore_package_grants_that_builds_enforce() {
     let module = lower_source("println(1);\n");
     assert!(check_target(&module, &options(&[]), CheckTarget::Component).is_empty());

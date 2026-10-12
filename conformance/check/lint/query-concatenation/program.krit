@@ -1,0 +1,4 @@
+// An unencoded piece of a query is K9013 too; `url_query` would encode it.
+fn search(term: String) -> HttpRequest {
+    HttpRequest { method: "GET", path: "/search", query: "q=" + term + "&page=1" }
+}
