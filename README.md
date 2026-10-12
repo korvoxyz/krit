@@ -252,6 +252,23 @@ repository is public. A package administrator must make it **Public** once in
 **Package settings > Change visibility** to enable anonymous pulls. Subsequent
 versions retain that setting.
 
+### Verifying a release
+
+From 0.3.1 on, the Release workflow attests every archive, `SHA256SUMS`, and
+the multi-architecture container image with signed SLSA build provenance.
+Check that a download or image was built from this repository by that
+workflow with the [GitHub CLI](https://cli.github.com/manual/gh_attestation_verify):
+
+```sh
+gh attestation verify krit-0.3.1-aarch64-apple-darwin.tar.gz --repo korvoxyz/krit
+gh attestation verify oci://ghcr.io/korvoxyz/krit:0.3.1 --repo korvoxyz/krit
+```
+
+Add `--signer-workflow korvoxyz/krit/.github/workflows/release.yml` to also
+require the Release workflow as the signer. Published releases are never
+modified; a correction ships as a new patch release. Report a download or
+image that fails verification as described in [SECURITY.md](SECURITY.md).
+
 ## Requirements
 
 These requirements apply only when building from source:

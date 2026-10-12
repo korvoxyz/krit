@@ -174,23 +174,34 @@ To publish a stable release:
    The tag must match the CLI's Cargo version. For this release, use `v0.3.0`,
    not `v3.0.0`.
 4. The Release workflow repeats the quality/package gate, builds and exercises
-   non-root containers from the packaged Linux binaries, publishes both native
-   images and a multi-architecture GHCR index, then attaches the native archives
-   and `SHA256SUMS` to a public GitHub Release.
+   non-root containers from the packaged Linux binaries, and publishes both
+   native images and a multi-architecture GHCR index under the version tag. It
+   attests the index (pushing the attestation to the registry), then the
+   native archives and `SHA256SUMS`, and checks each attestation with
+   `gh attestation verify`. It uploads the archives and `SHA256SUMS` to a draft
+   GitHub Release, compares the draft's assets byte for byte with the attested
+   files, and publishes the release as Latest. Only then does it move the
+   series (for example `0.3`) and `latest` image tags to the attested index.
 5. On the first GHCR publication, set the package's visibility to **Public** in
    GitHub Package settings. Linking a public repository does not do this
    automatically. The workflow reports the visibility and warns if this step
    remains outstanding.
 
 Publication uses the workflow's `GITHUB_TOKEN`: read-only for quality/build
-jobs, `packages: write` for container publication, and `contents: write` only
-for the release publisher. No publishing credential is supplied to pull
-requests. Actions are pinned to reviewed commit hashes.
+jobs, `packages: write` for container publication and the final tag move, and
+`contents: write` only for the release publisher. Only the two jobs that
+attest, the container index job and the release publisher, also get
+`id-token: write` and `attestations: write`. No publishing credential is
+supplied to pull requests. Actions are pinned to reviewed commit hashes.
 
-Published release tags are immutable by convention: never move or overwrite
-one. A failed unpublished release may be retried from its tag with the Release
-workflow's manual dispatch, or by rerunning the failed jobs. Existing draft
-assets can be replaced during recovery; published release assets cannot.
+Published releases and their tags are immutable: never move or overwrite one,
+and ship a correction as a new patch release. The workflow refuses to touch a
+release that is already published, and it uploads assets only to a draft that
+the same workflow run created, so rerunning the failed jobs of a run resumes
+that run's own draft. Any other draft for the tag stops the run; a maintainer
+must review and delete it before retrying with the Release workflow's manual
+dispatch. If the release was published but moving the image tags failed,
+rerun only the failed jobs; a full rerun stops at the release identity check.
 
 ## License
 

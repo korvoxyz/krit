@@ -15,6 +15,26 @@ treat it as one even though Krit is pre-1.0 and not yet production-ready.
 Security fixes ship as new patch releases of each supported line. The
 archived Racket prototype (tag `racket-v0.1.0`) is not supported.
 
+## Verifying a release
+
+From 0.3.1 on, the repository's Release workflow attests every release
+archive, `SHA256SUMS`, and the multi-architecture container image with signed
+SLSA build provenance. Verify a download or image with the
+[GitHub CLI](https://cli.github.com/manual/gh_attestation_verify) before
+trusting it:
+
+```sh
+gh attestation verify krit-0.3.1-x86_64-unknown-linux-gnu.tar.gz --repo korvoxyz/krit
+gh attestation verify oci://ghcr.io/korvoxyz/krit:0.3.1 --repo korvoxyz/krit
+```
+
+Add `--signer-workflow korvoxyz/krit/.github/workflows/release.yml` to also
+require the Release workflow as the signer. Published releases are never
+modified: their assets are uploaded to a draft, verified, and only then
+published, and a fix ships as a new patch release. A download or image
+presented as Krit that fails verification is in scope; report it privately as
+described below.
+
 ## Reporting a vulnerability
 
 Do not report a suspected vulnerability in a public issue, discussion, pull
