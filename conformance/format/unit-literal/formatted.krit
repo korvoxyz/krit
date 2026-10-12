@@ -1,0 +1,16 @@
+fn finish(ready: Bool) -> Result<Unit, String> {
+    if ready {
+        Ok(())
+    } else {
+        Err("no")
+    }
+}
+
+fn nothing() -> Unit {
+    ()
+}
+
+let units = [(), ()];
+let same = () == nothing();
+
+println(());

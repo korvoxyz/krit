@@ -1,0 +1,9 @@
+k1 v1 k2 v2 
+[record { name: "k1", value: "v1" }, record { name: "k2", value: "v2" }]
+true
+[record { name: "accept", value: "text/plain" }, record { name: "x-request-id", value: "r-1" }]
+attempt=1;source=conformance;
+record { status: 200, headers: [record { name: "x-one", value: "1" }], body: "" }
+[{"name":"k","value":"v"}]
+[record { name: "only", value: "entry" }]
+[]

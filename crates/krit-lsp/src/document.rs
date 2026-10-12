@@ -8,7 +8,8 @@ use std::{
 use krit::{
     Analysis, Block, Builtin, Diagnostic as CompilerDiagnostic, Effect, EntrypointKind, Expression,
     ExpressionKind, Pattern, PatternKind, Program, RequirementSet, ResolvedName, Severity, Source,
-    Span, Statement, StatementKind, SymbolKind as CompilerSymbolKind, Type, TypeAnnotation,
+    Span, Statement, StatementKind, StringPart, SymbolKind as CompilerSymbolKind, Type,
+    TypeAnnotation,
 };
 use krit_package::Manifest;
 use lsp_server::ErrorCode;
@@ -1040,9 +1041,10 @@ impl Document {
     ) -> Result<String, String> {
         let inferred = render_type(symbol.ty())?;
         let mut output = format!(
-            "```krit\n{}: {}\n```\n\n**Kind:** `{}`",
+            "```krit\n{}: {}\n```{}\n\n**Kind:** `{}`",
             symbol.name(),
             inferred,
+            hover_doc(declaration.doc.as_deref()),
             compiler_symbol_kind(symbol.kind())
         );
         if let Some(declared) = &declaration.declared_type {
@@ -1087,10 +1089,16 @@ impl Document {
                 if let Some(analysis) = &self.analysis
                     && let Some(symbol) = analysis.symbols().iter().find(|symbol| symbol.id() == id)
                 {
+                    let doc = self
+                        .declarations
+                        .iter()
+                        .find(|declaration| analysis.symbols()[declaration.symbol_index].id() == id)
+                        .and_then(|declaration| declaration.doc.as_deref());
                     format!(
-                        "```krit\n{}: {}\n```\n\n**Kind:** `{}`",
+                        "```krit\n{}: {}\n```{}\n\n**Kind:** `{}`",
                         symbol.name(),
                         inferred,
+                        hover_doc(doc),
                         compiler_symbol_kind(symbol.kind())
                     )
                 } else {
@@ -1112,6 +1120,14 @@ impl Document {
         );
         Ok(output)
     }
+}
+
+/// A declaration's doc comment as a hover paragraph after its signature, or
+/// nothing when it has none.
+fn hover_doc(doc: Option<&str>) -> String {
+    doc.filter(|doc| !doc.trim().is_empty())
+        .map(|doc| format!("\n\n{doc}"))
+        .unwrap_or_default()
 }
 
 fn append_effects_and_requirements(
@@ -1518,13 +1534,38 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
                     continue;
                 }
                 ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+                ExpressionKind::Unit => {}
+                ExpressionKind::Interpolation(parts) => {
+                    for part in parts {
+                        if let StringPart::Hole { value, .. } = part {
+                            expression_fields(value, fields);
+                        }
+                    }
+                }
                 ExpressionKind::List(elements) => {
                     for element in elements {
                         expression_fields(element, fields);
                     }
                 }
+                ExpressionKind::EntryList(entries) => {
+                    // Each entry is a `record { name, value }`.
+                    fields.insert("name".to_owned());
+                    fields.insert("value".to_owned());
+                    for entry in entries {
+                        expression_fields(&entry.key, fields);
+                        expression_fields(&entry.value, fields);
+                    }
+                }
                 ExpressionKind::Record(record_fields) => {
                     for field in record_fields {
+                        fields.insert(field.name.clone());
+                        expression_fields(&field.value, fields);
+                    }
+                }
+                ExpressionKind::Construct {
+                    fields: written, ..
+                } => {
+                    for field in written {
                         fields.insert(field.name.clone());
                         expression_fields(&field.value, fields);
                     }
@@ -1628,9 +1669,9 @@ fn builtin_completions() -> Vec<CompletionItem> {
             label: builtin.as_str().to_owned(),
             kind: Some(match builtin.category() {
                 krit::BuiltinCategory::Constructor => CompletionItemKind::CONSTRUCTOR,
-                krit::BuiltinCategory::Conversion | krit::BuiltinCategory::HostEffect => {
-                    CompletionItemKind::FUNCTION
-                }
+                krit::BuiltinCategory::Conversion
+                | krit::BuiltinCategory::HostEffect
+                | krit::BuiltinCategory::StandardLibrary => CompletionItemKind::FUNCTION,
             }),
             detail: Some(builtin.signature().to_owned()),
             documentation: Some(Documentation::MarkupContent(MarkupContent {
@@ -1912,6 +1953,9 @@ struct DeclarationFact {
     name_span: Option<Span>,
     visibility: Span,
     declared_type: Option<String>,
+    /// The text of the `///` doc comment of a function or entrypoint
+    /// declaration.
+    doc: Option<String>,
 }
 
 struct DeclarationCollector<'a> {
@@ -2004,18 +2048,21 @@ impl<'a> DeclarationCollector<'a> {
                 parameters,
                 return_type,
                 body,
+                doc,
             }
             | StatementKind::Webhook {
                 name,
                 parameters,
                 return_type,
                 body,
+                doc,
             }
             | StatementKind::QueueConsumer {
                 name,
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             }
             | StatementKind::ScheduleHandler {
@@ -2023,6 +2070,7 @@ impl<'a> DeclarationCollector<'a> {
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             } => {
                 let kind = match statement.kind {
@@ -2040,7 +2088,7 @@ impl<'a> DeclarationCollector<'a> {
                     }
                     _ => statement.span,
                 };
-                self.add(
+                if let Some(declaration) = self.add(
                     name,
                     kind,
                     statement.span,
@@ -2053,7 +2101,9 @@ impl<'a> DeclarationCollector<'a> {
                             .map(|parameter| parameter.annotation.as_ref()),
                         return_type.as_ref(),
                     )),
-                );
+                ) {
+                    declaration.doc = doc.as_ref().map(|doc| doc.text.clone());
+                }
                 for parameter in parameters {
                     self.add(
                         &parameter.name,
@@ -2106,12 +2156,31 @@ impl<'a> DeclarationCollector<'a> {
                     continue;
                 }
                 ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+                ExpressionKind::Unit => {}
+                ExpressionKind::Interpolation(parts) => {
+                    for part in parts {
+                        if let StringPart::Hole { value, .. } = part {
+                            self.expression(value);
+                        }
+                    }
+                }
                 ExpressionKind::List(elements) => {
                     for element in elements {
                         self.expression(element);
                     }
                 }
+                ExpressionKind::EntryList(entries) => {
+                    for entry in entries {
+                        self.expression(&entry.key);
+                        self.expression(&entry.value);
+                    }
+                }
                 ExpressionKind::Record(fields) => {
+                    for field in fields {
+                        self.expression(&field.value);
+                    }
+                }
+                ExpressionKind::Construct { fields, .. } => {
                     for field in fields {
                         self.expression(&field.value);
                     }
@@ -2172,6 +2241,9 @@ impl<'a> DeclarationCollector<'a> {
         }
     }
 
+    /// Records the declaration of the analyzed symbol `name` declared at
+    /// `symbol_span`, and returns it; `None` when analysis has no such
+    /// symbol.
     fn add(
         &mut self,
         name: &str,
@@ -2180,20 +2252,19 @@ impl<'a> DeclarationCollector<'a> {
         name_span: Option<Span>,
         visibility: Span,
         declared_type: Option<String>,
-    ) {
-        let Some(symbol_index) = self
+    ) -> Option<&mut DeclarationFact> {
+        let symbol_index = self
             .symbols
             .get(&(symbol_span, name.to_owned(), kind))
-            .copied()
-        else {
-            return;
-        };
+            .copied()?;
         self.declarations.push(DeclarationFact {
             symbol_index,
             name_span,
             visibility,
             declared_type,
+            doc: None,
         });
+        self.declarations.last_mut()
     }
 }
 
@@ -2260,9 +2331,13 @@ fn find_identifier_span(text: &str, span: Span, name: &str) -> Option<Span> {
 fn expression_kind(kind: &ExpressionKind) -> &'static str {
     match kind {
         ExpressionKind::Literal(_) => "literal",
+        ExpressionKind::Interpolation(_) => "interpolation",
+        ExpressionKind::Unit => "unit",
         ExpressionKind::Variable(_) => "name",
         ExpressionKind::List(_) => "list",
+        ExpressionKind::EntryList(_) => "entry-list",
         ExpressionKind::Record(_) => "record",
+        ExpressionKind::Construct { .. } => "construction",
         ExpressionKind::FieldAccess { .. } => "field-access",
         ExpressionKind::Block(_) => "block",
         ExpressionKind::If { .. } => "if",
@@ -3587,6 +3662,67 @@ origins = ["https://api.github.com"]
     }
 
     #[test]
+    fn completes_hovers_and_lints_the_standard_library() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let source = "fn fetch(owner: String) -> HttpRequest {\n    \
+                      HttpRequest { method: \"GET\", path: \"/repos/\\(owner)\" }\n}\n\
+                      let size = string_byte_len(\"é\");\n";
+        let opened = state.open(uri.clone(), 1, source.to_owned());
+        assert_eq!(opened.diagnostics.len(), 1);
+        let warning = &opened.diagnostics[0];
+        assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(
+            warning.code,
+            Some(NumberOrString::String("K9013".to_owned()))
+        );
+        assert_eq!(warning.range.start, Position::new(1, 47));
+        assert_eq!(warning.range.end, Position::new(1, 55));
+        assert!(
+            warning
+                .message
+                .contains("help: encode untrusted text with `url_path_segment`")
+        );
+
+        let hover = state
+            .hover(&uri, Position::new(3, 12))
+            .expect("hover should succeed")
+            .expect("a standard-library call should have hover facts");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("hover should use markdown")
+        };
+        assert!(
+            markup
+                .value
+                .contains("string_byte_len: fn(String) -> Int effects {}"),
+            "{}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("`standard-library`"),
+            "{}",
+            markup.value
+        );
+
+        let CompletionResponse::List(list) = state
+            .completion(&uri, Position::new(3, 11))
+            .expect("completion should succeed")
+        else {
+            panic!("completion should return a bounded list")
+        };
+        for builtin in krit::Builtin::STANDARD_LIBRARY {
+            let item = list
+                .items
+                .iter()
+                .find(|item| item.label == builtin.as_str())
+                .unwrap_or_else(|| panic!("`{builtin}` should be completed"));
+            assert_eq!(item.kind, Some(CompletionItemKind::FUNCTION));
+            assert_eq!(item.detail.as_deref(), Some(builtin.signature()));
+        }
+    }
+
+    #[test]
     fn completion_respects_lexical_visibility_and_custom_record_fields() {
         let directory = TestDirectory::new();
         let uri = directory.uri("main.krit");
@@ -3880,6 +4016,325 @@ fn unused() -> Result<String, String> {{
         }
         for ty in ["HttpRequest", "HttpResponse", "QueueJob", "ScheduleEvent"] {
             assert!(type_completions().iter().any(|item| item.label == ty));
+        }
+    }
+
+    #[test]
+    fn hover_shows_doc_comments_at_declarations_and_uses() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let source = "///Greets `name`.\n///\n/// Pure.\nfn greet(name: String) -> String {\n    /// Never shown at the top level.\n    fn inner() -> Int { 1 }\n    \"hi \" + name\n}\n\n/// Dangling: a `let` is not an item.\nlet greeting = greet(\"krit\");\n";
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let published = state.open(uri.clone(), 1, source.to_owned());
+        assert!(published.diagnostics.is_empty(), "{published:?}");
+
+        let markdown = |position: Position| {
+            let hover = state
+                .hover(&uri, position)
+                .expect("hover should succeed")
+                .expect("the position should have hover facts");
+            let HoverContents::Markup(markup) = hover.contents else {
+                panic!("hover should use markdown")
+            };
+            markup.value
+        };
+
+        // At the declaration the doc follows the signature, before the facts.
+        let declaration = markdown(Position::new(3, 4));
+        assert!(
+            declaration.starts_with(
+                "```krit\ngreet: fn(String) -> String effects {}\n```\n\nGreets `name`.\n\nPure.\n\n**Kind:** `function`"
+            ),
+            "{declaration}"
+        );
+        // A use of the function shows the same doc.
+        let call = markdown(Position::new(10, 16));
+        assert!(call.contains("Greets `name`.\n\nPure."), "{call}");
+        // A nested declaration has its own doc.
+        let nested = markdown(Position::new(5, 7));
+        assert!(nested.contains("Never shown at the top level."), "{nested}");
+        // A `///` line before a `let` documents nothing.
+        let binding = markdown(Position::new(10, 5));
+        assert!(!binding.contains("Dangling"), "{binding}");
+
+        let edits = state.formatting(&uri).expect("formatting should succeed");
+        assert!(
+            edits[0]
+                .new_text
+                .starts_with("/// Greets `name`.\n///\n/// Pure.\nfn greet"),
+            "{}",
+            edits[0].new_text
+        );
+        assert!(
+            edits[0]
+                .new_text
+                .contains("/// Dangling: a `let` is not an item.\nlet greeting"),
+            "{}",
+            edits[0].new_text
+        );
+    }
+
+    #[test]
+    fn hover_reaches_documented_helpers_through_question_marks_let_else_and_holes() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let source = "/// Encodes `name` as one segment.\nfn key(name: String) -> Result<String, String> {\n    let segment = url_path_segment(name)?;\n    Ok(\"notes/\\(segment)\")\n}\n\nfn state_lookup(key: String) -> Result<Option<String>, String> {\n    Ok(Some(key))\n}\n\nfn respond(name: String) -> HttpResponse {\n    let Ok(found) = key(name) else Err(error) => HttpResponse { status: 400, body: \"\\(error)\" };\n    match state_lookup(found) {\n        Ok(Some(text)) => HttpResponse { status: 200, headers: [\"x-key\": found], body: \"\\(text)\" },\n        Ok(None) => HttpResponse { status: 404 },\n        Err(_) => HttpResponse { status: 500 },\n    }\n}\n";
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let published = state.open(uri.clone(), 1, source.to_owned());
+        assert!(published.diagnostics.is_empty(), "{published:?}");
+
+        // The position of the `nth` occurrence of `needle`, plus `offset`.
+        let position = |needle: &str, nth: usize, offset: u32| {
+            let start = source
+                .match_indices(needle)
+                .nth(nth)
+                .unwrap_or_else(|| panic!("`{needle}` should occur"))
+                .0;
+            let line = source[..start].matches('\n').count();
+            let column = start - source[..start].rfind('\n').map_or(0, |index| index + 1);
+            Position::new(
+                u32::try_from(line).unwrap(),
+                u32::try_from(column).unwrap() + offset,
+            )
+        };
+        let markdown = |position: Position| {
+            let hover = state
+                .hover(&uri, position)
+                .expect("hover should succeed")
+                .expect("the position should have hover facts");
+            let HoverContents::Markup(markup) = hover.contents else {
+                panic!("hover should use markdown")
+            };
+            markup.value
+        };
+
+        // The documented helper whose body uses `?`, at a let-else value.
+        let call = markdown(position("key(name) else", 0, 0));
+        assert!(
+            call.starts_with(
+                "```krit\nkey: fn(String) -> Result<String, String> effects {}\n```\n\nEncodes `name` as one segment."
+            ),
+            "{call}"
+        );
+        // A let-else arm binder read in a hole of a construction's field.
+        let error = markdown(position("\\(error)", 0, 2));
+        assert!(error.starts_with("```krit\nerror: String\n```"), "{error}");
+        // A let-else pattern binder in an entry list, and a nested-pattern
+        // binder in a hole.
+        let found = markdown(position("found]", 0, 0));
+        assert!(found.starts_with("```krit\nfound: String\n```"), "{found}");
+        let text = markdown(position("\\(text)", 0, 2));
+        assert!(text.starts_with("```krit\ntext: String\n```"), "{text}");
+    }
+
+    #[test]
+    fn reports_entry_list_and_unit_facts() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let source = "let id = \"r-1\";\nlet fields = [\"request-id\": id, \"source\": \"lsp\"];\nlet done = Ok(());\n";
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let published = state.open(uri.clone(), 1, source.to_owned());
+        assert!(published.diagnostics.is_empty(), "{published:?}");
+
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        let expressions = facts["expressions"]
+            .as_array()
+            .expect("expression facts should be a list");
+        let entries = expressions
+            .iter()
+            .find(|fact| fact["syntaxKind"] == "entry-list")
+            .expect("the entry list should have an expression fact");
+        assert_eq!(
+            entries["inferredType"],
+            "List<Record { name: String, value: String }>"
+        );
+        assert!(
+            expressions
+                .iter()
+                .any(|fact| fact["syntaxKind"] == "name" && fact["resolved"]["name"] == "id"),
+            "the entry value should resolve: {expressions:?}"
+        );
+        let unit = expressions
+            .iter()
+            .find(|fact| fact["syntaxKind"] == "unit")
+            .expect("the unit value should have an expression fact");
+        assert_eq!(unit["inferredType"], "Unit");
+
+        let published = state
+            .change(&uri, 2, "let fields = [\"a\": 1];\n".to_owned())
+            .expect("the document should change");
+        assert_eq!(published.diagnostics.len(), 1);
+        assert_eq!(
+            published.diagnostics[0].code,
+            Some(NumberOrString::String("K3001".to_owned()))
+        );
+        let published = state
+            .change(&uri, 3, "let fields = [\"a\": \"b\", \"c\"];\n".to_owned())
+            .expect("the document should change");
+        assert_eq!(published.diagnostics.len(), 1);
+        assert_eq!(
+            published.diagnostics[0].code,
+            Some(NumberOrString::String("K1001".to_owned()))
+        );
+    }
+
+    #[test]
+    fn reports_named_construction_facts_hover_and_punned_formatting() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let source =
+            "let body = \"x\";\nlet response = HttpResponse { status: 200, body: body };\n";
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let published = state.open(uri.clone(), 1, source.to_owned());
+        assert!(published.diagnostics.is_empty());
+
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        let expressions = facts["expressions"]
+            .as_array()
+            .expect("expression facts should be a list");
+        let construction = expressions
+            .iter()
+            .find(|fact| fact["syntaxKind"] == "construction")
+            .expect("the construction should have an expression fact");
+        assert_eq!(
+            construction["inferredType"],
+            "Record { body: String, headers: List<HttpHeader>, status: Int }"
+        );
+        assert!(
+            expressions
+                .iter()
+                .any(|fact| fact["syntaxKind"] == "name" && fact["resolved"]["name"] == "body"),
+            "the field value should resolve: {expressions:?}"
+        );
+
+        let hover = state
+            .hover(&uri, Position::new(1, 17))
+            .expect("hover should succeed")
+            .expect("the construction should have hover facts");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("hover should use markdown")
+        };
+        assert!(
+            markup.value.contains("headers: List<HttpHeader>"),
+            "{}",
+            markup.value
+        );
+
+        let edits = state.formatting(&uri).expect("formatting should succeed");
+        assert_eq!(
+            edits[0].new_text,
+            "let body = \"x\";\nlet response = HttpResponse { status: 200, body };\n"
+        );
+
+        let published = state
+            .change(
+                &uri,
+                2,
+                "let response = HttpResponse { stauts: 200 };\n".to_owned(),
+            )
+            .expect("the document should change");
+        assert_eq!(published.diagnostics.len(), 1);
+        let diagnostic = &published.diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("K3016".to_owned()))
+        );
+        assert!(
+            diagnostic.message.contains("help: did you mean `status`?"),
+            "{}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn reports_interpolation_facts_hover_and_text_block_formatting() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let source = "let user = record { name: \"Ada\" };\n\
+                      let line = \"Hi \\(user.name)!\";\n\
+                      let prompt = \"\"\"\n  Name: \\(user.name)\n  \"\"\";\n";
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let published = state.open(uri.clone(), 1, source.to_owned());
+        assert!(published.diagnostics.is_empty(), "{published:?}");
+
+        let facts = serde_json::to_value(
+            state
+                .compiler_facts(&uri)
+                .expect("compiler facts should succeed"),
+        )
+        .expect("facts should serialize");
+        let expressions = facts["expressions"]
+            .as_array()
+            .expect("expression facts should be a list");
+        let interpolations = expressions
+            .iter()
+            .filter(|fact| fact["syntaxKind"] == "interpolation")
+            .collect::<Vec<_>>();
+        assert_eq!(interpolations.len(), 2, "{expressions:?}");
+        assert!(
+            interpolations
+                .iter()
+                .all(|fact| fact["inferredType"] == "String")
+        );
+        assert_eq!(
+            expressions
+                .iter()
+                .filter(|fact| fact["syntaxKind"] == "name" && fact["resolved"]["name"] == "user")
+                .count(),
+            2,
+            "both holes should resolve: {expressions:?}"
+        );
+        // Every expression fact keeps a span of its own.
+        let mut spans = expressions
+            .iter()
+            .map(|fact| fact["span"].to_string())
+            .collect::<Vec<_>>();
+        let count = spans.len();
+        spans.sort();
+        spans.dedup();
+        assert_eq!(spans.len(), count);
+
+        // Hovering over the field name inside the hole shows its type.
+        let hover = state
+            .hover(&uri, Position::new(1, 22))
+            .expect("hover should succeed")
+            .expect("the hole should have hover facts");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("hover should use markdown")
+        };
+        assert!(markup.value.contains("String"), "{}", markup.value);
+
+        let edits = state.formatting(&uri).expect("formatting should succeed");
+        assert_eq!(
+            edits[0].new_text,
+            "let user = record { name: \"Ada\" };\nlet line = \"Hi \\(user.name)!\";\n\
+             let prompt = \"\"\"\n    Name: \\(user.name)\n    \"\"\";\n"
+        );
+
+        for (version, (text, code)) in (2..).zip([
+            ("let n = 1;\nlet s = \"\\(n)\";\n", "K3015"),
+            ("let s = \"\\(f(1))\";\n", "K3015"),
+            ("let s = \"\"\"\n    a\n  b\n    \"\"\";\n", "K0004"),
+        ]) {
+            let published = state
+                .change(&uri, version, text.to_owned())
+                .expect("the document should change");
+            assert_eq!(published.diagnostics.len(), 1, "{text}");
+            assert_eq!(
+                published.diagnostics[0].code,
+                Some(NumberOrString::String(code.to_owned())),
+                "{text}"
+            );
         }
     }
 

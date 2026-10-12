@@ -1,0 +1,35 @@
+// Holes name a String binding or a field path; the string is the
+// concatenation of its parts from left to right.
+fn greet(name: String) -> String {
+    "Hello, \(name)!"
+}
+
+let user = record { name: "Ada", team: record { name: "core" } };
+let request = HttpRequest { method: "POST", path: "/issues/7" };
+let first = "Grace";
+let last = "Hopper";
+let empty = "";
+
+println(greet(user.name));
+println("\(request.method) \(request.path)");
+println("\(user.name) works on \(user.team.name)");
+println("\(first)\(last)");
+println("\(first)");
+println("[\(empty)]");
+println("[\(empty)\(empty)]");
+println("\"\(first)\"");
+println("tab\t\(first)\\(last)");
+println("\\\(first)");
+println("🤖\(last)✅");
+println(json_encode("line\n\(first)\n"));
+println("\(first)" == first);
+println("\(first) \(last)" == first + " " + last);
+
+let shadow = "outer";
+let shadowed = {
+    let shadow = "inner";
+    "\(shadow)"
+};
+
+println(shadowed);
+println("\(shadow)");

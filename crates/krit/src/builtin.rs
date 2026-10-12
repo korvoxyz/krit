@@ -38,10 +38,18 @@ pub enum Builtin {
     CacheDelete,
     SearchQuery,
     VectorSearch,
+    IntToString,
+    UrlPathSegment,
+    UrlQuery,
+    StringByteLen,
+    StringIsEmpty,
+    StringContains,
+    StringStartsWith,
+    StringEndsWith,
 }
 
 impl Builtin {
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 44] = [
         Self::AiInvoke,
         Self::ConfigString,
         Self::Err,
@@ -78,6 +86,27 @@ impl Builtin {
         Self::CachePut,
         Self::SearchQuery,
         Self::VectorSearch,
+        Self::IntToString,
+        Self::StringByteLen,
+        Self::StringContains,
+        Self::StringEndsWith,
+        Self::StringIsEmpty,
+        Self::StringStartsWith,
+        Self::UrlPathSegment,
+        Self::UrlQuery,
+    ];
+
+    /// The standard library: pure, deterministic functions with no effect and
+    /// no capability requirement (`spec/LANGUAGE.md`, "Standard library").
+    pub const STANDARD_LIBRARY: [Self; 8] = [
+        Self::IntToString,
+        Self::StringByteLen,
+        Self::StringContains,
+        Self::StringEndsWith,
+        Self::StringIsEmpty,
+        Self::StringStartsWith,
+        Self::UrlPathSegment,
+        Self::UrlQuery,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -118,6 +147,14 @@ impl Builtin {
             "cache_delete" => Some(Self::CacheDelete),
             "search_query" => Some(Self::SearchQuery),
             "vector_search" => Some(Self::VectorSearch),
+            "int_to_string" => Some(Self::IntToString),
+            "url_path_segment" => Some(Self::UrlPathSegment),
+            "url_query" => Some(Self::UrlQuery),
+            "string_byte_len" => Some(Self::StringByteLen),
+            "string_is_empty" => Some(Self::StringIsEmpty),
+            "string_contains" => Some(Self::StringContains),
+            "string_starts_with" => Some(Self::StringStartsWith),
+            "string_ends_with" => Some(Self::StringEndsWith),
             _ => None,
         }
     }
@@ -160,6 +197,14 @@ impl Builtin {
             Self::CacheDelete => "cache_delete",
             Self::SearchQuery => "search_query",
             Self::VectorSearch => "vector_search",
+            Self::IntToString => "int_to_string",
+            Self::UrlPathSegment => "url_path_segment",
+            Self::UrlQuery => "url_query",
+            Self::StringByteLen => "string_byte_len",
+            Self::StringIsEmpty => "string_is_empty",
+            Self::StringContains => "string_contains",
+            Self::StringStartsWith => "string_starts_with",
+            Self::StringEndsWith => "string_ends_with",
         }
     }
 
@@ -168,6 +213,14 @@ impl Builtin {
             Self::AiInvoke | Self::Print | Self::Println => BuiltinCategory::HostEffect,
             Self::Some | Self::None | Self::Ok | Self::Err => BuiltinCategory::Constructor,
             Self::JsonEncode | Self::JsonDecode => BuiltinCategory::Conversion,
+            Self::IntToString
+            | Self::UrlPathSegment
+            | Self::UrlQuery
+            | Self::StringByteLen
+            | Self::StringIsEmpty
+            | Self::StringContains
+            | Self::StringStartsWith
+            | Self::StringEndsWith => BuiltinCategory::StandardLibrary,
             Self::ConfigString
             | Self::Secret
             | Self::HttpRequest
@@ -271,6 +324,16 @@ impl Builtin {
             Self::VectorSearch => {
                 "fn(String, String, Int) -> Result<String, String> effects {search.vector}"
             }
+            Self::IntToString => "fn(Int) -> String effects {}",
+            Self::UrlPathSegment => "fn(String) -> Result<String, String> effects {}",
+            Self::UrlQuery => {
+                "fn(List<Record { name: String, value: String }>) -> String effects {}"
+            }
+            Self::StringByteLen => "fn(String) -> Int effects {}",
+            Self::StringIsEmpty => "fn(String) -> Bool effects {}",
+            Self::StringContains | Self::StringStartsWith | Self::StringEndsWith => {
+                "fn(String, String) -> Bool effects {}"
+            }
         }
     }
 
@@ -354,6 +417,26 @@ impl Builtin {
             Self::VectorSearch => {
                 "Runs one bounded similarity search against a manifest-granted named vector connector using a JSON-encoded vector."
             }
+            Self::IntToString => {
+                "Writes an integer in base ten, with a leading `-` when it is negative."
+            }
+            Self::UrlPathSegment => {
+                "Percent-encodes text as one URL path segment, keeping only RFC 3986 unreserved characters. Returns `Err` for text the host path rule would refuse: empty text, `/`, `\\`, an ASCII control character, `%` followed by a hex digit, `u`, or `U`, or text that reads as `.` or `..`."
+            }
+            Self::UrlQuery => {
+                "Builds a query string `name=value&...` from name/value entries, percent-encoding every name and value, with no leading `?`; an empty list gives `\"\"`."
+            }
+            Self::StringByteLen => "Counts the UTF-8 bytes of a string.",
+            Self::StringIsEmpty => "Whether a string has no bytes.",
+            Self::StringContains => {
+                "Whether the second string occurs in the first, comparing UTF-8 bytes; the empty string occurs in every string."
+            }
+            Self::StringStartsWith => {
+                "Whether the first string begins with the second, comparing UTF-8 bytes; every string begins with the empty string."
+            }
+            Self::StringEndsWith => {
+                "Whether the first string ends with the second, comparing UTF-8 bytes; every string ends with the empty string."
+            }
         }
     }
 }
@@ -369,6 +452,8 @@ pub enum BuiltinCategory {
     HostEffect,
     Constructor,
     Conversion,
+    /// A pure, deterministic standard-library function.
+    StandardLibrary,
 }
 
 impl BuiltinCategory {
@@ -377,6 +462,7 @@ impl BuiltinCategory {
             Self::HostEffect => "host-effect",
             Self::Constructor => "constructor",
             Self::Conversion => "conversion",
+            Self::StandardLibrary => "standard-library",
         }
     }
 }
@@ -399,6 +485,14 @@ mod tests {
             assert_eq!(Builtin::from_name(builtin.as_str()), Some(builtin));
             assert!(!builtin.signature().is_empty());
             assert!(!builtin.documentation().is_empty());
+            assert_eq!(
+                builtin.category() == BuiltinCategory::StandardLibrary,
+                Builtin::STANDARD_LIBRARY.contains(&builtin),
+                "{builtin}"
+            );
+        }
+        for builtin in Builtin::STANDARD_LIBRARY {
+            assert!(builtin.signature().ends_with("effects {}"), "{builtin}");
         }
     }
 }

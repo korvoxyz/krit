@@ -1,0 +1,59 @@
+/// The state key of the note a request names, encoded so the name cannot
+/// leave its segment.
+///
+/// Fails when the name cannot be a path segment.
+fn note_key(name: String) -> Result<String, String> {
+    let segment = url_path_segment(name)?;
+    Ok("notes/\(segment)")
+}
+
+/// Answers a note read, deciding the stored value with nested patterns.
+fn read(key: String, name: String) -> HttpResponse {
+    match state_get("agent-work", key) {
+        Ok(Some(text)) => HttpResponse {
+            status: 200,
+            headers: ["x-key": key, "x-bytes": int_to_string(string_byte_len(text))],
+            body: "\(name): \(text)",
+        },
+        Ok(None) => HttpResponse { status: 404, body: """
+            missing note
+              \(name)
+            """ },
+        Err(error) => HttpResponse { status: 500, body: "state failed: \(error)" },
+    }
+}
+
+/// Stores a note, passing every failure on with `?`.
+fn write(key: String, text: String) -> Result<HttpResponse, String> {
+    let previous = state_get("agent-work", key)?;
+    let stored: Unit = state_put("agent-work", key, text)?;
+    let replaced = match previous {
+        Some(_) => "true",
+        None => "false",
+    };
+    Ok(
+        HttpResponse {
+            status: 201,
+            headers: ["x-key": key, "x-replaced": replaced],
+            body: "stored " + url_path_segment(text)?,
+        },
+    )
+}
+
+/// Stores a note in a webhook-shaped helper with let-else.
+fn put(key: String, text: String) -> HttpResponse {
+    let Ok(response) = write(key, text) else
+        Err(error) => HttpResponse { status: 500, body: "not stored: \(error)" };
+    response
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let name = request.query;
+    let Ok(key) = note_key(name) else
+        Err(error) => HttpResponse { status: 400, body: "bad name \(name): \(error)" };
+    if request.method == "PUT" {
+        put(key, request.body)
+    } else {
+        read(key, name)
+    }
+}

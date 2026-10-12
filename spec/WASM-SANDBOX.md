@@ -265,7 +265,8 @@ Policy 1 represents `Int` as core `i64`, `Bool` as core `i32`, `Unit` as a
 zero-width value, and non-capturing function values as bounded-table `i32`
 slots. It supports:
 
-- integer, boolean, unit, and non-capturing function values
+- integer, boolean, unit (including the unit value `()`, `LANGUAGE.md`
+  section 5), and non-capturing function values
 - named recursion and higher-order non-capturing calls through `call_indirect`
 - literals, immutable binds, discards, nested blocks, conditionals, and
   source-ordered short circuiting
@@ -285,10 +286,25 @@ Policy 2 adds a deliberately bounded webhook ABI:
 - canonical UTF-8 strings and checked linear-memory allocation/reallocation
 - String concatenation (`+`), equality (`==`, `!=`), and byte-lexicographic
   ordering (`<`, `<=`, `>`, `>=`) through the guest string runtime below
+- interpolated strings and text blocks (`LANGUAGE.md` section 9.1), which
+  lower to static string literals and left-to-right concatenation, so a
+  prompt or path composed with holes builds wherever the same `+` chain does
 - `json_decode` into `String` through the guest JSON string decoder below
-- fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` records
-- ordered lists of headers
-- the Result/Option shapes returned by config, secrets, and HTTP
+- the standard library (`LANGUAGE.md` section 12.1) through the guest
+  standard library below: `int_to_string`, `url_path_segment`, `url_query`,
+  `string_byte_len`, `string_is_empty`, `string_contains`,
+  `string_starts_with`, and `string_ends_with`, each called directly
+- fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` records, written as
+  `record { ... }` or by named construction (`HttpResponse { status: 200 }`,
+  `LANGUAGE.md` section 8.4), whose omitted fields lower to the same `""` and
+  `[]` literals the full record would write
+- ordered lists of headers, written as list literals or as entry lists
+  (`["x-path": request.path]`, `LANGUAGE.md` section 11), which lower to the
+  same record and list operations as the spelled-out
+  `[record { name: ..., value: ... }]`, so an entry list builds wherever a
+  header list or a `log_info`/`log_error` field list does
+- the Result/Option shapes returned by config, secrets, HTTP, and
+  `url_path_segment`
 - Result/Option matching, including nested patterns and `_` over those
   shapes (`Ok(Some(value))`, `Ok(None)`, and `Err(error)` on the
   `Result<Option<String>, String>` that `state_get`, `checkpoint_get`,
@@ -440,6 +456,60 @@ publishes no response. Like every guest trap it is reported at the artifact
 artifacts carry no source map. A module that never decodes JSON into `String`
 has neither the decoder nor a `name` section.
 
+### Guest standard library
+
+Standard-library calls lower without any host import. `string_byte_len` and
+`string_is_empty` read the second word of the argument's pair inline (its
+byte length, zero-extended to `i64` or compared with zero). Every other
+function is a call of one more generated core function, emitted under the
+same rules as the string helpers (at most once per module, only when a live
+function calls it, after every other definition), so a module that calls
+none of them is unchanged:
+
+- `int_to_string(value: i64) -> pair` makes one 28-byte allocation: the pair,
+  then room for the longest text (`-9223372036854775808`). It writes digits
+  from the end by unsigned division by ten of the magnitude, which is
+  `0 - value` as an unsigned number for a negative value and so exact for
+  the minimum `i64`, then the sign.
+- `starts-with`, `ends-with`, and `contains(text, part) -> i32` compare the
+  part's bytes with the text's at the allowed offsets (zero; the text length
+  minus the part length; every offset from zero to that difference), eight
+  bytes at a time and then byte by byte, stopping at the first difference.
+  They never allocate. `contains` tries offsets in order, so a text of `n`
+  bytes and a part of `m` bytes cost at most `(n - m + 1) * m` byte
+  comparisons; fuel bounds the work like any other guest loop, while the
+  direct evaluator's search is linear.
+- `url-path-segment(text) -> result` scans the text once: it refuses at the
+  first `/`, `\`, or ASCII control byte, and otherwise records whether a `%`
+  is followed by a hex digit, `u`, or `U`, counts the bytes that need an
+  escape, and finds the first `;`, `?`, or `#`. It then applies the refusals
+  of `LANGUAGE.md` section 12.1 in their order (trimming only spaces, since
+  every other whitespace byte is a control byte refused already). An
+  accepted text without bytes to escape shares the input's bytes; otherwise
+  the exact encoded length is allocated and written with uppercase hex
+  escapes. The result is a fresh `Result<String, String>`; an `Err` message
+  is written into a fresh allocation from the same text the compiler's
+  shared definition (`krit_capability::request_target`) gives the direct
+  evaluator, so both report identical bytes.
+- `url-query(entries) -> pair` measures `name=value&...` over the entry
+  array (16 bytes per entry: the name pair, then the value pair) in 64 bits,
+  because entries may share their bytes and so encode to more than guest
+  memory holds; a length beyond `i32::MAX` traps (`K4001`) before anything is
+  allocated. It then allocates exactly that length and writes every name and
+  value with uppercase hex escapes. The empty list gives the empty string.
+
+Builders allocate through the module's bounded `realloc`, which traps with
+`K5103` when guest memory is exhausted, before any byte of the result is
+written. A runtime differential test compares every function with the
+direct evaluator over edge cases (empty and multibyte text, every refusal of
+the path rule, the minimum and maximum `i64`, reserved characters, host
+strings and header lists) and generated texts.
+
+Policy 1 has no string layout, so no standard-library call lowers there;
+each is `K7002` at the built-in's name. Like every built-in but `print` and
+`println`, a standard-library function used as a value (bound, passed, or
+returned) rather than called directly is `K7002` in a component.
+
 ### Support checking
 
 Builds fail with `K7001` for residual parametric layouts and `K7002` for
@@ -448,13 +518,16 @@ recursively; source nesting limits (`LANGUAGE.md` section 4.1) bound that
 nesting, and the backend independently refuses Core nested more than 8,192
 blocks deep with `K1005`, before support checking and equally in a
 `krit check` target check, rather than relying on that bound. Policy 1 rejects
-strings, lists, records, options, results (and so every postfix `?`), JSON
-conversion, lexical captures, matches, unsupported print values, and any
-operation without a correct lowering. It never substitutes a trapping
-placeholder or direct-evaluator fallback. Policy 1 has no linear memory, so a
-String operator in a module program is reported where the String value is
-produced (the literal, parameter, or field), with the "String has no concrete
-guest layout in WebAssembly policy 1" message.
+strings (interpolated strings and text blocks included), lists (entry lists
+included), records (named constructions included), options, results (and so
+every postfix `?`), JSON conversion, the standard library, lexical captures,
+matches, unsupported print values, and any operation without a correct
+lowering. It never substitutes a trapping placeholder or direct-evaluator
+fallback. Policy 1 has no linear memory, so a String operator in a module
+program is reported where the String value is produced (the literal,
+parameter, or field; for an interpolated string, its text parts and
+concatenations, inside the string), with the "String has no concrete guest
+layout in WebAssembly policy 1" message.
 
 Policy 2 does not generalize these layouts to arbitrary records/lists,
 capturing closures, JSON other than `json_decode` into `String`, or

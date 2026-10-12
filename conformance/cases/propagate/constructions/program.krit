@@ -1,0 +1,67 @@
+/// The path of one issue, with the owner encoded as one segment.
+///
+/// Fails when the owner cannot be a path segment.
+fn issue_path(owner: String, number: Int) -> Result<String, String> {
+    let segment = url_path_segment(owner)?;
+    let issue = int_to_string(number);
+    Ok("/repos/\(segment)/issues/\(issue)")
+}
+
+/// A request whose fields, header entries, and query use `?`.
+fn fetch(owner: String, number: Int) -> Result<HttpRequest, String> {
+    let accept = "application/json";
+    Ok(
+        HttpRequest {
+            method: "GET",
+            path: issue_path(owner, number)?,
+            query: url_query(["owner": owner, "page": int_to_string(number)]),
+            headers: ["accept": accept, "x-owner": url_path_segment(owner)?],
+        },
+    )
+}
+
+fn name(key: Option<String>) -> Option<String> {
+    let text = key?;
+    if string_is_empty(text) {
+        None
+    } else {
+        Some("x-\(text)")
+    }
+}
+
+/// An entry list whose keys and values use `?`, evaluated in source order.
+fn headers(first: Option<String>, second: Option<String>) -> Option<List<HttpHeader>> {
+    Some([name(first)?: "1", "x-second": name(second)?])
+}
+
+fn step(label: String, ok: Bool) -> Result<Unit, String> {
+    println("step \(label)");
+    if ok {
+        Ok(())
+    } else {
+        Err("\(label) failed")
+    }
+}
+
+fn describe(value: Unit) -> String {
+    if value == () {
+        "both"
+    } else {
+        "never"
+    }
+}
+
+/// A response built after two unit steps; a failed step skips the rest.
+fn respond(first: Bool, second: Bool) -> Result<HttpResponse, String> {
+    let done: Unit = step("one", first)?;
+    Ok(HttpResponse { status: 201, body: describe(step("two", second)?) })
+}
+
+println(fetch("octo cat", 3));
+println(fetch("..", 3));
+println(headers(Some("a"), Some("b")));
+println(headers(Some("a"), Some("")));
+println(headers(None, Some("b")));
+println(respond(true, true));
+println(respond(true, false));
+println(respond(false, true));

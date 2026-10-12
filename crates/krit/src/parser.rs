@@ -3,14 +3,14 @@ use std::collections::{BTreeMap, HashSet};
 use crate::{
     Diagnostic, Source, Span,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, MatchArm, Parameter, Pattern,
-        PatternKind, Program, RecordField, RecordTypeField, Statement, StatementKind,
-        TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral, VariantArm, VariantName,
-        VariantPattern,
+        BinaryOperator, Block, ConstructField, ContractRecord, DocComment, Expression,
+        ExpressionKind, ListEntry, MatchArm, Parameter, Pattern, PatternKind, Program, RecordField,
+        RecordTypeField, Statement, StatementKind, StringPart, TypeAnnotation, TypeKind,
+        UnaryOperator, ValueLiteral, VariantArm, VariantName, VariantPattern,
     },
     habits::Habit,
     limits::{MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, nesting_error, structural_error},
-    token::{Token, TokenKind},
+    token::{Template, TemplatePart, Token, TokenKind},
 };
 
 /// Parses `tokens`, which the lexer produced from `source`.
@@ -47,6 +47,12 @@ struct Parser<'source> {
     /// operator's first branch, the `?` to report and that `:`
     /// ([`ternary_colons`]).
     ternary_colons: BTreeMap<usize, (Span, Span)>,
+    /// Whether a contract type name followed by `{` starts a named
+    /// construction here. It does not directly in an `if` condition or a
+    /// `match` subject, where the `{` opens the block or the arms, until a
+    /// bracketed group or block inside them allows it again
+    /// ([`Self::with_construction`]).
+    construction_allowed: bool,
 }
 
 impl<'source> Parser<'source> {
@@ -61,6 +67,7 @@ impl<'source> Parser<'source> {
             peak: 0,
             speculations: 0,
             ternary_colons,
+            construction_allowed: true,
         }
     }
 
@@ -261,6 +268,7 @@ impl<'source> Parser<'source> {
     }
 
     fn function_declaration(&mut self) -> Result<Statement, Diagnostic> {
+        let doc = self.doc_comment();
         let start = self.expect(TokenKind::Fn)?.span;
         let (name, _) = self.binding_name()?;
         let parameters = self.parameters()?;
@@ -277,12 +285,14 @@ impl<'source> Parser<'source> {
                 parameters,
                 return_type,
                 body,
+                doc,
             },
             span,
         })
     }
 
     fn webhook_declaration(&mut self) -> Result<Statement, Diagnostic> {
+        let doc = self.doc_comment();
         let start = self.expect(TokenKind::Webhook)?.span;
         self.expect(TokenKind::Fn)?;
         let (name, _) = self.binding_name()?;
@@ -300,6 +310,7 @@ impl<'source> Parser<'source> {
                 parameters,
                 return_type,
                 body,
+                doc,
             },
             span,
         })
@@ -314,6 +325,7 @@ impl<'source> Parser<'source> {
         let keyword = self
             .entrypoint_keyword()
             .ok_or_else(|| self.expected("`queue` or `schedule`"))?;
+        let doc = self.doc_comment();
         let start = self.advance().span;
         let token = self.advance().clone();
         let TokenKind::String(resource) = token.kind else {
@@ -344,6 +356,7 @@ impl<'source> Parser<'source> {
                 parameters,
                 return_type,
                 body,
+                doc,
             }
         } else {
             StatementKind::ScheduleHandler {
@@ -353,9 +366,25 @@ impl<'source> Parser<'source> {
                 parameters,
                 return_type,
                 body,
+                doc,
             }
         };
         Ok(Statement { kind, span })
+    }
+
+    /// The doc comment of the item whose first token is the current one: the
+    /// `///` lines directly before it ([`doc_comment_before`]).
+    fn doc_comment(&self) -> Option<DocComment> {
+        let previous = self
+            .cursor
+            .checked_sub(1)
+            .map(|index| self.tokens[index].span);
+        doc_comment_before(
+            self.text,
+            previous.map_or(0, |span| span.end),
+            self.current().span.start,
+            previous.is_some(),
+        )
     }
 
     fn entrypoint_keyword(&self) -> Option<&'static str> {
@@ -367,9 +396,12 @@ impl<'source> Parser<'source> {
             "schedule" => "schedule",
             _ => return None,
         };
+        // An interpolated string or text block in the name's place is read
+        // as an entrypoint too, so its declaration reports that the name
+        // must be a direct literal.
         let follows_literal = matches!(
             self.tokens.get(self.cursor + 1).map(|token| &token.kind),
-            Some(TokenKind::String(_))
+            Some(TokenKind::String(_) | TokenKind::Template(_))
         );
         let follows_fn = matches!(
             self.tokens.get(self.cursor + 2).map(|token| &token.kind),
@@ -427,7 +459,9 @@ impl<'source> Parser<'source> {
 
     fn block(&mut self) -> Result<Block, Diagnostic> {
         let start = self.expect(TokenKind::LeftBrace)?.span;
-        self.nested(start, |parser| parser.block_contents(start))
+        self.nested(start, |parser| {
+            parser.with_construction(true, |parser| parser.block_contents(start))
+        })
     }
 
     fn block_contents(&mut self, start: Span) -> Result<Block, Diagnostic> {
@@ -605,18 +639,7 @@ impl<'source> Parser<'source> {
                 self.enter(open)?;
                 let arguments_depth = self.structural_depth();
                 let callee_peak = std::mem::replace(&mut self.peak, arguments_depth);
-                let mut arguments = Vec::new();
-                if !self.check(&TokenKind::RightParen) {
-                    loop {
-                        arguments.push(self.expression()?);
-                        if !self.consume(&TokenKind::Comma) {
-                            break;
-                        }
-                        if self.check(&TokenKind::RightParen) {
-                            break;
-                        }
-                    }
-                }
+                let arguments = self.with_construction(true, Self::arguments)?;
                 height = 1 + height.max(self.peak - arguments_depth);
                 self.peak = self.peak.max(callee_peak);
                 self.reach(base + height, open)?;
@@ -675,6 +698,23 @@ impl<'source> Parser<'source> {
         Ok(expression)
     }
 
+    /// Parses a call's arguments up to, but not including, its `)`.
+    fn arguments(&mut self) -> Result<Vec<Expression>, Diagnostic> {
+        let mut arguments = Vec::new();
+        if !self.check(&TokenKind::RightParen) {
+            loop {
+                arguments.push(self.expression()?);
+                if !self.consume(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightParen) {
+                    break;
+                }
+            }
+        }
+        Ok(arguments)
+    }
+
     fn primary(&mut self) -> Result<Expression, Diagnostic> {
         let token = self.advance().clone();
         match token.kind {
@@ -691,6 +731,7 @@ impl<'source> Parser<'source> {
                 kind: ExpressionKind::Literal(ValueLiteral::String(value)),
                 span: token.span,
             }),
+            TokenKind::Template(template) => self.interpolation(template, token.span),
             TokenKind::True => Ok(Expression {
                 kind: ExpressionKind::Literal(ValueLiteral::Boolean(true)),
                 span: token.span,
@@ -705,6 +746,16 @@ impl<'source> Parser<'source> {
                 }
                 if let Some(habit) = self.word_habit(&name, token.span) {
                     return Err(habit);
+                }
+                if let Some(contract) = ContractRecord::from_name(&name)
+                    && self.check(&TokenKind::LeftBrace)
+                {
+                    if self.construction_allowed {
+                        return self.construction(contract, token.span);
+                    }
+                    if let Some(error) = self.restricted_construction(contract, token.span) {
+                        return Err(error);
+                    }
                 }
                 Ok(Expression {
                     kind: ExpressionKind::Variable(name),
@@ -735,12 +786,24 @@ impl<'source> Parser<'source> {
         }
     }
 
-    /// Parses `( expression )` after its `(` at `open`, and reports an arrow
-    /// function's parameter list followed by `=>` (`K1109`): `(x) => e`,
-    /// `(x, y) => e`, `() => e`.
+    /// Parses `( expression )` or the unit value `()` after its `(` at `open`,
+    /// and reports an arrow function's parameter list followed by `=>`
+    /// (`K1109`): `(x) => e`, `(x, y) => e`, `() => e`.
     fn parenthesized(&mut self, open: Span) -> Result<Expression, Diagnostic> {
         let open_index = self.cursor - 1;
-        let expression = match self.nested(open, Self::expression) {
+        if self.check(&TokenKind::RightParen) {
+            let end = self.advance().span;
+            if self.check(&TokenKind::FatArrow) {
+                return Err(arrow_function(open.join(self.current().span)));
+            }
+            return Ok(Expression {
+                kind: ExpressionKind::Unit,
+                span: open.join(end),
+            });
+        }
+        let expression = match self.nested(open, |parser| {
+            parser.with_construction(true, Self::expression)
+        }) {
             Ok(expression) => expression,
             // `()` and parameters such as `(...rest)` are not expressions.
             Err(error) if !is_settled(&error) => {
@@ -762,6 +825,70 @@ impl<'source> Parser<'source> {
             span: open.join(end),
             ..expression
         })
+    }
+
+    /// Builds the interpolated string or text block at `span` from its
+    /// lexed `template`.
+    ///
+    /// The string opens one nesting level for its holes, and each field
+    /// access in a hole is one link of a postfix chain, measured as
+    /// [`Self::call`] measures field-access links.
+    fn interpolation(&mut self, template: Template, span: Span) -> Result<Expression, Diagnostic> {
+        let parts = self.nested(span, |parser| {
+            template
+                .parts
+                .into_iter()
+                .map(|part| match part {
+                    TemplatePart::Text { value, span } => Ok(StringPart::Text { value, span }),
+                    TemplatePart::Hole { path, span } => Ok(StringPart::Hole {
+                        value: parser.hole_path(path, span)?,
+                        span,
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        Ok(Expression {
+            kind: ExpressionKind::Interpolation(parts),
+            span,
+        })
+    }
+
+    /// Builds the value of the hole at `hole`: the variable named by the
+    /// first entry of `path`, followed by a field access for each later
+    /// entry, at the spans of the names inside the hole.
+    fn hole_path(
+        &mut self,
+        path: Vec<(String, Span)>,
+        hole: Span,
+    ) -> Result<Expression, Diagnostic> {
+        let base = self.structural_depth();
+        let depth = self.depth;
+        let mut segments = path.into_iter();
+        // The lexer never produces an empty path.
+        let (name, name_span) = segments.next().ok_or_else(|| {
+            Diagnostic::new("K3015", "interpolation hole is empty", hole)
+                .with_note("write the name of a `String` value between `\\(` and `)`")
+        })?;
+        let mut expression = Expression {
+            kind: ExpressionKind::Variable(name),
+            span: name_span,
+        };
+        for (height, (field, field_span)) in segments.enumerate() {
+            // The `.` directly precedes the field name.
+            let dot = Span::new(field_span.start.saturating_sub(1), field_span.start);
+            self.enter(dot)?;
+            self.reach(base + height + 1, dot)?;
+            let span = expression.span.join(field_span);
+            expression = Expression {
+                kind: ExpressionKind::FieldAccess {
+                    value: Box::new(expression),
+                    field,
+                },
+                span,
+            };
+        }
+        self.depth = depth;
+        Ok(expression)
     }
 
     /// Reports a habit word used as another language's keyword: `word` at
@@ -877,8 +1004,10 @@ impl<'source> Parser<'source> {
     ///   `f()?(1)`, `if x? {`), so only the bracket scan decides
     ///   ([`ternary_colons`]): a `:` at the `?`'s bracket depth before the
     ///   branch could end makes it a conditional operator, which no valid
-    ///   program contains there. Nothing is parsed twice, so a long chain of
-    ///   postfix `?` operators parses in linear time.
+    ///   program contains there, except the `:` of an entry list's entry
+    ///   (`[pick()?(k): v]`), which the scan does not count. Nothing is
+    ///   parsed twice, so a long chain of postfix `?` operators parses in
+    ///   linear time.
     fn question_misuse(&mut self, question: Span) -> Option<Diagnostic> {
         let next = self.current().clone();
         if !starts_expression(&next.kind) {
@@ -1008,14 +1137,49 @@ impl<'source> Parser<'source> {
     }
 
     fn list(&mut self, start: Span) -> Result<Expression, Diagnostic> {
-        self.nested(start, |parser| parser.list_elements(start))
+        self.nested(start, |parser| {
+            parser.with_construction(true, |parser| parser.list_elements(start))
+        })
     }
 
+    /// Parses the elements of a list literal after its `[` at `start`: plain
+    /// elements (`[a, b]`), or `key: value` entries (`["k": v]`), which make
+    /// it an entry list. The first element decides; a list that mixes the two
+    /// forms is `K1001` at the first element written the other way.
     fn list_elements(&mut self, start: Span) -> Result<Expression, Diagnostic> {
+        if self.check(&TokenKind::Colon)
+            && self
+                .tokens
+                .get(self.cursor + 1)
+                .is_some_and(|token| token.kind == TokenKind::RightBracket)
+        {
+            let end = self.tokens[self.cursor + 1].span;
+            return Err(
+                Diagnostic::new("K1001", "`[:]` is not Krit syntax", start.join(end))
+                    .with_note("the empty list is `[]`, for entry lists too"),
+            );
+        }
         let mut elements = Vec::new();
+        let mut entries = Vec::new();
         if !self.check(&TokenKind::RightBracket) {
             loop {
-                elements.push(self.expression()?);
+                let element = self.expression()?;
+                if self.check(&TokenKind::Colon) {
+                    if !elements.is_empty() {
+                        return Err(mixed_list(element.span.join(self.current().span)));
+                    }
+                    self.advance();
+                    let value = self.expression()?;
+                    entries.push(ListEntry {
+                        span: element.span.join(value.span),
+                        key: element,
+                        value,
+                    });
+                } else if !entries.is_empty() {
+                    return Err(mixed_list(element.span));
+                } else {
+                    elements.push(element);
+                }
                 if !self.consume(&TokenKind::Comma) {
                     break;
                 }
@@ -1025,14 +1189,21 @@ impl<'source> Parser<'source> {
             }
         }
         let end = self.expect(TokenKind::RightBracket)?.span;
+        let kind = if entries.is_empty() {
+            ExpressionKind::List(elements)
+        } else {
+            ExpressionKind::EntryList(entries)
+        };
         Ok(Expression {
-            kind: ExpressionKind::List(elements),
+            kind,
             span: start.join(end),
         })
     }
 
     fn record(&mut self, start: Span) -> Result<Expression, Diagnostic> {
-        self.nested(start, |parser| parser.record_fields(start))
+        self.nested(start, |parser| {
+            parser.with_construction(true, |parser| parser.record_fields(start))
+        })
     }
 
     fn record_fields(&mut self, start: Span) -> Result<Expression, Diagnostic> {
@@ -1071,6 +1242,96 @@ impl<'source> Parser<'source> {
         })
     }
 
+    /// Parses a named construction `TypeName { field: value, punned, ... }`
+    /// after its type name at `start`; the current token is its `{`.
+    ///
+    /// The parser accepts any field names. Which fields a contract has,
+    /// requires, and defaults is checked by analysis (`K3016`).
+    fn construction(
+        &mut self,
+        contract: ContractRecord,
+        start: Span,
+    ) -> Result<Expression, Diagnostic> {
+        self.expect(TokenKind::LeftBrace)?;
+        self.nested(start, |parser| {
+            parser.with_construction(true, |parser| parser.construction_fields(contract, start))
+        })
+    }
+
+    fn construction_fields(
+        &mut self,
+        contract: ContractRecord,
+        start: Span,
+    ) -> Result<Expression, Diagnostic> {
+        let mut fields = Vec::new();
+        if !self.check(&TokenKind::RightBrace) {
+            loop {
+                let (name, name_span) = self.identifier()?;
+                let value = if self.consume(&TokenKind::Colon) {
+                    self.expression()?
+                } else if self.check(&TokenKind::Comma) || self.check(&TokenKind::RightBrace) {
+                    // A punned field `body` means `body: body`.
+                    Expression {
+                        kind: ExpressionKind::Variable(name.clone()),
+                        span: name_span,
+                    }
+                } else {
+                    return Err(self.expected("`:`, `,`, or `}`"));
+                };
+                fields.push(ConstructField {
+                    span: name_span.join(value.span),
+                    name,
+                    name_span,
+                    value,
+                });
+                if !self.consume(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightBrace) {
+                    break;
+                }
+            }
+        }
+        let end = self.expect(TokenKind::RightBrace)?.span;
+        Ok(Expression {
+            kind: ExpressionKind::Construct {
+                contract,
+                contract_span: start,
+                fields,
+            },
+            span: start.join(end),
+        })
+    }
+
+    /// Reports a named construction written directly as an `if` condition or
+    /// a `match` subject, where its `{` would open the block or the arms
+    /// instead: the type name at `name` is followed by `{` and then a field
+    /// name with `:` or `,`, which never start a block.
+    ///
+    /// `if HttpResponse { x } else { y }` stays a condition named
+    /// `HttpResponse`, since `{ x }` is a valid block.
+    fn restricted_construction(&self, contract: ContractRecord, name: Span) -> Option<Diagnostic> {
+        let field = self.tokens.get(self.cursor + 1)?;
+        let after = self.tokens.get(self.cursor + 2)?;
+        let starts_field = matches!(field.kind, TokenKind::Identifier(_))
+            && matches!(after.kind, TokenKind::Colon | TokenKind::Comma);
+        starts_field.then(|| {
+            Diagnostic::new(
+                "K1001",
+                format!(
+                    "`{} {{ ... }}` cannot be written directly as an `if` condition or a \
+                     `match` subject",
+                    contract.name()
+                ),
+                name.join(self.current().span),
+            )
+            .with_note(format!(
+                "wrap the construction in parentheses: `({} {{ ... }})`",
+                contract.name()
+            ))
+        })
+    }
+
     /// Parses an `if` expression and its whole `else if` chain.
     ///
     /// An `else if` continuation stays at the nesting level of the `if` it
@@ -1081,7 +1342,9 @@ impl<'source> Parser<'source> {
         let mut links = Vec::new();
         let mut link_start = start;
         let alternative = loop {
-            let condition = self.nested(link_start, Self::expression)?;
+            let condition = self.nested(link_start, |parser| {
+                parser.with_construction(false, Self::expression)
+            })?;
             let consequent = self.block()?;
             let else_span = self.expect(TokenKind::Else)?.span;
             if let Some(habit) = self.else_return(else_span) {
@@ -1141,9 +1404,13 @@ impl<'source> Parser<'source> {
     }
 
     fn match_expression(&mut self, start: Span) -> Result<Expression, Diagnostic> {
-        let subject = self.nested(start, Self::expression)?;
+        let subject = self.nested(start, |parser| {
+            parser.with_construction(false, Self::expression)
+        })?;
         let open = self.expect(TokenKind::LeftBrace)?.span;
-        let arms = self.nested(open, Self::match_arms)?;
+        let arms = self.nested(open, |parser| {
+            parser.with_construction(true, Self::match_arms)
+        })?;
         let end = self.expect(TokenKind::RightBrace)?.span;
         Ok(Expression {
             kind: ExpressionKind::Match {
@@ -1445,11 +1712,19 @@ impl<'source> Parser<'source> {
         let start = self.current().span;
         let token = self.advance().clone();
         let TokenKind::Identifier(name) = token.kind else {
-            return Err(Diagnostic::new(
+            let error = Diagnostic::new(
                 "K1002",
                 format!("expected built-in type, found {}", token.kind.description()),
                 token.span,
-            ));
+            );
+            // `-> ()`: the unit value is not a type.
+            return Err(
+                if token.kind == TokenKind::LeftParen && self.check(&TokenKind::RightParen) {
+                    error.with_note("the unit type is spelled `Unit`; `()` is the unit value")
+                } else {
+                    error
+                },
+            );
         };
         let kind = match name.as_str() {
             "Int" => TypeKind::Int,
@@ -1585,6 +1860,17 @@ impl<'source> Parser<'source> {
         Ok((name, token.span))
     }
 
+    /// Runs `parse` with named construction allowed or not
+    /// ([`Self::construction_allowed`]), and restores the enclosing setting
+    /// whether `parse` succeeds or not, so a failed speculative parse leaves
+    /// it unchanged too.
+    fn with_construction<T>(&mut self, allowed: bool, parse: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = std::mem::replace(&mut self.construction_allowed, allowed);
+        let result = parse(self);
+        self.construction_allowed = outer;
+        result
+    }
+
     /// Parses one syntactic nesting level opened by the construct at `span`.
     fn nested<T>(
         &mut self,
@@ -1698,6 +1984,89 @@ impl<'source> Parser<'source> {
     }
 }
 
+/// A list literal at `span` that writes one element in the other form than
+/// its first element: a plain element in an entry list, or a `key: value`
+/// entry in a list of plain elements (`K1001`).
+fn mixed_list(span: Span) -> Diagnostic {
+    Diagnostic::new(
+        "K1001",
+        "a list literal cannot mix `key: value` entries and plain elements",
+        span,
+    )
+    .with_note(
+        "write every element as `key: value` for a list of `record { name, value }` entries, \
+         or write none that way",
+    )
+}
+
+/// The doc comment written directly before an item that starts at
+/// `item_start`, found in the trivia between `trivia_start` and the item:
+/// the end of the previous token (`after_token`) or the start of the file.
+///
+/// Trivia holds only whitespace and `//` comments, and a comment ends its
+/// line, so each line of it is blank or holds one comment after its
+/// indentation. The doc comment is the run of `///` lines that ends at the
+/// item, read upward and skipping blank lines; it stops at the first other
+/// comment, including a `////` banner, and at the line of the previous token,
+/// where a comment is an end-of-line comment.
+fn doc_comment_before(
+    text: &str,
+    trivia_start: usize,
+    item_start: usize,
+    after_token: bool,
+) -> Option<DocComment> {
+    let trivia = &text[trivia_start..item_start];
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    for (index, character) in trivia.char_indices() {
+        if character == '\n' || character == '\r' {
+            lines.push((trivia_start + line_start, &trivia[line_start..index]));
+            line_start = index + 1;
+        }
+    }
+    // The last piece is the item's own indentation, and with `after_token`
+    // the first shares the previous token's line.
+    let own_lines = lines.get(usize::from(after_token)..)?;
+    let mut doc_lines = Vec::new();
+    for (start, line) in own_lines.iter().rev() {
+        let comment = line.trim_start();
+        if comment.is_empty() {
+            continue;
+        }
+        let Some(line_text) = doc_line_text(comment) else {
+            break;
+        };
+        let comment_start = start + (line.len() - comment.len());
+        doc_lines.push((
+            Span::new(comment_start, comment_start + comment.trim_end().len()),
+            line_text.trim_end(),
+        ));
+    }
+    let (last, _) = *doc_lines.first()?;
+    let (first, _) = *doc_lines.last()?;
+    let text = doc_lines
+        .iter()
+        .rev()
+        .map(|(_, line)| *line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(DocComment {
+        text,
+        span: first.join(last),
+    })
+}
+
+/// The text of a doc comment line `comment` (from its `//` to the end of the
+/// line): what follows `///`, without one leading space. `None` when the
+/// comment is not a doc line, including a `////` banner.
+pub(crate) fn doc_line_text(comment: &str) -> Option<&str> {
+    let rest = comment.strip_prefix("///")?;
+    if rest.starts_with('/') {
+        return None;
+    }
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
 /// An arrow function at `span` (`K1109`).
 fn arrow_function(span: Span) -> Diagnostic {
     Habit::ArrowFunction.diagnostic("arrow functions are not Krit syntax", span)
@@ -1714,37 +2083,60 @@ fn ternary(span: Span) -> Diagnostic {
 /// `?`, or the first `;`, `,`, or `let` at that depth, none of which a first
 /// branch contains outside brackets.
 ///
+/// Directly inside a list literal's `[`, the first `:` after the `[` or after
+/// a `,` separates an entry's key from its value (`[load()?: v]`), so it ends
+/// the search of every `?` before it without being a branch end; only a later
+/// `:` at that depth, in the entry's value, can be one.
+///
 /// Each `?` that has such a `:` maps to the `?` to report with it and to the
 /// `:`. The `?` to report is the last one before the `:` at the same depth
 /// that a token able to start an expression follows: the innermost
 /// conditional operator ending at that `:` (`a ? -b ? c : d : e` reports
 /// `? c :`). One pass over the tokens finds every `?`'s `:`.
 fn ternary_colons(tokens: &[Token]) -> BTreeMap<usize, (Span, Span)> {
+    /// One open bracket level.
+    #[derive(Default)]
+    struct Level {
+        /// The `?` tokens still looking for their `:`.
+        questions: Vec<usize>,
+        /// Whether the level is a `[`, whose elements may be entries.
+        list: bool,
+        /// Whether a `:` here would separate an entry's key from its value:
+        /// the level is a `[` and no `:` has followed it or its last `,`.
+        entry_key: bool,
+    }
+
     let mut colons = BTreeMap::new();
-    // The `?` tokens still looking for their `:`, one list per open bracket
-    // level, outermost first. The outermost level is never closed.
-    let mut levels: Vec<Vec<usize>> = vec![Vec::new()];
+    // One level per open bracket, outermost first. The outermost level is
+    // never closed.
+    let mut levels = vec![Level::default()];
     for (index, token) in tokens.iter().enumerate() {
         let open = levels.len();
         let level = levels
             .last_mut()
             .expect("the outermost bracket level stays open");
         match &token.kind {
-            TokenKind::Question => level.push(index),
-            TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace => {
-                levels.push(Vec::new());
-            }
+            TokenKind::Question => level.questions.push(index),
+            TokenKind::LeftParen | TokenKind::LeftBrace => levels.push(Level::default()),
+            TokenKind::LeftBracket => levels.push(Level {
+                questions: Vec::new(),
+                list: true,
+                entry_key: true,
+            }),
             TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
                 // A bracket that closes the level of a `?` ends its search, and
                 // so does one that closes nothing opened in the file.
                 if open > 1 {
                     levels.pop();
                 } else {
-                    level.clear();
+                    level.questions.clear();
                 }
             }
             TokenKind::Colon => {
-                let pending = std::mem::take(level);
+                let pending = std::mem::take(&mut level.questions);
+                if std::mem::take(&mut level.entry_key) {
+                    continue;
+                }
                 let Some(&innermost) = pending.iter().rev().find(|question| {
                     tokens
                         .get(**question + 1)
@@ -1756,7 +2148,12 @@ fn ternary_colons(tokens: &[Token]) -> BTreeMap<usize, (Span, Span)> {
                     colons.insert(question, (tokens[innermost].span, token.span));
                 }
             }
-            TokenKind::Semicolon | TokenKind::Comma | TokenKind::Let => level.clear(),
+            TokenKind::Comma => {
+                level.questions.clear();
+                // The next element of a list may be an entry again.
+                level.entry_key = level.list;
+            }
+            TokenKind::Semicolon | TokenKind::Let => level.questions.clear(),
             TokenKind::Eof => break,
             _ => {}
         }
@@ -1779,6 +2176,7 @@ fn starts_operand_only(kind: &TokenKind) -> bool {
         TokenKind::Identifier(_)
             | TokenKind::Integer(_)
             | TokenKind::String(_)
+            | TokenKind::Template(_)
             | TokenKind::True
             | TokenKind::False
             | TokenKind::Record
@@ -1922,6 +2320,8 @@ mod tests {
             "blocks" => ("{ ", "1", " }", ""),
             "lists" => ("[", "1", "]", ""),
             "records" => ("record { a: ", "1", " }", ""),
+            "constructions" => ("HttpResponse { status: ", "1", " }", ""),
+            "entries" => ("[\"k\": ", "\"v\"", "]", ""),
             "ifs" => ("if true { ", "1", " } else { 0 }", ""),
             "matches" => ("match Some(1) { None => 0, Some(x) => ", "1", " }", ""),
             "calls" => ("f(", "1", ")", "fn f(x) { x }\n"),
@@ -1951,6 +2351,8 @@ mod tests {
             "blocks",
             "lists",
             "records",
+            "constructions",
+            "entries",
             "ifs",
             "matches",
             "calls",
@@ -2551,6 +2953,36 @@ mod tests {
     }
 
     #[test]
+    fn postfix_question_marks_in_entries_and_constructions_parse() {
+        // An entry's `:` after a key that ends in a postfix `?` (directly or
+        // through a call or operator after it) separates the key from the
+        // value; it never ends a conditional operator.
+        for text in [
+            "fn f() -> Result<List<HttpHeader>, String> { Ok([name()?: \"1\", \"b\": name()?]) }",
+            "fn f() -> Result<List<HttpHeader>, String> { Ok([pick()?(1): \"v\", pick()?(2): \"w\"]) }",
+            "fn f() -> Result<List<HttpHeader>, String> { Ok([\"k\": v, pick()?(1): \"w\",]) }",
+            "fn f() -> Result<List<HttpHeader>, String> { Ok([n? - 1: \"v\"]) }",
+            "fn f() -> Result<HttpResponse, String> { Ok(HttpResponse { status: code()?, body: pick()?(1) }) }",
+            "fn f(x) -> Result<HttpRequest, String> { Ok(HttpRequest { method: \"GET\", path: \"/\" + url_path_segment(x)? }) }",
+        ] {
+            parse_text(text).unwrap_or_else(|error| panic!("{text}: {error:?}"));
+        }
+        // A `:` in an entry's value still ends a conditional operator, and a
+        // first branch that parses is recognized in a list as anywhere.
+        for (text, spanned) in [
+            ("let l = [\"k\": c ? (1) : 2];", "? (1) :"),
+            ("let l = [\"k\": \"v\", \"j\": c ? -1 : 1];", "? -1 :"),
+            ("let l = [c ? 1 : 2];", "? 1 :"),
+            ("let l = [c ? f(1) : 2, 3];", "? f(1) :"),
+        ] {
+            let (code, actual_span, notes) = habit(text);
+            assert_eq!(code, "K1110", "{text}");
+            assert_eq!(actual_span, spanned, "{text}");
+            assert_eq!(notes.len(), 1, "{text}");
+        }
+    }
+
+    #[test]
     fn a_habit_word_before_a_line_break_keeps_the_generic_error() {
         // A bound habit word ending a line, followed by an operand on the
         // next, is a missing `;` or `,`, not a foreign construct.
@@ -2589,6 +3021,337 @@ mod tests {
             panic!("expected a match statement");
         };
         arms.iter().map(|arm| arm.pattern.to_string()).collect()
+    }
+
+    /// The written fields of the named construction `text` is the value of,
+    /// as `(name, punned)` pairs.
+    fn construction_fields(text: &str) -> (ContractRecord, Vec<(String, bool)>) {
+        let program = parse_text(text).expect("construction should parse");
+        let StatementKind::Let { value, .. } = &program.statements.last().unwrap().kind else {
+            panic!("the last statement should be a let");
+        };
+        let ExpressionKind::Construct {
+            contract, fields, ..
+        } = &value.kind
+        else {
+            panic!("the value should be a named construction: {value:?}");
+        };
+        let fields = fields
+            .iter()
+            .map(|field| (field.name.clone(), field.is_punned()))
+            .collect();
+        (*contract, fields)
+    }
+
+    #[test]
+    fn parses_named_construction_with_punning_and_trailing_commas() {
+        let (contract, fields) =
+            construction_fields("let body = \"x\";\nlet r = HttpResponse { status: 200, body, };");
+        assert_eq!(contract, ContractRecord::HttpResponse);
+        assert_eq!(
+            fields,
+            [("status".to_owned(), false), ("body".to_owned(), true)]
+        );
+
+        let (contract, fields) = construction_fields("let r = HttpRequest {};");
+        assert_eq!(contract, ContractRecord::HttpRequest);
+        assert!(fields.is_empty());
+
+        for (name, contract) in [
+            ("HttpHeader", ContractRecord::HttpHeader),
+            ("LogField", ContractRecord::LogField),
+        ] {
+            let (parsed, fields) =
+                construction_fields(&format!("let r = {name} {{ name: \"a\", value }};"));
+            assert_eq!(parsed, contract);
+            assert_eq!(
+                fields,
+                [("name".to_owned(), false), ("value".to_owned(), true)]
+            );
+        }
+
+        // A punned field's value is the variable at the field name's span.
+        let program = parse_text("let r = HttpResponse { status };").expect("should parse");
+        let StatementKind::Let { value, .. } = &program.statements[0].kind else {
+            panic!("let expected");
+        };
+        let ExpressionKind::Construct {
+            contract_span,
+            fields,
+            ..
+        } = &value.kind
+        else {
+            panic!("construction expected");
+        };
+        assert_eq!(*contract_span, Span::new(8, 20));
+        assert_eq!(value.span, Span::new(8, 31));
+        assert_eq!(fields[0].name_span, Span::new(23, 29));
+        assert_eq!(fields[0].value.span, fields[0].name_span);
+        assert!(
+            matches!(&fields[0].value.kind, ExpressionKind::Variable(name) if name == "status")
+        );
+    }
+
+    #[test]
+    fn only_the_four_contract_names_start_a_named_construction() {
+        for text in [
+            "let r = QueueJob { id: \"x\" };",
+            "let r = Response { status: 200 };",
+            "let r = httpResponse { status: 200 };",
+        ] {
+            let error = parse_text(text).expect_err("other names are not constructions");
+            assert_eq!(error.code(), "K1002", "{text}");
+        }
+        let error = parse_text("let r = HttpResponse { status 200 };")
+            .expect_err("a field needs `:`, `,`, or `}` after its name");
+        assert_eq!(error.code(), "K1002");
+        assert!(error.message().contains("`:`, `,`, or `}`"));
+    }
+
+    #[test]
+    fn named_construction_needs_parentheses_as_a_condition_or_subject() {
+        for (text, span) in [
+            (
+                "if HttpResponse { status: 1 }.status == 1 { 1 } else { 2 };",
+                Span::new(3, 17),
+            ),
+            (
+                "let x = 1;\nif x == 1 { 1 } else if HttpHeader { name, value: \"\" }.name == \"\" { 2 } else { 3 };",
+                Span::new(35, 47),
+            ),
+            (
+                "match HttpRequest { method: \"GET\", path: \"/\" }.method { _ => 1 };",
+                Span::new(6, 19),
+            ),
+            (
+                "if !LogField { name: \"a\", value: \"b\" }.name { 1 } else { 2 };",
+                Span::new(4, 14),
+            ),
+        ] {
+            let error = parse_text(text).expect_err("a bare construction condition should fail");
+            assert_eq!(error.code(), "K1001", "{text}");
+            assert_eq!(error.span(), span, "{text}");
+            assert_eq!(error.notes().len(), 1, "{text}");
+        }
+
+        // Parentheses, brackets, call arguments, blocks, and match arms
+        // inside a condition or subject allow it again.
+        for text in [
+            "if (HttpResponse { status: 1 }).status == 1 { 1 } else { 2 };",
+            "fn f(r) { r.status == 1 }\nif f(HttpResponse { status: 1 }) { 1 } else { 2 };",
+            "if [HttpHeader { name: \"a\", value: \"b\" }] == [] { 1 } else { 2 };",
+            "if { HttpResponse { status: 1 } }.status == 1 { 1 } else { 2 };",
+            "if match Some(1) { Some(x) => HttpResponse { status: x }, None => HttpResponse { status: 0 } }.status == 1 { 1 } else { 2 };",
+            "match (HttpRequest { method: \"GET\", path: \"/\" }).headers { [] => 0, [h, ..t] => 1 };",
+            "if true { HttpResponse { status: 1 } } else { HttpResponse { status: 2 } };",
+        ] {
+            parse_text(text).unwrap_or_else(|error| panic!("{text}: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn contract_names_before_a_block_keep_their_meaning_in_conditions() {
+        // `{ x }` is a valid block, so the condition is the name itself.
+        let program = parse_text(
+            "let HttpResponse = true;\nlet x = 1;\nlet y = if HttpResponse { x } else { 2 };",
+        )
+        .expect("a bound contract name is an ordinary condition");
+        let StatementKind::Let { value, .. } = &program.statements[2].kind else {
+            panic!("let expected");
+        };
+        let ExpressionKind::If { condition, .. } = &value.kind else {
+            panic!("if expected");
+        };
+        assert!(
+            matches!(&condition.kind, ExpressionKind::Variable(name) if name == "HttpResponse")
+        );
+        parse_text("let HttpRequest = [];\nmatch HttpRequest { [] => 0, [h, ..t] => 1 };")
+            .expect("a bound contract name is an ordinary match subject");
+    }
+
+    #[test]
+    fn a_conditional_operator_around_a_construction_is_still_reported() {
+        for text in [
+            "if ready ? HttpResponse { status: 1 } : other { 1 } else { 2 };",
+            "let r = ready ? HttpResponse { status: 1 } : HttpResponse { status: 2 };",
+        ] {
+            let error = parse_text(text).expect_err("should not parse");
+            assert_eq!(error.code(), "K1110", "{text}");
+        }
+    }
+
+    fn let_value_at(program: &Program, index: usize) -> &Expression {
+        let StatementKind::Let { value, .. } = &program.statements[index].kind else {
+            panic!("statement {index} should be a `let`");
+        };
+        value
+    }
+
+    #[test]
+    fn parses_entry_lists_with_entry_spans_and_trailing_commas() {
+        let text = "let fields = [\"x-a\": a, \"x-\" + b: f(c),];";
+        let program = parse_text(text).expect("entry list should parse");
+        let value = let_value_at(&program, 0);
+        let ExpressionKind::EntryList(entries) = &value.kind else {
+            panic!("an entry list expected, found {:?}", value.kind);
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            &text[entries[0].span.start..entries[0].span.end],
+            "\"x-a\": a"
+        );
+        assert!(matches!(entries[0].key.kind, ExpressionKind::Literal(_)));
+        assert_eq!(
+            &text[entries[1].span.start..entries[1].span.end],
+            "\"x-\" + b: f(c)"
+        );
+        assert!(matches!(entries[1].key.kind, ExpressionKind::Binary { .. }));
+        assert!(matches!(entries[1].value.kind, ExpressionKind::Call { .. }));
+        assert_eq!(
+            &text[value.span.start..value.span.end],
+            &text[13..text.len() - 1]
+        );
+
+        // `[]` stays the plain empty list.
+        let program = parse_text("let empty = [];").expect("empty list should parse");
+        assert!(matches!(
+            &let_value_at(&program, 0).kind,
+            ExpressionKind::List(elements) if elements.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_list_cannot_mix_entries_and_plain_elements() {
+        for (text, offending) in [
+            ("let l = [\"k\": \"v\", plain];", "plain"),
+            ("let l = [plain, \"k\": \"v\"];", "\"k\":"),
+            ("let l = [\"k\": \"v\", \"j\": \"w\", [1]];", "[1]"),
+        ] {
+            let error = parse_text(text).expect_err("a mixed list should not parse");
+            assert_eq!(error.code(), "K1001", "{text}");
+            assert_eq!(
+                &text[error.span().start..error.span().end],
+                offending,
+                "{text}"
+            );
+            assert_eq!(error.notes().len(), 1, "{text}");
+        }
+
+        let error = parse_text("let l = [:];").expect_err("`[:]` should not parse");
+        assert_eq!(error.code(), "K1001");
+        assert_eq!(error.span(), Span::new(8, 11));
+        assert_eq!(error.notes().len(), 1);
+
+        let error = parse_text("let l = [\"k\" \"v\"];").expect_err("a missing `,` fails");
+        assert_eq!(error.code(), "K1002");
+    }
+
+    #[test]
+    fn parses_the_unit_value_and_keeps_unit_types_spelled_unit() {
+        let text = "let done = Ok(( ));\nlet unit: Unit = ();";
+        let program = parse_text(text).expect("unit values should parse");
+        let ExpressionKind::Call { arguments, .. } = &let_value_at(&program, 0).kind else {
+            panic!("a call expected");
+        };
+        assert!(matches!(arguments[0].kind, ExpressionKind::Unit));
+        assert_eq!(&text[arguments[0].span.start..arguments[0].span.end], "( )");
+        assert!(matches!(
+            let_value_at(&program, 1).kind,
+            ExpressionKind::Unit
+        ));
+
+        for text in ["let f = () => 1;", "let f = (  ) => { 1 };"] {
+            let error = parse_text(text).expect_err("an arrow function should not parse");
+            assert_eq!(error.code(), "K1109", "{text}");
+        }
+
+        let error = parse_text("fn f() -> () { () }").expect_err("`()` is not a type");
+        assert_eq!(error.code(), "K1002");
+        assert_eq!(error.span(), Span::new(10, 11));
+        assert_eq!(
+            error.notes(),
+            ["the unit type is spelled `Unit`; `()` is the unit value"]
+        );
+        let error = parse_text("fn f() -> [Int] { [] }").expect_err("not a type either");
+        assert!(error.notes().is_empty());
+    }
+
+    /// The doc comment of each item statement of `program`, in order.
+    fn docs(program: &Program) -> Vec<Option<String>> {
+        program
+            .statements
+            .iter()
+            .filter(|statement| !matches!(statement.kind, StatementKind::Let { .. }))
+            .map(|statement| statement.doc().map(|doc| doc.text.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn attaches_doc_comments_to_the_next_item() {
+        let text = "/// First line.\n///\n///   indented\n/// trailing   \nfn first() {}\n";
+        let program = parse_text(text).expect("documented function should parse");
+        let doc = program.statements[0].doc().expect("the doc should attach");
+        assert_eq!(doc.text, "First line.\n\n  indented\ntrailing");
+        assert_eq!(
+            &text[doc.span.start..doc.span.end],
+            &text[..text.find("   \n").unwrap()]
+        );
+
+        // Blank lines are whitespace: they neither split nor end a doc.
+        let program = parse_text(
+            "///A\n\n///B\n\nwebhook fn handle(request: HttpRequest) -> HttpResponse { x }\n",
+        )
+        .expect("documented webhook should parse");
+        assert_eq!(docs(&program), [Some("A\nB".to_owned())]);
+        let program = parse_text(
+            "/// Queue.\nqueue \"jobs\" fn work(job: QueueJob) -> Result<String, String> { x }\n",
+        )
+        .expect("documented queue consumer should parse");
+        assert_eq!(docs(&program), [Some("Queue.".to_owned())]);
+
+        let program = parse_text(
+            "/// Schedule.\r\nschedule \"hourly\" fn tick(event: ScheduleEvent) -> Result<String, String> {\n    /// Nested.\n    fn inner() {}\n    x\n}\n",
+        )
+        .expect("documented schedule should parse");
+        assert_eq!(docs(&program), [Some("Schedule.".to_owned())]);
+        let StatementKind::ScheduleHandler { body, .. } = &program.statements[0].kind else {
+            panic!("schedule expected");
+        };
+        assert_eq!(
+            body.statements[0].doc().map(|doc| doc.text.as_str()),
+            Some("Nested.")
+        );
+    }
+
+    #[test]
+    fn other_comments_and_end_of_line_doc_comments_document_nothing() {
+        for text in [
+            // Four slashes are a banner.
+            "//// Banner.\nfn f() {}\n",
+            // An ordinary comment ends the run before the item.
+            "/// Lost.\n// ordinary\nfn f() {}\n",
+            // An end-of-line comment belongs to its line.
+            "let x = 1; /// end of line\nfn f() {}\n",
+            // A `let` and a function expression are not items.
+            "/// Not an item.\nlet g = fn() { 1 };\nfn f() {}\n",
+            // No doc at all.
+            "fn f() {}\n",
+            "let x = 1; fn f() {}\n",
+        ] {
+            let program = parse_text(text).expect("source should parse");
+            assert_eq!(docs(&program), [None], "{text:?}");
+        }
+
+        let program =
+            parse_text("/// Kept.\n//// banner\n/// Only this.\nfn f() {}\n/// Dangling.\n")
+                .expect("source should parse");
+        assert_eq!(docs(&program), [Some("Only this.".to_owned())]);
+        let program = parse_text("fn f() { /// after the brace\n    fn g() {}\n}\n")
+            .expect("source should parse");
+        let StatementKind::Function { body, .. } = &program.statements[0].kind else {
+            panic!("function expected");
+        };
+        assert!(body.statements[0].doc().is_none());
     }
 
     #[test]
@@ -2832,5 +3595,94 @@ mod tests {
             ")".repeat(MAX_NESTING_DEPTH - 1)
         );
         parse_on_compiler_stack(value).expect("the value at the limit should parse");
+    }
+
+    fn interpolation_parts(text: &str) -> Vec<StringPart> {
+        let program = parse_text(text).expect("source should parse");
+        let StatementKind::Let { value, .. } = &program.statements[0].kind else {
+            panic!("a let declaration expected");
+        };
+        let ExpressionKind::Interpolation(parts) = &value.kind else {
+            panic!("an interpolation expected, found {:?}", value.kind);
+        };
+        parts.clone()
+    }
+
+    #[test]
+    fn parses_holes_as_names_and_field_accesses_inside_the_string() {
+        let text = r#"let s = "a\(user.team.name)b\(id)";"#;
+        let parts = interpolation_parts(text);
+        assert_eq!(parts.len(), 4);
+        let StringPart::Hole { value, span } = &parts[1] else {
+            panic!("a hole expected");
+        };
+        assert_eq!(&text[span.start..span.end], r"\(user.team.name)");
+        assert_eq!(&text[value.span.start..value.span.end], "user.team.name");
+        let ExpressionKind::FieldAccess {
+            value: inner,
+            field,
+        } = &value.kind
+        else {
+            panic!("a field access expected");
+        };
+        assert_eq!(field, "name");
+        assert_eq!(&text[inner.span.start..inner.span.end], "user.team");
+        let ExpressionKind::FieldAccess { value: root, field } = &inner.kind else {
+            panic!("a field access expected");
+        };
+        assert_eq!(field, "team");
+        assert!(matches!(&root.kind, ExpressionKind::Variable(name) if name == "user"));
+        assert_eq!(&text[root.span.start..root.span.end], "user");
+        let StringPart::Hole { value, .. } = &parts[3] else {
+            panic!("a hole expected");
+        };
+        assert!(matches!(&value.kind, ExpressionKind::Variable(name) if name == "id"));
+        assert!(matches!(&parts[0], StringPart::Text { value, .. } if value == "a"));
+        assert!(matches!(&parts[2], StringPart::Text { value, .. } if value == "b"));
+    }
+
+    #[test]
+    fn every_text_block_is_an_interpolation_never_a_literal() {
+        let parts = interpolation_parts("let s = \"\"\"\n    reviewer\n    \"\"\";");
+        assert!(matches!(&parts[..], [StringPart::Text { value, .. }] if value == "reviewer"));
+        assert!(interpolation_parts("let s = \"\"\"\n\"\"\";").is_empty());
+
+        let program = parse_text("let s = \"plain\";").expect("source should parse");
+        let StatementKind::Let { value, .. } = &program.statements[0].kind else {
+            panic!("a let declaration expected");
+        };
+        assert!(matches!(
+            value.kind,
+            ExpressionKind::Literal(ValueLiteral::String(_))
+        ));
+    }
+
+    #[test]
+    fn hole_field_paths_count_toward_the_nesting_limit() {
+        // The string opens one level and each field access one more.
+        let hole = |fields: usize| format!("let s = \"\\(r{})\";\n", ".a".repeat(fields));
+        parse_on_compiler_stack(hole(MAX_NESTING_DEPTH - 1))
+            .expect("a hole at the nesting limit should parse");
+        let text = hole(MAX_NESTING_DEPTH);
+        let error = parse_on_compiler_stack(text.clone()).expect_err("a deeper hole should fail");
+        assert_eq!(error.code(), "K1005");
+        assert_eq!(error.span().start, text.rfind('.').expect("a dot"));
+
+        let error = parse_on_compiler_stack(hole(2_000)).expect_err("a deep hole should fail");
+        assert_eq!(error.code(), "K1005");
+    }
+
+    #[test]
+    fn an_interpolated_queue_name_is_not_a_literal() {
+        let error = parse_text(
+            "queue \"jobs-\\(x)\" fn handle(job: QueueJob) -> Result<String, String> { Ok(job.id) }",
+        )
+        .expect_err("an interpolated queue name should fail");
+        assert_eq!(error.code(), "K1002");
+        assert!(
+            error
+                .message()
+                .contains("direct canonical `queue` name literal")
+        );
     }
 }

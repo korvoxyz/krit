@@ -1,0 +1,22 @@
+//// A banner with four slashes is an ordinary comment.
+/// A doc comment may come first in a file.
+///
+fn first() -> Int {
+    1
+}
+
+/// Interrupted: this line is an ordinary comment,
+// because an ordinary comment comes before the item.
+fn second() -> Int {
+    /// Nested declarations have docs too.
+    fn inner() -> Int {
+        2
+    }
+    inner()
+}
+
+/// The webhook's own doc.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    HttpResponse { status: first() + second(), body: request.path }
+}
+/// A doc comment that no item follows is an ordinary comment.

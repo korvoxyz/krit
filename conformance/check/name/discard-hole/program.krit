@@ -1,0 +1,2 @@
+let _ = "discarded";
+let text = "read \(_)";

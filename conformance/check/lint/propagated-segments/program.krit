@@ -1,0 +1,31 @@
+fn direct(owner: String) -> Result<HttpRequest, String> {
+    Ok(
+        HttpRequest {
+            method: "GET",
+            path: "/repos/" + url_path_segment(owner)? + "/issues",
+        },
+    )
+}
+
+fn bound(owner: String) -> Result<HttpRequest, String> {
+    let segment = url_path_segment(owner)?;
+    Ok(HttpRequest { method: "GET", path: "/repos/\(segment)" })
+}
+
+fn through_name(owner: String) -> Result<HttpRequest, String> {
+    let encoded = url_path_segment(owner);
+    let segment = encoded?;
+    Ok(HttpRequest { method: "GET", path: "/repos/\(segment)/" + encoded? })
+}
+
+fn let_else(owner: String) -> HttpRequest {
+    let Ok(segment) = url_path_segment(owner) else
+        Err(_) => HttpRequest { method: "GET", path: "/" };
+    HttpRequest { method: "GET", path: "/repos/\(segment)" }
+}
+
+fn let_else_name(owner: String) -> HttpRequest {
+    let encoded = url_path_segment(owner);
+    let Ok(segment) = encoded else Err(_) => HttpRequest { method: "GET", path: "/" };
+    HttpRequest { method: "GET", path: "/repos/\(segment)" }
+}

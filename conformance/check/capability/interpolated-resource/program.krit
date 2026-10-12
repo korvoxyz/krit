@@ -1,0 +1,2 @@
+let key = "model";
+let value = config_string("agent.\(key)");

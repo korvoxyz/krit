@@ -1,0 +1,1 @@
+let query = url_query(["q", "a"]);

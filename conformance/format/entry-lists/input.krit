@@ -1,0 +1,11 @@
+let a="1";let b="2";
+let short=["x-a":a,"x-b":b,];
+let spaced = [ "x-a" : a , "x-b" : b ];
+let long = ["x-request-identifier": "0123456789abcdef", "x-forwarded-for": "203.0.113.7", "accept": "application/json"];
+let computed = ["x-" + "trace": a + b];
+let nested = HttpResponse { status: 200, headers: ["content-type": "text/plain"], body: "ok" };
+let commented = [ // first
+"x-a": a, // after a
+"x-b": b
+];
+println(short);

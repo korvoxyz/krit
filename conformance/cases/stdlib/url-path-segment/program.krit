@@ -1,0 +1,35 @@
+// `url_path_segment` keeps only RFC 3986 unreserved bytes and refuses text
+// the host path rule would refuse, with the first reason that applies.
+fn show(text: String) -> Unit {
+    match url_path_segment(text) {
+        Ok(segment) => println("ok " + segment),
+        Err(reason) => println("err " + reason),
+    }
+}
+
+show("issues");
+show("octo cat");
+show("AZaz09-._~");
+show("café");
+show("😀");
+show("a;b?c#d");
+show("100%");
+show("50%off");
+show("...");
+show("..a");
+show(";..");
+show("");
+show(".");
+show("..");
+show(" .. ");
+show("..;x=1");
+show(".?");
+show("a/b");
+show("a\\b");
+show("tab\there");
+show("nul\0byte");
+show("../%41");
+show("%41");
+show("%2e%2e");
+show("%u002e");
+show("x%U");

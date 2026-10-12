@@ -117,28 +117,41 @@ network service, or nondeterministic value.
 | `core/booleans` | strict booleans and short-circuiting |
 | `core/strings` | UTF-8 strings and concatenation |
 | `core/string-ordering` | byte-lexicographic UTF-8 string ordering and string equality |
+| `core/interpolation` | interpolated strings: holes with field paths, adjacent holes, escapes beside holes, empty parts, a hole that is the whole string, `\\(` as text, scoping, and equality with the `+` chain |
+| `core/text-blocks` | text blocks: the closing delimiter's indentation is removed, deeper indentation, blank lines, quotes, escapes, and holes are kept, no final line break, and the empty block |
 | `core/chains` | `else if` chains and left-associative operator chains, including short-circuiting |
 | `core/else-if-chain` | a 300-branch `else if` chain adds no nesting levels |
+| `core/unit` | the unit value `()`: printing, equality, `Ok(())`, and `Unit` results |
 | `scope/closures` | immutable lexical capture and shadowing |
 | `scope/builtin-shadowing` | match binders shadow unreserved built-in names, as in checking |
 | `scope/discard` | repeated `_` bindings in one scope; reading `_` evaluates the most recent one and warns (`K2003`) |
 | `scope/discard-pattern` | reading a pattern's `_` (a nested variant payload, a let-else pattern) evaluates the value at its position rather than an outer `_`, and warns (`K2003`) |
 | `functions/recursion` | recursive declaration and calls |
 | `functions/deep-recursion` | 9,000 nested calls stay within the call-depth limit |
+| `functions/doc-comments` | doc comments, banners, and `///` lines that document nothing change no behavior |
 | `lists/match` | list construction and exhaustive decomposition |
 | `lists/patterns` | list patterns with `_` head or tail in either arm order, and list patterns nested in `Ok` |
+| `lists/entry-lists` | entry lists: keys and values evaluated in source order, equality with the spelled-out records, header and log-field lists, trailing commas, and JSON encoding |
 | `records/fields` | ordered record rendering and field access |
+| `records/named-construction` | named construction of the four contract records: punning, spec-fixed defaults, contract field order, source-order evaluation, and equality with the full `record { ... }` |
 | `variants/option-match` | exhaustive Option matching |
 | `variants/result-match` | exhaustive Result matching |
 | `variants/nested-patterns` | nested `Ok(Some(v))`/`Ok(None)`/`Err(e)`, `Some(Err(_))`, and three-level Option patterns, in any arm order |
 | `propagate/result`, `propagate/option` | postfix `?` unwraps `Ok` and `Some` and returns `Err` and `None` from the enclosing function |
 | `propagate/order` | arguments evaluate left to right; effects before a `?` exit stay performed and nothing after it evaluates |
 | `propagate/positions` | `?` in `if` conditions, `match` subjects, list and record elements, and nested blocks |
+| `propagate/constructions` | `?` inside named-construction fields, entry-list keys and values, and on `url_path_segment` results in a documented helper; a failing `Unit` step skips the rest of the construction |
 | `let-else/result`, `let-else/option` | let-else binds the payload of either variant for the rest of the body and otherwise returns its arm's value from the function; `_` and `None` bind nothing |
 | `let-else/order` | the value evaluates before the arm; effects before the exit stay performed and nothing after it evaluates; consecutive let-else statements |
+| `let-else/responses` | let-else arms that build `HttpResponse { ... }` with holes, after a `url_path_segment` step; nested patterns over a `Result<Option<String>, String>` whose arms are constructions with entry lists, holes, and a text block |
 | `json/round-trip` | deterministic JSON conversion |
 | `json/string-escapes` | every JSON string escape, surrogate pairs, and surrounding whitespace decode |
 | `types/annotations` | parsed binding, parameter, return, and generic types |
+| `stdlib/int-to-string` | `int_to_string` in base ten: zero, negative values, and both `Int` bounds |
+| `stdlib/url-path-segment` | `url_path_segment`: RFC 3986 unreserved bytes kept, every other byte escaped in uppercase hex, and each refusal of the host path rule with its message, in order |
+| `stdlib/url-query` | `url_query`: encoded `name=value` pairs joined by `&` from entry, header, and log-field lists; the empty list and empty names |
+| `stdlib/string-byte-len`, `stdlib/string-is-empty` | UTF-8 byte length and emptiness |
+| `stdlib/string-contains`, `stdlib/string-starts-with`, `stdlib/string-ends-with` | byte-wise searches: the empty part, a part longer than the text, multibyte text, and no case folding or normalization |
 | `errors/division-zero` | checked division |
 | `errors/overflow` | checked signed 64-bit arithmetic |
 | `errors/json-invalid` | invalid JSON input |
@@ -146,26 +159,42 @@ network service, or nondeterministic value.
 | `errors/json-invalid-escape` | an unknown escape is invalid JSON |
 | `errors/call-depth` | runaway recursion fails with `K4010` instead of aborting |
 | `check/valid/inference` | recursion, closures, empty lists, None, and effects infer together |
+| `check/valid/returned-record-field-type`, `check/valid/returned-record-presence` | a record returned through a helper that reads one field keeps its other fields and their types for the caller |
 | `check/syntax/missing-semicolon` | missing required syntax |
 | `check/syntax/habit-word-line-break` | a bound habit word ending a line before a missing `;` stays an ordinary name (`K1002`) |
-| `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
+| `check/syntax/construction-in-condition` | a named construction written directly as an `if` condition is `K1001` with a note to add parentheses |
+| `check/syntax/entry-list-mixed-*`, `check/syntax/empty-entry-list` | a list literal that mixes `key: value` entries with plain elements, and `[:]`, are `K1001` with one note |
+| `check/syntax/unit-type` | `()` written as a type is `K1002` with a note to write `Unit` |
+| `check/syntax/hole-*` | an interpolation hole that is not a name path (a call, an operator, a literal, a postfix `?`, whitespace, an empty or unclosed hole) is `K3015` at the hole with one note |
+| `check/syntax/text-block-*` | a text block with text after its opening `"""`, a line indented less than its closing `"""`, or a closing `"""` inside a line is `K0004`; an unclosed one is `K0002`; each with one note |
+| `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields and a binding that reuses a standard-library name |
 | `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, an unbound `_` is undefined, and reading a pattern's `_` refers to the value at its position, beside an outer `_`, with `K2003` |
 | `check/name/did-you-mean`, `check/name/null` | undefined names (`K2001`) that carry a did-you-mean or `None` note |
+| `check/name/hole-undefined`, `check/name/discard-hole` | a hole's name resolves like any other: an undefined one is `K2001` with a did-you-mean note, and reading `_` warns (`K2003`) |
 | `check/habit/*` | one case per construct from another language (`K1101`-`K1112`): `return`, loops, assignment, `struct`, `import`, `await`, `throw`, indexing, arrow functions, the conditional operator, `switch`, and `else { return ... }`; plus a conditional operator whose first branch does not parse and one after a postfix `?` |
 | `check/syntax/question-before-operand` | a `?` followed on its line by an operand, without a `:`, is an unexpected token (`K1001`) with one note |
 | `check/propagate/*` | postfix `?` where it cannot return (`K3012`: top level, anonymous function, webhook, missing or non-`Result`/`Option` return type), with another family or error type (`K3013`), and with an opaque `Secret` error type (`K3009`) |
 | `check/valid/propagate-queue` | a queue entrypoint returns its failures with `?` and builds |
-| `check/let-else/*` | let-else at the top level, in a nested block or branch, or in an anonymous function, with patterns that are not the two variants of one family, with a nested pattern, or with a value ending in `}` (`K3014`); a missing `else` arm (`K1002`) or a block arm (`K1003`), each with one note; an arm of another type (`K3001`), a value of another family (`K3005`), a binder declared twice (`K2002`), and a binder read in the arm (`K2001`) |
+| `check/let-else/*` | let-else at the top level, in a nested block or branch, or in an anonymous function, with patterns that are not the two variants of one family, with a nested pattern, or with a value ending in `}`, a named construction included (`K3014`); a missing `else` arm (`K1002`) or a block arm (`K1003`), each with one note; an arm of another type (`K3001`), a value of another family (`K3005`), a binder declared twice (`K2002`), and a binder read in the arm (`K2001`) |
 | `check/valid/let-else-queue` | a queue entrypoint binds an object read and returns early with let-else, including a `None` pattern, and builds |
 | `check/valid/habit-words-as-names` | habit words stay ordinary identifiers outside foreign constructs |
-| `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings and a method call on a string (`K3011`) |
+| `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings, a method call on a string (`K3011`), and a `url_query` argument that is not a list of name/value records |
+| `check/lint/*` | `K9013`: an unencoded hole or `+` operand of an `HttpRequest` path or query warns, in a named construction or a record literal, without failing the check or the build; pieces from `url_path_segment`, `url_query`, or `int_to_string` (direct or bound), `url_path_segment` results taken apart with `?` or let-else, literal paths, and forwarded values do not warn, while a `?` on another function's result, a let-else `Err` binder, and a nested `Ok(Some(_))` binder do |
+| `check/type/construction-*` | named construction with an unknown, repeated, or missing required field (`K3016`, one note) or a value of the wrong type (`K3001`) |
+| `check/valid/named-construction` | named constructions flow wherever contract records do: helper results, list annotations, parenthesized conditions, and equality with records |
+| `check/type/entry-list-*` | entry-list keys and values must be `String`, and an entry list is not a list of another element type (`K3001`) |
+| `check/type/hole-*` | a hole whose value is an `Int` (named or a field) or an `Option` is `K3015` at the hole with one note |
+| `check/valid/entry-lists-unit-docs` | entry lists flow into `List<HttpHeader>` and `List<LogField>`, constructions, and equality with records; the unit value; documented helpers |
+| `check/valid/doc-comments` | doc comments attach to declarations and entrypoints; banners, runs interrupted by an ordinary comment, and dangling `///` lines are ordinary comments |
 | `check/match/*` | match arms with one family per position, no duplicate, unreachable, or overlapping arm (`K1003`, each with one note), a malformed list pattern (`K1003`), no top-level catch-all `_` or name (`K3005`, one note), patterns of the payload's type (`K3005`), and exhaustiveness with every missing pattern listed (`K3005`, one note) |
 | `check/valid/nested-patterns` | nested patterns with `_` payloads and list patterns, in any arm order, check |
+| `check/valid/entry-key-propagate` | an entry key that ends in a postfix `?`, also before a call, is an entry, not a conditional operator |
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
+| `check/capability/interpolated-resource`, `check/capability/text-block-resource` | an interpolated string or a text block is never a resource literal (`K3008`) |
 | `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, types that grow after they are bound, and types that grow when two solved types unify |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
-| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook helper chaining config, secret, and HTTP calls with `?` builds; a webhook binding config, secret, HTTP, and AI results with let-else in its own body builds, and so does one committing or rolling back a database transaction; a webhook deciding `state_get`'s `Result<Option<String>, String>` with nested patterns builds, and so does one reading a pattern's `_` (with `K2003`) |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook helper chaining config, secret, and HTTP calls with `?` builds; a webhook binding config, secret, HTTP, and AI results with let-else in its own body builds, and so does one committing or rolling back a database transaction; a webhook deciding `state_get`'s `Result<Option<String>, String>` with nested patterns builds, and so does one reading a pattern's `_` (with `K2003`); a webhook built from named constructions builds; a webhook writing headers and log fields as entry lists and returning `Ok(())` from a helper builds; a webhook composing its model prompt from a text block with holes builds; a webhook calling every standard-library function builds; a webhook mixing let-else, `?` inside constructions, nested patterns over `state_get`, entry lists, holes, a text block, and doc comments builds |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |
@@ -173,6 +202,7 @@ network service, or nondeterministic value.
 | `package/dependencies/declared` | a declared version dependency fails closed with `K6003` |
 | `package/dependencies/path-source` | a declared source-table dependency fails closed with `K6003` |
 | `package/dependencies/empty-table` | an empty `[dependencies]` table is accepted |
+| `package/config/*` | configuration keys may contain `_` after their first character; a configuration key that starts with `_`, and a secret name containing `_`, are `K6001` |
 | `build/compat/0.2.0/factorial` | a 0.2.0-built policy-1 module artifact runs in the sandbox |
 | `build/compat/0.2.0/stateful-webhook` | a 0.2.0-built policy-2 durable-state webhook artifact invokes |
 | `format/comments` | exact standalone and end-of-line comment preservation |
@@ -181,6 +211,13 @@ network service, or nondeterministic value.
 | `format/propagate` | postfix `?` stays attached to its operand and chains like a call |
 | `format/let-else` | a let-else stays on one line when it fits, otherwise breaks after `else` with its arm indented one level; a block or comment in the arm always breaks |
 | `format/patterns` | nested and list patterns stay compact, keep their arm order, and nested list patterns are never list literals |
+| `format/named-construction` | canonical named construction: one line when it fits, one field per line otherwise, and punning exactly when a value is the field's own name |
+| `format/entry-lists` | canonical entry lists: one line when they fit, one entry per line with a trailing comma otherwise |
+| `format/unit-literal` | the unit value is written `()` |
+| `format/interpolation` | interpolated strings keep their holes exactly and write their text as any string |
+| `format/text-blocks` | text blocks keep their content and are re-indented: at the opening `"""` when it starts its line, one level deeper than its line otherwise |
+| `format/doc-comments` | attached doc comments get exactly one space after `///`; banners, end-of-line and dangling `///` comments keep their text |
+| `format/cross-features` | documented helpers with `?`, constructions holding `?` and entry lists, let-else arms with punned fields and text blocks, nested patterns with holes, and `()` together are canonical and idempotent |
 
 ## Adding a case
 

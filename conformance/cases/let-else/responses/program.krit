@@ -1,0 +1,44 @@
+/// A stand-in for a durable read: a failure, a missing value, or a value.
+fn lookup(key: String) -> Result<Option<String>, String> {
+    if string_is_empty(key) {
+        Err("empty key")
+    } else if string_starts_with(key, "known-") {
+        Ok(Some("saved \(key)"))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Decides a read with nested patterns, each arm a named construction.
+fn read(key: String) -> HttpResponse {
+    match lookup(key) {
+        Ok(Some(text)) => HttpResponse {
+            status: 200,
+            headers: ["x-key": key, "x-bytes": int_to_string(string_byte_len(text))],
+            body: "\(key): \(text)",
+        },
+        Err(reason) => HttpResponse { status: 500, body: "failed: \(reason)" },
+        Ok(None) => HttpResponse { status: 404, body: """
+            missing
+              \(key)
+            """ },
+    }
+}
+
+/// Binds each step with let-else; every arm returns a response at once.
+fn handle(request: HttpRequest) -> HttpResponse {
+    let Ok(segment) = url_path_segment(request.body) else
+        Err(reason) => HttpResponse { status: 400, body: "bad key \(request.body): \(reason)" };
+    let Ok(stored) = lookup(segment) else
+        Err(reason) => HttpResponse { status: 500, body: reason };
+    let Some(text) = stored else None => read(segment);
+    println("found \(segment)");
+    HttpResponse { status: 200, headers: ["x-path": request.path], body: text }
+}
+
+println(handle(HttpRequest { method: "GET", path: "/a", body: "known-1" }));
+println(handle(HttpRequest { method: "GET", path: "/b", body: "other" }));
+println(handle(HttpRequest { method: "GET", path: "/c", body: "" }));
+println(handle(HttpRequest { method: "GET", path: "/d", body: ".." }));
+println(read("known-2"));
+println(read(""));

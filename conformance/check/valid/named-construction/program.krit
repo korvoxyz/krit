@@ -1,0 +1,27 @@
+fn header(name: String, value: String) -> HttpHeader {
+    HttpHeader { name, value }
+}
+
+fn fetch(path: String) -> HttpRequest {
+    HttpRequest { method: "GET", path, headers: [header("accept", "text/plain")] }
+}
+
+fn status(response: HttpResponse) -> Int {
+    response.status
+}
+
+fn ok(body: String) -> Result<HttpResponse, String> {
+    Ok(HttpResponse { status: 200, body })
+}
+
+let fields: List<LogField> = [LogField { name: "path", value: fetch("/x").path }];
+let code = status(HttpResponse { status: 201 });
+let routed = if (HttpResponse { status: code }).status == 201 {
+    "created"
+} else {
+    "other"
+};
+let same = match ok("x") {
+    Ok(response) => response == record { status: 200, headers: [], body: "x" },
+    Err(error) => false,
+};

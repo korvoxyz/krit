@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     Block, Diagnostic, Expression, ExpressionKind, Pattern, PatternKind, Program, Source, Span,
-    Statement, StatementKind, TypeAnnotation, TypeKind,
+    Statement, StatementKind, StringPart, TypeAnnotation, TypeKind,
     lexer::{Comment, lex_with_comments},
     parser,
-    token::{Token, TokenKind},
+    token::{TemplatePart, Token, TokenKind},
 };
 
 /// The formatter's soft line-width target.
@@ -62,6 +62,9 @@ struct ActiveGroup {
 
 struct Formatter {
     tokens: Vec<Token>,
+    /// Tokens the canonical form leaves out: the `: name` of a construction
+    /// field whose value is its own name, which is written punned.
+    omitted: Vec<bool>,
     token_text: Vec<String>,
     comments: Vec<Comment>,
     comment_cursor: usize,
@@ -84,9 +87,11 @@ struct Formatter {
 }
 
 impl Formatter {
-    fn new(tokens: Vec<Token>, comments: Vec<Comment>, program: &Program) -> Self {
+    fn new(tokens: Vec<Token>, mut comments: Vec<Comment>, program: &Program) -> Self {
         let token_text = tokens.iter().map(canonical_token_text).collect::<Vec<_>>();
         let syntax = SyntaxMap::new(program, &tokens);
+        canonicalize_doc_comments(&mut comments, &syntax.doc_spans);
+        let omitted = punned_tokens(&tokens, &comments, &syntax.pun_values);
         let (groups, close_to_open) = build_groups(
             &tokens,
             &token_text,
@@ -94,8 +99,10 @@ impl Formatter {
             &syntax.block_spans,
             &syntax.call_group_spans,
             &syntax.pattern_group_spans,
+            &omitted,
         );
         Self {
+            omitted,
             type_tokens: syntax.type_tokens,
             generic_commas: syntax.generic_commas,
             breaks_after: syntax.breaks_after,
@@ -127,7 +134,7 @@ impl Formatter {
             }
             self.emit_comments_before(self.tokens[index].span.start);
 
-            if self.should_skip_trailing_comma(index) {
+            if self.omitted[index] || self.should_skip_trailing_comma(index) {
                 continue;
             }
 
@@ -186,7 +193,13 @@ impl Formatter {
         if self.needs_space(index) {
             self.writer.space();
         }
-        self.writer.write(&self.token_text[index]);
+        if let TokenKind::Template(template) = &self.tokens[index].kind
+            && let Some(lines) = &template.text_block
+        {
+            self.writer.write_text_block(lines);
+        } else {
+            self.writer.write(&self.token_text[index]);
+        }
         self.previous_rendered = Some(index);
         self.closing_group = None;
     }
@@ -311,18 +324,28 @@ impl Formatter {
             return true;
         }
         let mut column = self.writer.column();
+        let mut previous = else_index;
         for index in else_index + 1..=semicolon {
+            // The arm is measured as it would be written on this line: without
+            // the `: name` of a punned construction field, and without a
+            // trailing comma, which a group that stays on the line drops.
+            // Measuring the input's spelling instead would break an arm that
+            // fits once written, and the next formatting would join it again.
+            if self.omitted[index] || self.drops_trailing_comma(index) {
+                continue;
+            }
             if token_pair_needs_space(
                 &self.tokens,
                 &self.groups,
                 &self.close_to_open,
                 &self.type_tokens,
-                index - 1,
+                previous,
                 index,
                 |_| false,
             ) {
                 column += 1;
             }
+            previous = index;
             column += self.token_text[index].chars().count();
             if let Some(group) = self.groups[index]
                 && (group.forced_multiline
@@ -332,6 +355,17 @@ impl Formatter {
             }
         }
         column > FORMAT_LINE_WIDTH
+    }
+
+    /// Whether the token at `index` is a trailing comma, which a group that
+    /// allows one drops when it stays on one line.
+    fn drops_trailing_comma(&self, index: usize) -> bool {
+        matches!(self.tokens[index].kind, TokenKind::Comma)
+            && self
+                .next_significant_token(index)
+                .and_then(|close| self.close_to_open[close])
+                .and_then(|open| self.groups[open])
+                .is_some_and(|group| group.kind.allows_trailing_comma())
     }
 
     fn request_break(&mut self, lines: usize) {
@@ -390,6 +424,8 @@ struct Writer {
     indent: usize,
     column: usize,
     line_start: bool,
+    /// The indentation level the current line started at.
+    line_indent: usize,
 }
 
 impl Default for Writer {
@@ -399,6 +435,7 @@ impl Default for Writer {
             indent: 0,
             column: 0,
             line_start: true,
+            line_indent: 0,
         }
     }
 }
@@ -411,9 +448,39 @@ impl Writer {
             }
             self.column = self.indent * 4;
             self.line_start = false;
+            self.line_indent = self.indent;
         }
         self.output.push_str(text);
         self.column += text.chars().count();
+    }
+
+    /// Writes a text block whose content lines, without indentation, are
+    /// `lines`: the opening `"""` here, then each line and the closing
+    /// `"""` at the opening delimiter's indentation when it starts its
+    /// line, or one level deeper than the line it opens on otherwise. An
+    /// empty content line stays empty, so no trailing whitespace is added;
+    /// every other line is written exactly as it was, after the new
+    /// indentation.
+    fn write_text_block(&mut self, lines: &[String]) {
+        let starts_line = self.line_start;
+        self.write("\"\"\"");
+        let level = if starts_line {
+            self.line_indent
+        } else {
+            self.line_indent + 1
+        };
+        let indentation = " ".repeat(level * 4);
+        for line in lines {
+            self.output.push('\n');
+            if !line.is_empty() {
+                self.output.push_str(&indentation);
+                self.output.push_str(line);
+            }
+        }
+        self.output.push('\n');
+        self.output.push_str(&indentation);
+        self.output.push_str("\"\"\"");
+        self.column = indentation.len() + 3;
     }
 
     fn space(&mut self) {
@@ -456,6 +523,7 @@ impl Writer {
 }
 
 struct SyntaxMap {
+    doc_spans: Vec<Span>,
     block_spans: HashSet<(usize, usize)>,
     call_group_spans: HashSet<(usize, usize)>,
     /// The parentheses and brackets of patterns, including those of
@@ -465,6 +533,17 @@ struct SyntaxMap {
     generic_commas: Vec<bool>,
     breaks_after: HashMap<usize, usize>,
     let_else_arms: HashMap<usize, usize>,
+    pun_values: Vec<PunCandidate>,
+}
+
+/// A construction field written `name: name`, which the canonical form
+/// writes punned as `name`.
+#[derive(Clone, Copy, Debug)]
+struct PunCandidate {
+    /// The end of the field name.
+    name_end: usize,
+    /// The span of the value, a single identifier token.
+    value: Span,
 }
 
 impl SyntaxMap {
@@ -578,6 +657,7 @@ impl SyntaxMap {
         }
 
         Self {
+            doc_spans: collector.doc_spans,
             block_spans: collector.block_spans,
             call_group_spans,
             pattern_group_spans,
@@ -585,12 +665,78 @@ impl SyntaxMap {
             generic_commas,
             breaks_after,
             let_else_arms,
+            pun_values: collector.pun_values,
         }
     }
 }
 
+/// Writes every line of an attached doc comment with exactly one space
+/// between its `///` and its text (none when the text is empty), leaving the
+/// text itself as written. Other comments, including `///` lines that no item
+/// follows, keep their exact text.
+///
+/// Comments are in source order and doc comments never overlap, so one sweep
+/// over both finds the doc comment, if any, that holds each comment.
+fn canonicalize_doc_comments(comments: &mut [Comment], doc_spans: &[Span]) {
+    let mut doc_spans = doc_spans.to_vec();
+    doc_spans.sort_unstable_by_key(|span| span.start);
+    let mut docs = doc_spans.iter().peekable();
+    for comment in comments {
+        while docs
+            .next_if(|span| span.end <= comment.span.start)
+            .is_some()
+        {}
+        let attached = docs
+            .peek()
+            .is_some_and(|span| comment.span.start >= span.start && comment.span.start < span.end);
+        if !attached {
+            continue;
+        }
+        if let Some(text) = parser::doc_line_text(&comment.text) {
+            comment.text = if text.is_empty() {
+                "///".to_owned()
+            } else {
+                format!("/// {text}")
+            };
+        }
+    }
+}
+
+/// Marks the `:` and value tokens of every pun candidate, so the field is
+/// written punned. A field with a comment between its name and the end of
+/// its value keeps its `name: name` spelling, so no comment moves.
+fn punned_tokens(tokens: &[Token], comments: &[Comment], candidates: &[PunCandidate]) -> Vec<bool> {
+    let mut omitted = vec![false; tokens.len()];
+    for candidate in candidates {
+        let commented = {
+            let first = comments.partition_point(|comment| comment.span.end <= candidate.name_end);
+            comments
+                .get(first)
+                .is_some_and(|comment| comment.span.start < candidate.value.end)
+        };
+        if commented {
+            continue;
+        }
+        let value = tokens.partition_point(|token| token.span.start < candidate.value.start);
+        let is_value = tokens
+            .get(value)
+            .is_some_and(|token| token.span == candidate.value);
+        let colon = value.checked_sub(1).filter(|colon| {
+            tokens[*colon].kind == TokenKind::Colon
+                && tokens[*colon].span.start >= candidate.name_end
+        });
+        if let (true, Some(colon)) = (is_value, colon) {
+            omitted[colon] = true;
+            omitted[value] = true;
+        }
+    }
+    omitted
+}
+
 #[derive(Default)]
 struct SyntaxCollector {
+    /// The spans of the doc comments attached to items.
+    doc_spans: Vec<Span>,
     block_spans: HashSet<(usize, usize)>,
     call_spans: Vec<Span>,
     type_spans: Vec<Span>,
@@ -603,6 +749,7 @@ struct SyntaxCollector {
     list_pattern_spans: Vec<Span>,
     /// The `else` keyword and the whole statement of each let-else.
     let_else_spans: Vec<(Span, Span)>,
+    pun_values: Vec<PunCandidate>,
 }
 
 /// One syntax-tree node awaiting collection.
@@ -664,26 +811,33 @@ impl SyntaxCollector {
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             }
             | StatementKind::Webhook {
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             }
             | StatementKind::QueueConsumer {
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             }
             | StatementKind::ScheduleHandler {
                 parameters,
                 return_type,
                 body,
+                doc,
                 ..
             } => {
+                if let Some(doc) = doc {
+                    self.doc_spans.push(doc.span);
+                }
                 for parameter in parameters {
                     if let Some(annotation) = &parameter.annotation {
                         pending.push(SyntaxNode::Annotation(annotation));
@@ -713,9 +867,21 @@ impl SyntaxCollector {
 
     fn expression<'a>(&mut self, expression: &'a Expression, pending: &mut Vec<SyntaxNode<'a>>) {
         match &expression.kind {
-            ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+            ExpressionKind::Literal(_) | ExpressionKind::Unit | ExpressionKind::Variable(_) => {}
+            ExpressionKind::Interpolation(parts) => {
+                pending.extend(parts.iter().filter_map(|part| match part {
+                    StringPart::Hole { value, .. } => Some(SyntaxNode::Expression(value)),
+                    StringPart::Text { .. } => None,
+                }));
+            }
             ExpressionKind::List(elements) => {
                 pending.extend(elements.iter().map(SyntaxNode::Expression));
+            }
+            ExpressionKind::EntryList(entries) => {
+                for entry in entries {
+                    pending.push(SyntaxNode::Expression(&entry.key));
+                    pending.push(SyntaxNode::Expression(&entry.value));
+                }
             }
             ExpressionKind::Record(fields) => {
                 pending.extend(
@@ -723,6 +889,23 @@ impl SyntaxCollector {
                         .iter()
                         .map(|field| SyntaxNode::Expression(&field.value)),
                 );
+            }
+            ExpressionKind::Construct { fields, .. } => {
+                for field in fields {
+                    // Exactly the identifier `name`, not `(name)`.
+                    let is_own_name = matches!(
+                        &field.value.kind,
+                        ExpressionKind::Variable(name) if *name == field.name
+                    ) && field.value.span.end - field.value.span.start
+                        == field.name.len();
+                    if is_own_name && !field.is_punned() {
+                        self.pun_values.push(PunCandidate {
+                            name_end: field.name_span.end,
+                            value: field.value.span,
+                        });
+                    }
+                    pending.push(SyntaxNode::Expression(&field.value));
+                }
             }
             ExpressionKind::FieldAccess { value, .. } => {
                 pending.push(SyntaxNode::Expression(value));
@@ -843,6 +1026,7 @@ fn build_groups(
     block_spans: &HashSet<(usize, usize)>,
     call_group_spans: &HashSet<(usize, usize)>,
     pattern_group_spans: &HashSet<(usize, usize)>,
+    omitted: &[bool],
 ) -> (Vec<Option<GroupInfo>>, Vec<Option<usize>>) {
     let mut pairs = vec![None; tokens.len()];
     let mut close_to_open = vec![None; tokens.len()];
@@ -892,13 +1076,15 @@ fn build_groups(
         });
     }
 
-    let mut optional_trailing_commas = vec![false; tokens.len()];
+    // Tokens the flat width leaves out: omitted pun tokens, and trailing
+    // commas, which a single-line group drops.
+    let mut unrendered = omitted.to_vec();
     for info in groups.iter().flatten() {
         if info.kind.allows_trailing_comma()
             && info.close > 0
             && matches!(tokens[info.close - 1].kind, TokenKind::Comma)
         {
-            optional_trailing_commas[info.close - 1] = true;
+            unrendered[info.close - 1] = true;
         }
     }
 
@@ -906,8 +1092,7 @@ fn build_groups(
         let Some(info) = groups[open] else {
             continue;
         };
-        let flat_width =
-            canonical_flat_width(open, info.close, token_text, &optional_trailing_commas);
+        let flat_width = canonical_flat_width(open, info.close, token_text, &unrendered);
         groups[open]
             .as_mut()
             .expect("opening delimiter should have group information")
@@ -996,6 +1181,10 @@ fn canonical_token_text(token: &Token) -> String {
     match &token.kind {
         TokenKind::Identifier(value) | TokenKind::Integer(value) => value.clone(),
         TokenKind::String(value) => canonical_string(value),
+        // A text block is laid out by `Writer::write_text_block`; within a
+        // line it is as wide as its opening delimiter.
+        TokenKind::Template(template) if template.text_block.is_some() => "\"\"\"".to_owned(),
+        TokenKind::Template(template) => canonical_template(&template.parts),
         TokenKind::Let => "let".to_owned(),
         TokenKind::Fn => "fn".to_owned(),
         TokenKind::Webhook => "webhook".to_owned(),
@@ -1041,6 +1230,36 @@ fn canonical_token_text(token: &Token) -> String {
 fn canonical_string(value: &str) -> String {
     let mut output = String::with_capacity(value.len() + 2);
     output.push('"');
+    push_canonical_text(&mut output, value);
+    output.push('"');
+    output
+}
+
+/// A one-line interpolated string: its text written as in any string, and
+/// each hole exactly as written, `\(name.field)`.
+fn canonical_template(parts: &[TemplatePart]) -> String {
+    let mut output = String::from("\"");
+    for part in parts {
+        match part {
+            TemplatePart::Text { value, .. } => push_canonical_text(&mut output, value),
+            TemplatePart::Hole { path, .. } => {
+                output.push_str("\\(");
+                for (index, (name, _)) in path.iter().enumerate() {
+                    if index > 0 {
+                        output.push('.');
+                    }
+                    output.push_str(name);
+                }
+                output.push(')');
+            }
+        }
+    }
+    output.push('"');
+    output
+}
+
+/// Appends `value` as the inside of a canonical string literal.
+fn push_canonical_text(output: &mut String, value: &str) {
     for character in value.chars() {
         match character {
             '"' => output.push_str("\\\""),
@@ -1057,18 +1276,16 @@ fn canonical_string(value: &str) -> String {
             character => output.push(character),
         }
     }
-    output.push('"');
-    output
 }
 
 fn canonical_flat_width(
     open: usize,
     close: usize,
     token_text: &[String],
-    optional_trailing_commas: &[bool],
+    unrendered: &[bool],
 ) -> usize {
     (open..=close)
-        .filter(|index| !optional_trailing_commas[*index])
+        .filter(|index| !unrendered[*index])
         .map(|index| token_text[index].chars().count() + 1)
         .sum()
 }
@@ -1194,6 +1411,7 @@ fn is_word(kind: &TokenKind) -> bool {
         TokenKind::Identifier(_)
             | TokenKind::Integer(_)
             | TokenKind::String(_)
+            | TokenKind::Template(_)
             | TokenKind::Let
             | TokenKind::Fn
             | TokenKind::Webhook
@@ -1235,6 +1453,7 @@ fn can_end_expression(kind: &TokenKind) -> bool {
         TokenKind::Identifier(_)
             | TokenKind::Integer(_)
             | TokenKind::String(_)
+            | TokenKind::Template(_)
             | TokenKind::True
             | TokenKind::False
             | TokenKind::RightParen
@@ -1415,6 +1634,36 @@ mod tests {
     }
 
     #[test]
+    fn let_else_arms_are_measured_as_written_with_punning_and_no_trailing_comma() {
+        // The arm fits once its `body: body` field is written punned and its
+        // trailing comma dropped, so it stays on the line in both spellings;
+        // measuring the input's spelling would break it in one formatting and
+        // join it again in the next.
+        let fits = "fn f(key: String, body: String) -> HttpResponse {\n    \
+                    let Ok(value) = load(keyyyyyyyyyyyyyy) else Err(error) => HttpResponse { status: 500, body };\n    \
+                    HttpResponse { status: 200, body: value }\n}\n";
+        assert!(fits.lines().all(|line| line.len() <= 100), "{fits}");
+        for spelling in ["body: body", "body: body,", "body,"] {
+            let source = fits.replace("body };", &format!("{spelling} }};"));
+            assert_eq!(format(&source), fits, "{spelling}");
+        }
+        assert_eq!(format(fits), fits);
+
+        // One column more breaks after `else` in every spelling.
+        let breaks = fits.replace("keyyyyyyyyyyyyyy", "keyyyyyyyyyyyyyyy");
+        let expected = breaks.replace(
+            " else Err(error) => HttpResponse",
+            " else\n        Err(error) => HttpResponse",
+        );
+        for spelling in ["body: body", "body: body,", "body"] {
+            let source = breaks.replace("body };", &format!("{spelling} }};"));
+            let formatted = format(&source);
+            assert_eq!(formatted, expected, "{spelling}");
+            assert_eq!(format(&formatted), formatted, "{spelling}");
+        }
+    }
+
+    #[test]
     fn preserves_comments_in_source_order() {
         let source = "// head\nlet value=1+2;// inline\n// middle\nprintln( // call\nvalue// argument\n);// tail\n";
         let formatted = format(source);
@@ -1559,5 +1808,182 @@ mod tests {
             ),
             "let r = f(3, (1 + 2));\nlet wrapped = record { value: (1 + 2) };\n\nif [129] {\n    1\n} else {\n    2\n};\nmatch [129] {\n    [] => 0,\n    [head, ..tail] => head,\n};\n"
         );
+    }
+
+    #[test]
+    fn writes_construction_fields_punned_exactly_when_the_value_is_the_name() {
+        assert_eq!(
+            format(
+                "let status=1;let body=\"x\";\nlet r=HttpResponse{status:status,body:body,};\nlet s = HttpResponse { status: (status), body: body2 };\n"
+            ),
+            "let status = 1;\nlet body = \"x\";\nlet r = HttpResponse { status, body };\nlet s = HttpResponse { status: (status), body: body2 };\n"
+        );
+        // `record { ... }` has no punning.
+        assert_eq!(
+            format("let r = record { body: body };\n"),
+            "let r = record { body: body };\n"
+        );
+        // A comment between the name and the value keeps both.
+        let commented = format("let r = HttpResponse { status: // why\nstatus };\n");
+        assert_eq!(
+            commented,
+            "let r = HttpResponse {\n    status: // why\n    status,\n};\n"
+        );
+        assert_eq!(format(&commented), commented);
+    }
+
+    #[test]
+    fn lays_out_entry_lists_like_lists() {
+        assert_eq!(
+            format("let f=[\"x-a\" : a,\"x-b\":b,];\n"),
+            "let f = [\"x-a\": a, \"x-b\": b];\n"
+        );
+        let long = format(
+            "let f = [\"x-request-identifier\": \"0123456789abcdef\", \"x-forwarded-for\": \"203.0.113.7\", \"accept\": \"json\"];\n",
+        );
+        assert_eq!(
+            long,
+            "let f = [\n    \"x-request-identifier\": \"0123456789abcdef\",\n    \"x-forwarded-for\": \"203.0.113.7\",\n    \"accept\": \"json\",\n];\n"
+        );
+        assert_eq!(format(&long), long);
+        // A comment inside keeps the list multiline, one entry per line.
+        let commented = format("let f = [\"a\": a, // first\n\"b\": b];\n");
+        assert_eq!(
+            commented,
+            "let f = [\n    \"a\": a, // first\n    \"b\": b,\n];\n"
+        );
+        assert_eq!(format(&commented), commented);
+    }
+
+    #[test]
+    fn writes_the_unit_value_compactly() {
+        assert_eq!(
+            format("let u = ( );\nprintln(Ok(( )), [(),( )]);\n"),
+            "let u = ();\n\nprintln(Ok(()), [(), ()]);\n"
+        );
+    }
+
+    #[test]
+    fn normalizes_only_the_space_after_attached_doc_comment_slashes() {
+        let source = "///Adds.\n///\n/// \n///   kept indentation\nfn add() -> Int { 1 }\n\n\
+                      ////banner\n///dangling before a let\nlet x = 1; ///inline\n///at the end\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "/// Adds.\n///\n///\n///   kept indentation\nfn add() -> Int {\n    1\n}\n\n\
+             ////banner\n///dangling before a let\nlet x = 1; ///inline\n///at the end\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+
+        // Formatting keeps every doc comment attached to its item.
+        let program = |text: &str| {
+            crate::parse_source(&Source::new("doc.krit", text)).expect("source should parse")
+        };
+        let before = program(source);
+        let after = program(&formatted);
+        assert_eq!(
+            before.statements[0].doc().map(|doc| doc.text.clone()),
+            after.statements[0].doc().map(|doc| doc.text.clone())
+        );
+        assert_eq!(
+            after.statements[0].doc().map(|doc| doc.text.as_str()),
+            Some("Adds.\n\n\n  kept indentation")
+        );
+    }
+
+    #[test]
+    fn breaks_long_constructions_one_field_per_line() {
+        let source = "let r = HttpRequest { method: \"POST\", path: \"/repos/example/issues/1/comments\", headers: [HttpHeader { name: \"accept\", value: \"application/json\" }], body: body };\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "let r = HttpRequest {\n    method: \"POST\",\n    path: \"/repos/example/issues/1/comments\",\n    headers: [HttpHeader { name: \"accept\", value: \"application/json\" }],\n    body,\n};\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+        // The punned spelling is what decides the width: this fits once
+        // `body: body` becomes `body`, and a value that cannot be punned
+        // does not.
+        let method = "m".repeat(48);
+        let fits = format(&format!(
+            "let r = HttpRequest {{ method: \"{method}\", path, body: body }};\n"
+        ));
+        assert_eq!(
+            fits,
+            format!("let r = HttpRequest {{ method: \"{method}\", path, body }};\n")
+        );
+        let breaks = format(&format!(
+            "let r = HttpRequest {{ method: \"{method}\", path, body: body2 }};\n"
+        ));
+        assert_eq!(breaks.lines().count(), 5, "{breaks}");
+    }
+
+    /// The output of running `text`, which must check.
+    fn output(text: &str) -> String {
+        let mut output = Vec::new();
+        crate::run_source(&Source::new("test.krit", text), &mut output).expect("source should run");
+        String::from_utf8(output).expect("output should be UTF-8")
+    }
+
+    #[test]
+    fn keeps_holes_and_canonicalizes_the_text_of_interpolated_strings() {
+        let source = "let user=record{name:\"Ada\"};\nprintln(\"\\u{48}i,\\t\\(user.name)\\\\(x)\\u{21}\"  );\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "let user = record { name: \"Ada\" };\n\nprintln(\"Hi,\\t\\(user.name)\\\\(x)!\");\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+        assert_eq!(output(&formatted), output(source));
+    }
+
+    #[test]
+    fn re_indents_text_blocks_and_preserves_their_content() {
+        let source = "fn p(t: String) -> String {\n\"\"\"\n\t\tTitle: \\(t)\n\t\t  deeper \"quoted\"   \n\n\t\t\"\"\"\n}\n\
+                      let a = p(\"\"\"\n  x\n  \"\"\");\nprintln(json_encode(a));\n\
+                      println(json_encode(HttpResponse{status:1,body:\"\"\"\n                  far\n                  \"\"\"}.body));\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "fn p(t: String) -> String {\n    \"\"\"\n    Title: \\(t)\n      deeper \"quoted\"   \n\n    \"\"\"\n}\n\n\
+             let a = p(\"\"\"\n    x\n    \"\"\");\n\n\
+             println(json_encode(a));\n\
+             println(json_encode(HttpResponse { status: 1, body: \"\"\"\n    far\n    \"\"\" }.body));\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+        assert_eq!(output(&formatted), output(source));
+        assert_eq!(
+            output(source),
+            "\"Title: x\\n  deeper \\\"quoted\\\"   \\n\"\n\"far\"\n"
+        );
+    }
+
+    #[test]
+    fn text_blocks_in_crlf_sources_format_to_line_feeds() {
+        let source =
+            "let t = \"\"\"\r\n      a\r\n\r\n        b\r\n      \"\"\";\r\nprintln(t);\r\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "let t = \"\"\"\n    a\n\n      b\n    \"\"\";\n\nprintln(t);\n"
+        );
+        assert_eq!(output(&formatted), output(source));
+        assert_eq!(output(source), "a\n\n  b\n");
+    }
+
+    #[test]
+    fn a_text_block_in_a_broken_group_indents_from_its_own_line() {
+        let long = "x".repeat(60);
+        let source = format!(
+            "fn f(a: String, b: String, c: String) -> String {{ a }}\n\
+             let v = f(\"{long}\", \"{long}\", \"\"\"\n  tail\n  \"\"\");\n"
+        );
+        let formatted = format(&source);
+        assert!(
+            formatted.ends_with(&format!(
+                "let v = f(\n    \"{long}\",\n    \"{long}\",\n    \"\"\"\n    tail\n    \"\"\",\n);\n"
+            )),
+            "{formatted}"
+        );
+        assert_eq!(format(&formatted), formatted);
     }
 }

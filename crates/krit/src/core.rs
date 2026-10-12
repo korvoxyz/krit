@@ -6,10 +6,11 @@ use std::{
 };
 
 use crate::{
-    Analysis, BinaryOperator, Block, Builtin, EffectSet, Expression, ExpressionKind, FunctionType,
-    MatchArm, Parameter, Pattern, PatternKind, Program, RequirementSet, ResolvedName, Span,
-    Statement, StatementKind, SymbolId, SymbolKind, Type, UnaryOperator, ValueLiteral, VariantArm,
-    VariantFamily, VariantName, VariantPattern,
+    Analysis, BinaryOperator, Block, Builtin, ConstructField, ContractRecord, EffectSet,
+    Expression, ExpressionKind, FieldDefault, FunctionType, ListEntry, MatchArm, Parameter,
+    Pattern, PatternKind, Program, RequirementSet, ResolvedName, Span, Statement, StatementKind,
+    StringPart, SymbolId, SymbolKind, Type, UnaryOperator, ValueLiteral, VariantArm, VariantFamily,
+    VariantName, VariantPattern,
     limits::{MAX_CORE_BLOCK_DEPTH, MAX_TREE_DEPTH},
     patterns,
 };
@@ -893,6 +894,9 @@ impl<'a> Lowerer<'a> {
                 source,
                 OperationKind::Literal(literal.clone()),
             )),
+            ExpressionKind::Interpolation(parts) => {
+                self.lower_interpolation(parts, ty, expression.span, operations)
+            }
             ExpressionKind::Variable(_) => {
                 let resolution = fact.resolved_name().ok_or_else(|| {
                     IrError::new(format!(
@@ -923,6 +927,16 @@ impl<'a> Lowerer<'a> {
                         OperationKind::Builtin(builtin),
                     )),
                 }
+            }
+            ExpressionKind::Unit => Ok(self.emit(
+                operations,
+                ty,
+                EffectSet::default(),
+                source,
+                OperationKind::Unit,
+            )),
+            ExpressionKind::EntryList(entries) => {
+                self.lower_entry_list(entries, ty, source, operations)
             }
             ExpressionKind::List(elements) => {
                 let values = elements
@@ -956,6 +970,11 @@ impl<'a> Lowerer<'a> {
                     OperationKind::Record(fields),
                 ))
             }
+            ExpressionKind::Construct {
+                contract,
+                contract_span,
+                fields,
+            } => self.lower_construction(*contract, *contract_span, fields, ty, source, operations),
             ExpressionKind::FieldAccess { value, field } => {
                 let value = self.lower_expression(value, operations)?;
                 Ok(self.emit(
@@ -1619,6 +1638,203 @@ impl<'a> Lowerer<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Lowers an interpolated string or text block at `span` to left-to-right
+    /// concatenation: each text part is a string literal operation at its
+    /// span, each hole is its lowered value, and every part after the first
+    /// is appended with one `add` operation spanning the string up to that
+    /// part. A string with no parts is the empty string literal, and a
+    /// string that is one hole is that hole's value.
+    fn lower_interpolation(
+        &mut self,
+        parts: &[StringPart],
+        ty: Arc<Type>,
+        span: Span,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<ValueId, IrError> {
+        if ty.as_ref() != &Type::String {
+            return Err(IrError::new(format!(
+                "interpolated string has non-string type `{ty}`"
+            )));
+        }
+        let mut result = None;
+        for part in parts {
+            let (value, part_end) = match part {
+                StringPart::Text { value, span } => (
+                    self.emit(
+                        operations,
+                        Arc::clone(&ty),
+                        EffectSet::default(),
+                        Some(*span),
+                        OperationKind::Literal(ValueLiteral::String(value.clone())),
+                    ),
+                    span.end,
+                ),
+                StringPart::Hole { value, span } => {
+                    (self.lower_expression(value, operations)?, span.end)
+                }
+            };
+            result = Some(match result {
+                None => value,
+                Some(left) => self.emit(
+                    operations,
+                    Arc::clone(&ty),
+                    EffectSet::default(),
+                    Some(Span::new(span.start, part_end)),
+                    OperationKind::Binary {
+                        left,
+                        operator: BinaryOperator::Add,
+                        right: value,
+                    },
+                ),
+            });
+        }
+        Ok(result.unwrap_or_else(|| {
+            self.emit(
+                operations,
+                ty,
+                EffectSet::default(),
+                Some(span),
+                OperationKind::Literal(ValueLiteral::String(String::new())),
+            )
+        }))
+    }
+
+    /// Lowers an entry list to the operations `[record { name: k, value: v },
+    /// ...]` would produce: each key and then its value in source order, one
+    /// record operation per entry at the entry's span, and the list
+    /// operation.
+    fn lower_entry_list(
+        &mut self,
+        entries: &[ListEntry],
+        ty: Arc<Type>,
+        source: Option<Span>,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<ValueId, IrError> {
+        let Type::List(element) = ty.as_ref() else {
+            return Err(IrError::new(format!("entry list has non-list type `{ty}`")));
+        };
+        let mut values = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let name = self.lower_expression(&entry.key, operations)?;
+            let value = self.lower_expression(&entry.value, operations)?;
+            values.push(self.emit(
+                operations,
+                Arc::clone(element),
+                EffectSet::default(),
+                Some(entry.span),
+                OperationKind::Record(vec![
+                    RecordOperand {
+                        name: "name".to_owned(),
+                        value: name,
+                    },
+                    RecordOperand {
+                        name: "value".to_owned(),
+                        value,
+                    },
+                ]),
+            ));
+        }
+        Ok(self.emit(
+            operations,
+            ty,
+            EffectSet::default(),
+            source,
+            OperationKind::List(values),
+        ))
+    }
+
+    /// Lowers a named construction to the same record operation that
+    /// `record { ... }` with every contract field would produce.
+    ///
+    /// The written values are lowered in source order, so their effects
+    /// happen in the order they are written. Each omitted field becomes one
+    /// pure literal operation for its spec-fixed default (`""` or `[]`), at
+    /// the type name's span, typed with the field's type from the
+    /// construction's analyzed record type.
+    fn lower_construction(
+        &mut self,
+        contract: ContractRecord,
+        contract_span: Span,
+        fields: &[ConstructField],
+        ty: Arc<Type>,
+        source: Option<Span>,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<ValueId, IrError> {
+        let Type::Record(record_types) = ty.as_ref() else {
+            return Err(IrError::new(format!(
+                "`{}` construction has non-record type `{ty}`",
+                contract.name()
+            )));
+        };
+        let mut written = BTreeMap::new();
+        for field in fields {
+            let value = self.lower_expression(&field.value, operations)?;
+            if written.insert(field.name.as_str(), value).is_some() {
+                return Err(IrError::new(format!(
+                    "`{}` construction writes field `{}` twice",
+                    contract.name(),
+                    field.name
+                )));
+            }
+        }
+        let mut operands = Vec::with_capacity(contract.fields().len());
+        for field in contract.fields() {
+            let value = match (written.remove(field.name), field.default) {
+                (Some(value), _) => value,
+                (None, Some(default)) => {
+                    let field_type = record_types
+                        .iter()
+                        .find(|record_type| record_type.name() == field.name)
+                        .map(crate::RecordType::shared_type)
+                        .ok_or_else(|| {
+                            IrError::new(format!(
+                                "`{}` construction type has no field `{}`",
+                                contract.name(),
+                                field.name
+                            ))
+                        })?;
+                    let kind = match default {
+                        FieldDefault::EmptyString => {
+                            OperationKind::Literal(ValueLiteral::String(String::new()))
+                        }
+                        FieldDefault::EmptyList => OperationKind::List(Vec::new()),
+                    };
+                    self.emit(
+                        operations,
+                        field_type,
+                        EffectSet::default(),
+                        Some(contract_span),
+                        kind,
+                    )
+                }
+                (None, None) => {
+                    return Err(IrError::new(format!(
+                        "`{}` construction omits required field `{}`",
+                        contract.name(),
+                        field.name
+                    )));
+                }
+            };
+            operands.push(RecordOperand {
+                name: field.name.to_owned(),
+                value,
+            });
+        }
+        if let Some(name) = written.keys().next() {
+            return Err(IrError::new(format!(
+                "`{}` construction writes unknown field `{name}`",
+                contract.name()
+            )));
+        }
+        Ok(self.emit(
+            operations,
+            ty,
+            EffectSet::default(),
+            source,
+            OperationKind::Record(operands),
+        ))
     }
 
     /// Lowers an `if` expression and its whole `else if` chain.
@@ -3059,7 +3275,15 @@ impl<'a> Verifier<'a> {
             | Builtin::JsonEncode
             | Builtin::JsonDecode
             | Builtin::LogInfo
-            | Builtin::LogError => Ok(Vec::new()),
+            | Builtin::LogError
+            | Builtin::IntToString
+            | Builtin::UrlPathSegment
+            | Builtin::UrlQuery
+            | Builtin::StringByteLen
+            | Builtin::StringIsEmpty
+            | Builtin::StringContains
+            | Builtin::StringStartsWith
+            | Builtin::StringEndsWith => Ok(Vec::new()),
         }
     }
 
@@ -3207,6 +3431,26 @@ impl<'a> Verifier<'a> {
                 } else {
                     Err(IrError::new(format!("{builtin} has invalid signature")))
                 }
+            }
+            Builtin::IntToString => verify_pure_builtin(builtin, ty, &[Type::Int], &Type::String),
+            Builtin::UrlPathSegment => verify_pure_builtin(
+                builtin,
+                ty,
+                &[Type::String],
+                &Type::Result(Arc::new(Type::String), Arc::new(Type::String)),
+            ),
+            Builtin::UrlQuery => verify_pure_builtin(
+                builtin,
+                ty,
+                &[Type::List(Arc::new(Type::HttpHeader))],
+                &Type::String,
+            ),
+            Builtin::StringByteLen => verify_pure_builtin(builtin, ty, &[Type::String], &Type::Int),
+            Builtin::StringIsEmpty => {
+                verify_pure_builtin(builtin, ty, &[Type::String], &Type::Bool)
+            }
+            Builtin::StringContains | Builtin::StringStartsWith | Builtin::StringEndsWith => {
+                verify_pure_builtin(builtin, ty, &[Type::String, Type::String], &Type::Bool)
             }
             Builtin::Some => verify_constructor_function(ty, VariantFamily::Option, true),
             Builtin::Ok => verify_constructor_function(ty, VariantFamily::Result, true),
@@ -3459,7 +3703,9 @@ impl<'a> Verifier<'a> {
                 }
             }
             BinaryOperator::Equal | BinaryOperator::NotEqual => {
-                if left_type != right_type
+                // A built-in contract type and its structural record are the
+                // same type, so `response == record { ... }` compares them.
+                if !type_equivalent(left_type, right_type)
                     || !type_contains_no_function(left_type)
                     || operation.ty.as_ref() != &Type::Bool
                 {
@@ -3871,6 +4117,35 @@ fn verify_host_builtin(
     if function.parameters() == expected.as_slice()
         && function.return_type() == result
         && effect.is_none_or(|effect| function.effects().contains(&effect))
+    {
+        Ok(())
+    } else {
+        Err(IrError::new(format!("{builtin} has invalid signature")))
+    }
+}
+
+/// Verifies a standard-library function: exactly these parameters and this
+/// result, up to the structural equivalence of the contract records (so the
+/// `url_query` parameter is any list of name/value records), and no direct
+/// requirement. Its effect set is not checked: a pure built-in used as a
+/// value can share an effect variable with a callback it is unified with,
+/// and its call operations carry their own verified effects.
+fn verify_pure_builtin(
+    builtin: Builtin,
+    ty: &Type,
+    parameters: &[Type],
+    result: &Type,
+) -> Result<(), IrError> {
+    let Type::Function(function) = ty else {
+        return Err(IrError::new(format!("{builtin} has non-function type")));
+    };
+    if function.parameters().len() == parameters.len()
+        && function
+            .parameters()
+            .iter()
+            .zip(parameters)
+            .all(|(actual, expected)| type_equivalent(actual, expected))
+        && type_equivalent(function.return_type(), result)
     {
         Ok(())
     } else {
@@ -5059,5 +5334,178 @@ mod tests {
                 .to_string()
                 .contains("capture count")
         );
+    }
+
+    #[test]
+    fn lowers_named_construction_to_a_full_record_with_default_literals() {
+        let text = "let body = \"x\";\nlet response = HttpResponse { body, status: 200 };\n";
+        let module = lowered(text);
+        assert!(!module.has_residual_types());
+        let rendered = module.render_text();
+        // The written value is lowered in source order, the omitted field
+        // becomes a typed `[]`, and the record lists the contract's order.
+        assert!(
+            rendered.contains(
+                "    v2: Int = int 200\n    v3: List<HttpHeader> = list []\n    \
+                 v4: Record { body: String, headers: List<HttpHeader>, status: Int } = \
+                 record {status: v2, headers: v3, body: v0}\n"
+            ),
+            "{rendered}"
+        );
+        let block = &module.functions()[0].body;
+        let default = block
+            .operations
+            .iter()
+            .find(|operation| matches!(operation.kind, OperationKind::List(_)))
+            .expect("the omitted headers become a list operation");
+        let type_name = text.find("HttpResponse").expect("type name");
+        assert_eq!(
+            default.source,
+            Some(Span::new(type_name, type_name + "HttpResponse".len()))
+        );
+
+        // A contract-typed value and a construction or record compare.
+        let compared = lowered(
+            "fn respond(body: String) -> HttpResponse {\n    HttpResponse { status: 200, body }\n}\n\
+             let same = respond(\"a\") == record { status: 200, headers: [], body: \"a\" };\n\
+             let also = HttpResponse { status: 1 } != respond(\"b\");\n",
+        );
+        compared.verify().expect("contract equality should verify");
+
+        let request = lowered("let r = HttpRequest { path: \"/x\", method: \"GET\" };");
+        assert!(
+            request
+                .render_text()
+                .contains("record {method: v1, path: v0, query: v2, headers: v3, body: v4}"),
+            "{}",
+            request.render_text()
+        );
+    }
+
+    #[test]
+    fn lowers_interpolation_to_left_to_right_concatenation() {
+        let text = "let user = record { name: \"Ada\" };\nlet id = \"7\";\n\
+                    let line = \"<\\(user.name)|\\(id)>\";\n";
+        let module = lowered(text);
+        let rendered = module.render_text();
+        assert!(
+            rendered.contains(
+                "    v5: String = string \"<\"\n    v6: String = field v1.name\n    \
+                 v7: String = add v5 v6\n    v8: String = string \"|\"\n    \
+                 v9: String = add v7 v8\n    v10: String = add v9 v3\n    \
+                 v11: String = string \">\"\n    v12: String = add v10 v11\n    \
+                 v13: Unit = bind b2 = v12\n"
+            ),
+            "{rendered}"
+        );
+        // Each text part is a literal at its own span, and each appended part
+        // spans the string up to that part.
+        let string = text.find("\"<").expect("string");
+        let mut sources = Vec::new();
+        visit_operations(&module.functions()[0].body, &mut |operation| {
+            if matches!(
+                operation.kind,
+                OperationKind::Literal(ValueLiteral::String(_)) | OperationKind::Binary { .. }
+            ) && operation.source.is_some_and(|span| span.start >= string)
+            {
+                let span = operation.source.expect("checked above");
+                sources.push(&text[span.start..span.end]);
+            }
+        });
+        assert_eq!(
+            sources,
+            [
+                "<",
+                "\"<\\(user.name)",
+                "|",
+                "\"<\\(user.name)|",
+                "\"<\\(user.name)|\\(id)",
+                ">",
+                "\"<\\(user.name)|\\(id)>",
+            ]
+        );
+
+        // A lone hole is its value, and an empty text block the empty string.
+        let rendered = lowered("let id = \"7\";\nlet same = \"\\(id)\";\n").render_text();
+        assert!(
+            rendered.contains("    v2: Unit = bind b1 = v0\n"),
+            "{rendered}"
+        );
+        let rendered = lowered("let empty = \"\"\"\n\"\"\";\n").render_text();
+        assert!(
+            rendered.contains("    v0: String = string \"\"\n    v1: Unit = bind b0 = v0\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn lowers_and_verifies_standard_library_calls_as_pure_builtins() {
+        let module = lowered(
+            "let a = int_to_string(1);\nlet b = url_path_segment(a);\n\
+             let c = url_query([\"q\": a]);\nlet d = url_query([HttpHeader { name: a, value: a }]);\n\
+             let e = string_byte_len(a);\nlet f = string_is_empty(a);\n\
+             let g = string_contains(a, a) && string_starts_with(a, a) && string_ends_with(a, a);\n",
+        );
+        let rendered = module.render_text();
+        for builtin in Builtin::STANDARD_LIBRARY {
+            assert!(
+                rendered.contains(&format!("builtin {builtin} [standard-library]")),
+                "{builtin}: {rendered}"
+            );
+        }
+        assert!(module.entrypoint_function().signature.effects.is_empty());
+        assert!(
+            module
+                .entrypoint_function()
+                .signature
+                .requirements
+                .is_empty()
+        );
+
+        let function = |parameters: Vec<Type>, result: Type| {
+            Type::Function(FunctionType::new(
+                parameters.into_iter().map(Arc::new).collect(),
+                Arc::new(result),
+                EffectSet::default(),
+                RequirementSet::default(),
+            ))
+        };
+        let pairs = Type::List(Arc::new(Type::HttpHeader));
+        for (builtin, ty, parameters, result) in [
+            (
+                Builtin::IntToString,
+                function(vec![Type::String], Type::String),
+                vec![Type::Int],
+                Type::String,
+            ),
+            (
+                Builtin::StringByteLen,
+                function(vec![Type::String], Type::Bool),
+                vec![Type::String],
+                Type::Int,
+            ),
+            (
+                Builtin::StringContains,
+                function(vec![Type::String], Type::Bool),
+                vec![Type::String, Type::String],
+                Type::Bool,
+            ),
+            (
+                Builtin::UrlQuery,
+                function(vec![Type::List(Arc::new(Type::String))], Type::String),
+                vec![pairs.clone()],
+                Type::String,
+            ),
+            (
+                Builtin::StringIsEmpty,
+                Type::String,
+                vec![Type::String],
+                Type::Bool,
+            ),
+        ] {
+            let error = verify_pure_builtin(builtin, &ty, &parameters, &result)
+                .expect_err("a mismatched signature must be refused");
+            assert!(error.to_string().contains(builtin.as_str()), "{error}");
+        }
     }
 }

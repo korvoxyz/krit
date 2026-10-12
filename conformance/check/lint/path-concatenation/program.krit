@@ -1,0 +1,4 @@
+// Each unencoded operand of a `+` chain is K9013; literals are not.
+fn fetch(request: HttpRequest, number: String) -> HttpRequest {
+    HttpRequest { method: "GET", path: "/repos/" + request.body + "/issues/" + number }
+}

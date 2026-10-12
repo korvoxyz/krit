@@ -1265,6 +1265,31 @@ fn encode_builtin_call(
             }
             encode_json_string_decode(function, context, operation.result, *input)?;
         }
+        Builtin::StringByteLen | Builtin::StringIsEmpty => {
+            let [text] = arguments else {
+                return Err(BuildError::invalid_core(format!(
+                    "{} call does not have one argument",
+                    builtin.as_str()
+                )));
+            };
+            // A pair's second word is its byte length.
+            load_value(function, context, *text)?;
+            function.instruction(&Instruction::I32Load(memarg(4, 2)));
+            if builtin == Builtin::StringByteLen {
+                function.instruction(&Instruction::I64ExtendI32U);
+            } else {
+                function.instruction(&Instruction::I32Eqz);
+            }
+            store_value(function, context, operation.result)?;
+        }
+        Builtin::IntToString
+        | Builtin::UrlPathSegment
+        | Builtin::UrlQuery
+        | Builtin::StringContains
+        | Builtin::StringStartsWith
+        | Builtin::StringEndsWith => {
+            encode_helper_call(function, context, operation, builtin, arguments)?;
+        }
         Builtin::None | Builtin::JsonEncode => {
             return Err(BuildError::unsupported(
                 format!(
@@ -1276,6 +1301,42 @@ fn encode_builtin_call(
         }
     }
     Ok(())
+}
+
+/// Lowers a standard-library call to its generated guest function, which
+/// takes the arguments' values and returns the result's value.
+fn encode_helper_call(
+    function: &mut Function,
+    context: &FunctionContext<'_>,
+    operation: &CoreOperation,
+    builtin: Builtin,
+    arguments: &[ValueId],
+) -> Result<(), BuildError> {
+    let helper = StringHelper::for_call(builtin, &operation.ty).ok_or_else(|| {
+        BuildError::invalid_core(format!("`{}` has no guest function", builtin.as_str()))
+    })?;
+    let index = context
+        .shared
+        .string_helpers
+        .get(&helper)
+        .copied()
+        .ok_or_else(|| {
+            BuildError::invalid_core(format!(
+                "the guest function of `{}` was not emitted",
+                builtin.as_str()
+            ))
+        })?;
+    if arguments.len() != helper.signature().params.len() {
+        return Err(BuildError::invalid_core(format!(
+            "{} call has the wrong number of arguments",
+            builtin.as_str()
+        )));
+    }
+    for argument in arguments {
+        load_value(function, context, *argument)?;
+    }
+    function.instruction(&Instruction::Call(index));
+    store_value(function, context, operation.result)
 }
 
 /// Lowers `json_decode` into `String` to the guest JSON string decoder,

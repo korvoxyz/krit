@@ -1,0 +1,17 @@
+// `url_query` percent-encodes every name and value, joins them as
+// `name=value&...` in order, and writes no leading `?`.
+println(url_query([]));
+println(url_query(["q": "rust lang"]));
+println(url_query(["state": "open", "labels": "bug,good first issue"]));
+println(url_query(["": ""]));
+println(url_query(["a&b": "c=d#e?f"]));
+println(url_query(["name": "café 😀", "path": "/a/b"]));
+
+let mixed = [HttpHeader { name: "x", value: "1" }, LogField { name: "y", value: "2" }];
+
+println(url_query(mixed));
+
+let headers: List<HttpHeader> = ["accept": "*/*"];
+
+println(url_query(headers));
+println(url_query(["k": "AZaz09-._~"]));

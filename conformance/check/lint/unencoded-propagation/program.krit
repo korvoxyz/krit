@@ -1,0 +1,22 @@
+fn other(owner: String) -> Result<String, String> {
+    Ok(owner)
+}
+
+fn propagated(owner: String) -> Result<HttpRequest, String> {
+    let copied = other(owner)?;
+    Ok(HttpRequest { method: "GET", path: "/repos/" + other(owner)? + "/\(copied)" })
+}
+
+fn arm(owner: String) -> HttpRequest {
+    let Ok(segment) = url_path_segment(owner) else
+        Err(reason) => HttpRequest { method: "GET", path: "/errors/\(reason)" };
+    HttpRequest { method: "GET", path: "/repos/\(segment)" }
+}
+
+fn nested(stored: Result<Option<String>, String>) -> HttpRequest {
+    match stored {
+        Ok(Some(text)) => HttpRequest { method: "GET", path: "/notes/\(text)" },
+        Ok(None) => HttpRequest { method: "GET", path: "/" },
+        Err(_) => HttpRequest { method: "GET", path: "/" },
+    }
+}

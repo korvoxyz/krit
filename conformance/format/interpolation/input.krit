@@ -1,0 +1,5 @@
+let user=record{name:"Ada",team:record{name:"core"}};
+let line="\u{48}ello,\t\(user.name) of \(user.team.name)\u{21}";
+let joined   =   "\(user.name)\(user.team.name)"   ;
+fn greet(name:String)->String{"Hi \(name)"+" and "+"\\(not a hole)"}
+println( greet( "\(user.name)" ) );

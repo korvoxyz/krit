@@ -1,0 +1,9 @@
+record { status: 200, headers: [], body: "ready" }
+record { method: "GET", path: "/x", query: "", headers: [], body: "" }
+[record { name: "accept", value: "text/plain" }, record { name: "x-trace", value: "1" }]
+record { name: "attempt", value: "1" }
+true
+{"body":"","headers":[],"status":204}
+404
+body status 
+record { status: 201, headers: [], body: "late" }

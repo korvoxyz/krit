@@ -13,6 +13,21 @@ pub struct Statement {
     pub span: Span,
 }
 
+impl Statement {
+    /// The doc comment of a function or entrypoint declaration.
+    pub fn doc(&self) -> Option<&DocComment> {
+        match &self.kind {
+            StatementKind::Function { doc, .. }
+            | StatementKind::Webhook { doc, .. }
+            | StatementKind::QueueConsumer { doc, .. }
+            | StatementKind::ScheduleHandler { doc, .. } => doc.as_ref(),
+            StatementKind::Let { .. }
+            | StatementKind::LetElse { .. }
+            | StatementKind::Expression(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum StatementKind {
     Let {
@@ -40,12 +55,16 @@ pub enum StatementKind {
         parameters: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Block,
+        /// The `///` doc comment written directly before the declaration.
+        doc: Option<DocComment>,
     },
     Webhook {
         name: String,
         parameters: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Block,
+        /// The `///` doc comment written directly before the declaration.
+        doc: Option<DocComment>,
     },
     QueueConsumer {
         queue: String,
@@ -54,6 +73,8 @@ pub enum StatementKind {
         parameters: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Block,
+        /// The `///` doc comment written directly before the declaration.
+        doc: Option<DocComment>,
     },
     ScheduleHandler {
         schedule: String,
@@ -62,8 +83,25 @@ pub enum StatementKind {
         parameters: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Block,
+        /// The `///` doc comment written directly before the declaration.
+        doc: Option<DocComment>,
     },
     Expression(Expression),
+}
+
+/// A `///` doc comment: the run of `///` lines written directly before an
+/// item, with only whitespace between them and the item.
+///
+/// Analysis ignores it; the formatter preserves it, and `krit explain` and
+/// the language server show its text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocComment {
+    /// The text of the lines in order, joined by `\n`. Each line is what
+    /// follows its `///`, without one leading space and without trailing
+    /// whitespace.
+    pub text: String,
+    /// From the first line's `///` to the end of the last line's text.
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -82,9 +120,42 @@ pub struct Expression {
 #[derive(Clone, Debug)]
 pub enum ExpressionKind {
     Literal(ValueLiteral),
+    /// A string written with interpolation holes (`"Hi \(name)!"`), or a
+    /// `"""` text block, with or without holes: the concatenation of its
+    /// parts from left to right, of type `String`.
+    ///
+    /// It is never a [`ValueLiteral`], so it never counts as a capability
+    /// resource literal. Its parts have no syntax nodes apart from each
+    /// hole's value, whose spans lie inside the string, so every node keeps a
+    /// span of its own.
+    Interpolation(Vec<StringPart>),
+    /// The unit value `()`.
+    Unit,
     Variable(String),
     List(Vec<Expression>),
+    /// An entry list `["name": value, ...]`: the list of
+    /// `record { name: key, value: value }` records, one per entry, in
+    /// source order.
+    ///
+    /// The records have no syntax node of their own; each is identified by
+    /// its entry's span, which covers the key, the `:`, and the value. The
+    /// empty list `[]` is always [`ExpressionKind::List`].
+    EntryList(Vec<ListEntry>),
     Record(Vec<RecordField>),
+    /// Named construction of a built-in contract record:
+    /// `HttpResponse { status: 200, body }`.
+    ///
+    /// Only the written fields are syntax. The fields a construction omits
+    /// take their spec-fixed defaults ([`ContractRecord::fields`]), which
+    /// analysis, Core lowering, and the evaluator synthesize without any
+    /// syntax node, so no analysis fact is keyed by a span the source does
+    /// not contain.
+    Construct {
+        contract: ContractRecord,
+        /// The span of the type name.
+        contract_span: Span,
+        fields: Vec<ConstructField>,
+    },
     FieldAccess {
         value: Box<Expression>,
         field: String,
@@ -139,6 +210,149 @@ pub struct RecordField {
     pub name: String,
     pub value: Expression,
     pub span: Span,
+}
+
+/// One part of an interpolated string or text block.
+#[derive(Clone, Debug)]
+pub enum StringPart {
+    /// Literal text with its escapes decoded; in a text block, with each
+    /// line's indentation removed and line breaks normalized to `\n`. The
+    /// parser never produces an empty text part or two adjacent ones.
+    Text { value: String, span: Span },
+    /// A hole `\(name.field)`. `value` is the variable named in it, followed
+    /// by its field accesses, at the spans of those names inside the hole;
+    /// `span` covers the hole from its `\` to its `)`.
+    Hole { value: Expression, span: Span },
+}
+
+/// One `key: value` entry of an entry list.
+#[derive(Clone, Debug)]
+pub struct ListEntry {
+    pub key: Expression,
+    pub value: Expression,
+    /// From the start of the key to the end of the value.
+    pub span: Span,
+}
+
+/// One written field of a named construction.
+///
+/// A punned field `body` is written as its name alone and means `body: body`:
+/// its value is the variable expression at the name's own span.
+#[derive(Clone, Debug)]
+pub struct ConstructField {
+    pub name: String,
+    pub name_span: Span,
+    pub value: Expression,
+    pub span: Span,
+}
+
+impl ConstructField {
+    /// Whether the field was written as its name alone (`body`).
+    pub fn is_punned(&self) -> bool {
+        self.value.span == self.name_span
+    }
+}
+
+/// A built-in contract record type that named construction can build.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ContractRecord {
+    HttpRequest,
+    HttpResponse,
+    HttpHeader,
+    LogField,
+}
+
+/// The spec-fixed value of a contract field that a construction omits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FieldDefault {
+    /// `""`
+    EmptyString,
+    /// `[]`
+    EmptyList,
+}
+
+impl FieldDefault {
+    /// The default as it would be written in source.
+    pub const fn as_source(self) -> &'static str {
+        match self {
+            Self::EmptyString => "\"\"",
+            Self::EmptyList => "[]",
+        }
+    }
+}
+
+/// One field of a contract record, in the contract's declared order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContractField {
+    pub name: &'static str,
+    /// `None` for a required field.
+    pub default: Option<FieldDefault>,
+}
+
+const fn required(name: &'static str) -> ContractField {
+    ContractField {
+        name,
+        default: None,
+    }
+}
+
+const fn defaulted(name: &'static str, default: FieldDefault) -> ContractField {
+    ContractField {
+        name,
+        default: Some(default),
+    }
+}
+
+const HTTP_REQUEST_FIELDS: [ContractField; 5] = [
+    required("method"),
+    required("path"),
+    defaulted("query", FieldDefault::EmptyString),
+    defaulted("headers", FieldDefault::EmptyList),
+    defaulted("body", FieldDefault::EmptyString),
+];
+const HTTP_RESPONSE_FIELDS: [ContractField; 3] = [
+    required("status"),
+    defaulted("headers", FieldDefault::EmptyList),
+    defaulted("body", FieldDefault::EmptyString),
+];
+const NAME_VALUE_FIELDS: [ContractField; 2] = [required("name"), required("value")];
+
+impl ContractRecord {
+    /// The contract that `name` constructs, if it is one of the four
+    /// constructible built-in record types.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "HttpRequest" => Some(Self::HttpRequest),
+            "HttpResponse" => Some(Self::HttpResponse),
+            "HttpHeader" => Some(Self::HttpHeader),
+            "LogField" => Some(Self::LogField),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::HttpRequest => "HttpRequest",
+            Self::HttpResponse => "HttpResponse",
+            Self::HttpHeader => "HttpHeader",
+            Self::LogField => "LogField",
+        }
+    }
+
+    /// Every field of the contract in its declared order, which is also the
+    /// order of the constructed record's fields.
+    pub const fn fields(self) -> &'static [ContractField] {
+        match self {
+            Self::HttpRequest => &HTTP_REQUEST_FIELDS,
+            Self::HttpResponse => &HTTP_RESPONSE_FIELDS,
+            Self::HttpHeader | Self::LogField => &NAME_VALUE_FIELDS,
+        }
+    }
+
+    /// The field named `name`, if the contract has one.
+    pub fn field(self, name: &str) -> Option<&'static ContractField> {
+        self.fields().iter().find(|field| field.name == name)
+    }
 }
 
 /// One `match` arm: `pattern => value`.

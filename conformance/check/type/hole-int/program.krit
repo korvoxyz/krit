@@ -1,0 +1,2 @@
+let count = 3;
+let summary = "\(count) issues";

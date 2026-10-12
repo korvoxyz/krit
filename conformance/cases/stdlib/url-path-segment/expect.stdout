@@ -1,0 +1,26 @@
+ok issues
+ok octo%20cat
+ok AZaz09-._~
+ok caf%C3%A9
+ok %F0%9F%98%80
+ok a%3Bb%3Fc%23d
+ok 100%25
+ok 50%25off
+ok ...
+ok ..a
+ok %3B..
+err path segment is empty
+err path segment reads as `.` or `..`
+err path segment reads as `.` or `..`
+err path segment reads as `.` or `..`
+err path segment reads as `.` or `..`
+err path segment reads as `.` or `..`
+err path segment contains `/`, `\`, or an ASCII control character
+err path segment contains `/`, `\`, or an ASCII control character
+err path segment contains `/`, `\`, or an ASCII control character
+err path segment contains `/`, `\`, or an ASCII control character
+err path segment contains `/`, `\`, or an ASCII control character
+err path segment contains `%` followed by a hex digit, `u`, or `U`
+err path segment contains `%` followed by a hex digit, `u`, or `U`
+err path segment contains `%` followed by a hex digit, `u`, or `U`
+err path segment contains `%` followed by a hex digit, `u`, or `U`

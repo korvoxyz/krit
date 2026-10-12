@@ -1,0 +1,4 @@
+fn respond(request: HttpRequest) -> HttpResponse {
+    let Some(response) = HttpResponse { status: 200, body: request.body } else None => HttpResponse { status: 500 };
+    response
+}

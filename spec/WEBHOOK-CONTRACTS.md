@@ -113,6 +113,13 @@ control byte, or a backslash. Encoded separators in a query are ordinary data.
 The origin is the only HTTP authority a program holds. This rule keeps a path
 built from untrusted text, such as an inbound field or model output, from
 escaping the prefix the program meant to address after a server resolves it.
+Programs build such paths and queries with the standard library
+(`LANGUAGE.md` section 12.1): `url_path_segment` returns `Err` for exactly
+the texts whose percent-encoded segment this rule refuses (and the empty
+text), so a program handles untrusted text as a value instead of trapping,
+and every `url_query` result satisfies the query rule. The host and the
+compiler share one definition of both rules. Warning `K9013` reports a path
+or query piece that neither function encoded (`DIAGNOSTICS.md`).
 
 A violation is `K4001`, and the diagnostic never echoes the path. An inbound
 request is refused before guest execution. A guest `http_request` or durable

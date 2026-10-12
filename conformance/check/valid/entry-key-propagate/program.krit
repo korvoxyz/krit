@@ -1,0 +1,29 @@
+fn prefix(enabled: Bool) -> Result<String, String> {
+    if enabled {
+        Ok("x-")
+    } else {
+        Err("disabled")
+    }
+}
+
+fn namer(enabled: Bool) {
+    if enabled {
+        Ok(fn(name: String) {
+            name
+        })
+    } else {
+        Err("disabled")
+    }
+}
+
+fn headers(enabled: Bool, id: String) -> Result<List<HttpHeader>, String> {
+    Ok(
+        [
+            prefix(enabled)?: id,
+            namer(enabled)?("x-id"): id,
+            "x-trace": prefix(enabled)? + id,
+        ],
+    )
+}
+
+println(headers(true, "7"));

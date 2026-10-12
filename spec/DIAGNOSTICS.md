@@ -126,9 +126,10 @@ Initial required codes:
 | Code | Meaning |
 |---|---|
 | `K0001` | Invalid source character or token |
-| `K0002` | Unterminated string |
-| `K0003` | Invalid string escape |
-| `K1001` | Unexpected token, including a `?` followed on its line by an operand that does not form a conditional operator (`K1110`) |
+| `K0002` | Unterminated string or text block |
+| `K0003` | Invalid string escape, including `\` at the end of a text-block line |
+| `K0004` | Text block layout is invalid: text after the opening `"""` on its line, a content line that does not begin with the closing delimiter's indentation, or `"""` inside a content line |
+| `K1001` | Unexpected token, including a `?` followed on its line by an operand that does not form a conditional operator (`K1110`), a named construction written directly as an `if` condition or `match` subject, a list literal that mixes `key: value` entries with plain elements, and `[:]` |
 | `K1002` | Expected token not found |
 | `K1003` | Invalid match pattern, or `match` arms that mix families at one position, repeat an arm, or overlap (including an unreachable arm) |
 | `K1004` | Webhook declaration is nested or otherwise misplaced |
@@ -162,6 +163,8 @@ Initial required codes:
 | `K3012` | Postfix `?` where it cannot return: at the top level, in an anonymous function or a webhook entrypoint, or in a named function whose declared return type is missing or is neither a `Result` nor an `Option` |
 | `K3013` | Postfix `?` whose operand's family or error type differs from the enclosing function's declared `Result<_, E>` or `Option<_>` |
 | `K3014` | let-else that is not a direct statement of a named function's body, whose two patterns are not the two variants of one family, whose pattern nests another pattern, or whose value ends in `}` |
+| `K3015` | Invalid interpolation hole: its content is not a name followed by field accesses (reported while the source is read), or its value is not a `String` |
+| `K3016` | Named construction of a contract record writes a field the contract does not have, writes a field more than once, or omits a required field |
 | `K4001` | Generic guest trap, wrong runtime value kind, or HTTP request/response the host refuses (including a request path that breaks the rule in `WEBHOOK-CONTRACTS.md`, "Request paths and queries") |
 | `K4002` | Calling a non-function |
 | `K4003` | Function argument count mismatch |
@@ -211,6 +214,7 @@ Initial required codes:
 | `K8105` | Proposed source failed canonical formatting or compiler checking |
 | `K8106` | Required authority expansion lacks exact review approval or a manifest grant |
 | `K8107` | Proposal or accepted-source atomic I/O failed |
+| `K9013` | Warning (lint): a piece of an `HttpRequest` `path` or `query` built by interpolation or `+` is not a literal, a direct call of `url_path_segment`, `url_query`, or `int_to_string`, a postfix `?` on a `url_path_segment` result, or a name bound to such a result |
 
 ## Build-target diagnostics
 
@@ -253,6 +257,50 @@ may improve, but which diagnostics carry one is part of each code's contract:
   listing the pattern forms; `K1003` for `match` arms that mix families,
   repeat, or overlap, and `K3005` for a catch-all arm or a non-exhaustive
   `match`, each carry one note with the fix (see [Matches](#matches)).
+- `K1001` for a named construction written directly as an `if` condition or
+  a `match` subject carries one note: wrap the construction in parentheses.
+- `K1001` for a list literal that mixes `key: value` entries with plain
+  elements carries one note: write every element as an entry, or none. It is
+  reported at the first element written in the other form than the list's
+  first element (an entry's key and `:`, or a plain element).
+- `K1001` for `[:]` carries one note: the empty list is `[]`, for entry lists
+  too.
+- `K1002` for `()` written as a type (`fn f() -> () { ... }`) carries one
+  note: the unit type is spelled `Unit`, and `()` is the unit value.
+- `K0004` always carries exactly one note: put the text on the next line,
+  indent the line at least as far as the closing `"""`, or move the `"""` to
+  a line of its own (or escape it as `\"""`).
+- `K0002` for an unterminated text block carries one note: close it with
+  `"""` on a line of its own. An unterminated one-line string carries none.
+  A text block that no line closes but that has `"""` inside a content line
+  is reported as `K0004` at that `"""`, which most likely meant to close it.
+- `K3015` always carries exactly one note. It is reported at the hole, from
+  its `\` to its `)` (at the `\(` alone for a hole whose line ends before its
+  `)`). A hole that is not a name path is reported while the source is read,
+  before any syntax error later in the file, with a note to bind the value to
+  a name first (or to remove the whitespace, or to name a value); a hole whose
+  value is not a `String` names the hole's path and type, and its note says
+  how to obtain a `String`: for an `Int`, a `let` that converts it with
+  `int_to_string` (`LANGUAGE.md` section 12.1).
+
+```text
+main.krit:2:16: error[K3015]: interpolation hole `count` has type `Int`, but a hole must be a `String`
+help: convert it first, as in `let count_text = int_to_string(count);`, then write `\(count_text)`
+```
+
+- `K9013` always carries exactly one note: for a path, to encode text with
+  `url_path_segment` and numbers with `int_to_string`, binding each result
+  to a name; for a query, to build it with `url_query`.
+- `K3016` always carries exactly one note. For an unknown field it lists the
+  contract's fields, preceded by `did you mean `name`?` when one of them is
+  close by the rule for undefined names below; for a repeated field it lists
+  the contract's fields; for missing fields it names the contract's required
+  fields and the default of each other field:
+
+```text
+main.krit:1:15: error[K3016]: `HttpRequest { ... }` is missing required field `path`
+help: `HttpRequest` requires `method` and `path`; `query` defaults to `""`, `headers` defaults to `[]`, and `body` defaults to `""`
+```
 
 ### Constructs from other languages
 
@@ -362,11 +410,35 @@ standard-library function that does the job when there is one:
 | other | any | passing the value to a function |
 
 The note spells the receiver as written when it is a name or a short field
-path (`string_byte_len(request.body)`), and as `value` otherwise.
+path (`string_byte_len(request.body)`), and as `value` otherwise. The string
+and integer functions it names are the standard library (`LANGUAGE.md`
+section 12.1).
 
 ```text
 main.krit:2:9: error[K3011]: cannot call `.len()` on a value of type `String`: Krit values have no methods
-help: call `string_byte_len(name)` instead; it counts UTF-8 bytes (standard library, arriving in Krit 0.3)
+help: call `string_byte_len(name)` instead; it counts UTF-8 bytes
+```
+
+### Request path and query lints
+
+`K9013` reports text that reaches the path or query of an outbound
+`HttpRequest` without percent-encoding, where untrusted text could add `/`,
+`..`, `?`, `#`, or an escape and so address a different resource than the
+program meant. In a named construction or a record literal typed as
+`HttpRequest`, a `path` or `query` value written as an interpolated string or
+a `+` chain is split into pieces: each hole and each operand. A piece that is
+a literal, a direct call of `url_path_segment`, `url_query`, or
+`int_to_string`, a postfix `?` on a direct `url_path_segment` call or on a
+name bound to one, or a name bound to the result of one (by `let x = <call>;`,
+by `let x = <call or name>?;`, or as the `Ok` binder of a match arm or a
+let-else on a direct `url_path_segment` call or a name bound to one) is
+encoded; every other piece is reported at its hole or operand. A literal-only path, and a value that is not split, such as
+`request.path` forwarded unchanged, never warn (`TYPES-AND-EFFECTS.md`,
+Lints).
+
+```text
+main.krit:2:51: warning[K9013]: this value is inserted into an `HttpRequest` path without percent-encoding
+help: encode untrusted text with `url_path_segment` and numbers with `int_to_string`, binding each result to a name, so the value cannot add `/`, `..`, `?`, or `#` to the path
 ```
 
 ### Error propagation

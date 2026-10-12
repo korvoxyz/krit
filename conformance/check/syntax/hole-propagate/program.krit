@@ -1,0 +1,3 @@
+fn greet(name: Option<String>) -> Option<String> {
+    Some("hello \(name?)")
+}

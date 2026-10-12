@@ -5,6 +5,8 @@ pub enum TokenKind {
     Identifier(String),
     Integer(String),
     String(String),
+    /// A string with interpolation holes, or any `"""` text block.
+    Template(Template),
     Let,
     Fn,
     Webhook,
@@ -51,7 +53,7 @@ impl TokenKind {
         match self {
             Self::Identifier(_) => "identifier",
             Self::Integer(_) => "integer",
-            Self::String(_) => "string",
+            Self::String(_) | Self::Template(_) => "string",
             Self::Let => "`let`",
             Self::Fn => "`fn`",
             Self::Webhook => "`webhook`",
@@ -93,6 +95,32 @@ impl TokenKind {
             Self::Eof => "end of file",
         }
     }
+}
+
+/// The contents of a string literal written with interpolation holes, or of
+/// a `"""` text block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Template {
+    /// The decoded text and the holes in source order. Text parts are never
+    /// empty and never adjacent.
+    pub parts: Vec<TemplatePart>,
+    /// For a text block, its content lines as written, without the closing
+    /// delimiter's indentation and without line breaks; `None` for a one-line
+    /// string. The formatter re-indents these lines.
+    pub text_block: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TemplatePart {
+    /// Literal text with its escapes decoded; in a text block, with each
+    /// line's indentation removed and line breaks normalized to `\n`.
+    Text { value: String, span: Span },
+    /// A hole `\(name.field)`: the identifier and each field name with
+    /// their spans, and the span of the whole hole from `\` to `)`.
+    Hole {
+        path: Vec<(String, Span)>,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -1,0 +1,13 @@
+Ok(record { method: "GET", path: "/repos/octo%20cat/issues/3", query: "owner=octo%20cat&page=3", headers: [record { name: "accept", value: "application/json" }, record { name: "x-owner", value: "octo%20cat" }], body: "" })
+Err("path segment reads as `.` or `..`")
+Some([record { name: "x-a", value: "1" }, record { name: "x-second", value: "x-b" }])
+None
+None
+step one
+step two
+Ok(record { status: 201, headers: [], body: "both" })
+step one
+step two
+Err("two failed")
+step one
+Err("one failed")

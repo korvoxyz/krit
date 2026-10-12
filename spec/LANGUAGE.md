@@ -25,7 +25,9 @@ A source file is UTF-8 and conventionally ends in `.krit`.
 - Keywords and identifiers are case-sensitive.
 - Version 0.2 identifiers use ASCII letters, digits, and `_`.
 - An identifier starts with a letter or `_`.
-- `//` begins a comment ending at the next line break.
+- `//` begins a comment ending at the next line break. A comment that begins
+  with exactly three slashes, `///`, is a doc-comment line (section 2.1);
+  four or more slashes begin an ordinary comment.
 - Whitespace has no semantic meaning except token separation.
 - Tabs are permitted in input; the canonical formatter emits spaces.
 - Source positions are one-based Unicode scalar-value line and column numbers.
@@ -39,10 +41,42 @@ else false fn if let match record true webhook
 Reserved built-in names:
 
 ```text
-Err None Ok Some ai_invoke checkpoint_get checkpoint_put config_string db_begin_read db_begin_write db_commit db_execute db_query db_rollback http_request json_decode json_encode log_error log_info object_delete object_get object_put print println queue_publish replay_ai replay_http secret state_delete state_get state_put
+Err None Ok Some ai_invoke cache_delete cache_get cache_put checkpoint_get checkpoint_put config_string db_begin_read db_begin_write db_commit db_execute db_query db_rollback http_request int_to_string json_decode json_encode log_error log_info object_delete object_get object_put print println queue_publish replay_ai replay_http search_query secret state_delete state_get state_put string_byte_len string_contains string_ends_with string_is_empty string_starts_with url_path_segment url_query vector_search
 ```
 
 A binding cannot use a keyword or reserved built-in name.
+
+## 2.1 Doc comments
+
+The **doc comment** of an item is the run of `///` lines directly before it.
+Items are function declarations, nested ones included, and `webhook`,
+`queue`, and `schedule` entrypoint declarations.
+
+```krit
+/// Labels one issue.
+///
+/// Fails when the model's answer is not a known label.
+fn label(issue: String) -> Result<String, String> {
+    // ...
+}
+```
+
+- Reading upward from the item's first token, the run takes every `///` line
+  and skips blank lines; it ends at the first other line. Blank lines are
+  whitespace, so they neither split a doc comment nor separate it from its
+  item. Any other comment, including a `////` banner, ends the run, so `///`
+  lines above it document nothing.
+- A line's text is what follows its `///`, without one leading space and
+  without trailing whitespace. The doc comment's text is its lines' texts
+  joined by line feeds, so a `///` line with no text adds an empty line.
+- A `///` comment written after code on the same line, or one that no item
+  follows (before a `let`, an expression statement, a `}`, or the end of the
+  file), is an ordinary comment. It is never an error.
+
+Doc comments do not affect checking, evaluation, or building. The formatter
+preserves them (section 16), `krit explain` reports the doc comment of every
+top-level function and entrypoint, and the language server shows a function's
+doc comment when hovering over its declaration or a use of it.
 
 ## 3. Lexical grammar
 
@@ -52,9 +86,69 @@ text is literal.
 ```text
 identifier  = (letter | "_"), (letter | digit | "_")* ;
 integer     = digit, (digit | "_")* ;
-string      = '"', string-character*, '"' ;
+string      = '"', (string-character | hole)*, '"' ;
+hole        = "\(", identifier, (".", identifier)*, ")" ;
+text-block  = '"""', line-break,
+              (text-block-line, line-break)*,
+              indentation, '"""' ;
+text-block-line
+            = (text-block-character | hole)* ;
+indentation = (" " | "\t")* ;
+line-break  = "\n" | "\r\n" | "\r" ;
 comment     = "//", non-line-break* ;
+doc-comment = "///", (non-slash-non-line-break, non-line-break*)? ;
 ```
+
+A `doc-comment` is a `comment` too: both are trivia, which the syntactic grammar
+does not mention.
+
+A `hole` inside a string or text block is written without whitespace, and its
+identifiers are not keywords. A string that contains at least one hole is an
+**interpolated string**; section 9.1 gives its meaning. `\(` followed by
+anything other than an identifier path and `)` is `K3015` at the hole, which
+the lexer reports while it reads the source, with one note:
+`\(f(x))`, `\(a + b)`, `\("x")`, `\(1)`, `\(true)`, `\( name )`, `\()`, and
+a hole whose line ends before its `)`. A quoted string inside a hole is
+skipped while looking for the hole's `)`, so `\(f("x"))` is one invalid hole.
+A string without holes is an ordinary string literal, and `\\(` is a
+backslash followed by `(`, never a hole.
+
+A **text block** starts with `"""` followed immediately by a line break; any
+other text after the opening `"""`, even a space, is `K0004`. It ends at the
+first line whose first characters other than spaces and tabs are `"""`; that
+line's spaces and tabs are the block's **indentation**, and the closing
+`"""` may be followed by more tokens on its line (`""")`). The lines between
+the two delimiters are its content lines:
+
+- Every content line must begin with the indentation, character for
+  character, which is removed from it. A line that does not is `K0004` at its
+  start, unless it holds only spaces and tabs, which makes it an empty line.
+  Spaces and tabs after the indentation are kept.
+- The content lines are joined by `\n`, whatever line breaks the source
+  uses, so a file with CRLF line endings means exactly what it means with LF
+  line endings. The line break before the closing delimiter is not part of
+  the text, so a block with no content lines is the empty string.
+- Escapes and holes work in content lines as in strings, within one line: a
+  line cannot end with `\` (`K0003`). A `"` or `""` needs no escape, but
+  `"""` anywhere in a content line is `K0004` (write `\"""` for three quote
+  characters).
+- A text block that no line closes is `K0002`, or `K0004` at the first
+  `"""` inside one of its lines when there is one, since that `"""` was most
+  likely meant to close it.
+
+```krit
+fn prompt(title: String, body: String) -> String {
+    """
+    Classify this issue as "bug" or "feature".
+      Title: \(title)
+
+    \(body)
+    """
+}
+```
+
+The value of `prompt("Crash", "It fails.")` is
+`Classify this issue as "bug" or "feature".\n  Title: Crash\n\nIt fails.`.
 
 Integer separators cannot be leading, trailing, or repeated. Integers are
 signed through unary `-`; the sign is not part of the token.
@@ -63,13 +157,14 @@ signed through unary `-`; the sign is not part of the token.
 8.2). After an operand, the parser also uses it to recognize another
 language's conditional operator (section 4.2).
 
-Strings support these escapes:
+Strings and text blocks support these escapes:
 
 ```text
 \"  \\  \n  \r  \t  \0  \u{hex-scalar}
 ```
 
-Other escapes and invalid Unicode scalar values are lexical errors.
+`\(` starts a hole instead. Other escapes and invalid Unicode scalar values
+are lexical errors (`K0003`).
 
 ## 4. Syntactic grammar
 
@@ -125,21 +220,33 @@ arguments       = expression, (",", expression)*, ","? ;
 
 primary         = integer
                 | string
+                | text-block
                 | "true"
                 | "false"
                 | identifier
                 | list
                 | record
+                | construction
                 | block
                 | if-expression
                 | match-expression
                 | function-expression
+                | "(", ")"
                 | "(", expression, ")" ;
 
-list            = "[", arguments?, "]" ;
+list            = "[", (arguments | entries)?, "]" ;
+entries         = entry, (",", entry)*, ","? ;
+entry           = expression, ":", expression ;
 record          = "record", "{", record-fields?, "}" ;
 record-fields   = record-field, (",", record-field)*, ","? ;
 record-field    = identifier, ":", expression ;
+
+construction    = contract-name, "{", construction-fields?, "}" ;
+contract-name   = "HttpRequest" | "HttpResponse" | "HttpHeader" | "LogField" ;
+construction-fields
+                = construction-field, (",", construction-field)*, ","? ;
+construction-field
+                = identifier, (":", expression)? ;
 
 if-expression   = "if", expression, block, "else",
                   (block | if-expression) ;
@@ -172,6 +279,26 @@ record-type-field
                 = identifier, ":", type ;
 ```
 
+`()` is the unit value (section 5). A list whose first element is an
+`entry` is an entry list (section 11); every element after it must be an
+entry too, and a list whose first element is a plain expression cannot
+contain one. Mixing the two forms is `K1001` at the first element written the
+other way, with a note. `[]` is the empty list, entry lists included, and
+`[:]` is `K1001`. In a type the unit type is spelled `Unit`: `-> ()` is
+`K1002`, with a note.
+
+A `contract-name` is an ordinary identifier, not a keyword; only these four
+names followed by `{` start a `construction` (section 8.4), and any other
+identifier followed by `{` keeps its meaning. In the condition of an `if` or
+`else if` and in the subject of a `match`, a contract name followed by `{` is
+not a construction either: the `{` opens the `if` block or the match arms, as
+it does after any other name. A construction there must be written inside
+parentheses, a list, a call's argument list, a block, a record or construction
+field, or a match arm: `if (HttpResponse { status: 200 }).status == 200 { ... }`.
+When the tokens after that `{` are a name followed by `:` or `,`, which never
+start a block, the parser reports `K1001` with a note to add the parentheses;
+`if HttpResponse { x } else { y }` remains a condition named `HttpResponse`.
+
 Assignments and mutable bindings do not exist in edition 2026. Neither do
 `return`, loops, classes, modules, `async`, exceptions, indexing, arrow
 functions, the conditional operator, or `switch`; section 4.2 specifies how
@@ -200,9 +327,13 @@ operation; the name does not create an ambient network listener.
 A source file may nest syntax at most **256 levels** deep. Each of the
 following opens one level for what it contains:
 
-- a parenthesized expression, a block, a list literal, and a record literal
+- a parenthesized expression, a block, a list literal (an entry list
+  included), a record literal, a named construction, and an interpolated
+  string or text block, for its holes
 - the argument list of a call, and each call, field-access, or `?` link of a
-  postfix chain (`a.b(c)?.d` opens four levels for what follows `a`)
+  postfix chain (`a.b(c)?.d` opens four levels for what follows `a`),
+  including the field accesses in a hole (`"\(a.b.c)"` opens three levels
+  for `a`: the string and two links)
 - the operand of a unary operator
 - the condition of an `if`, the subject and the arm list of a `match`, and
   the arm of a let-else (section 8.3)
@@ -310,8 +441,11 @@ These constructs are reported wherever they occur:
   conditional operator. Call a `:` a **branch end** for the `?` when it
   follows the `?` at the same bracket depth before the end of the file, a
   closing bracket opened before the `?`, or the first `;`, `,`, or `let` at
-  that depth; no valid program has one, since a first branch contains none of
-  those outside brackets. What follows the `?` decides:
+  that depth, and is not the `:` of an entry: directly inside a list
+  literal's `[`, the first `:` after the `[` or after a `,` separates an
+  entry's key from its value (section 11), so `[pick()?(k): v]` is an entry
+  list. No valid program has a branch end, since a first branch contains
+  none of those outside brackets. What follows the `?` decides:
   - A token that can only start an operand, as above (`ready ? 1 : 2`): the
     `?` is `K1110` when the tokens after it are an expression and then `:`,
     or start an expression that does not parse and a branch end follows
@@ -358,8 +492,10 @@ Items execute in source order.
 - An empty block or a block ending in a statement produces unit.
 - A file's value is not printed automatically.
 
-The unit value is written by the REPL as `()`. There is no unit literal in
-edition 2026; unit is produced by statements and empty blocks.
+The unit value is written `()`, in source and when printed. Statements and
+empty blocks produce it too. `()` evaluates to unit with no effect and is
+valid wherever a value is (`Ok(())`, `if ready { () } else { log() }`). It is
+a value, not a type: the unit type is spelled `Unit`.
 
 ## 6. Values
 
@@ -583,14 +719,14 @@ return when the value is the other variant:
 
 ```krit
 fn failure(error: String) -> HttpResponse {
-    record { status: 502, headers: [], body: error }
+    HttpResponse { status: 502, body: error }
 }
 
 webhook fn handle(request: HttpRequest) -> HttpResponse {
     let Ok(repository) = config_string("reference.repository") else Err(error) => failure(error);
     let Ok(stored) = state_get("agent-work", request.path) else Err(error) => failure(error);
-    let Some(summary) = stored else None => record { status: 404, headers: [], body: "" };
-    record { status: 200, headers: [], body: repository + ": " + summary }
+    let Some(summary) = stored else None => HttpResponse { status: 404 };
+    HttpResponse { status: 200, body: "\(repository): \(summary)" }
 }
 ```
 
@@ -639,10 +775,10 @@ the fix:
 - a pattern nests another variant or list pattern in its payload
   (`let Ok(Some(x)) = ...`): bind the payload, then decide it with another
   let-else or a `match` (section 11), whose patterns nest;
-- its value ends in `}`, such as an `if`, `match`, block, `record`, or
-  anonymous function: in `let Ok(x) = if c { a } else { b } else Err(e) =>
-  ...`, the first `else` would read as part of the let-else. Bind the value
-  with `let` first, or wrap it in parentheses.
+- its value ends in `}`, such as an `if`, `match`, block, `record`, named
+  construction, or anonymous function: in `let Ok(x) = if c { a } else { b }
+  else Err(e) => ...`, the first `else` would read as part of the let-else.
+  Bind the value with `let` first, or wrap it in parentheses.
 
 Unlike `?`, a let-else works in a webhook entrypoint, which returns
 `HttpResponse`, and in any named function whatever its return type. An
@@ -657,6 +793,48 @@ expression, and ends with a verified function exit (`TYPES-AND-EFFECTS.md`,
 "Let-else"), which components lower to a WebAssembly `return`
 (`WASM-SANDBOX.md`). A body of many let-else statements therefore nests no
 deeper than one of them.
+
+## 8.4 Named construction
+
+The contract records `HttpRequest`, `HttpResponse`, `HttpHeader`, and
+`LogField` (section 13.1) can be built by name:
+
+```krit
+let fetch = HttpRequest { method: "GET", path: "/issues/1" };
+let response = HttpResponse { status: 200, body };
+```
+
+A field written as its name alone is punned: `body` means `body: body`, a
+reference to the binding named `body`. Fields may be written in any order, and
+a trailing comma is allowed. A construction may omit a field that has a
+spec-fixed default:
+
+| Contract | Required fields | Defaults of the other fields |
+|---|---|---|
+| `HttpRequest` | `method`, `path` | `query: ""`, `headers: []`, `body: ""` |
+| `HttpResponse` | `status` | `headers: []`, `body: ""` |
+| `HttpHeader` | `name`, `value` | none |
+| `LogField` | `name`, `value` | none |
+
+Writing a field the contract does not have, writing a field more than once, or
+omitting a required field is error `K3016`. The field names are checked before
+any field value: an unknown or repeated field is reported at its name, and
+missing required fields at the type name. Each written value must have its
+contract field's type (`K3001` otherwise; `TYPES-AND-EFFECTS.md`).
+
+The value is exactly the record that `record { ... }` with every contract
+field would build. Its static type is the contract's closed structural record
+type (section 8.1), so it flows anywhere such a record does, including
+`http_request`, webhook results, and log field lists, and it is equal to that
+record. Because the type is structural, `HttpHeader { ... }` and
+`LogField { ... }` have the same type. The written values evaluate from left
+to right in source order. The record lists its fields in the contract's
+declared order (sections 8.1 and 13.1, and the table above), whatever order
+they are written in, and renders in that order
+(`record { status: 200, headers: [], body: "ready" }`). Defaults have no
+source text and perform no evaluation or effect; the compiler supplies them
+directly, without any syntax node. `record { ... }` remains valid for every
+record, including these four.
 
 ## 9. Operators
 
@@ -695,6 +873,27 @@ so `a == b` exactly when neither `a < b` nor `b < a`.
 No implicit conversions occur. In particular, integers and strings are not
 automatically converted for `+`, and non-booleans are not truthy.
 
+## 9.1 Interpolated strings and text blocks
+
+An interpolated string or a text block (section 3) is an expression of type
+`String`: the concatenation of its text and its holes from left to right.
+`"\(method) \(request.path)"` means `method + " " + request.path`, and a
+text block with holes means the same concatenation of its dedented lines.
+
+- Each hole names a value in scope, optionally followed by field accesses,
+  and that value must be a `String`. Any other type is `K3015` at the hole,
+  with one note; for an `Int`, the note shows how to convert it with
+  `int_to_string` (section 12.1) into a name first. There are no implicit
+  conversions (section 9).
+- A hole that names an undefined value is `K2001` at the name, and reading
+  `_` in a hole is the `K2003` warning, as anywhere else.
+- Holes are names, so evaluating one has no effect and the parts' order is
+  never observable.
+- An interpolated string or text block is never a direct string literal, so
+  it is never a capability resource (section 13.1): `config_string("agent.\(key)")`
+  and an adapter name written as a text block are both `K3008`. A text block
+  without holes is not a literal either.
+
 ## 10. Conditionals
 
 ```krit
@@ -719,21 +918,43 @@ let response = record { status: 200, body: "ready" };
 println(response.status);
 ```
 
-The `record` prefix distinguishes a record literal from a block. Fields
+The `record` prefix distinguishes a record literal from a block; a named
+construction (section 8.4) starts with a contract name instead. Fields
 evaluate from left to right. Accessing a field requires a record containing
 that field.
 
 Values have no methods. `value.name(arguments)` reads field `name` of the
 record `value` and calls the function stored there. When `value` has no such
 field, because it is not a record or is a record without that field, checking
-reports the method call (`K3011`) with the standard-library function to use
-instead when there is one, such as `string_byte_len(s)` for `s.len()`.
+reports the method call (`K3011`) with the standard-library function
+(section 12.1) to use instead when there is one, such as `string_byte_len(s)`
+for `s.len()`.
 
 List literal:
 
 ```krit
 [1, 2, 3]
 ```
+
+An **entry list** writes a list of name/value records, such as HTTP headers
+and log fields:
+
+```krit
+["accept": "application/json", "x-request-id": id]
+```
+
+`["k1": v1, "k2": v2]` means
+`[record { name: k1, value: v1 }, record { name: k2, value: v2 }]`. Keys and
+values are arbitrary expressions of type `String` (`K3001` at the key or
+value otherwise, `TYPES-AND-EFFECTS.md`) and evaluate from left to right in
+source order: `k1`, `v1`, `k2`, `v2`. Each record lists `name` and then
+`value`. The list's type is `List<Record { name: String, value: String }>`,
+the closed structural record that `HttpHeader` and `LogField` name (sections
+8.1 and 13.1), so an entry list is a header list for `HttpRequest` and
+`HttpResponse` and a field list for `log_info` and `log_error`, and it is
+equal to the spelled-out list. A trailing comma is allowed. An entry list has
+at least one entry; `[]` is the empty list of every element type. One literal
+cannot mix entries with plain elements (section 4).
 
 The only list decomposition construct in edition 2026 is matching:
 
@@ -832,6 +1053,101 @@ interfaces plus `state.transaction`, `queue.publish`, `object.read`,
 `search.query`, and `search.vector` to typed webhook, queue,
 and schedule artifacts.
 
+## 12.1 Standard library
+
+The standard library is a fixed set of built-in functions. Each is pure: it
+has no effect, needs no capability, and returns the same result for the same
+arguments in every implementation and target. Names are flat, prefixed by the
+kind of value they work on:
+
+| Function | Type |
+|---|---|
+| `int_to_string` | `fn(Int) -> String` |
+| `url_path_segment` | `fn(String) -> Result<String, String>` |
+| `url_query` | `fn(List<Record { name: String, value: String }>) -> String` |
+| `string_byte_len` | `fn(String) -> Int` |
+| `string_is_empty` | `fn(String) -> Bool` |
+| `string_contains` | `fn(String, String) -> Bool` |
+| `string_starts_with` | `fn(String, String) -> Bool` |
+| `string_ends_with` | `fn(String, String) -> Bool` |
+
+They are built-in names (section 2): a `let`, function, or parameter cannot
+reuse one (`K2002`), and a match binder may shadow one (section 7). Like
+every built-in, each is a function value that can be bound and passed;
+component targets require a direct call (`WASM-SANDBOX.md`). Checking
+reports a wrong argument type as `K3001` and a wrong argument count as
+`K3003`. In a checked program no standard-library call ever fails.
+
+- `int_to_string(n)` writes `n` in base ten exactly as `print` does: ASCII
+  digits without separators or leading zeros, preceded by `-` when `n` is
+  negative and by nothing otherwise. `int_to_string(-9223372036854775808)`
+  is `"-9223372036854775808"`.
+- `string_byte_len(s)` is the number of bytes of `s`'s UTF-8 encoding
+  (`string_byte_len("é")` is `2`), and `string_is_empty(s)` is
+  `string_byte_len(s) == 0`.
+- `string_contains(s, part)`, `string_starts_with(s, part)`, and
+  `string_ends_with(s, part)` are true when the UTF-8 bytes of `part` occur
+  contiguously in those of `s`: anywhere, at its start, or at its end. The
+  empty `part` occurs in every string, and a `part` longer than `s` in none.
+  Comparison is byte equality, with no case folding or Unicode
+  normalization (`string_ends_with("e\u{301}", "é")` is `false`). Both
+  strings are valid UTF-8, so a match always begins and ends at character
+  boundaries of `s`.
+- `url_path_segment(text)` percent-encodes `text` as one URL path segment:
+  every byte that is not an RFC 3986 unreserved character (`A`-`Z`, `a`-`z`,
+  `0`-`9`, `-`, `.`, `_`, `~`) is written `%HH` with uppercase hex digits,
+  each byte of a multibyte character on its own (`"octo cat"` gives
+  `"octo%20cat"`, `"café"` gives `"caf%C3%A9"`). It returns `Err` with the
+  first of these messages that applies, and `Ok` with the encoded segment
+  otherwise:
+
+  | Text | `Err` message |
+  |---|---|
+  | empty | `path segment is empty` |
+  | contains `/`, `\`, or an ASCII control character (U+0000-U+001F, U+007F) | ``path segment contains `/`, `\`, or an ASCII control character`` |
+  | contains `%` followed by a hex digit, `u`, or `U` | ``path segment contains `%` followed by a hex digit, `u`, or `U` `` |
+  | its part before the first `;`, `?`, or `#`, with spaces trimmed from both ends, is `.` or `..` | ``path segment reads as `.` or `..` `` |
+
+  These are exactly the texts whose encoding the host path rule refuses
+  (`WEBHOOK-CONTRACTS.md`, "Request paths and queries"), plus the empty
+  text, whose segment would vanish and leave `//` in a path. So every `Ok`
+  segment is accepted by the host wherever it stands between two `/`, and
+  decoding it once gives back `text`; untrusted text fails recoverably,
+  as a value the program handles, instead of making the host refuse the
+  request and trap the invocation. Messages never contain the text. Forms
+  the host rule does not model, such as a fullwidth `．．`, are encoded and
+  accepted.
+- `url_query(entries)` builds a query string: `name=value` for each entry
+  in list order, joined by `&`, with every name and value percent-encoded
+  exactly as `url_path_segment` encodes (a space is `%20`, never `+`), no
+  leading `?`, and `""` for the empty list. Entries may be written as an
+  entry list (`url_query(["q": term, "page": "2"])`, section 11) or be any
+  list of `HttpHeader` or `LogField` records. The result holds only
+  unreserved characters, `%`, hex digits, `=`, and `&`, so the host query
+  rule accepts every result and `url_query` cannot fail.
+
+```krit
+fn issue_request(owner: String, number: Int) -> Result<HttpRequest, String> {
+    let segment = url_path_segment(owner)?;
+    let issue = int_to_string(number);
+    Ok(
+        HttpRequest {
+            method: "GET",
+            path: "/repos/\(segment)/issues/\(issue)",
+            query: url_query(["state": "open"]),
+        },
+    )
+}
+```
+
+A `webhook` entrypoint, where `?` cannot return (section 8.2), binds the
+segment with let-else instead (section 8.3):
+`let Ok(segment) = url_path_segment(owner) else Err(reason) => HttpResponse { status: 400, body: reason };`.
+A path or query built from text that none of these functions encoded is
+warning `K9013` (`DIAGNOSTICS.md`); a segment taken from a
+`url_path_segment` result with `?`, let-else, or a `match` counts as
+encoded.
+
 ## 13. JSON conversion
 
 `json_encode(value)` returns a compact deterministic JSON string.
@@ -908,8 +1224,11 @@ db_commit(transaction) // Result<Unit, String>
 db_rollback(transaction) // Result<Unit, String>
 ```
 
-Config and secret operations require exactly one direct string-literal
-resource argument in canonical-name form (see `CAPABILITIES.md`); a
+A direct string literal is a one-line string without holes (section 3);
+interpolated strings and text blocks never count as one, so a resource must
+be written out in full. Config and secret operations require exactly one
+direct string-literal resource argument in canonical-name form (see
+`CAPABILITIES.md`); a
 configuration key may additionally contain `_`, as in `"agent.timeout_ms"`,
 while a secret name may not. A malformed name is `K3008`. `http_request`
 requires a direct normalized exact-origin literal, an `HttpRequest`, and
@@ -976,7 +1295,9 @@ schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String
 `queue` and `schedule` are contextual keywords: they introduce an entrypoint
 only when directly followed by a canonical name literal and `fn`, so ordinary
 bindings, parameters, and record fields may still be spelled `queue` or
-`schedule`. The declared name is the exact resource of the
+`schedule`. An interpolated string or text block followed by `fn` in the
+name's place is read as a declaration too, and is `K1002` because the name is
+not a direct literal. The declared name is the exact resource of the
 `queue.consume("queue")` or `schedule.trigger("schedule")` requirement.
 
 `QueueJob` is the closed contract
@@ -1035,7 +1356,8 @@ Checking reports these, so a program containing one is never evaluated:
 - `match` arms that mix families at a position, overlap, include a top-level
   catch-all, or leave an outcome unnamed (section 11)
 
-Evaluation reports these:
+Evaluation reports these (standard-library calls in a checked program
+never fail, section 12.1):
 
 - integer literal outside signed 64-bit range
 - integer overflow
@@ -1091,7 +1413,8 @@ syntax. Formatting changes trivia, equivalent literal spellings, and
 grammar-permitted trailing commas, not expression order or program semantics.
 
 - Indentation is four ASCII spaces. Formatter-produced structural whitespace
-  contains no tabs or trailing spaces.
+  contains no tabs or trailing spaces; the content of a text block, which the
+  formatter keeps, may.
 - Output uses LF line endings and exactly one final line feed.
 - Binary operators, `=`, `=>`, `->`, and type/value colons use stable spacing.
   Calls, field access, postfix `?`, unary operators, generic type brackets,
@@ -1111,17 +1434,55 @@ grammar-permitted trailing commas, not expression order or program semantics.
 - Multiline lists, records, parameter lists, argument lists, record types,
   and matches have one item per line and a trailing comma. Single-line forms
   omit a trailing comma.
+- A named construction is laid out like a record literal: on one line when it
+  fits (`HttpResponse { status: 200, body }`), otherwise one field per line
+  with a trailing comma. A field whose value is exactly the identifier with
+  the field's own name is written punned (`body`, from `body` or
+  `body: body`); every other field is written `field: value`, including
+  `body: (body)`. A field keeps its `name: name` spelling when a comment
+  stands between the name and the value, so no comment moves. Record literals
+  are never punned.
+- An entry list is laid out like a list: on one line when it fits
+  (`["x-a": a, "x-b": b]`), otherwise one entry per line with a trailing
+  comma. Each entry is written `key: value`, with no space before the `:` and
+  one after it.
+- The unit value is written `()`, with nothing between its parentheses.
+- Each line of a doc comment (section 2.1) is written with exactly one space
+  between its `///` and its text, or as `///` alone when the line has no
+  text; the text after that one space, further indentation and trailing
+  whitespace included, is kept as written (`///Adds.` becomes `/// Adds.`,
+  `///   code` keeps its indentation). A `///` comment that documents
+  nothing keeps its exact text, as every other comment does. As before any
+  comment, blank lines between a doc comment and its item are removed, which
+  never changes the doc comment.
 - Top-level declarations are separated from executable expression statements
   by one blank line.
 - Integer separators are removed. Strings use direct printable Unicode plus
   `\"`, `\\`, `\n`, `\r`, `\t`, `\0`, or lowercase `\u{...}` escapes for
-  required control characters.
+  required control characters. The text of an interpolated string is written
+  the same way, and each hole exactly as written (`\(request.path)`).
+- A text block keeps its delimiters and its content lines exactly as written
+  after their indentation, holes, escapes, quotes, tabs, and trailing
+  whitespace included; only the indentation changes. The content lines and
+  the closing `"""` are indented one level deeper than the line the block
+  opens on, or at the opening `"""`'s own indentation when it starts its
+  line, and an empty content line stays empty. Within its line a text block
+  is as wide as its opening `"""`, so an argument list or construction that
+  holds one can stay on one line around it:
+
+  ```krit
+  let reply = ai_invoke("reviewer", """
+      Classify: \(request.path)
+      """);
+  ```
 - Parentheses from the input are retained, including every pair needed to
   preserve evaluation order.
 - Every `//` comment and its text is retained in source order. Standalone
   comments remain standalone, and end-of-line comments remain after code so
   they cannot comment out a following token. Whitespace inside comment text is
-  not rewritten.
+  not rewritten, apart from the one space after a doc comment's `///` (above).
+  Formatting therefore never attaches a doc comment to an item or detaches
+  one from it.
 
 The formatter uses a soft 100-column target. It wraps delimiter-based
 collections and signatures deterministically; an indivisible string, comment,

@@ -1,0 +1,9 @@
+// `string_byte_len` counts UTF-8 bytes, not characters.
+println(string_byte_len(""));
+println(string_byte_len("krit"));
+println(string_byte_len("é"));
+println(string_byte_len("€"));
+println(string_byte_len("😀"));
+println(string_byte_len("日本語"));
+println(string_byte_len("a\nb"));
+println(string_byte_len("hi " + "there"));

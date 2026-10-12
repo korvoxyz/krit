@@ -1,5 +1,6 @@
 use crate::{
-    Block, Expression, ExpressionKind, Program, Span, Statement, StatementKind, ValueLiteral,
+    Block, Expression, ExpressionKind, Program, Span, Statement, StatementKind, StringPart,
+    ValueLiteral,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -159,12 +160,27 @@ fn collect_expression<'a>(
     facts: &mut Vec<DurableOperationFact>,
 ) {
     match &expression.kind {
-        ExpressionKind::Literal(_) | ExpressionKind::Variable(_) => {}
+        ExpressionKind::Literal(_) | ExpressionKind::Unit | ExpressionKind::Variable(_) => {}
+        ExpressionKind::Interpolation(parts) => {
+            pending.extend(parts.iter().filter_map(|part| match part {
+                StringPart::Hole { value, .. } => Some(Pending::Expression(value)),
+                StringPart::Text { .. } => None,
+            }));
+        }
         ExpressionKind::List(elements) => {
             pending.extend(elements.iter().map(Pending::Expression));
         }
         ExpressionKind::Record(fields) => {
             pending.extend(fields.iter().map(|field| Pending::Expression(&field.value)));
+        }
+        ExpressionKind::Construct { fields, .. } => {
+            pending.extend(fields.iter().map(|field| Pending::Expression(&field.value)));
+        }
+        ExpressionKind::EntryList(entries) => {
+            for entry in entries {
+                pending.push(Pending::Expression(&entry.key));
+                pending.push(Pending::Expression(&entry.value));
+            }
         }
         ExpressionKind::FieldAccess { value, .. } => pending.push(Pending::Expression(value)),
         ExpressionKind::Block(block) => pending.push(Pending::Block(block)),

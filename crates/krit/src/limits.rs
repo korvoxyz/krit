@@ -12,8 +12,9 @@ use crate::{Diagnostic, Span};
 
 /// Maximum syntactic nesting depth of a source file (`K1005`).
 ///
-/// Parenthesized expressions, blocks, list and record literals, call argument
-/// lists, field-access, call, and `?` links, unary operands, `if` conditions,
+/// Parenthesized expressions, blocks, list and record literals, named
+/// constructions, interpolated strings and text blocks, call argument lists,
+/// field-access, call, and `?` links, unary operands, `if` conditions,
 /// `match` subjects and arms, let-else arms, the payloads of variant patterns,
 /// and type argument lists each open one level, and a `match` arm's value
 /// opens one more for each variant or list pattern nested in a payload of its

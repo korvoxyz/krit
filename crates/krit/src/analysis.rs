@@ -10,11 +10,12 @@ use krit_capability::{HttpOrigin, is_valid_config_key, is_valid_resource_name};
 use crate::{
     Builtin, Diagnostic, Span,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, MatchArm, Parameter, Pattern,
-        PatternKind, Program, Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator,
-        ValueLiteral, VariantArm, VariantFamily, VariantName, VariantPattern,
+        BinaryOperator, Block, ConstructField, ContractRecord, Expression, ExpressionKind,
+        ListEntry, MatchArm, Parameter, Pattern, PatternKind, Program, Statement, StatementKind,
+        StringPart, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral, VariantArm,
+        VariantFamily, VariantName, VariantPattern,
     },
-    habits::{MethodReceiver, method_hint, undefined_name_note},
+    habits::{MethodReceiver, closest_name, method_hint, undefined_name_note},
     limits::{MAX_NESTING_DEPTH, MAX_TREE_DEPTH, tree_depth_error},
     patterns,
 };
@@ -471,6 +472,10 @@ impl RecordType {
     pub fn ty(&self) -> &Type {
         self.ty.as_ref()
     }
+
+    pub(crate) fn shared_type(&self) -> Arc<Type> {
+        Arc::clone(&self.ty)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -740,11 +745,16 @@ pub struct AnalysisReport {
 }
 
 /// Analyzes `program` exactly as [`analyze`] does and also returns the
-/// warnings found, whether analysis succeeds or fails.
+/// warnings found, whether analysis succeeds or fails. The lints
+/// (`K9000`-`K9999`) need the complete analysis, so they run only when
+/// analysis succeeds.
 pub fn analyze_with_warnings(program: &Program) -> AnalysisReport {
     let mut analyzer = Analyzer::new();
     let result = analyzer.program(program);
     let mut warnings = analyzer.warnings;
+    if let Ok(analysis) = &result {
+        warnings.extend(crate::lint::lint(program, analysis));
+    }
     warnings.sort_by(|left, right| {
         left.span()
             .cmp(&right.span())
@@ -1288,12 +1298,14 @@ impl Analyzer {
                 parameters,
                 return_type,
                 body,
+                ..
             }
             | StatementKind::Webhook {
                 name,
                 parameters,
                 return_type,
                 body,
+                ..
             }
             | StatementKind::QueueConsumer {
                 name,
@@ -1620,6 +1632,7 @@ impl Analyzer {
                 },
                 effects: InferEffects::default(),
             }),
+            ExpressionKind::Interpolation(parts) => self.interpolation(parts),
             ExpressionKind::Variable(name) => {
                 let (ty, resolution) = self.lookup(name, expression.span)?;
                 if name == DISCARD && matches!(resolution, ResolvedName::Symbol(_)) {
@@ -1674,7 +1687,12 @@ impl Analyzer {
                     effects: InferEffects::default(),
                 })
             }
+            ExpressionKind::Unit => Ok(ExpressionInfo {
+                ty: InferType::Unit,
+                effects: InferEffects::default(),
+            }),
             ExpressionKind::List(elements) => self.list(elements),
+            ExpressionKind::EntryList(entries) => self.entry_list(entries),
             ExpressionKind::Record(fields) => {
                 let mut types = BTreeMap::new();
                 let mut effects = InferEffects::default();
@@ -1702,6 +1720,11 @@ impl Analyzer {
                     effects,
                 })
             }
+            ExpressionKind::Construct {
+                contract,
+                contract_span,
+                fields,
+            } => self.construction(*contract, *contract_span, fields),
             ExpressionKind::FieldAccess { value, field } => {
                 let called = self.method_callee.take() == Some(expression.span);
                 let receiver = value;
@@ -1764,6 +1787,57 @@ impl Analyzer {
             effects: info.effects.clone(),
             resolved_name,
         });
+    }
+
+    /// Analyzes a named construction such as `HttpResponse { status: 200 }`.
+    ///
+    /// The field set is checked first (`K3016`). Each written value is then
+    /// analyzed in source order and must have its contract field's type. The
+    /// construction has exactly the closed structural record type that
+    /// `record { ... }` with every contract field would have; the omitted
+    /// fields take their spec-fixed defaults, whose types are the contract
+    /// field types, so they need no syntax node and no expression fact.
+    fn construction(
+        &mut self,
+        contract: ContractRecord,
+        contract_span: Span,
+        fields: &[ConstructField],
+    ) -> Result<ExpressionInfo, Diagnostic> {
+        check_construction_fields(contract, contract_span, fields)?;
+        let InferType::Record {
+            fields: contract_fields,
+            ..
+        } = contract_record(&contract_nominal(contract))
+        else {
+            unreachable!("built-in record contracts normalize to records")
+        };
+        let mut effects = InferEffects::default();
+        for field in fields {
+            let value = self.expression(&field.value)?;
+            self.constraints.push(TypeConstraint {
+                ty: value.ty.clone(),
+                span: field.value.span,
+                kind: ConstraintKind::StructuralValue,
+            });
+            let expected = contract_fields
+                .get(&field.name)
+                .cloned()
+                .expect("checked construction fields belong to their contract");
+            self.unify(
+                expected,
+                value.ty,
+                field.value.span,
+                &format!("`{}` field `{}`", contract.name(), field.name),
+            )?;
+            effects.union(value.effects);
+        }
+        Ok(ExpressionInfo {
+            ty: InferType::Record {
+                fields: contract_fields,
+                open: false,
+            },
+            effects,
+        })
     }
 
     /// Analyzes an `if` expression and its whole `else if` chain.
@@ -1854,6 +1928,99 @@ impl Analyzer {
         }
         Ok(ExpressionInfo {
             ty: InferType::List(Box::new(element_type)),
+            effects,
+        })
+    }
+
+    /// Analyzes an interpolated string or text block.
+    ///
+    /// Each hole's value is analyzed in source order and must be a `String`
+    /// (`K3015` at the hole otherwise). The string has type `String`, and its
+    /// effects and literal requirements are its holes', which are names and
+    /// field accesses and so have none.
+    fn interpolation(&mut self, parts: &[StringPart]) -> Result<ExpressionInfo, Diagnostic> {
+        let mut effects = InferEffects::default();
+        for part in parts {
+            let StringPart::Hole { value, span } = part else {
+                continue;
+            };
+            let info = self.expression(value)?;
+            if self
+                .unify_inner(InferType::String, info.ty.clone(), *span)
+                .is_err()
+            {
+                return Err(self
+                    .type_depth_error
+                    .take()
+                    .unwrap_or_else(|| self.hole_type_error(value, &info.ty, *span)));
+            }
+            effects.union(info.effects);
+        }
+        Ok(ExpressionInfo {
+            ty: InferType::String,
+            effects,
+        })
+    }
+
+    /// The error for the interpolation hole at `span` whose value `value` has
+    /// type `ty`, which is not `String` (`K3015`, always with one note).
+    fn hole_type_error(&self, value: &Expression, ty: &InferType, span: Span) -> Diagnostic {
+        let path = receiver_path(value);
+        let message = format!(
+            "{} has type `{}`, but a hole must be a `String`",
+            path.as_ref().map_or_else(
+                || "this interpolation hole".to_owned(),
+                |path| format!("interpolation hole `{path}`")
+            ),
+            self.render_type(ty)
+        );
+        let note = match self.resolve_head(ty) {
+            InferType::Int => {
+                let path = path.as_deref().unwrap_or("value");
+                let name = path.rsplit('.').next().unwrap_or(path);
+                format!(
+                    "convert it first, as in `let {name}_text = int_to_string({path});`, then \
+                     write `\\({name}_text)`"
+                )
+            }
+            InferType::Secret => "a `Secret` is opaque and never becomes text".to_owned(),
+            InferType::Option(_) | InferType::Result(_, _) => {
+                "match the value first and interpolate the `String` it holds".to_owned()
+            }
+            _ => "a hole inserts text: bind a `String` to a name and interpolate that name"
+                .to_owned(),
+        };
+        Diagnostic::new("K3015", message, span).with_note(note)
+    }
+
+    /// Analyzes an entry list `["k": v, ...]`.
+    ///
+    /// Every key and value must be a `String`; they are analyzed in source
+    /// order (`k1`, `v1`, `k2`, ...). The list has exactly the type of
+    /// `[record { name: k, value: v }, ...]` with `String` fields, the closed
+    /// structural record that `HttpHeader` and `LogField` name.
+    fn entry_list(&mut self, entries: &[ListEntry]) -> Result<ExpressionInfo, Diagnostic> {
+        let mut effects = InferEffects::default();
+        for entry in entries {
+            for (part, context) in [(&entry.key, "entry key"), (&entry.value, "entry value")] {
+                let info = self.expression(part)?;
+                self.constraints.push(TypeConstraint {
+                    ty: info.ty.clone(),
+                    span: part.span,
+                    kind: ConstraintKind::StructuralValue,
+                });
+                self.unify(InferType::String, info.ty, part.span, context)?;
+                effects.union(info.effects);
+            }
+        }
+        Ok(ExpressionInfo {
+            ty: InferType::List(Box::new(InferType::Record {
+                fields: BTreeMap::from([
+                    ("name".to_owned(), InferType::String),
+                    ("value".to_owned(), InferType::String),
+                ]),
+                open: false,
+            })),
             effects,
         })
     }
@@ -3692,7 +3859,7 @@ impl Analyzer {
     ///
     /// Krit values have no methods; `value.name(...)` is valid only as a call
     /// of a function stored in a record field. The note names the standard
-    /// library function that does the job when one exists or is planned.
+    /// library function that does the job when one exists.
     fn method_call_error(
         &self,
         receiver_type: &InferType,
@@ -4154,6 +4321,48 @@ impl Analyzer {
                     effect,
                 }
             }
+            // The standard library is pure: no effect and no requirement.
+            Builtin::IntToString => InferType::Function {
+                parameters: vec![InferType::Int],
+                return_type: Box::new(InferType::String),
+                effect: self.fresh_effect(),
+            },
+            Builtin::UrlPathSegment => InferType::Function {
+                parameters: vec![InferType::String],
+                return_type: Box::new(InferType::Result(
+                    Box::new(InferType::String),
+                    Box::new(InferType::String),
+                )),
+                effect: self.fresh_effect(),
+            },
+            Builtin::UrlQuery => InferType::Function {
+                parameters: vec![InferType::List(Box::new(InferType::Record {
+                    fields: BTreeMap::from([
+                        ("name".to_owned(), InferType::String),
+                        ("value".to_owned(), InferType::String),
+                    ]),
+                    open: false,
+                }))],
+                return_type: Box::new(InferType::String),
+                effect: self.fresh_effect(),
+            },
+            Builtin::StringByteLen => InferType::Function {
+                parameters: vec![InferType::String],
+                return_type: Box::new(InferType::Int),
+                effect: self.fresh_effect(),
+            },
+            Builtin::StringIsEmpty => InferType::Function {
+                parameters: vec![InferType::String],
+                return_type: Box::new(InferType::Bool),
+                effect: self.fresh_effect(),
+            },
+            Builtin::StringContains | Builtin::StringStartsWith | Builtin::StringEndsWith => {
+                InferType::Function {
+                    parameters: vec![InferType::String, InferType::String],
+                    return_type: Box::new(InferType::Bool),
+                    effect: self.fresh_effect(),
+                }
+            }
         };
         Some((ty, ResolvedName::Builtin(builtin)))
     }
@@ -4534,6 +4743,128 @@ fn contract_record(nominal: &InferType) -> InferType {
     InferType::Record {
         fields,
         open: false,
+    }
+}
+
+/// The built-in nominal type that `contract` constructs a record of.
+const fn contract_nominal(contract: ContractRecord) -> InferType {
+    match contract {
+        ContractRecord::HttpRequest => InferType::HttpRequest,
+        ContractRecord::HttpResponse => InferType::HttpResponse,
+        ContractRecord::HttpHeader => InferType::HttpHeader,
+        ContractRecord::LogField => InferType::LogField,
+    }
+}
+
+/// Checks the written field names of a named construction (`K3016`): each
+/// must belong to the contract and be written once, and every required field
+/// must be written. Fields are checked in source order, and a missing field
+/// is reported at the type name after every written field has been checked.
+pub(crate) fn check_construction_fields(
+    contract: ContractRecord,
+    contract_span: Span,
+    fields: &[ConstructField],
+) -> Result<(), Diagnostic> {
+    let name = contract.name();
+    let all_fields = || {
+        format!(
+            "`{name}` has the fields {}",
+            code_list(contract.fields().iter().map(|field| field.name))
+        )
+    };
+    let mut written = BTreeSet::new();
+    for field in fields {
+        if contract.field(&field.name).is_none() {
+            let note = match closest_name(
+                &field.name,
+                contract.fields().iter().map(|field| field.name),
+            ) {
+                Some(candidate) => format!("did you mean `{candidate}`? {}", all_fields()),
+                None => all_fields(),
+            };
+            return Err(Diagnostic::new(
+                "K3016",
+                format!("`{name}` has no field `{}`", field.name),
+                field.name_span,
+            )
+            .with_note(note));
+        }
+        if !written.insert(field.name.as_str()) {
+            return Err(Diagnostic::new(
+                "K3016",
+                format!(
+                    "field `{}` is written more than once in `{name} {{ ... }}`",
+                    field.name
+                ),
+                field.name_span,
+            )
+            .with_note(format!("write each field once; {}", all_fields())));
+        }
+    }
+    let missing = contract
+        .fields()
+        .iter()
+        .filter(|field| field.default.is_none() && !written.contains(field.name))
+        .map(|field| field.name)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let required = contract
+        .fields()
+        .iter()
+        .filter(|field| field.default.is_none())
+        .map(|field| field.name);
+    let defaults = contract
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            field
+                .default
+                .map(|default| format!("`{}` defaults to `{}`", field.name, default.as_source()))
+        })
+        .collect::<Vec<_>>();
+    let note = if defaults.is_empty() {
+        format!(
+            "`{name}` requires {} and has no defaults",
+            code_list(required)
+        )
+    } else {
+        format!(
+            "`{name}` requires {}; {}",
+            code_list(required),
+            prose_list(defaults)
+        )
+    };
+    Err(Diagnostic::new(
+        "K3016",
+        format!(
+            "`{name} {{ ... }}` is missing required {} {}",
+            if missing.len() == 1 {
+                "field"
+            } else {
+                "fields"
+            },
+            code_list(missing.iter().copied())
+        ),
+        contract_span,
+    )
+    .with_note(note))
+}
+
+/// Joins names as code spans in an English list: "`a`", "`a` and `b`", or
+/// "`a`, `b`, and `c`".
+fn code_list<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    prose_list(names.into_iter().map(|name| format!("`{name}`")).collect())
+}
+
+/// Joins phrases in an English list with a serial comma.
+fn prose_list(items: Vec<String>) -> String {
+    match items.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
     }
 }
 
@@ -6474,5 +6805,380 @@ mod tests {
                 .to_string(),
             "String"
         );
+    }
+
+    #[test]
+    fn named_construction_has_the_structural_type_of_the_full_record() {
+        let analysis = check(
+            r#"
+            let body = "ready";
+            let response = HttpResponse { status: 200, body };
+            let explicit = record { status: 200, headers: [], body: "ready" };
+            let same = response == explicit;
+            let request = HttpRequest { method: "GET", path: "/x" };
+            let header = HttpHeader { name: "accept", value: "text/plain" };
+            let field = LogField { name: "k", value: "v" };
+            let full = HttpRequest {
+                body,
+                headers: [HttpHeader { name: "a", value: "b" }],
+                query: "",
+                path: "/",
+                method: "POST",
+            };
+            fn status(value: HttpResponse) -> Int { value.status }
+            let code = status(HttpResponse { status: 204 });
+            let accepted: List<HttpHeader> = [LogField { name: "k", value: "v" }];
+            "#,
+        )
+        .expect("constructions should check");
+        let types = analysis
+            .bindings()
+            .iter()
+            .map(|binding| (binding.name().to_owned(), binding.ty().to_string()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            types["response"],
+            "Record { body: String, headers: List<HttpHeader>, status: Int }"
+        );
+        assert_eq!(
+            types["request"],
+            "Record { body: String, headers: List<HttpHeader>, method: String, path: String, query: String }"
+        );
+        assert_eq!(types["full"], types["request"]);
+        assert_eq!(types["header"], "Record { name: String, value: String }");
+        assert_eq!(types["field"], types["header"]);
+        assert_eq!(types["same"], "Bool");
+
+        // The punned field's value is a resolved reference to the binding.
+        let text = "let body = \"x\";\nlet r = HttpResponse { status: 1, body };";
+        let analysis = check(text).expect("punning should check");
+        let start = text.rfind("body").expect("punned field");
+        let fact = analysis
+            .expression(Span::new(start, start + 4))
+            .expect("the punned value has an expression fact");
+        assert_eq!(
+            fact.resolved_name(),
+            Some(ResolvedName::Symbol(analysis.bindings()[0].id()))
+        );
+    }
+
+    #[test]
+    fn named_construction_values_carry_effects_and_requirements() {
+        let analysis = check(
+            r#"
+            fn respond() -> HttpResponse {
+                HttpResponse {
+                    status: 200,
+                    body: match config_string("agent.greeting") {
+                        Ok(text) => text,
+                        Err(error) => error,
+                    },
+                }
+            }
+            "#,
+        )
+        .expect("an effectful field value should check");
+        let Type::Function(function) = analysis.bindings()[0].ty() else {
+            panic!("respond should be a function");
+        };
+        assert!(function.effects().contains(&Effect::ConfigRead));
+        assert!(
+            function
+                .requirements()
+                .contains(&CapabilityRequirement::new(
+                    Effect::ConfigRead,
+                    "agent.greeting"
+                ))
+        );
+    }
+
+    #[test]
+    fn reports_unknown_duplicate_and_missing_construction_fields() {
+        for (text, message, note) in [
+            (
+                "let r = HttpResponse { stauts: 200 };",
+                "`HttpResponse` has no field `stauts`",
+                "did you mean `status`? `HttpResponse` has the fields `status`, `headers`, and `body`",
+            ),
+            (
+                "let r = HttpHeader { name: \"a\", value: \"b\", extra: 1 };",
+                "`HttpHeader` has no field `extra`",
+                "`HttpHeader` has the fields `name` and `value`",
+            ),
+            (
+                "let r = HttpResponse { status: 1, body: \"a\", body: \"b\" };",
+                "field `body` is written more than once in `HttpResponse { ... }`",
+                "write each field once; `HttpResponse` has the fields `status`, `headers`, and `body`",
+            ),
+            (
+                "let r = HttpRequest { method: \"GET\" };",
+                "`HttpRequest { ... }` is missing required field `path`",
+                "`HttpRequest` requires `method` and `path`; `query` defaults to `\"\"`, \
+                 `headers` defaults to `[]`, and `body` defaults to `\"\"`",
+            ),
+            (
+                "let r = HttpResponse { body: \"x\" };",
+                "`HttpResponse { ... }` is missing required field `status`",
+                "`HttpResponse` requires `status`; `headers` defaults to `[]` and `body` \
+                 defaults to `\"\"`",
+            ),
+            (
+                "let r = LogField {};",
+                "`LogField { ... }` is missing required fields `name` and `value`",
+                "`LogField` requires `name` and `value` and has no defaults",
+            ),
+        ] {
+            let (code, actual, notes) = error_notes(text);
+            assert_eq!(code, "K3016", "{text}");
+            assert_eq!(actual, message, "{text}");
+            assert_eq!(notes, [note], "{text}");
+        }
+
+        // The unknown field is reported at its name, a missing field at the
+        // type name, and the field set before any value is analyzed.
+        let error = check("let r = HttpResponse { status: missing, stauts: 1 };")
+            .expect_err("unknown field");
+        assert_eq!(error.code(), "K3016");
+        assert_eq!(error.span(), Span::new(40, 46));
+        let error = check("let r = HttpRequest {\n    method: \"GET\",\n};").expect_err("missing");
+        assert_eq!(error.span(), Span::new(8, 19));
+    }
+
+    #[test]
+    fn construction_values_must_have_their_contract_field_types() {
+        let error = check("let r = HttpResponse { status: \"200\" };").expect_err("mismatch");
+        assert_eq!(error.code(), "K3001");
+        assert_eq!(error.span(), Span::new(31, 36));
+        assert_eq!(
+            error.message(),
+            "`HttpResponse` field `status` type mismatch: expected `Int`, found `String`"
+        );
+        let error = check("let r = HttpRequest { method: \"GET\", path: \"/\", headers: [1] };")
+            .expect_err("mismatch");
+        assert_eq!(error.code(), "K3001");
+        let error =
+            check("let s = secret(\"token\");\nlet r = HttpResponse { status: 1, body: s };")
+                .expect_err("a secret result is not a body");
+        assert_eq!(error.code(), "K3001");
+    }
+
+    #[test]
+    fn interpolation_is_a_string_and_records_each_hole_at_its_own_span() {
+        let text = "fn line(user, id: String) {\n    \"\\(user.name) #\\(id)\"\n}\n\
+                    let shown = line(record { name: \"Ada\" }, \"7\");\n";
+        let analysis = check(text).expect("interpolation should analyze");
+        let line = &analysis.bindings()[0];
+        assert_eq!(
+            line.ty().to_string(),
+            "fn(Record { name: String }, String) -> String effects {}"
+        );
+        let span_of = |needle: &str| {
+            let start = text.find(needle).expect("needle should occur");
+            Span::new(start, start + needle.len())
+        };
+        let string = span_of("\"\\(user.name) #\\(id)\"");
+        assert_eq!(
+            analysis.expression(string).map(|fact| fact.ty()),
+            Some(&Type::String)
+        );
+        for (needle, ty) in [("user.name", "String"), ("id", "String")] {
+            let start = text[string.start..].find(needle).expect("hole") + string.start;
+            let fact = analysis
+                .expression(Span::new(start, start + needle.len()))
+                .expect("each hole value has a fact");
+            assert_eq!(fact.ty().to_string(), ty);
+        }
+        assert!(
+            analysis
+                .expressions()
+                .windows(2)
+                .all(|window| window[0].span() < window[1].span())
+        );
+    }
+
+    #[test]
+    fn a_hole_that_is_not_a_string_is_k3015_with_one_note() {
+        for (text, message, note, hole) in [
+            (
+                "let count = 3;\nlet s = \"n=\\(count)\";",
+                "interpolation hole `count` has type `Int`",
+                "let count_text = int_to_string(count);",
+                "\\(count)",
+            ),
+            (
+                "let issue = record { number: 7 };\nlet s = \"\\(issue.number)\";",
+                "interpolation hole `issue.number` has type `Int`",
+                "let number_text = int_to_string(issue.number);",
+                "\\(issue.number)",
+            ),
+            (
+                "let title = Some(\"a\");\nlet s = \"\\(title)\";",
+                "has type `Option<String>`",
+                "match the value first",
+                "\\(title)",
+            ),
+            (
+                "let s = secret(\"token\");\nlet t = \"\\(s)\";",
+                "has type `Result<Secret, String>`",
+                "match the value first",
+                "\\(s)",
+            ),
+            (
+                "fn f(token: Secret) -> String { \"\\(token)\" }",
+                "has type `Secret`",
+                "opaque",
+                "\\(token)",
+            ),
+            (
+                "let flag = true;\nlet s = \"\\(flag)\";",
+                "has type `Bool`",
+                "bind a `String` to a name",
+                "\\(flag)",
+            ),
+            (
+                "let s = \"\\(println)\";",
+                "has type `fn(",
+                "bind a `String` to a name",
+                "\\(println)",
+            ),
+            (
+                "fn f(n) { let a = n + 1; \"\\(n)\" }",
+                "interpolation hole `n` has type `Int`",
+                "let n_text = int_to_string(n);",
+                "\\(n)",
+            ),
+        ] {
+            let error = check(text).expect_err("a non-String hole should fail");
+            assert_eq!(error.code(), "K3015", "{text}");
+            assert!(
+                error.message().contains(message),
+                "{text}: {}",
+                error.message()
+            );
+            assert_eq!(error.notes().len(), 1, "{text}");
+            assert!(
+                error.notes()[0].contains(note),
+                "{text}: {:?}",
+                error.notes()
+            );
+            assert_eq!(&text[error.span().start..error.span().end], hole, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_hole_fixes_an_inferred_type_to_string() {
+        let error = check("fn f(n) { \"\\(n)\" }\nlet x = f(1);")
+            .expect_err("calling with an Int should fail");
+        assert_eq!(error.code(), "K3001");
+        let error = check("fn f(r) { let a = r.count + 1; \"\\(r.count)\" }")
+            .expect_err("an Int field should fail");
+        assert_eq!(error.code(), "K3015");
+    }
+
+    #[test]
+    fn interpolated_strings_and_text_blocks_are_never_resource_literals() {
+        for text in [
+            "let key = \"model\";\nlet v = config_string(\"agent.\\(key)\");",
+            "let v = config_string(\"\"\"\n    agent.model\n    \"\"\");",
+            "let id = \"reviewer\";\nfn f(x: String) { ai_invoke(\"\\(id)\", x) }",
+            "fn f() { log_info(\"\"\"\n    review.started\n    \"\"\", []) }",
+            "fn f() { state_get(\"\"\"\n    agent-work\n    \"\"\", \"k\") }",
+            "let o = \"https://example.com\";\n\
+             fn f(r: HttpRequest) { http_request(\"\\(o)\", r, None) }",
+        ] {
+            let error = check(text).expect_err("a template resource should fail");
+            assert_eq!(error.code(), "K3008", "{text}");
+            let template = text.rfind("(\"").map(|index| index + 1).expect("call");
+            assert_eq!(error.span().start, template, "{text}");
+        }
+        check("let v = config_string(\"agent.model\");").expect("a literal resource is valid");
+    }
+
+    #[test]
+    fn types_the_standard_library_as_pure_functions() {
+        let analysis = check(
+            r#"
+            let text = int_to_string(-7);
+            let segment = url_path_segment(text);
+            let query = url_query(["q": text]);
+            let headers: List<HttpHeader> = [HttpHeader { name: "a", value: "b" }];
+            let from_headers = url_query(headers);
+            let fields = url_query([LogField { name: "k", value: "v" }]);
+            let length = string_byte_len(text);
+            let empty = string_is_empty(text);
+            let found = string_contains(text, "7") && string_starts_with(text, "-")
+                && string_ends_with(text, "7");
+            let search = string_contains;
+            "#,
+        )
+        .expect("standard library calls should check");
+        let binding = |name: &str| {
+            analysis
+                .bindings()
+                .iter()
+                .find(|binding| binding.name() == name)
+                .unwrap_or_else(|| panic!("binding `{name}`"))
+                .ty()
+                .to_string()
+        };
+        for (name, ty) in [
+            ("text", "String"),
+            ("segment", "Result<String, String>"),
+            ("query", "String"),
+            ("from_headers", "String"),
+            ("fields", "String"),
+            ("length", "Int"),
+            ("empty", "Bool"),
+            ("found", "Bool"),
+            ("search", "fn(String, String) -> Bool effects {}"),
+        ] {
+            assert_eq!(binding(name), ty, "{name}");
+        }
+        assert!(analysis.effects().is_empty());
+        assert!(analysis.requirements().is_empty());
+        for builtin in Builtin::STANDARD_LIBRARY {
+            assert_eq!(builtin.category(), crate::BuiltinCategory::StandardLibrary);
+        }
+    }
+
+    #[test]
+    fn standard_library_arguments_must_have_their_types() {
+        for (text, code) in [
+            ("int_to_string(\"1\");", "K3001"),
+            ("url_path_segment(1);", "K3001"),
+            ("url_query([\"a\"]);", "K3001"),
+            ("url_query([record { name: \"a\" }]);", "K3001"),
+            ("url_query([record { name: \"a\", value: 1 }]);", "K3001"),
+            ("string_byte_len([]);", "K3001"),
+            ("string_contains(\"a\", 1);", "K3001"),
+            ("let n: String = string_byte_len(\"a\");", "K3001"),
+            ("string_starts_with(\"a\");", "K3003"),
+            (
+                "let secret_text = match secret(\"token\") { Ok(value) => string_byte_len(value), Err(error) => 0 };",
+                "K3001",
+            ),
+        ] {
+            let error = check(text).expect_err("a mistyped call should fail");
+            assert_eq!(error.code(), code, "{text}");
+        }
+    }
+
+    #[test]
+    fn standard_library_names_are_built_in() {
+        for text in [
+            "let int_to_string = 1;",
+            "fn url_query(items) { items }",
+            "fn f(string_contains) { string_contains }",
+        ] {
+            let error = check(text).expect_err("a built-in name cannot be declared");
+            assert_eq!(error.code(), "K2002", "{text}");
+        }
+        // As for every built-in the parser does not reserve, a match binder
+        // may reuse the name within its arm.
+        check("let n = match Some(1) { Some(string_byte_len) => string_byte_len, None => 0 };")
+            .expect("a match binder may shadow a standard-library name");
+        let error = check("let n = string_byte_lenn(\"a\");").expect_err("a typo is undefined");
+        assert_eq!(error.code(), "K2001");
+        assert_eq!(error.notes(), ["did you mean `string_byte_len`?"]);
     }
 }

@@ -48,7 +48,35 @@ fn analysis_code(source: &Source) -> Result<(), &'static str> {
 #[test]
 fn formatting_fixtures_are_canonical_and_idempotent() {
     let root = repository_root().join("conformance/format");
-    for fixture in ["comments", "edition-2026", "webhook"] {
+    let fixtures = [
+        "comments",
+        "cross-features",
+        "doc-comments",
+        "edition-2026",
+        "entry-lists",
+        "interpolation",
+        "let-else",
+        "named-construction",
+        "patterns",
+        "propagate",
+        "text-blocks",
+        "unit-literal",
+        "webhook",
+    ];
+    // Every fixture directory is listed, so none is skipped.
+    let mut directories = fs::read_dir(&root)
+        .expect("formatter fixtures should be readable")
+        .map(|entry| {
+            entry
+                .expect("fixture entry should be readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    directories.sort();
+    assert_eq!(directories, fixtures);
+    for fixture in fixtures {
         let directory = root.join(fixture);
         let input = fs::read_to_string(directory.join("input.krit"))
             .expect("formatter input should be readable");
@@ -200,6 +228,31 @@ fn deterministic_generated_corpus_preserves_formatting_properties() {
                 .to_owned(),
         ),
         (
+            "named-construction-punning".to_owned(),
+            "let status = 1;\nlet body = \"x\";\nlet r = HttpResponse{status:status,body:body,};\nlet c = HttpResponse { status: // pinned\nstatus };\n"
+                .to_owned(),
+        ),
+        (
+            "entry-lists".to_owned(),
+            "let a = \"1\";\nlet fields = [\"x-a\":a,\"x-b\":a+a,];\nlet commented = [ // pinned\n\"k\": a ];\n"
+                .to_owned(),
+        ),
+        (
+            "doc-comments".to_owned(),
+            "///Doc.\n///\n///   kept\n\nfn documented()->Int{1}\n//// banner\n/// dangling\nlet x = 1; ///inline\n"
+                .to_owned(),
+        ),
+        (
+            "interpolation".to_owned(),
+            "let who=record{name:\"Ada\"};\nlet id = \"7\";\nprintln(\"\\u{48}i \\(who.name)\\(id)\\\\(x)\"+\"\\(id)\");\n"
+                .to_owned(),
+        ),
+        (
+            "text-blocks".to_owned(),
+            "fn p(t:String)->String{\n\"\"\"\n\t\tTitle: \\(t)\n\t\t  \"quoted\"\n\n\t\t\"\"\"}\nlet a = p(\"\"\"\r\n  x\r\n  \"\"\");\nlet b = [\"\"\"\n\"\"\", \"\"\"\n\n  \"\"\"];\n"
+                .to_owned(),
+        ),
+        (
             "webhook-contract".to_owned(),
             "webhook fn handle(request:HttpRequest)->HttpResponse{record{status:200,headers:[],body:request.path}}\n"
                 .to_owned(),
@@ -220,6 +273,12 @@ fn deterministic_generated_corpus_preserves_formatting_properties() {
         "if true { 1 } else { 2 }",
         "{ let inner = 1; inner + 1 }",
         "fn(value: Int) -> Int { value }",
+        "HttpResponse { status: 200, }",
+        "HttpHeader { name: \"a\", value: \"b\" }",
+        "[\"k\": \"v\",]",
+        "Ok(( ))",
+        "\"\\(generated_0)-\\(generated_2)\"",
+        "\"\"\"\n  text \\(generated_2)\n  \"\"\"",
     ];
     for (index, atom) in atoms.iter().enumerate() {
         corpus.push((

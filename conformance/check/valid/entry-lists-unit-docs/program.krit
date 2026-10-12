@@ -1,0 +1,24 @@
+/// The trace fields of one request.
+fn trace(id: String) -> List<LogField> {
+    ["request-id": id, "source": "check"]
+}
+
+/// Accepts every path but `/`.
+fn validate(path: String) -> Result<Unit, String> {
+    if path == "/" {
+        Err("root path")
+    } else {
+        Ok(())
+    }
+}
+
+let headers: List<HttpHeader> = ["accept": "application/json"];
+let request = HttpRequest { method: "GET", path: "/x", headers: ["x-id": "1"] };
+let response = HttpResponse { status: 200, headers };
+let fields = trace("r-1");
+let same = fields == [
+    LogField { name: "request-id", value: "r-1" },
+    record { name: "source", value: "check" },
+];
+let unit: Unit = ();
+let checked = validate("/x");

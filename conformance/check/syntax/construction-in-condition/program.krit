@@ -1,0 +1,5 @@
+let code = if HttpResponse { status: 200 }.status == 200 {
+    "ok"
+} else {
+    "other"
+};

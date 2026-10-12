@@ -1,0 +1,47 @@
+/// Encodes one owner as a path.
+/// Fails when the owner cannot be a path segment.
+fn owner_path(owner: String) -> Result<String, String> {
+    let segment = url_path_segment(owner)?;
+    Ok("/repos/\(segment)")
+}
+
+/// Builds a request whose fields use `?`.
+fn fetch(owner: String, number: Int) -> Result<HttpRequest, String> {
+    let accept = "application/json";
+    Ok(
+        HttpRequest {
+            method: "GET",
+            path: "/repos/" + url_path_segment(owner)? + "/issues/" + int_to_string(number),
+            headers: ["accept": accept, "x-owner": url_path_segment(owner)?],
+            query: url_query(["page": "1"]),
+        },
+    )
+}
+
+fn respond(owner: String, body: String) -> HttpResponse {
+    let Ok(request) = fetch(owner, 1) else Err(error) => HttpResponse { status: 400, body };
+    let Ok(_) = fetch(owner, 2) else
+        Err(error) => HttpResponse { status: 400, headers: ["x-error": error], body: """
+            could not fetch \(owner)
+              \(error)
+            """ };
+    HttpResponse { status: 200, body: request.path }
+}
+
+fn describe(stored: Result<Option<String>, String>, name: String) -> String {
+    match stored {
+        Ok(Some(text)) => "\(name): \(text)",
+        Err(_) => "failed",
+        Ok(None) => """
+            none for \(name)
+            """,
+    }
+}
+
+fn finish(flag: Bool) -> Result<Unit, String> {
+    if flag {
+        Ok(())
+    } else {
+        Err("no")
+    }
+}

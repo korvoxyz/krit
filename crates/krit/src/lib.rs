@@ -9,6 +9,7 @@ mod formatter;
 mod habits;
 mod lexer;
 mod limits;
+mod lint;
 mod parser;
 mod patterns;
 mod source;
@@ -20,8 +21,9 @@ pub use analysis::{
     SymbolAnalysis, SymbolId, SymbolKind, Type, analyze, analyze_with_warnings,
 };
 pub use ast::{
-    BinaryOperator, Block, Expression, ExpressionKind, MatchArm, Parameter, Pattern, PatternKind,
-    Program, RecordField, RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind,
+    BinaryOperator, Block, ConstructField, ContractField, ContractRecord, DocComment, Expression,
+    ExpressionKind, FieldDefault, ListEntry, MatchArm, Parameter, Pattern, PatternKind, Program,
+    RecordField, RecordTypeField, Statement, StatementKind, StringPart, TypeAnnotation, TypeKind,
     UnaryOperator, ValueLiteral, VariantArm, VariantFamily, VariantName, VariantPattern,
 };
 pub use builtin::{Builtin, BuiltinCategory};

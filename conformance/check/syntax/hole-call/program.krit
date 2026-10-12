@@ -1,0 +1,6 @@
+fn shout(text: String) -> String {
+    text + "!"
+}
+
+let name = "krit";
+let greeting = "hello \(shout(name))";

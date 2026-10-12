@@ -39,10 +39,65 @@ fn(A, B) -> C
 The public Rust analysis API represents unresolved inference variables as
 `Type::Variable` and renders them as stable lowercase names such as `'a`.
 Source-level generic declaration syntax is not yet accepted. `HttpHeader`,
-`HttpRequest`, and `HttpResponse` are stable built-in aliases for the closed
-record structures in `LANGUAGE.md`; they retain their nominal names at public
-entrypoint and Core boundaries while participating in structural record
-checking. `Secret` is a distinct opaque type, never a `String` alias.
+`HttpRequest`, `HttpResponse`, and `LogField` are stable built-in aliases for
+the closed record structures in `LANGUAGE.md`; they retain their nominal names
+at public entrypoint and Core boundaries while participating in structural
+record checking. `Secret` is a distinct opaque type, never a `String` alias.
+
+A named construction such as `HttpResponse { status: 200, body }`
+(`LANGUAGE.md` section 8.4) has its contract's closed structural record type,
+`Record { body: String, headers: List<HttpHeader>, status: Int }` here, which
+is the type `record { ... }` with every contract field has once it meets the
+contract. The checker first checks the written field names (`K3016`), then
+analyzes each written value in source order and unifies it with its contract
+field's type, reporting a mismatch as `K3001` at the value (`` `HttpResponse`
+field `status` type mismatch ``). An omitted field contributes its contract
+field's concrete type (`String` or `List<HttpHeader>`) and no inference
+variable, effect, or requirement. The construction's effects and literal
+requirements are the union of its written values'. Core lowering emits the
+same record operation the full `record { ... }` would, with one pure literal
+operation per omitted field at the type name's span.
+
+The unit value `()` has type `Unit` and no effect. An entry list
+`["k": v, ...]` (`LANGUAGE.md` section 11) has type
+`List<Record { name: String, value: String }>`, the type
+`[record { name: k, value: v }, ...]` has once its fields are `String`, so it
+unifies with `List<HttpHeader>` and `List<LogField>`. The checker analyzes
+each key and then its value in source order and unifies each with `String`,
+reporting a mismatch as `K3001` at that key or value (`entry key type
+mismatch`, `entry value type mismatch`). The entry list's effects and literal
+requirements are the union of its keys' and values'. Core lowering emits the
+operations of the spelled-out list: each key and then its value, one record
+operation per entry at the entry's span (from the key to the value), and the
+list operation. Doc comments (`LANGUAGE.md` section 2.1) take no part in
+checking.
+
+An interpolated string or text block (`LANGUAGE.md` section 9.1) has type
+`String`. The checker analyzes each hole's value in source order, a name with
+optional field accesses, records a fact for it at its own span inside the
+string, and unifies its type with `String`; a mismatch is `K3015` at the hole
+(`` interpolation hole `count` has type `Int`, but a hole must be a `String` ``)
+with one note, never `K3001`. So a hole fixes an unannotated parameter or an
+open record field to `String`, as `+` with a `String` operand would, and a
+later use at another type is the ordinary `K3001` there. Holes add no effect
+and no requirement. Core lowering is left-to-right concatenation with the
+existing operations: one string literal operation per text part at that
+text's span, each hole's value, and one `add` per part after the first,
+spanning the string up to that part; a string with no parts is the empty
+string literal, and one that is a single hole is that hole's value. No
+operation or Core form is specific to interpolation, so every backend that
+lowers string literals and string `+` lowers it.
+
+The standard-library functions (`LANGUAGE.md` section 12.1) have the fixed
+function types listed there and no effect or literal requirement. Each use of
+one gets a fresh function type, so a use checks its arguments exactly as a
+call of any function does: a mismatch is `K3001` at the argument, a wrong
+count `K3003`. The `url_query` parameter is the closed structural
+`List<Record { name: String, value: String }>`, so an entry list, a
+`List<HttpHeader>`, and a `List<LogField>` all unify with it. Core lowering
+emits an ordinary built-in operation and call, which the verifier checks
+against the same signature (up to the structural equivalence of the contract
+records), with no requirement.
 
 There are no implicit numeric, string, boolean, or collection conversions.
 Union types, subtyping, null, exceptions, and user-defined mutable objects are
@@ -270,7 +325,7 @@ Implemented analysis recognizes `io.stdout`, `config.read`, `secret.read`,
 empty
 effect set. Calling a function adds its effects to the caller,
 including recursive and higher-order propagation. Branch and match effects
-are conservative unions. JSON conversion is pure.
+are conservative unions. JSON conversion and the standard library are pure.
 
 The Rust API returns effects in sorted deterministic order through
 `Analysis::effects`; function types expose their inferred latent effects.
@@ -310,11 +365,15 @@ WebAssembly target check described in `WASM-SANDBOX.md`, which reports every
 `K7001` residual type and `K7002` unsupported construct that `krit build`
 would, after eliminating functions the selected entrypoint cannot reach.
 `krit explain FILE` renders module-init effects, top-level binding types,
-stable Core facts, and a compact webhook contract when present.
+stable Core facts, and a compact webhook contract when present; each
+top-level function or entrypoint binding with a doc comment (`LANGUAGE.md`
+section 2.1) is followed by its doc comment's lines, each written `/// text`.
 `krit explain --json FILE` keeps schema 1 compatibility and adds a versioned
 entrypoint-contract fact containing source name, kind, normalized signature,
 sorted effects, sorted capability requirements, and exact draft-2020-12
-request/response JSON Schemas.
+request/response JSON Schemas. A binding or entrypoint fact whose declaration
+has a doc comment carries its text in an optional `doc` string field; the
+field is absent otherwise.
 
 ## Effects versus capabilities
 
@@ -322,6 +381,11 @@ Effects and capabilities answer different questions:
 
 - **Effect:** what an expression may attempt.
 - **Capability:** what the host permits this execution to do.
+
+Literal requirements come only from direct string literals, which are
+one-line strings without holes. An interpolated string or text block in a
+resource position is `K3008`, even when it has no holes, so every resource is
+spelled out where it is used.
 
 A program can type-check while lacking a runtime grant. The analyzer reports
 the inferred effect and requirement sets to compiler clients. Source-only
@@ -398,6 +462,32 @@ error is a method call (`K3011`) rather than a field-access error (`K3004`),
 and its note names the standard-library function to use instead where there
 is one (`DIAGNOSTICS.md`, Fix hints). An undefined name (`K2001`) carries a
 did-you-mean note chosen from the names visible at the reference.
+
+## Lints
+
+After analysis accepts a program, lints (`K9000`-`K9999`, `DIAGNOSTICS.md`)
+examine its syntax with the analysis facts: resolved names and inferred
+types. They report warnings only, never change the analysis, and do not run
+when analysis rejects the program.
+
+`K9013` guards the path and query of an outbound request. It examines the
+`path` and `query` values of every `HttpRequest` the program builds, written
+as a named construction or as a record literal whose analyzed type is the
+`HttpRequest` record (its five fields, each with its contract type or a type
+still unknown, as `headers: []` has). Only a value that is an interpolated
+string or a `+` chain is split into pieces: each hole (also one in a string
+inside the chain) and each other operand of the chain. A literal piece is
+safe, and so is a direct call of `url_path_segment`, `url_query`, or
+`int_to_string` whose callee resolves to the built-in, a postfix `?` on a
+direct call of `url_path_segment` or on a name bound to one, or a name that
+resolves to a binding of one of these results: a `let` whose value is such a
+call or such a `?`, or the top-level `Ok` binder of a match arm or a let-else
+whose subject is a direct call of `url_path_segment` or a name bound to one.
+Bindings are immutable, so such a
+name always holds the encoded value, in the function that binds it or one
+nested inside it. Every other piece is `K9013` at its hole or operand. A value
+that is a literal, a name, a field access, or any other expression is not
+split and never warns, so forwarding `request.path` unchanged is allowed.
 
 ## Open decisions
 

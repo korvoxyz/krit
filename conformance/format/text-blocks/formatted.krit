@@ -1,0 +1,29 @@
+fn prompt(title: String, body: String) -> String {
+    """
+    Classify this issue.
+      Title: \(title)
+
+      Body: \(body)
+    """
+}
+
+let summary = prompt("Crash", """
+    Steps:
+      1. open "a.txt"
+      2. save
+    """);
+let reply = HttpResponse { status: 200, body: """
+    tab indented line
+      and a deeper one
+    """ };
+
+fn wrap(text: String) -> String {
+    let header = """
+        # Report
+        """;
+    header + """
+        \(text)
+        """
+}
+
+println(summary);

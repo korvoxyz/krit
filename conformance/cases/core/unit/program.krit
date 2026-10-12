@@ -1,0 +1,24 @@
+fn finish(ready: Bool) -> Result<Unit, String> {
+    if ready {
+        Ok(())
+    } else {
+        Err("not ready")
+    }
+}
+
+fn nothing() -> Unit {
+    ()
+}
+
+let unit: Unit = ();
+
+println(unit);
+println(());
+println(nothing() == ());
+println(finish(true));
+println(finish(false));
+println([(), ()]);
+println(match finish(true) {
+    Ok(value) => value,
+    Err(message) => (),
+});

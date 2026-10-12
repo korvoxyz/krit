@@ -1,0 +1,7 @@
+found known-1
+record { status: 200, headers: [record { name: "x-path", value: "/a" }], body: "saved known-1" }
+record { status: 404, headers: [], body: "missing\n  other" }
+record { status: 400, headers: [], body: "bad key : path segment is empty" }
+record { status: 400, headers: [], body: "bad key ..: path segment reads as `.` or `..`" }
+record { status: 200, headers: [record { name: "x-key", value: "known-2" }, record { name: "x-bytes", value: "13" }], body: "known-2: saved known-2" }
+record { status: 500, headers: [], body: "failed: empty key" }

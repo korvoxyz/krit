@@ -1,0 +1,10 @@
+// `string_starts_with` compares UTF-8 bytes; every string starts with the
+// empty string.
+println(string_starts_with("/repos/acme", "/repos/"));
+println(string_starts_with("/repos/acme", ""));
+println(string_starts_with("", ""));
+println(string_starts_with("", "/"));
+println(string_starts_with("/re", "/repos/"));
+println(string_starts_with("éa", "é"));
+println(string_starts_with("éa", "e"));
+println(string_starts_with("POST", "post"));

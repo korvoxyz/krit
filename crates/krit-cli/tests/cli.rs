@@ -3518,6 +3518,358 @@ license = "Apache-2.0"
 }
 
 #[test]
+fn named_construction_formats_checks_builds_and_invokes() {
+    let directory = TestDirectory::new("named-construction");
+    let program = directory.file(
+        "main.krit",
+        r#"webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let body = request.path;
+    if request.method == "POST" {
+        HttpResponse { status: 201, body: body, headers: [HttpHeader { name: "x-made", value: "yes" }] }
+    } else {
+        HttpResponse { status: 200, body }
+    }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/construction"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+"#,
+    );
+
+    let unformatted = krit()
+        .args(["fmt", "--check"])
+        .arg(&program)
+        .output()
+        .expect("Krit should check formatting");
+    assert_eq!(unformatted.status.code(), Some(1));
+    let formatted = krit()
+        .arg("fmt")
+        .arg(&program)
+        .output()
+        .expect("Krit should format");
+    assert!(formatted.status.success());
+    let text = fs::read_to_string(&program).expect("formatted source should be readable");
+    assert!(
+        text.contains(
+            "        HttpResponse {\n            status: 201,\n            body,\n            headers: [HttpHeader { name: \"x-made\", value: \"yes\" }],\n        }\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("        HttpResponse { status: 200, body }\n"),
+        "{text}"
+    );
+
+    let checked = krit()
+        .arg("check")
+        .arg(&program)
+        .output()
+        .expect("Krit should check");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    for (name, method, expected) in [
+        (
+            "created",
+            "POST",
+            r#"{"status":201,"headers":[{"name":"x-made","value":"yes"}],"body":"/hello"}"#,
+        ),
+        (
+            "read",
+            "GET",
+            r#"{"status":200,"headers":[],"body":"/hello"}"#,
+        ),
+    ] {
+        let request = directory.file(
+            &format!("{name}.json"),
+            &format!(
+                r#"{{"method":"{method}","path":"/hello","query":"","headers":[],"body":""}}"#
+            ),
+        );
+        let invoked = krit_in(&directory)
+            .args(["invoke", "--manifest"])
+            .arg(&manifest)
+            .arg("--request")
+            .arg(&request)
+            .output()
+            .expect("Krit should invoke");
+        assert!(
+            invoked.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&invoked.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(invoked.stdout).expect("response should be UTF-8"),
+            format!("{expected}\n"),
+            "{name}"
+        );
+    }
+
+    let invalid = directory.file(
+        "invalid.krit",
+        "let request = HttpRequest { method: \"GET\" };\n",
+    );
+    for command in ["check", "run"] {
+        let output = krit()
+            .args([command, "--diagnostic-format", "json"])
+            .arg(&invalid)
+            .output()
+            .expect("Krit should start");
+        assert_eq!(output.status.code(), Some(1), "{command}");
+        assert!(output.stdout.is_empty(), "{command}");
+        let diagnostics = parse_json_lines(&output.stderr);
+        assert_eq!(diagnostics.len(), 1, "{command}");
+        assert_eq!(diagnostics[0]["code"], "K3016", "{command}");
+        assert_eq!(
+            diagnostics[0]["message"], "`HttpRequest { ... }` is missing required field `path`",
+            "{command}"
+        );
+        assert_eq!(diagnostics[0]["span"]["start"]["column"], 15, "{command}");
+        assert_eq!(
+            diagnostics[0]["notes"].as_array().map(Vec::len),
+            Some(1),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn entry_lists_unit_and_doc_comments_format_check_build_invoke_and_explain() {
+    let directory = TestDirectory::new("entry-lists");
+    let program = directory.file(
+        "main.krit",
+        r#"///Accepts every path but `/`.
+fn validate(path: String) -> Result<Unit, String> {
+    if path == "/" { Err("root path") } else { Ok(( )) }
+}
+
+/// Echoes the request in headers and logs it.
+///
+/// Rejects `/`.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match validate(request.path) {
+        Ok(done) => {
+            let logged = log_info("request.accepted", ["path" : request.path, "method": request.method,]);
+            HttpResponse { status: 200, headers: ["x-path": request.path], body: "ok" }
+        },
+        Err(reason) => HttpResponse { status: 400, headers: ["x-reason": reason], body: reason },
+    }
+}
+"#,
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/entry-lists"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+
+[capabilities]
+logs = true
+"#,
+    );
+
+    let formatted = krit()
+        .arg("fmt")
+        .arg(&program)
+        .output()
+        .expect("Krit should format");
+    assert!(formatted.status.success());
+    let text = fs::read_to_string(&program).expect("formatted source should be readable");
+    assert!(
+        text.starts_with("/// Accepts every path but `/`.\nfn validate"),
+        "{text}"
+    );
+    assert!(text.contains("        Ok(())\n"), "{text}");
+    assert!(
+        text.contains(
+            "/// Echoes the request in headers and logs it.\n///\n/// Rejects `/`.\nwebhook fn handle"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("[\"path\": request.path, \"method\": request.method]"),
+        "{text}"
+    );
+    let unchanged = krit()
+        .args(["fmt", "--check"])
+        .arg(&program)
+        .output()
+        .expect("Krit should check formatting");
+    assert!(unchanged.status.success(), "formatting is idempotent");
+
+    let checked = krit()
+        .arg("check")
+        .arg(&program)
+        .output()
+        .expect("Krit should check");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    for (name, path, expected, event) in [
+        (
+            "accepted",
+            "/hello",
+            r#"{"status":200,"headers":[{"name":"x-path","value":"/hello"}],"body":"ok"}"#,
+            Some(
+                r#""event":"request.accepted","fields":[{"name":"path","value":"/hello"},{"name":"method","value":"GET"}]"#,
+            ),
+        ),
+        (
+            "rejected",
+            "/",
+            r#"{"status":400,"headers":[{"name":"x-reason","value":"root path"}],"body":"root path"}"#,
+            None,
+        ),
+    ] {
+        let request = directory.file(
+            &format!("{name}.json"),
+            &format!(r#"{{"method":"GET","path":"{path}","query":"","headers":[],"body":""}}"#),
+        );
+        let invoked = krit_in(&directory)
+            .args(["invoke", "--manifest"])
+            .arg(&manifest)
+            .arg("--request")
+            .arg(&request)
+            .output()
+            .expect("Krit should invoke");
+        assert!(
+            invoked.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&invoked.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(invoked.stdout).expect("response should be UTF-8"),
+            format!("{expected}\n"),
+            "{name}"
+        );
+        let events = String::from_utf8(invoked.stderr).expect("events should be UTF-8");
+        match event {
+            Some(event) => assert!(events.contains(event), "{name}: {events}"),
+            None => assert!(!events.contains("\"event\""), "{name}: {events}"),
+        }
+    }
+
+    let explained = krit()
+        .arg("explain")
+        .arg(&program)
+        .output()
+        .expect("Krit should explain");
+    assert!(explained.status.success());
+    let explanation = String::from_utf8(explained.stdout).expect("explanation should be UTF-8");
+    assert!(
+        explanation.contains(
+            "  b0 validate: fn(String) -> Result<Unit, String> effects {}\n    /// Accepts every path but `/`.\n"
+        ),
+        "{explanation}"
+    );
+    assert!(
+        explanation.contains(
+            "    /// Echoes the request in headers and logs it.\n    ///\n    /// Rejects `/`.\n"
+        ),
+        "{explanation}"
+    );
+
+    let explained = krit()
+        .args(["explain", "--json"])
+        .arg(&program)
+        .output()
+        .expect("Krit should explain");
+    assert!(explained.status.success());
+    let explanation: serde_json::Value =
+        serde_json::from_slice(&explained.stdout).expect("explanation should be valid JSON");
+    let bindings = explanation["bindings"]
+        .as_array()
+        .expect("bindings should be a list");
+    assert_eq!(bindings[0]["name"], "validate");
+    assert_eq!(bindings[0]["doc"], "Accepts every path but `/`.");
+    let handle = bindings
+        .iter()
+        .find(|binding| binding["name"] == "handle")
+        .expect("the webhook should be a top-level binding");
+    let webhook_doc = "Echoes the request in headers and logs it.\n\nRejects `/`.";
+    assert_eq!(handle["doc"], webhook_doc);
+    let items = explanation["entrypoints"]["items"]
+        .as_array()
+        .expect("entrypoints should be a list");
+    assert!(items[0].get("doc").is_none(), "module-init has no doc");
+    assert_eq!(items[1]["name"], "handle");
+    assert_eq!(items[1]["doc"], webhook_doc);
+
+    // A binding without a doc comment has no `doc` field.
+    let plain = directory.file("plain.krit", "fn one() -> Int {\n    1\n}\n");
+    let explained = krit()
+        .args(["explain", "--json"])
+        .arg(&plain)
+        .output()
+        .expect("Krit should explain");
+    let explanation: serde_json::Value =
+        serde_json::from_slice(&explained.stdout).expect("explanation should be valid JSON");
+    assert!(explanation["bindings"][0].get("doc").is_none());
+
+    let invalid = directory.file("mixed.krit", "let fields = [\"k\": \"v\", \"plain\"];\n");
+    for command in ["check", "run"] {
+        let output = krit()
+            .args([command, "--diagnostic-format", "json"])
+            .arg(&invalid)
+            .output()
+            .expect("Krit should start");
+        assert_eq!(output.status.code(), Some(1), "{command}");
+        assert!(output.stdout.is_empty(), "{command}");
+        let diagnostics = parse_json_lines(&output.stderr);
+        assert_eq!(diagnostics.len(), 1, "{command}");
+        assert_eq!(diagnostics[0]["code"], "K1001", "{command}");
+        assert_eq!(diagnostics[0]["span"]["start"]["column"], 25, "{command}");
+        assert_eq!(
+            diagnostics[0]["notes"].as_array().map(Vec::len),
+            Some(1),
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn invoke_decodes_escaped_json_strings_and_reports_invalid_json() {
     let directory = TestDirectory::new("invoke-json-escapes");
     let program = directory.file(
@@ -7769,4 +8121,330 @@ fn invoke_refuses_the_swapped_token_probe_with_k5006() {
         "{stderr}"
     );
     assert!(!stderr.contains(secret_value));
+}
+
+#[test]
+fn interpolation_and_text_blocks_format_check_build_invoke_and_explain() {
+    let directory = TestDirectory::new("interpolation");
+    let program = directory.file(
+        "main.krit",
+        "/// Describes the request.\nfn describe(request: HttpRequest) -> String {\n        \"\"\"\n        Route: \\(request.method) \\(request.path)\n          Body: \"\\(request.body)\"\n        \"\"\"\n}\n\n\
+         webhook fn handle(request: HttpRequest) -> HttpResponse {\n    \
+         HttpResponse{status:200,headers:[\"x-route\": \"\\(request.method)\\u{20}\\(request.path)\"],body:describe(request)}\n}\n",
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/interpolation"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+"#,
+    );
+
+    let formatted = krit()
+        .arg("fmt")
+        .arg(&program)
+        .output()
+        .expect("Krit should format");
+    assert!(formatted.status.success());
+    let text = fs::read_to_string(&program).expect("formatted source should be readable");
+    assert!(
+        text.contains(
+            "fn describe(request: HttpRequest) -> String {\n    \"\"\"\n    Route: \\(request.method) \\(request.path)\n      Body: \"\\(request.body)\"\n    \"\"\"\n}\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("headers: [\"x-route\": \"\\(request.method) \\(request.path)\"],"),
+        "{text}"
+    );
+    let unchanged = krit()
+        .args(["fmt", "--check"])
+        .arg(&program)
+        .output()
+        .expect("Krit should check formatting");
+    assert!(unchanged.status.success(), "formatting is idempotent");
+
+    let checked = krit()
+        .arg("check")
+        .arg(&program)
+        .output()
+        .expect("Krit should check");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let request = directory.file(
+        "request.json",
+        r#"{"method":"POST","path":"/issues/7","query":"","headers":[],"body":"It \"crashes\"."}"#,
+    );
+    let invoked = krit_in(&directory)
+        .args(["invoke", "--manifest"])
+        .arg(&manifest)
+        .arg("--request")
+        .arg(&request)
+        .output()
+        .expect("Krit should invoke");
+    assert!(
+        invoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&invoked.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(invoked.stdout).expect("response should be UTF-8"),
+        concat!(
+            r#"{"status":200,"headers":[{"name":"x-route","value":"POST /issues/7"}],"#,
+            r#""body":"Route: POST /issues/7\n  Body: \"It \"crashes\".\""}"#,
+            "\n"
+        )
+    );
+
+    let explained = krit()
+        .arg("explain")
+        .arg(&program)
+        .output()
+        .expect("Krit should explain");
+    assert!(explained.status.success());
+    let explanation = String::from_utf8(explained.stdout).expect("explanation should be UTF-8");
+    assert!(
+        explanation.contains("  b0 describe: fn(HttpRequest) -> String effects {}\n"),
+        "{explanation}"
+    );
+    assert!(explanation.contains("string \"Route: \""), "{explanation}");
+
+    for (name, source, code, column) in [
+        (
+            "int-hole",
+            "let count = 3;\nlet s = \"n=\\(count)\";\n",
+            "K3015",
+            12,
+        ),
+        ("call-hole", "let s = \"\\(f(1))\";\n", "K3015", 10),
+        (
+            "indentation",
+            "let s = \"\"\"\n    a\n  b\n    \"\"\";\n",
+            "K0004",
+            1,
+        ),
+        (
+            "resource",
+            "let key = \"model\";\nlet v = config_string(\"agent.\\(key)\");\n",
+            "K3008",
+            23,
+        ),
+    ] {
+        let invalid = directory.file(&format!("{name}.krit"), source);
+        for command in ["check", "run"] {
+            let output = krit()
+                .args([command, "--diagnostic-format", "json"])
+                .arg(&invalid)
+                .output()
+                .expect("Krit should start");
+            assert_eq!(output.status.code(), Some(1), "{name} {command}");
+            assert!(output.stdout.is_empty(), "{name} {command}");
+            let diagnostics = parse_json_lines(&output.stderr);
+            assert_eq!(diagnostics.len(), 1, "{name} {command}");
+            assert_eq!(diagnostics[0]["code"], code, "{name} {command}");
+            assert_eq!(
+                diagnostics[0]["span"]["start"]["column"], column,
+                "{name} {command}"
+            );
+            let notes = usize::from(code != "K3008");
+            assert_eq!(
+                diagnostics[0]["notes"].as_array().map(Vec::len),
+                Some(notes),
+                "{name} {command}"
+            );
+        }
+    }
+}
+
+#[test]
+fn standard_library_runs_checks_builds_invokes_explains_and_lints() {
+    let directory = TestDirectory::new("stdlib");
+    let script = directory.file(
+        "script.krit",
+        "println(int_to_string(-9223372036854775807 - 1));\n\
+         println(url_path_segment(\"octo cat\"));\nprintln(url_path_segment(\"..\"));\n\
+         println(url_query([\"q\": \"a&b\", \"page\": int_to_string(2)]));\n\
+         println(string_byte_len(\"é\"));\nprintln(string_contains(\"krit\", \"ri\"));\n",
+    );
+    let ran = krit()
+        .arg("run")
+        .arg(&script)
+        .output()
+        .expect("Krit should run");
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(ran.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(ran.stdout).expect("output should be UTF-8"),
+        "-9223372036854775808\nOk(\"octo%20cat\")\nErr(\"path segment reads as `.` or `..`\")\n\
+         q=a%26b&page=2\n2\ntrue\n"
+    );
+
+    let program = directory.file(
+        "main.krit",
+        "webhook fn handle(request: HttpRequest) -> HttpResponse {\n    \
+         match url_path_segment(request.body) {\n        \
+         Ok(owner) => {\n            \
+         let number = int_to_string(string_byte_len(request.query));\n            \
+         HttpResponse {\n                status: 200,\n                \
+         body: \"/repos/\\(owner)/issues/\\(number)?\" + url_query([\"q\": request.query]),\n            \
+         }\n        },\n        \
+         Err(reason) => HttpResponse { status: 400, body: reason },\n    }\n}\n",
+    );
+    let manifest = directory.file(
+        "krit.pkg",
+        r#"
+schema = 1
+
+[package]
+name = "test/stdlib"
+version = "1.0.0"
+edition = "2026"
+entry = "main.krit"
+license = "Apache-2.0"
+"#,
+    );
+    let unchanged = krit()
+        .args(["fmt", "--check"])
+        .arg(&program)
+        .output()
+        .expect("Krit should check formatting");
+    assert!(
+        unchanged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unchanged.stderr)
+    );
+    let checked = krit()
+        .arg("check")
+        .arg(&program)
+        .output()
+        .expect("Krit should check");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(checked.stderr.is_empty(), "no warnings for encoded pieces");
+    let built = krit_in(&directory)
+        .args(["build", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("Krit should build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    for (body, query, expected) in [
+        (
+            "octo cat",
+            "label=bug",
+            r#"{"status":200,"headers":[],"body":"/repos/octo%20cat/issues/9?q=label%3Dbug"}"#,
+        ),
+        (
+            "../admin",
+            "",
+            r#"{"status":400,"headers":[],"body":"path segment contains `/`, `\\`, or an ASCII control character"}"#,
+        ),
+    ] {
+        let request = directory.file(
+            "request.json",
+            &format!(
+                r#"{{"method":"POST","path":"/hook","query":{},"headers":[],"body":{}}}"#,
+                serde_json::Value::from(query),
+                serde_json::Value::from(body)
+            ),
+        );
+        let invoked = krit_in(&directory)
+            .args(["invoke", "--manifest"])
+            .arg(&manifest)
+            .arg("--request")
+            .arg(&request)
+            .output()
+            .expect("Krit should invoke");
+        assert!(
+            invoked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&invoked.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(invoked.stdout).expect("response should be UTF-8"),
+            format!("{expected}\n")
+        );
+    }
+
+    let explained = krit()
+        .arg("explain")
+        .arg(&program)
+        .output()
+        .expect("Krit should explain");
+    assert!(explained.status.success());
+    let explanation = String::from_utf8(explained.stdout).expect("explanation should be UTF-8");
+    for builtin in [
+        "url_path_segment",
+        "int_to_string",
+        "string_byte_len",
+        "url_query",
+    ] {
+        assert!(
+            explanation.contains(&format!("builtin {builtin} [standard-library]")),
+            "{explanation}"
+        );
+    }
+    assert!(explanation.contains("  effects: {}\n"), "{explanation}");
+
+    // K9013 is a warning: every command reports it and none fails.
+    let linted = directory.file(
+        "lint.krit",
+        "fn fetch(owner: String) -> HttpRequest {\n    \
+         HttpRequest { method: \"GET\", path: \"/repos/\" + owner }\n}\nprintln(fetch(\"a\").path);\n",
+    );
+    let checked = krit()
+        .args(["check", "--diagnostic-format", "json"])
+        .arg(&linted)
+        .output()
+        .expect("Krit should check");
+    assert_eq!(checked.status.code(), Some(0));
+    let diagnostics = parse_json_lines(&checked.stderr);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["severity"], "warning");
+    assert_eq!(diagnostics[0]["code"], "K9013");
+    assert_eq!(diagnostics[0]["span"]["start"]["line"], 2);
+    assert_eq!(diagnostics[0]["span"]["start"]["column"], 52);
+    assert_eq!(diagnostics[0]["notes"].as_array().map(Vec::len), Some(1));
+    let ran = krit()
+        .arg("run")
+        .arg(&linted)
+        .output()
+        .expect("Krit should run");
+    assert_eq!(ran.status.code(), Some(0));
+    assert_eq!(ran.stdout, b"/repos/a\n");
+    let stderr = String::from_utf8(ran.stderr).expect("warnings should be UTF-8");
+    assert!(
+        stderr.contains("lint.krit:2:52: warning[K9013]: "),
+        "{stderr}"
+    );
+    assert!(stderr.contains("\nhelp: encode untrusted text with `url_path_segment`"));
 }

@@ -1,0 +1,33 @@
+fn trace(label: String) -> String {
+    print(label + " ");
+    label
+}
+
+fn names(fields: List<LogField>) -> String {
+    match fields {
+        [] => "",
+        [field, ..rest] => field.name + "=" + field.value + ";" + names(rest),
+    }
+}
+
+let fields = [trace("k1"): trace("v1"), trace("k2"): trace("v2")];
+
+println("");
+println(fields);
+println(
+    fields == [record { name: "k1", value: "v1" }, record { name: "k2", value: "v2" }],
+);
+
+let id = "r-1";
+let headers: List<HttpHeader> = ["accept": "text/plain", "x-request-" + "id": id];
+
+println(headers);
+println(names(["attempt": "1", "source": "conformance"]));
+println(HttpResponse { status: 200, headers: ["x-one": "1"] });
+println(json_encode(["k": "v"]));
+
+let single = ["only": "entry"];
+let empty: List<LogField> = [];
+
+println(single);
+println(empty);
