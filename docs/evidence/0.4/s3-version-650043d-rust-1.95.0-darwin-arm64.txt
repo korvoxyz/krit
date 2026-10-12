@@ -1,0 +1,137 @@
+Version 0.3.1 evidence: 0.3.1 item S3 (R0.4)
+
+Commit:   650043d (clean tree), track/0.3.1-supply; baseline ee87cf2
+          (workspace version 0.3.0)
+Date:     2026-10-12
+Host:     macOS (Darwin 27.0.0), arm64; Rust 1.95.0 for the gate; Rust 1.98
+          debug builds of `krit` for the before/after comparison;
+          cargo-deny 0.20.2, cargo-audit 0.22.2
+
+1. Version fields
+
+- Cargo.toml [workspace.package] version 0.3.0 -> 0.3.1, and
+  `cargo +1.95.0 update --workspace --offline` changed 11 lockfile entries
+  (22 diff lines), all of them workspace crates. No third-party crate moved.
+- The language version stays 0.3.0. Its four mirrored places are hand-set
+  constants, separate from the toolchain version that
+  env!("CARGO_PKG_VERSION") supplies, and 0.3.1 has no language change:
+    crates/krit-wasm/src/metadata.rs:10   LANGUAGE_VERSION = "0.3.0"
+    crates/krit-assist/src/protocol.rs:10 LANGUAGE_VERSION = "0.3.0"
+    crates/krit-lsp/src/document.rs:1007  language_version: "0.3.0"
+    ai/prompt-pack.json:4                 "languageVersion": "0.3.0"
+  (ai/prompt-pack.json's "promptVersion" also stays 0.3.0: the pack did not
+  change.)
+- `git diff 2e8194c 650043d` touches none of crates/krit, krit-wasm,
+  krit-cli, krit-package, krit-capability, or krit-lsp.
+
+2. Artifacts: 0.3.0 against 0.3.1, version strings normalized
+
+`krit build --manifest M --output OUT` ran with a 0.3.0 binary (built at
+ee87cf2) and a 0.3.1 binary (built at 650043d) over every tracked
+`*krit.pkg` (25 manifests; the 7 that fail to build fail identically). For
+each of the 18 artifacts the check requires: the 0.3.1 component holds
+"0.3.1" exactly twice (embedded compilerVersion and the producers
+processed-by entry) and "0.3.0" once (the language); replacing "0.3.1" with
+"0.3.0" gives the 0.3.0 component byte for byte; and the adjacent metadata
+differs only in compiler.version and digest (and, for the root krit.pkg,
+whose manifest moved to 0.3.1, package.version).
+
+  benchmarks/sketches/02-slack-summarize                 5675 bytes  identical
+  benchmarks/sketches/03-payment-webhook                 7061 bytes  identical
+  benchmarks/sketches/03b-payment-webhook-buildable      5119 bytes  identical
+  benchmarks/sketches/05-ticket-router                   8946 bytes  identical
+  benchmarks/sketches/06-flaky-worker                    7188 bytes  identical
+  benchmarks/sketches/07-rag-answerer                    7777 bytes  identical
+  conformance/build/compat/0.2.0/factorial               1393 bytes  identical
+  conformance/build/compat/0.2.0/stateful-webhook        5784 bytes  identical
+  conformance/package/config/underscore-key              1213 bytes  identical
+  conformance/package/dependencies/empty-table           1213 bytes  identical
+  examples/cached-search                                 5455 bytes  identical
+  examples/database-webhook                              5426 bytes  identical
+  examples/jobs-schedule                                 3516 bytes  identical
+  examples/jobs-webhook                                  3184 bytes  identical
+  examples/jobs-worker                                   6888 bytes  identical
+  examples/stateful-webhook                              5704 bytes  identical
+  examples/webhook-agent                                11255 bytes  identical
+  krit.pkg (root, examples/factorial.krit)               1393 bytes  identical
+  result: ALL OK
+
+The root package's digest moves from
+blake3:abac5167a4fea46de03db6c9d0d8c2512c70bdb593718a7b1ee5f2fe952a1ba1
+(0.3.0, the old pin in crates/krit-wasm/tests/artifact.rs) to
+blake3:1286e662ae8a8c5de59195f57d41041ad3cac13c350b74815166eb3871543de6,
+the new pin. Its length stays 1393 bytes.
+
+3. CLI output
+
+`krit check --diagnostic-format json` and `krit explain --json` on every
+tracked examples/*.krit and benchmarks/sketches/*.krit, and the stdout,
+stderr, and exit status of each build above: 86 files, identical between
+0.3.0 and 0.3.1 once the output directory in `built`/`metadata` lines is
+normalized. `krit --version` prints "Krit 0.3.1".
+
+The 0.3.1 binary runs an artifact that 0.3.0 built (toolchain window):
+
+  $ krit-0.3.1 sandbox --manifest krit.pkg --artifact target/krit/krit.wasm
+  720
+  $ krit-0.3.1 permissions --artifact target/krit/krit.wasm --json krit.pkg
+  {... "effective":[{"capability":"io.stdout"}], ... "localGrantStatus":"allowed" ...}
+
+The 0.2.0 compatibility goldens under conformance/build/compat/0.2.0 are
+unchanged and load in the test suite below.
+
+4. scripts/gate.sh
+
+$ scripts/gate.sh --target-dir target/rust-1.95
+(--target-dir only reuses a warm 1.95.0 cache in this worktree; the commands
+and environment are the gate's defaults.)
+
+gate: toolchain  rustc 1.95.0 (59807616e 2026-04-14) (+1.95.0)
+gate: os         Darwin 27.0.0 arm64
+gate: commit     650043d14e8e
+gate: target dir target/rust-1.95
+
+$ cargo +1.95.0 fmt --all --check
+$ python3 -I scripts/metrics.py --check-depth 3 examples
+$ python3 -I scripts/metrics.py --check-lines 50 examples/webhook-agent.krit
+$ cargo +1.95.0 clippy --workspace --all-targets --locked -- -D warnings
+$ cargo +1.95.0 test --workspace --all-targets --locked
+$ cargo +1.95.0 test --workspace --doc --locked
+$ cargo +1.95.0 deny --locked check
+$ cargo +1.95.0 audit
+
+tests: 69 "test result" lines (59 all-targets, 10 doc), 1023 passed, 0 failed,
+       1 ignored (network::tests::trusted_public_https_smoke_test, which
+       needs public DNS and network access, and is ignored in CI too)
+cargo-deny 0.20.2
+advisories ok, bans ok, licenses ok, sources ok
+cargo-audit 0.22.2
+Loaded 1299 security advisories (from ~/.cargo/advisory-db)
+Scanning Cargo.lock for vulnerabilities (251 crate dependencies)
+
+gate: summary
+gate:   Check formatting                       ok          0s
+gate:   Check example metrics                  ok          0s
+gate:   Run Clippy                             ok          5s
+gate:   Run tests and conformance              ok        101s
+gate:   Run documentation tests                ok          2s
+gate:   Check dependencies with cargo deny     ok          1s
+gate:   Audit dependencies with cargo audit    ok          3s
+gate: PASS | rustc 1.95.0 (59807616e 2026-04-14) | Darwin 27.0.0 arm64 | 650043d14e8e
+
+Also on Rust 1.98 (the default toolchain): `cargo clippy --workspace
+--all-targets -- -D warnings` is clean, and `cargo test --workspace
+--all-targets` passes 1021 tests with 1 ignored.
+
+Appendix: the artifact check (Python 3, run as `python3 -I compare.py OLD NEW`
+on the two output directories)
+
+  for name in artifacts:
+      old, new = OLD/name bytes, NEW/name bytes
+      require new.count(b"0.3.1") == 2 and new.count(b"0.3.0") == 1
+      require old.count(b"0.3.0") == 3 and len(old) == len(new)
+      require new.replace(b"0.3.1", b"0.3.0") == old
+      require the keys whose values differ between OLD/name.json and
+          NEW/name.json are {compiler, digest}, or {compiler, digest,
+          package} with package.version 0.3.0 -> 0.3.1
+      require NEW compiler.version == "0.3.1", language.version == "0.3.0"
