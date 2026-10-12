@@ -58,6 +58,27 @@ pub fn parse_source(source: &Source) -> Result<Program, Diagnostic> {
 /// diagnostic and produces no output. Analysis warnings never prevent
 /// evaluation and are not returned; [`analyze_with_warnings`] reports them.
 /// [`execute`] evaluates a program without analyzing it.
+///
+/// # Examples
+///
+/// ```
+/// use krit::{Source, run_source};
+///
+/// let source = Source::new(
+///     "main.krit",
+///     "fn double(x: Int) -> Int {\n    x * 2\n}\n\nprintln(double(21));\n",
+/// );
+/// let mut output = Vec::new();
+/// run_source(&source, &mut output).expect("the program should run");
+/// assert_eq!(output, b"42\n");
+///
+/// // Analysis rejects the undefined name before the first line runs.
+/// let source = Source::new("main.krit", "println(\"before\");\nprintln(missing);\n");
+/// let mut output = Vec::new();
+/// let error = run_source(&source, &mut output).expect_err("analysis should reject it");
+/// assert_eq!(error.code(), "K2001");
+/// assert!(output.is_empty());
+/// ```
 pub fn run_source(source: &Source, output: &mut dyn std::io::Write) -> Result<Value, Diagnostic> {
     let program = parse_source(source)?;
     analyze(&program)?;

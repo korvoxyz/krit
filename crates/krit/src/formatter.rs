@@ -12,6 +12,27 @@ use crate::{
 pub const FORMAT_LINE_WIDTH: usize = 100;
 
 /// Formats one parseable edition-2026 source file into canonical Krit source.
+///
+/// # Examples
+///
+/// ```
+/// use krit::{Source, format_source};
+///
+/// let source = Source::new("main.krit", "fn double(x:Int)->Int{x*2}\nprintln( double(21) );\n");
+/// let formatted = format_source(&source).expect("the source should parse");
+/// assert_eq!(
+///     formatted,
+///     "fn double(x: Int) -> Int {\n    x * 2\n}\n\nprintln(double(21));\n",
+/// );
+///
+/// // Canonical source is a fixed point.
+/// let again = format_source(&Source::new("main.krit", formatted.as_str())).unwrap();
+/// assert_eq!(again, formatted);
+///
+/// // Source that does not parse is reported, never rewritten.
+/// let error = format_source(&Source::new("main.krit", "let x =")).unwrap_err();
+/// assert_eq!(error.code(), "K1001");
+/// ```
 pub fn format_source(source: &Source) -> Result<String, Diagnostic> {
     let lexed = lex_with_comments(source)?;
     let program = parser::parse(source, lexed.tokens.clone())?;
