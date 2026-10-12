@@ -197,7 +197,9 @@ the first error:
    with that family over fresh payload types (`K3005` at the match for the
    subject, or at the nested pattern for a payload). The position below
    `Some`, `Ok`, or `Err` has type `T`, `T`, or `E`; a list pattern's head
-   has type `T` and its tail `List<T>`.
+   has type `T` and its tail `List<T>`. Each position is typed once, by the
+   first arm whose pattern requires a family there; later arms reuse its
+   payload types, so typing costs one unification per position.
 5. The paths must be exhaustive: at every proper prefix of a path, each
    constructor of the next position's family continues some path. Otherwise
    the match is `K3005`, listing each missing prefix-plus-constructor as a

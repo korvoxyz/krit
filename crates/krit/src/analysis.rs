@@ -959,6 +959,63 @@ struct PatternBinding {
     ty: InferType,
 }
 
+/// The positions that the patterns of one `match` reach and their types: the
+/// subject, and below each typed variant position, its payloads.
+///
+/// A position is typed against its family once, by the first pattern that
+/// reaches it, and the patterns of every later arm reuse its payload types,
+/// so typing a match costs one unification per position rather than one per
+/// position of every arm.
+struct PatternPositions {
+    /// The type of the value at each position.
+    types: Vec<InferType>,
+    /// What each position's family gave the patterns below it, once a
+    /// pattern at the position has been typed.
+    payloads: Vec<Option<PositionPayloads>>,
+}
+
+impl PatternPositions {
+    /// The position of the match's subject.
+    const SUBJECT: usize = 0;
+
+    fn new(subject: InferType) -> Self {
+        Self {
+            types: vec![subject],
+            payloads: vec![None],
+        }
+    }
+
+    /// Adds a position whose value has type `ty` and returns it.
+    fn add(&mut self, ty: InferType) -> usize {
+        self.types.push(ty);
+        self.payloads.push(None);
+        self.types.len() - 1
+    }
+}
+
+/// What a typed position gives the patterns below it.
+#[derive(Clone)]
+enum PositionPayloads {
+    /// An `Option<T>` position: the position of a `Some` payload, of type `T`.
+    Option { some: usize },
+    /// A `Result<T, E>` position: the positions of an `Ok` payload, of type
+    /// `T`, and of an `Err` payload, of type `E`.
+    Result { ok: usize, err: usize },
+    /// A `List<T>` position: the types of a list pattern's head, `T`, and
+    /// tail, `List<T>`, which are names or `_`.
+    List { element: InferType, list: InferType },
+}
+
+impl PositionPayloads {
+    const fn family(&self) -> patterns::Family {
+        match self {
+            Self::Option { .. } => patterns::Family::Option,
+            Self::Result { .. } => patterns::Family::Result,
+            Self::List { .. } => patterns::Family::List,
+        }
+    }
+}
+
 impl Analyzer {
     fn new() -> Self {
         Self {
@@ -2324,9 +2381,10 @@ impl Analyzer {
             _ => None,
         };
         patterns::check_arms(arms, known_family)?;
+        let mut positions = PatternPositions::new(subject.ty);
         let mut arm_bindings = Vec::with_capacity(arms.len());
         for arm in arms {
-            arm_bindings.push(self.pattern_bindings(&arm.pattern, subject.ty.clone(), span)?);
+            arm_bindings.push(self.pattern_bindings(&arm.pattern, &mut positions, span)?);
         }
         patterns::check_exhaustive(arms, span)?;
 
@@ -2353,23 +2411,19 @@ impl Analyzer {
         })
     }
 
-    /// Types `pattern`, an arm of the match at `span`, against the type
-    /// `subject` of the value it matches and returns the names and `_` it
-    /// binds, in source order, each with the type of the value at its
-    /// position.
+    /// Types `pattern`, an arm of the match at `span`, against the types of
+    /// the match's `positions` and returns the names and `_` it binds, in
+    /// source order, each with the type of the value at its position.
     ///
-    /// A variant or list pattern requires its family (`K3005`): at the top
-    /// level the subject's, reported at the match, and below it the payload
-    /// type of the enclosing pattern, reported at the nested pattern. An
-    /// unresolved type takes the pattern's family with fresh payload types.
-    /// Patterns are paths, so this walks one iteratively.
+    /// Patterns are paths, so this walks one iteratively, from the subject's
+    /// position down through each variant pattern's payload.
     fn pattern_bindings(
         &mut self,
         pattern: &Pattern,
-        subject: InferType,
+        positions: &mut PatternPositions,
         span: Span,
     ) -> Result<Vec<PatternBinding>, Diagnostic> {
-        let mut ty = subject;
+        let mut position = PatternPositions::SUBJECT;
         let mut current = pattern;
         let mut nested = false;
         loop {
@@ -2378,28 +2432,38 @@ impl Analyzer {
                     return Ok(vec![PatternBinding {
                         name: name.clone(),
                         span: current.span,
-                        ty,
+                        ty: positions.types[position].clone(),
                     }]);
                 }
                 PatternKind::Wildcard => {
                     return Ok(vec![PatternBinding {
                         name: DISCARD.to_owned(),
                         span: current.span,
-                        ty,
+                        ty: positions.types[position].clone(),
                     }]);
                 }
-                PatternKind::EmptyList | PatternKind::Cons { .. } => {
-                    let element = self.fresh_type();
-                    let list = InferType::List(Box::new(element.clone()));
-                    self.expect_pattern_type(
-                        ty,
-                        list.clone(),
-                        "List",
-                        nested.then_some(current),
+                PatternKind::EmptyList => {
+                    self.type_position(
+                        positions,
+                        position,
+                        patterns::Family::List,
+                        current,
+                        nested,
                         span,
                     )?;
-                    let PatternKind::Cons { head, tail } = &current.kind else {
-                        return Ok(Vec::new());
+                    return Ok(Vec::new());
+                }
+                PatternKind::Cons { head, tail } => {
+                    let PositionPayloads::List { element, list } = self.type_position(
+                        positions,
+                        position,
+                        patterns::Family::List,
+                        current,
+                        nested,
+                        span,
+                    )?
+                    else {
+                        unreachable!("a `List` position has list payloads");
                     };
                     if let (PatternKind::Binder(head_name), PatternKind::Binder(tail_name)) =
                         (&head.kind, &tail.kind)
@@ -2426,41 +2490,94 @@ impl Analyzer {
                         .collect());
                 }
                 PatternKind::Variant { variant, payload } => {
-                    let first = self.fresh_type();
-                    let (expected, payload_type, family) = match variant.family() {
-                        VariantFamily::Option => {
-                            (InferType::Option(Box::new(first.clone())), first, "Option")
-                        }
-                        VariantFamily::Result => {
-                            let second = self.fresh_type();
-                            let payload_type = if *variant == VariantName::Err {
-                                second.clone()
-                            } else {
-                                first.clone()
-                            };
-                            (
-                                InferType::Result(Box::new(first), Box::new(second)),
-                                payload_type,
-                                "Result",
-                            )
-                        }
+                    let family = match variant.family() {
+                        VariantFamily::Option => patterns::Family::Option,
+                        VariantFamily::Result => patterns::Family::Result,
                     };
-                    self.expect_pattern_type(
-                        ty,
-                        expected,
-                        family,
-                        nested.then_some(current),
-                        span,
-                    )?;
+                    let payloads =
+                        self.type_position(positions, position, family, current, nested, span)?;
                     let Some(payload) = payload else {
                         return Ok(Vec::new());
                     };
-                    ty = payload_type;
+                    position = match (payloads, variant) {
+                        (PositionPayloads::Option { some }, VariantName::Some)
+                        | (PositionPayloads::Result { ok: some, .. }, VariantName::Ok)
+                        | (PositionPayloads::Result { err: some, .. }, VariantName::Err) => some,
+                        _ => unreachable!("a variant's position has its family's payloads"),
+                    };
                     current = payload;
                     nested = true;
                 }
             }
         }
+    }
+
+    /// Requires `family` at `position` for the variant or list pattern
+    /// `pattern` of the match at `span`, and returns what that family gives
+    /// the patterns below it.
+    ///
+    /// The first pattern of a family to reach a position unifies the type
+    /// there with the family over fresh payload types (`K3005` for another
+    /// type: at the match for the subject, or at `pattern` when it is
+    /// `nested` in a payload); every later pattern of that family at the
+    /// position reuses them, so a position is typed once however many arms
+    /// reach it. A pattern of another family is typed afresh and fails.
+    fn type_position(
+        &mut self,
+        positions: &mut PatternPositions,
+        position: usize,
+        family: patterns::Family,
+        pattern: &Pattern,
+        nested: bool,
+        span: Span,
+    ) -> Result<PositionPayloads, Diagnostic> {
+        if let Some(payloads) = &positions.payloads[position]
+            && payloads.family() == family
+        {
+            return Ok(payloads.clone());
+        }
+        let (expected, payloads, name) = match family {
+            patterns::Family::Option => {
+                let some = self.fresh_type();
+                (
+                    InferType::Option(Box::new(some.clone())),
+                    PositionPayloads::Option {
+                        some: positions.add(some),
+                    },
+                    "Option",
+                )
+            }
+            patterns::Family::Result => {
+                let ok = self.fresh_type();
+                let err = self.fresh_type();
+                (
+                    InferType::Result(Box::new(ok.clone()), Box::new(err.clone())),
+                    PositionPayloads::Result {
+                        ok: positions.add(ok),
+                        err: positions.add(err),
+                    },
+                    "Result",
+                )
+            }
+            patterns::Family::List => {
+                let element = self.fresh_type();
+                let list = InferType::List(Box::new(element.clone()));
+                (
+                    list.clone(),
+                    PositionPayloads::List { element, list },
+                    "List",
+                )
+            }
+        };
+        self.expect_pattern_type(
+            positions.types[position].clone(),
+            expected,
+            name,
+            nested.then_some(pattern),
+            span,
+        )?;
+        positions.payloads[position] = Some(payloads.clone());
+        Ok(payloads)
     }
 
     /// Requires a pattern of `family` to match a value of type `actual`,
@@ -6221,6 +6338,43 @@ mod tests {
                 None => assert_eq!(error.notes().len(), 1, "{text}"),
             }
         }
+    }
+
+    #[test]
+    fn typing_a_match_unifies_each_position_once_however_many_arms_reach_it() {
+        // An exhaustive match over `Result<Result<..>, Result<..>>` nested
+        // `depth` deep has 2^depth arms, each `depth` patterns long, but only
+        // 2^(depth + 1) - 1 positions; typing creates the payload types of
+        // each position once, not once per arm that passes through it.
+        let depth = 8;
+        let mut ty = "Int".to_owned();
+        for _ in 0..depth {
+            ty = format!("Result<{ty}, {ty}>");
+        }
+        let arms = (0..1_u32 << depth)
+            .map(|index| {
+                let mut pattern = "x".to_owned();
+                for level in 0..depth {
+                    let variant = if index >> level & 1 == 0 { "Ok" } else { "Err" };
+                    pattern = format!("{variant}({pattern})");
+                }
+                format!("{pattern} => {index}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let text = format!("fn f(v: {ty}) -> Int {{ match v {{ {arms} }} }}");
+        let program = parse_source(&Source::new("wide.krit", text.as_str()))
+            .expect("the wide match should parse");
+        let mut analyzer = Analyzer::new();
+        analyzer
+            .program(&program)
+            .expect("the wide match should check");
+        let positions = (1_u32 << (depth + 1)) - 1;
+        let variables = analyzer.next_type_variable;
+        assert!(
+            variables <= 2 * positions,
+            "{variables} type variables for {positions} positions"
+        );
     }
 
     #[test]
