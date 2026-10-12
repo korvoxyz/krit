@@ -7,6 +7,77 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-12
+
+0.3.1 is the first published 0.3 release. 0.3.0 was tagged but never
+published: its CI run failed, on Clippy's `collapsible_match` lint under Rust
+1.95 and on a Windows compile error over curl's `CURLcode` type, and the
+Release workflow, which runs CI first, stopped before packaging. 0.3.0 has no
+published binaries, container image, or GitHub release, and its `v0.3.0` tag
+is left unchanged. 0.3.1 contains everything listed under 0.3.0 below, plus
+the changes in this section.
+
+0.3.1 changes no compiler or CLI behavior beyond the version number it
+reports. The language version stays 0.3.0, and every artifact 0.3.1 builds is
+byte for byte the one 0.3.0 builds, apart from the compiler version recorded
+in it.
+
+### Fixed
+
+- The Rust 1.95 quality job passes Clippy again: the runtime host's
+  `cache.write` grant check, flagged by `collapsible_match`, is now a match
+  guard with the same behavior
+- krit-runtime's library tests compile on Windows, where curl's `CURLcode` is
+  `i32` rather than `u32`
+- Compiler warnings: two Windows-only ones in krit-assist (an unused
+  `read_source` function and an unused `package` parameter), and the
+  deprecation of `AtomicU64::fetch_update` on toolchains newer than Rust 1.95
+
+### Security
+
+- RUSTSEC-2026-0285 (GHSA-2mjx-qc3c-rqvc) in rustls, the TLS library behind
+  the curl client that the runtime host and `krit assist` use for outbound
+  HTTPS. rustls 0.23.13 through 0.23.44 accepted TLS 1.3 handshake messages
+  sent at the wrong encryption level when they followed a key-changing message
+  in the same record, which RFC 8446 forbids. The handshake transcript is
+  still authenticated, so an attacker cannot use this to alter or complete a
+  handshake; the effect is that a peer could send in plaintext handshake
+  messages that should have been encrypted, and the connection was not
+  refused. GitHub rates it moderate: CVSS 3.1 base score 5.3, with low
+  confidentiality impact and no integrity or availability impact. rustls-ffi
+  0.15.3, reached through curl, pinned rustls to exactly 0.23.39; 0.3.1 moves
+  to rustls-ffi 0.15.4, which pins the patched rustls 0.23.45, and no other
+  dependency changes. The published 0.2.0 binaries also contain rustls 0.23.39
+
+### Added
+
+- `scripts/gate.sh` runs the checks of CI's quality and supply-chain jobs
+  locally, with CI's Rust 1.95.0 toolchain, `--locked`, and CI's environment,
+  and names the toolchain, OS, and commit next to its result
+- `deny.toml`, a fail-closed cargo-deny policy for advisories, bans,
+  licenses, and sources
+- A "Supply chain" CI job that runs `cargo deny` and `cargo audit` at pinned
+  versions; the native packages wait for it. CI also runs on pushes to
+  `release/**` branches
+- Release attestations: the Release workflow attests every archive,
+  `SHA256SUMS`, and the multi-architecture container image with signed SLSA
+  build provenance, and checks each attestation with `gh attestation verify`.
+  "Verifying a release" in README.md and SECURITY.md shows how to check a
+  download or image
+- Immutable release publishing: assets are uploaded only to a draft that the
+  same workflow run created, compared byte for byte with the attested files,
+  and then published as Latest. A published release is never modified, and the
+  series and `latest` image tags move only after the release is published
+
+### Compatibility and upgrade notes
+
+- Every 0.3.0 note below applies to an upgrade from 0.2.0 to 0.3.1
+- 0.3.1 artifacts record compiler version 0.3.1 and language version 0.3.0,
+  and 0.3.1 loads artifacts from 0.1, 0.2, and 0.3 toolchains
+- Rebuilding a program with 0.3.1 changes its artifact digest, because the
+  recorded compiler version changes. As the 0.3.0 notes describe, the rebuild
+  orphans the program's durable replay and inbound-idempotency records
+
 ## [0.3.0] - 2026-10-12
 
 "Honest and flat." What checks is what ships, failures are diagnostics instead

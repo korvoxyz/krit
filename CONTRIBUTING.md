@@ -171,8 +171,8 @@ To publish a stable release:
    `[workspace.dependencies]`. Commit and push to `main`.
 2. Wait for CI, including every native package, to succeed.
 3. Create and push an annotated `vMAJOR.MINOR.PATCH` tag on that exact commit.
-   The tag must match the CLI's Cargo version. For this release, use `v0.3.0`,
-   not `v3.0.0`.
+   The tag must match the CLI's Cargo version. For this release, use `v0.3.1`,
+   not `v3.1.0`.
 4. The Release workflow repeats the quality/package gate, builds and exercises
    non-root containers from the packaged Linux binaries, and publishes both
    native images and a multi-architecture GHCR index under the version tag. It
