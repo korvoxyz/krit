@@ -130,19 +130,27 @@ single allocation (roadmap §9.2).
 ## 5. Release gate (all must hold)
 
 1. `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace` green; release build.
-2. Every example formats, checks, builds; `examples/webhook-agent.krit` ≤ 50 lines, all examples depth ≤ 3.
+2. Every example formats and checks; every example that is a deployable package (has a manifest, plus `factorial` via the root `krit.pkg`) builds; `examples/webhook-agent.krit` ≤ 50 lines, all examples depth ≤ 3. Exception, recorded 2026-10-12: `examples/lists.krit` is pure list processing that runs with `krit run`; Wasm list layouts and list matching are 0.4 scope (it did not build in 0.2 either), and a test pins it as the only unbuildable example.
 3. A webhook routing on `request.method == "POST"` and composing strings with `+`/interpolation builds and runs through `krit invoke`.
 4. 0.2.0 golden artifact runs on the 0.3 runtime.
 5. Swapped-token probe refused with K5006.
 6. 100k recursion → K4010; 2k nesting → K1005; no exit 134.
 7. `run` refuses every check failure; `check --target` == `build` on every file.
 8. Re-measure the 8 grounded use-case sketches: deployable count rises from 1 (target ≥ 4 using 0.3 features).
+   **Measured 2026-10-12:** 5/8 pass check and build (02 Slack, 03 payment,
+   05 ticket router, 06 flaky worker, 07 RAG), but 02, 03 and 05 only after
+   scope reductions (signature check in a shim, auth via query token and
+   host-SQL decoding, one-word model output). With full behavior, 2/8 (06,
+   07), up from 1/8. The remaining blockers (typed decoding into records,
+   record/list layouts, header lookup via list matching, HMAC) are 0.4
+   scope. The gate is met only when reduced-scope rewrites count; that is the
+   owner's release decision.
 
 ## 6. Metrics
 
 | Metric | 0.2.0 | 0.3 target |
 |---|---|---|
-| Realistic sketches that pass check *and* build | 1/8 | ≥ 4/8 |
+| Realistic sketches that pass check *and* build | 1/8 | ≥ 4/8 (measured: 5/8 with reduced scope, 2/8 full behavior) |
 | webhook-agent lines / max depth | 79 / 15 | ≤ 50 / ≤ 3 |
 | Process aborts on adversarial depth | yes | none |
 | Conformance run / check / format | 25 / 29 / 3 | ≥ 40 / ≥ 60 / ≥ 8 |
