@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use krit::{Source, analyze, lower, parse_source};
+use krit::{Source, analyze, analyze_with_warnings, lower, parse_source};
 use krit_package::Manifest;
 use krit_runtime::{
     AgentHost, AgentHostPolicy, AiAdapterConfig, ApprovalOperation, ApprovalPolicy,
@@ -239,6 +239,266 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
     let direct = DurableStore::open(&database, Durability::Full, store_limits()).unwrap();
     assert_eq!(direct.get("rolled-back").unwrap(), None);
     assert_eq!(direct.get("last").unwrap(), Some(b"two".to_vec()));
+}
+
+#[test]
+fn option_and_result_question_marks_exit_durable_state_helpers() {
+    let directory = TestDirectory::new("propagate");
+    let database = directory.database();
+    let artifact = compile(
+        r#"
+fn both(first: Option<String>, second: Option<String>) -> Option<String> {
+    first?;
+    second
+}
+
+fn respond(request: HttpRequest) -> Result<String, String> {
+    if request.method == "PUT" {
+        state_put("agent-work", request.path, request.body)?;
+        Ok("stored")
+    } else {
+        let first = state_get("agent-work", "/a")?;
+        let second = state_get("agent-work", "/b")?;
+        match both(first, second) {
+            Some(value) => Ok("both, the second is " + value),
+            None => Ok("missing"),
+        }
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match respond(request) {
+        Ok(body) => record { status: 200, headers: [], body: body },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}
+"#,
+        &["state.transaction"],
+    );
+    let grants = GrantSet::from_manifest(&manifest("state = [\"agent-work\"]"));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default()).unwrap();
+    let state_host = host(inputs, durable(database, false));
+    let send = |method: &str, path: &str, body: &str| {
+        Runtime::default()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &state_host,
+                HttpRequest {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    query: String::new(),
+                    headers: Vec::new(),
+                    body: body.to_owned(),
+                },
+            )
+            .expect("the webhook should run")
+            .response
+            .body
+    };
+
+    // `first?` exits `both` with `None` while `/a` is unset.
+    assert_eq!(send("GET", "/read", ""), "missing");
+    assert_eq!(send("PUT", "/b", "two"), "stored");
+    assert_eq!(send("GET", "/read", ""), "missing");
+    assert_eq!(send("PUT", "/a", "one"), "stored");
+    assert_eq!(send("GET", "/read", ""), "both, the second is two");
+}
+
+#[test]
+fn let_else_binds_durable_state_options_in_a_webhook_body() {
+    let directory = TestDirectory::new("let-else");
+    let database = directory.database();
+    let artifact = compile(
+        r#"
+fn failure(error: String) -> HttpResponse {
+    record { status: 500, headers: [], body: error }
+}
+
+fn create(request: HttpRequest, stored: Option<String>) -> HttpResponse {
+    let None = stored else
+        Some(existing) => record { status: 409, headers: [], body: "exists: " + existing };
+    let Ok(_) = state_put("agent-work", request.path, request.body) else
+        Err(error) => failure(error);
+    record { status: 201, headers: [], body: "created" }
+}
+
+fn read(request: HttpRequest, stored: Option<String>) -> HttpResponse {
+    let Some(value) = stored else
+        None => record { status: 404, headers: [], body: "missing " + request.path };
+    record { status: 200, headers: [], body: "found " + value }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let Ok(stored) = state_get("agent-work", request.path) else Err(error) => failure(error);
+    if request.method == "PUT" {
+        create(request, stored)
+    } else {
+        read(request, stored)
+    }
+}
+"#,
+        &["state.transaction"],
+    );
+    let grants = GrantSet::from_manifest(&manifest("state = [\"agent-work\"]"));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default()).unwrap();
+    let state_host = host(inputs, durable(database, false));
+    let send = |method: &str, path: &str, body: &str| {
+        let response = Runtime::default()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &state_host,
+                HttpRequest {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    query: String::new(),
+                    headers: Vec::new(),
+                    body: body.to_owned(),
+                },
+            )
+            .expect("the webhook should run")
+            .response;
+        (response.status, response.body)
+    };
+
+    assert_eq!(send("GET", "/a", ""), (404, "missing /a".to_owned()));
+    assert_eq!(send("PUT", "/a", "one"), (201, "created".to_owned()));
+    assert_eq!(send("GET", "/a", ""), (200, "found one".to_owned()));
+    // `let None = stored` meets `Some`: the arm's conflict is returned and
+    // nothing is overwritten.
+    assert_eq!(send("PUT", "/a", "two"), (409, "exists: one".to_owned()));
+    assert_eq!(send("GET", "/a", ""), (200, "found one".to_owned()));
+}
+
+#[test]
+fn nested_patterns_decide_durable_state_reads_in_a_webhook() {
+    let directory = TestDirectory::new("nested-patterns");
+    let database = directory.database();
+    let artifact = compile(
+        r#"
+fn lookup(request: HttpRequest) -> Result<Option<String>, String> {
+    if request.method == "DELETE" {
+        Err("refused " + request.path)
+    } else {
+        state_get("agent-work", request.path)
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    if request.method == "PUT" {
+        match state_put("agent-work", request.path, request.body) {
+            Ok(_) => record { status: 201, headers: [], body: "stored" },
+            Err(_) => record { status: 500, headers: [], body: "not stored" },
+        }
+    } else {
+        match lookup(request) {
+            Ok(Some(value)) => record { status: 200, headers: [], body: "found " + value },
+            Ok(None) => record { status: 404, headers: [], body: "missing " + request.path },
+            Err(error) => record { status: 500, headers: [], body: error },
+        }
+    }
+}
+"#,
+        &["state.transaction"],
+    );
+    let grants = GrantSet::from_manifest(&manifest("state = [\"agent-work\"]"));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default()).unwrap();
+    let state_host = host(inputs, durable(database, false));
+    let send = |method: &str, path: &str, body: &str| {
+        let response = Runtime::default()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &state_host,
+                HttpRequest {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    query: String::new(),
+                    headers: Vec::new(),
+                    body: body.to_owned(),
+                },
+            )
+            .expect("the webhook should run")
+            .response;
+        (response.status, response.body)
+    };
+
+    // `state_get` returns `Result<Option<String>, String>`; each of the three
+    // arms of the nested match is reached.
+    assert_eq!(send("GET", "/a", ""), (404, "missing /a".to_owned()));
+    assert_eq!(send("PUT", "/a", "one"), (201, "stored".to_owned()));
+    assert_eq!(send("GET", "/a", ""), (200, "found one".to_owned()));
+    assert_eq!(send("DELETE", "/a", ""), (500, "refused /a".to_owned()));
+}
+
+#[test]
+fn reading_a_pattern_discard_in_a_webhook_reads_the_value_at_its_position() {
+    // Edition 2026 keeps 0.2's meaning: a pattern's `_` binds the value at
+    // its position, so reading it (warning K2003) sees the payload, here in
+    // the guest, rather than the outer `_`.
+    let directory = TestDirectory::new("pattern-discard-read");
+    let database = directory.database();
+    let source = r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let _ = "outer";
+    if request.method == "PUT" {
+        match state_put("agent-work", request.path, request.body) {
+            Ok(_) => record { status: 201, headers: [], body: "stored" },
+            Err(_) => record { status: 500, headers: [], body: _ },
+        }
+    } else {
+        match state_get("agent-work", request.path) {
+            Ok(Some(_)) => record { status: 200, headers: [], body: "found " + _ },
+            Ok(None) => record { status: 404, headers: [], body: _ },
+            Err(_) => record { status: 500, headers: [], body: _ },
+        }
+    }
+}
+"#;
+    let report = analyze_with_warnings(
+        &parse_source(&Source::new("src/main.krit", source)).expect("source should parse"),
+    );
+    report.result.expect("reading `_` should check");
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .map(|warning| warning.code())
+            .collect::<Vec<_>>(),
+        ["K2003"; 4]
+    );
+    let artifact = compile(source, &["state.transaction"]);
+    let grants = GrantSet::from_manifest(&manifest("state = [\"agent-work\"]"));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default()).unwrap();
+    let state_host = host(inputs, durable(database, false));
+    let send = |method: &str, path: &str, body: &str| {
+        let response = Runtime::default()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &state_host,
+                HttpRequest {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    query: String::new(),
+                    headers: Vec::new(),
+                    body: body.to_owned(),
+                },
+            )
+            .expect("the webhook should run")
+            .response;
+        (response.status, response.body)
+    };
+
+    // `Ok(None)` binds no `_`, so its arm reads the outer one.
+    assert_eq!(send("GET", "/a", ""), (404, "outer".to_owned()));
+    assert_eq!(send("PUT", "/a", "one"), (201, "stored".to_owned()));
+    assert_eq!(send("GET", "/a", ""), (200, "found one".to_owned()));
 }
 
 #[test]

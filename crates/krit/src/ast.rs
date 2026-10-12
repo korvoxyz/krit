@@ -20,6 +20,21 @@ pub enum StatementKind {
         annotation: Option<TypeAnnotation>,
         value: Expression,
     },
+    /// `let PATTERN (: TYPE)? = value else ARM;`: binds the payload of
+    /// `value` when it matches `pattern`, and otherwise makes the enclosing
+    /// function return the value of `arm`, whose pattern is the other
+    /// variant of the same family.
+    ///
+    /// `annotation` states the type of `value`. Analysis accepts a let-else
+    /// only as a direct statement of a named function's body.
+    LetElse {
+        pattern: VariantPattern,
+        annotation: Option<TypeAnnotation>,
+        value: Expression,
+        /// The `else` keyword.
+        else_span: Span,
+        arm: Box<VariantArm>,
+    },
     Function {
         name: String,
         parameters: Vec<Parameter>,
@@ -89,9 +104,24 @@ pub enum ExpressionKind {
         callee: Box<Expression>,
         arguments: Vec<Expression>,
     },
+    /// Postfix `?`: `operand?` yields the payload of `Ok` or `Some`, and an
+    /// `Err` or `None` operand makes the enclosing function return it.
+    ///
+    /// The node's span extends past the operand's to the `?` at `question`,
+    /// so the two never share a span.
+    Propagate {
+        operand: Box<Expression>,
+        question: Span,
+    },
+    /// `match subject { arms }`: evaluates `subject` once and the value of
+    /// the one arm whose pattern matches it.
+    ///
+    /// Analysis requires the arms' patterns to name every outcome exactly
+    /// once: none matches everything at the top level, no two overlap, and
+    /// together they are exhaustive.
     Match {
         subject: Box<Expression>,
-        kind: MatchKind,
+        arms: Vec<MatchArm>,
     },
     Unary {
         operator: UnaryOperator,
@@ -111,20 +141,108 @@ pub struct RecordField {
     pub span: Span,
 }
 
+/// One `match` arm: `pattern => value`.
 #[derive(Clone, Debug)]
-pub enum MatchKind {
-    List {
-        empty_case: Box<Expression>,
-        head_name: String,
-        head_span: Span,
-        tail_name: String,
-        tail_span: Span,
-        cons_case: Box<Expression>,
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub value: Expression,
+    /// From the start of the pattern to the end of the value.
+    pub span: Span,
+}
+
+/// A `match` pattern.
+///
+/// A pattern constrains one path into its value: a variant pattern's payload
+/// is itself a pattern, while a list pattern's parts are only names or `_`.
+#[derive(Clone, Debug)]
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum PatternKind {
+    /// A name, which matches any value and binds it.
+    Binder(String),
+    /// `_`, which matches any value without naming an outcome. In edition
+    /// 2026 it binds the value as the discard name `_`, whose reads are
+    /// warning `K2003`.
+    Wildcard,
+    /// `Some(p)`, `Ok(p)`, or `Err(p)`, whose payload matches `p`, or
+    /// `None`, which has no payload.
+    Variant {
+        variant: VariantName,
+        payload: Option<Box<Pattern>>,
     },
-    Variants {
-        family: VariantFamily,
-        arms: Vec<VariantArm>,
+    /// `[]`, the empty list.
+    EmptyList,
+    /// `[head, ..tail]`, a non-empty list; `head` and `tail` are each a
+    /// [`PatternKind::Binder`] or a [`PatternKind::Wildcard`].
+    Cons {
+        head: Box<Pattern>,
+        tail: Box<Pattern>,
     },
+}
+
+impl Pattern {
+    /// The number of variant and list patterns on the pattern's path: 0 for
+    /// a name or `_`, 1 for `None`, `[]`, `[head, ..tail]`, or a variant
+    /// whose payload is a name or `_`, and one more for each variant pattern
+    /// it is the payload of (`Ok(Some(v))` is 2).
+    pub fn constructor_depth(&self) -> usize {
+        let mut depth = 0;
+        let mut current = self;
+        loop {
+            match &current.kind {
+                PatternKind::Binder(_) | PatternKind::Wildcard => return depth,
+                PatternKind::EmptyList | PatternKind::Cons { .. } => return depth + 1,
+                PatternKind::Variant { payload, .. } => {
+                    depth += 1;
+                    match payload {
+                        Some(payload) => current = payload,
+                        None => return depth,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the pattern matches every value: a name or `_`.
+    pub const fn is_catch_all(&self) -> bool {
+        matches!(self.kind, PatternKind::Binder(_) | PatternKind::Wildcard)
+    }
+}
+
+/// Renders the pattern in its canonical spelling.
+impl fmt::Display for Pattern {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Patterns are paths, so the closing parentheses are counted rather
+        // than produced by recursion.
+        let mut closing = 0;
+        let mut current = self;
+        loop {
+            match &current.kind {
+                PatternKind::Binder(name) => formatter.write_str(name)?,
+                PatternKind::Wildcard => formatter.write_str("_")?,
+                PatternKind::EmptyList => formatter.write_str("[]")?,
+                PatternKind::Cons { head, tail } => write!(formatter, "[{head}, ..{tail}]")?,
+                PatternKind::Variant { variant, payload } => {
+                    formatter.write_str(variant.as_str())?;
+                    if let Some(payload) = payload {
+                        formatter.write_str("(")?;
+                        closing += 1;
+                        current = payload;
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+        for _ in 0..closing {
+            formatter.write_str(")")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,11 +251,26 @@ pub enum VariantFamily {
     Result,
 }
 
+/// The arm of a let-else: `PATTERN => value`, whose pattern is a flat
+/// variant pattern as in [`VariantPattern`].
 #[derive(Clone, Debug)]
 pub struct VariantArm {
     pub variant: VariantName,
+    /// The payload binder of `Some`, `Ok`, or `Err`, possibly the discard
+    /// name `_`; `None` binds nothing.
     pub binding: Option<String>,
     pub value: Expression,
+    pub span: Span,
+}
+
+/// A flat variant pattern: `Some(name)`, `Ok(name)`, `Err(name)`, or
+/// `None`, as written after `let` in a let-else.
+#[derive(Clone, Debug)]
+pub struct VariantPattern {
+    pub variant: VariantName,
+    /// The binder of `Some`, `Ok`, or `Err`, possibly the discard name `_`;
+    /// `None` binds nothing.
+    pub binding: Option<String>,
     pub span: Span,
 }
 
@@ -156,6 +289,35 @@ impl VariantName {
             Self::None => "None",
             Self::Ok => "Ok",
             Self::Err => "Err",
+        }
+    }
+
+    /// The family the variant belongs to.
+    pub const fn family(self) -> VariantFamily {
+        match self {
+            Self::Some | Self::None => VariantFamily::Option,
+            Self::Ok | Self::Err => VariantFamily::Result,
+        }
+    }
+
+    /// The other variant of the same family.
+    pub const fn complement(self) -> Self {
+        match self {
+            Self::Some => Self::None,
+            Self::None => Self::Some,
+            Self::Ok => Self::Err,
+            Self::Err => Self::Ok,
+        }
+    }
+
+    /// The variant as a pattern, with an example binder when it binds one:
+    /// `Ok(value)`, `Err(error)`, `Some(value)`, or `None`.
+    pub const fn example_pattern(self) -> &'static str {
+        match self {
+            Self::Some => "Some(value)",
+            Self::None => "None",
+            Self::Ok => "Ok(value)",
+            Self::Err => "Err(error)",
         }
     }
 }

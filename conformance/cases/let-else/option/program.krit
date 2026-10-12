@@ -1,0 +1,21 @@
+fn first(items: List<String>) -> Option<String> {
+    match items {
+        [] => None,
+        [head, ..tail] => Some(head),
+    }
+}
+
+fn greet(names: List<String>) -> String {
+    let Some(name) = first(names) else None => "nobody to greet";
+    "hello " + name
+}
+
+fn require_empty(names: List<String>) -> String {
+    let None = first(names) else Some(name) => "already has " + name;
+    "empty"
+}
+
+println(greet(["ada", "grace"]));
+println(greet([]));
+println(require_empty([]));
+println(require_empty(["linus"]));

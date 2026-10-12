@@ -289,7 +289,18 @@ Policy 2 adds a deliberately bounded webhook ABI:
 - fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` records
 - ordered lists of headers
 - the Result/Option shapes returned by config, secrets, and HTTP
-- Result/Option matching and static references to non-capturing helpers
+- Result/Option matching, including nested patterns and `_` over those
+  shapes (`Ok(Some(value))`, `Ok(None)`, and `Err(error)` on the
+  `Result<Option<String>, String>` that `state_get`, `checkpoint_get`,
+  `object_get`, and `cache_get` return), and static references to
+  non-capturing helpers
+- postfix `?` on those Result/Option shapes in helpers and in `queue` and
+  `schedule` entrypoints, whenever the function's declared result has a
+  layout (for example `Result<HttpResponse, String>`, `Result<String, String>`,
+  or `Option<String>`); see [Function exits](#function-exits)
+- let-else on those Result/Option shapes in the body of any helper or
+  entrypoint whose result has a layout, including a webhook entrypoint
+  returning `HttpResponse`; see [Function exits](#function-exits)
 - a typed webhook export plus exact stdout/config/secrets/HTTP imports
 - neutral AI string results and ordered structured logging fields
 - transactional string state, named checkpoints, anonymous HTTP replay, and AI
@@ -298,6 +309,51 @@ Policy 2 adds a deliberately bounded webhook ABI:
 The core uses guest linear-memory offsets, never host pointers. Canonical
 parameters/results, list elements, records, variants, UTF-8, and allocation
 bounds are checked by the component adapter and host.
+
+### Function exits
+
+Core lowers postfix `?` (`LANGUAGE.md` section 8.2) to a variant match whose
+failure arm builds the `Err` or `None` at the function's declared result type
+and ends with an `exit` operation (`TYPES-AND-EFFECTS.md`, "Error
+propagation"). Both code generators lower `exit` to loading its value and a
+core `return`, which leaves the function from any depth of nested `if` blocks
+with the function's own result layout: a policy-2 `Result` or `Option` result
+is the `i32` guest offset of its variant, exactly what the function's normal
+end returns, so callers and the entry adapter see one result representation.
+Core verification guarantees that an `exit` is the last operation and the
+result of its block; the instructions after the `return` that store that
+block's result are unreachable, never execute, and validate against the
+polymorphic operand stack, so no placeholder value is produced. Policy 1
+lowers `exit` the same way but never meets one, because a `?` operand is a
+`Result` or `Option`, which policy 1 has no layout for. Support checking
+treats an `exit` like any other operation: its value has the function's
+result type, which is checked with the function signature, and a `?` whose
+`Result` or `Option` shape has no policy-2 layout fails at that shape with
+`K7002`.
+
+A let-else (`LANGUAGE.md` section 8.3) lowers the same way: a variant match
+on its value whose arm for the pattern yields the payload and whose other arm
+evaluates the source arm's expression and ends with an `exit` of that value
+(`TYPES-AND-EFFECTS.md`, "Let-else"). The exited value has the function's
+result type, whatever it is, so a webhook entrypoint returns the arm's
+`HttpResponse` through the same `return` as its normal end, and the entry
+adapter sees one result representation. The match and the binding of its
+payload are ordinary policy-2 operations, so a let-else builds exactly where
+the equivalent `match` builds; its value's shape, like a `match` subject's,
+fails with `K7002` when it has no layout, which is always the case in
+policy 1.
+
+### Nested patterns
+
+Core lowers a `match` with nested patterns to nested two-arm variant matches,
+one per position, whose arms bind each payload to the source name or to a
+Core-only binding (`TYPES-AND-EFFECTS.md`, "Matching"). Both code generators
+compile those exactly as they compile the equivalent hand-nested matches, so
+a nested pattern builds wherever every shape it decides has a policy-2
+layout; a shape without one fails with `K7002` at the first pattern that
+decides it, such as the `Some(n)` of `Some(Some(n))` on an
+`Option<Option<Int>>`. List patterns, like every list match, are outside both
+policies.
 
 ### Guest string runtime
 
@@ -392,13 +448,13 @@ recursively; source nesting limits (`LANGUAGE.md` section 4.1) bound that
 nesting, and the backend independently refuses Core nested more than 8,192
 blocks deep with `K1005`, before support checking and equally in a
 `krit check` target check, rather than relying on that bound. Policy 1 rejects
-strings, lists, records, options, results, JSON conversion, lexical captures,
-matches, unsupported print values, and any operation without a correct
-lowering. It never substitutes a trapping placeholder or direct-evaluator
-fallback. Policy 1 has no linear memory, so a String operator in a module
-program is reported where the String value is produced (the literal,
-parameter, or field), with the "String has no concrete guest layout in
-WebAssembly policy 1" message.
+strings, lists, records, options, results (and so every postfix `?`), JSON
+conversion, lexical captures, matches, unsupported print values, and any
+operation without a correct lowering. It never substitutes a trapping
+placeholder or direct-evaluator fallback. Policy 1 has no linear memory, so a
+String operator in a module program is reported where the String value is
+produced (the literal, parameter, or field), with the "String has no concrete
+guest layout in WebAssembly policy 1" message.
 
 Policy 2 does not generalize these layouts to arbitrary records/lists,
 capturing closures, JSON other than `json_decode` into `String`, or

@@ -1,0 +1,32 @@
+fn count(items: List<Int>) -> Int {
+    match items {
+        [_, ..rest] => 1 + count(rest),
+        [] => 0,
+    }
+}
+
+fn first_or(items: List<Int>, fallback: Int) -> Int {
+    match items {
+        [] => fallback,
+        [head, .._] => head,
+    }
+}
+
+fn second(items: Result<List<String>, String>) -> String {
+    match items {
+        Ok([_, ..rest]) => match rest {
+            [value, .._] => value,
+            [] => "only one",
+        },
+        Ok([]) => "empty",
+        Err(error) => error,
+    }
+}
+
+println(count([4, 5, 6]));
+println(first_or([], 9));
+println(first_or([7, 8], 9));
+println(second(Ok(["a", "b", "c"])));
+println(second(Ok(["a"])));
+println(second(Ok([])));
+println(second(Err("unreadable")));

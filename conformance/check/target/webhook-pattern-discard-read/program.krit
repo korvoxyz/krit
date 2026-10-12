@@ -1,0 +1,7 @@
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match state_get("agent-work", request.path) {
+        Ok(Some(_)) => record { status: 200, headers: [], body: _ },
+        Ok(None) => record { status: 404, headers: [], body: "" },
+        Err(_) => record { status: 500, headers: [], body: _ },
+    }
+}

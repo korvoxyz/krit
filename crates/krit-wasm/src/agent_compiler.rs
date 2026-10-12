@@ -754,6 +754,13 @@ fn encode_operation(
             store_value(function, context, operation.result)?;
         }
         OperationKind::Unit | OperationKind::Bind { .. } | OperationKind::Discard { .. } => {}
+        OperationKind::Exit { value } => {
+            // The value has the function's result layout. Code after the
+            // `return` in this block, which reads the exit's own result, is
+            // unreachable and validates against the polymorphic stack.
+            load_value(function, context, *value)?;
+            function.instruction(&Instruction::Return);
+        }
         OperationKind::Builtin(builtin) => {
             if matches!(builtin, Builtin::Print | Builtin::Println) {
                 let flavor = StdoutFlavor::from_builtin(*builtin, &operation.ty)?;

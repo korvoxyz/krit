@@ -127,6 +127,55 @@ schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String
 }
 
 #[test]
+fn entrypoints_written_with_question_marks_build_with_the_same_authority() {
+    let worker = compile(
+        r#"
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    match object_get("render-output", job.id)? {
+        Some(previous) => Ok(previous),
+        None => {
+            object_put("render-output", job.id, job.body)?;
+            checkpoint_put("agent-work", "last-render", job.id)?;
+            Ok(job.id)
+        },
+    }
+}
+"#,
+        &[
+            "object.read",
+            "object.write",
+            "queue.consume",
+            "state.transaction",
+        ],
+    );
+    let matched = queue_worker();
+    assert_eq!(worker.metadata.world, matched.metadata.world);
+    assert_eq!(worker.metadata.imports, matched.metadata.imports);
+    assert_eq!(worker.metadata.effects, matched.metadata.effects);
+    assert_eq!(worker.metadata.requirements, matched.metadata.requirements);
+    let inspection =
+        validate_artifact(&worker.bytes, &worker.metadata).expect("queue artifact should validate");
+    assert_eq!(inspection.exports, [JOB_INTERFACE]);
+
+    let schedule = compile(
+        r#"
+schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
+    object_put("render-output", event.id, event.schedule)?;
+    Ok(event.id)
+}
+"#,
+        &["object.read", "object.write", "schedule.trigger"],
+    );
+    assert_eq!(
+        schedule.metadata.world,
+        "krit:runtime/schedule-objwrite-program@0.2.0"
+    );
+    let inspection = validate_artifact(&schedule.bytes, &schedule.metadata)
+        .expect("schedule artifact should validate");
+    assert_eq!(inspection.exports, [SCHEDULE_INTERFACE]);
+}
+
+#[test]
 fn queue_publishers_stay_webhook_shaped_with_publish_only_authority() {
     let artifact = compile(
         r#"

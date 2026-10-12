@@ -1,0 +1,5 @@
+fn first(items: List<Int>) -> Int {
+    match items {
+        [head, .._] => head,
+    }
+}

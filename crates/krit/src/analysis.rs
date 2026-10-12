@@ -10,12 +10,13 @@ use krit_capability::{HttpOrigin, is_valid_config_key, is_valid_resource_name};
 use crate::{
     Builtin, Diagnostic, Span,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
-        Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral,
-        VariantFamily, VariantName,
+        BinaryOperator, Block, Expression, ExpressionKind, MatchArm, Parameter, Pattern,
+        PatternKind, Program, Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator,
+        ValueLiteral, VariantArm, VariantFamily, VariantName, VariantPattern,
     },
     habits::{MethodReceiver, method_hint, undefined_name_note},
     limits::{MAX_NESTING_DEPTH, MAX_TREE_DEPTH, tree_depth_error},
+    patterns,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -889,12 +890,130 @@ struct Analyzer {
     /// The span of the field access `call` is about to analyze as its callee,
     /// so a failed access reports the method call it is part of (`K3011`).
     method_callee: Option<Span>,
+    /// What a postfix `?` may exit, one entry per enclosing function body,
+    /// innermost last; empty at the top level.
+    exits: Vec<ExitContext>,
+    /// Where a let-else may exit, one entry per enclosing function body,
+    /// innermost last; empty at the top level.
+    let_else_bodies: Vec<LetElseBody>,
+}
+
+/// Whether a let-else may return from the function whose body it is in.
+#[derive(Clone)]
+enum LetElseBody {
+    /// The body block at `block` of a named function (or entrypoint) whose
+    /// result type is `result`: a let-else that is a direct statement of
+    /// that block returns its arm's value from the function.
+    Named { block: Span, result: InferType },
+    /// The body of an anonymous function, which no let-else may exit.
+    Closure,
+}
+
+/// Whether a postfix `?` in a function body may return from that function.
+#[derive(Clone)]
+enum ExitContext {
+    Propagates(Propagation),
+    Refused(Refusal),
+}
+
+/// A named function (or a `queue`/`schedule` entrypoint) declared to return
+/// `Result<_, E>` or `Option<_>`, which a postfix `?` in its body returns
+/// from.
+#[derive(Clone)]
+struct Propagation {
+    name: String,
+    family: VariantFamily,
+    /// The declared error type `E` of a `Result` family.
+    error: Option<InferType>,
+    /// The declared return type as written.
+    return_type: String,
+}
+
+/// Why a postfix `?` cannot return from where it stands (`K3012`).
+#[derive(Clone)]
+enum Refusal {
+    /// Outside every function body.
+    TopLevel,
+    /// In an anonymous function `fn(...) { ... }`.
+    Closure,
+    /// In a webhook entrypoint, which returns `HttpResponse`.
+    Webhook,
+    /// In a named function without a declared return type.
+    Undeclared { name: String },
+    /// In a named function declared to return a type that is neither a
+    /// `Result` nor an `Option`.
+    Other { name: String, return_type: String },
 }
 
 #[derive(Clone)]
 struct ScopeBinding {
     id: SymbolId,
     ty: InferType,
+}
+
+/// A name or `_` at the end of a pattern's path, with its span and the type
+/// of the value at its position.
+struct PatternBinding {
+    name: String,
+    span: Span,
+    ty: InferType,
+}
+
+/// The positions that the patterns of one `match` reach and their types: the
+/// subject, and below each typed variant position, its payloads.
+///
+/// A position is typed against its family once, by the first pattern that
+/// reaches it, and the patterns of every later arm reuse its payload types,
+/// so typing a match costs one unification per position rather than one per
+/// position of every arm.
+struct PatternPositions {
+    /// The type of the value at each position.
+    types: Vec<InferType>,
+    /// What each position's family gave the patterns below it, once a
+    /// pattern at the position has been typed.
+    payloads: Vec<Option<PositionPayloads>>,
+}
+
+impl PatternPositions {
+    /// The position of the match's subject.
+    const SUBJECT: usize = 0;
+
+    fn new(subject: InferType) -> Self {
+        Self {
+            types: vec![subject],
+            payloads: vec![None],
+        }
+    }
+
+    /// Adds a position whose value has type `ty` and returns it.
+    fn add(&mut self, ty: InferType) -> usize {
+        self.types.push(ty);
+        self.payloads.push(None);
+        self.types.len() - 1
+    }
+}
+
+/// What a typed position gives the patterns below it.
+#[derive(Clone)]
+enum PositionPayloads {
+    /// An `Option<T>` position: the position of a `Some` payload, of type `T`.
+    Option { some: usize },
+    /// A `Result<T, E>` position: the positions of an `Ok` payload, of type
+    /// `T`, and of an `Err` payload, of type `E`.
+    Result { ok: usize, err: usize },
+    /// A `List<T>` position: the types of a list pattern's head, `T`, and
+    /// tail, `List<T>`, which are names or `_`.
+    List { element: InferType, list: InferType },
+}
+
+impl PositionPayloads {
+    const fn family(&self) -> patterns::Family {
+        match self {
+            Self::Option { .. } => patterns::Family::Option,
+            Self::Result { .. } => patterns::Family::Result,
+            Self::List { .. } => patterns::Family::List,
+        }
+    }
 }
 
 impl Analyzer {
@@ -920,13 +1039,15 @@ impl Analyzer {
             type_depth_error: None,
             warnings: Vec::new(),
             method_callee: None,
+            exits: Vec::new(),
+            let_else_bodies: Vec::new(),
         }
     }
 
     fn program(&mut self, program: &Program) -> Result<Analysis, Diagnostic> {
         let mut effects = InferEffects::default();
         for statement in &program.statements {
-            effects.union(self.statement(statement)?);
+            effects.union(self.statement(statement, None)?);
         }
         self.validate_host_builtin_references()?;
         self.validate_constraints()?;
@@ -1102,7 +1223,13 @@ impl Analyzer {
         Ok(Some((symbol_kind, requirement)))
     }
 
-    fn statement(&mut self, statement: &Statement) -> Result<InferEffects, Diagnostic> {
+    /// Analyzes `statement`, a direct statement of the block at `block`, or
+    /// of the program when `block` is `None`.
+    fn statement(
+        &mut self,
+        statement: &Statement,
+        block: Option<Span>,
+    ) -> Result<InferEffects, Diagnostic> {
         match &statement.kind {
             StatementKind::Let {
                 name,
@@ -1142,6 +1269,20 @@ impl Analyzer {
                 });
                 Ok(value.effects)
             }
+            StatementKind::LetElse {
+                pattern,
+                annotation,
+                value,
+                arm,
+                ..
+            } => self.let_else(
+                statement.span,
+                block,
+                pattern,
+                annotation.as_ref(),
+                value,
+                arm,
+            ),
             StatementKind::Function {
                 name,
                 parameters,
@@ -1185,6 +1326,11 @@ impl Analyzer {
                     Some(annotation) => self.annotation(annotation),
                     None => self.fresh_type(),
                 };
+                let exit = if matches!(statement.kind, StatementKind::Webhook { .. }) {
+                    ExitContext::Refused(Refusal::Webhook)
+                } else {
+                    named_exit_context(name, return_type.as_ref(), &declared_return)
+                };
                 let effect = self.fresh_effect();
                 let function_type = InferType::Function {
                     parameters: parameter_types.clone(),
@@ -1202,7 +1348,15 @@ impl Analyzer {
 
                 self.push_scope();
                 self.define_parameters(parameters, &parameter_types)?;
-                let body_info = self.block(body)?;
+                self.exits.push(exit);
+                self.let_else_bodies.push(LetElseBody::Named {
+                    block: body.span,
+                    result: declared_return.clone(),
+                });
+                let body_info = self.block(body);
+                self.let_else_bodies.pop();
+                self.exits.pop();
+                let body_info = body_info?;
                 self.pop_scope();
                 self.unify(
                     declared_return,
@@ -1227,6 +1381,178 @@ impl Analyzer {
             }
             StatementKind::Expression(expression) => Ok(self.expression(expression)?.effects),
         }
+    }
+
+    /// Analyzes the let-else `let PATTERN (: TYPE)? = value else ARM;` at
+    /// `span`, a direct statement of the block at `block` (`None` at the top
+    /// level).
+    ///
+    /// It is valid only as a direct statement of a named function's body,
+    /// with the two complementary patterns of one family (`K3014`). The value
+    /// has the annotated type and belongs to the pattern's family. The arm's
+    /// binder is in scope only in the arm, whose value is the function's
+    /// return value and so has its result type. The pattern's binder is then
+    /// declared like a `let` binding for the rest of the block. A binder `_`
+    /// is the discard name, declared like any other binder, so reading it is
+    /// warning `K2003`, as for every `_`. The effects are those of the value
+    /// and the arm.
+    fn let_else(
+        &mut self,
+        span: Span,
+        block: Option<Span>,
+        pattern: &VariantPattern,
+        annotation: Option<&TypeAnnotation>,
+        value: &Expression,
+        arm: &VariantArm,
+    ) -> Result<InferEffects, Diagnostic> {
+        let head = Span::new(span.start, pattern.span.end);
+        let result = self.let_else_result(head, block)?;
+        let complement = pattern.variant.complement();
+        if arm.variant != complement {
+            return Err(Diagnostic::new(
+                "K3014",
+                format!(
+                    "the arm of a let-else on `{}` must match `{}`, found `{}`",
+                    pattern.variant.as_str(),
+                    complement.as_str(),
+                    arm.variant.as_str()
+                ),
+                arm.span,
+            )
+            .with_note(format!(
+                "the two patterns of a let-else are the two variants of one family, `Ok` and \
+                 `Err` or `Some` and `None`: write `else {} => ...`",
+                complement.example_pattern()
+            )));
+        }
+        for (variant, binding, at) in [
+            (pattern.variant, &pattern.binding, pattern.span),
+            (arm.variant, &arm.binding, arm.span),
+        ] {
+            if (variant != VariantName::None) != binding.is_some() {
+                return Err(Diagnostic::new(
+                    "K3005",
+                    format!("invalid `{}` let-else binding", variant.as_str()),
+                    at,
+                ));
+            }
+        }
+        if let Some(name) = &pattern.binding {
+            self.ensure_name_available(name, span)?;
+        }
+
+        let value_info = self.expression(value)?;
+        let subject = if let Some(annotation) = annotation {
+            let annotated = self.annotation(annotation);
+            self.unify(
+                annotated.clone(),
+                value_info.ty,
+                annotation.span,
+                "let-else annotation",
+            )?;
+            annotated
+        } else {
+            value_info.ty
+        };
+        let family = pattern.variant.family();
+        let family_name = match family {
+            VariantFamily::Option => "an `Option`",
+            VariantFamily::Result => "a `Result`",
+        };
+        let found = self.resolve_head(&subject);
+        if !matches!(
+            (&found, family),
+            (InferType::Variable(_), _)
+                | (InferType::Option(_), VariantFamily::Option)
+                | (InferType::Result(_, _), VariantFamily::Result)
+        ) {
+            return Err(Diagnostic::new(
+                "K3005",
+                format!(
+                    "let-else on `{}` requires {family_name} value, found `{}`",
+                    pattern.variant.as_str(),
+                    self.render_type(&found)
+                ),
+                value.span,
+            ));
+        }
+        let payload = self.fresh_type();
+        let error = self.fresh_type();
+        let expected = match family {
+            VariantFamily::Option => InferType::Option(Box::new(payload.clone())),
+            VariantFamily::Result => {
+                InferType::Result(Box::new(payload.clone()), Box::new(error.clone()))
+            }
+        };
+        self.unify(expected, subject, value.span, "let-else value")?;
+        let payload_of = |variant| match variant {
+            VariantName::Err => error.clone(),
+            _ => payload.clone(),
+        };
+
+        self.push_scope();
+        if let Some(binding) = &arm.binding {
+            self.define_symbol(
+                binding,
+                payload_of(arm.variant),
+                arm.span,
+                SymbolKind::Match,
+                false,
+            );
+        }
+        let arm_info = self.expression(&arm.value)?;
+        self.pop_scope();
+        self.unify(result, arm_info.ty, arm.value.span, "let-else arm")?;
+
+        if let Some(name) = &pattern.binding {
+            let binding_type = self.fresh_type();
+            self.unify(
+                binding_type.clone(),
+                payload_of(pattern.variant),
+                span,
+                "let-else binding",
+            )?;
+            let id = self.define_symbol(name, binding_type.clone(), span, SymbolKind::Let, false);
+            self.bindings.push(PendingBinding {
+                id,
+                name: name.clone(),
+                ty: binding_type,
+                span,
+                top_level: false,
+            });
+        }
+        let mut effects = value_info.effects;
+        effects.union(arm_info.effects);
+        Ok(effects)
+    }
+
+    /// The result type of the function a let-else whose `let` and pattern
+    /// are at `head` returns from, when it is a direct statement of that
+    /// function's body block; `block` is the block it is a statement of.
+    fn let_else_result(&self, head: Span, block: Option<Span>) -> Result<InferType, Diagnostic> {
+        let (message, note) = match self.let_else_bodies.last() {
+            Some(LetElseBody::Named {
+                block: body,
+                result,
+            }) if block == Some(*body) => return Ok(result.clone()),
+            Some(LetElseBody::Named { .. }) => (
+                "let-else must be a statement of the function body itself, not of a nested \
+                 block",
+                "let-else returns from the enclosing function, so it may only appear at the top \
+                 level of a named function's body; handle the value with `match` here",
+            ),
+            Some(LetElseBody::Closure) => (
+                "let-else is not allowed in an anonymous function",
+                "let-else returns only from a named function; handle the value with `match` \
+                 here, or move the code into a named `fn`",
+            ),
+            None => (
+                "let-else is not allowed at the top level",
+                "let-else returns early from the enclosing named function; at the top level, \
+                 handle the value with `match`",
+            ),
+        };
+        Err(Diagnostic::new("K3014", message, head).with_note(note))
     }
 
     /// Counts one level of analyzer recursion.
@@ -1254,7 +1580,7 @@ impl Analyzer {
         self.push_scope();
         let mut effects = InferEffects::default();
         for statement in &block.statements {
-            effects.union(self.statement(statement)?);
+            effects.union(self.statement(statement, Some(block.span))?);
         }
         let ty = if let Some(tail) = block.tail.as_deref() {
             let tail = self.expression(tail)?;
@@ -1404,8 +1730,9 @@ impl Analyzer {
             ExpressionKind::Call { callee, arguments } => {
                 self.call(callee, arguments, expression.span)
             }
-            ExpressionKind::Match { subject, kind } => {
-                self.match_expression(subject, kind, expression.span)
+            ExpressionKind::Propagate { operand, question } => self.propagate(operand, *question),
+            ExpressionKind::Match { subject, arms } => {
+                self.match_expression(subject, arms, expression.span)
             }
             ExpressionKind::Unary { operator, operand } => {
                 let operand = self.expression(operand)?;
@@ -1552,7 +1879,12 @@ impl Analyzer {
 
         self.push_scope();
         self.define_parameters(parameters, &parameter_types)?;
-        let body_info = self.block(body)?;
+        self.exits.push(ExitContext::Refused(Refusal::Closure));
+        self.let_else_bodies.push(LetElseBody::Closure);
+        let body_info = self.block(body);
+        self.let_else_bodies.pop();
+        self.exits.pop();
+        let body_info = body_info?;
         self.pop_scope();
         self.unify(
             declared_return.clone(),
@@ -1921,116 +2253,154 @@ impl Analyzer {
         })
     }
 
+    /// Analyzes `operand?`, whose `?` is at `question`.
+    ///
+    /// `?` is valid only in the body of a named function declared to return
+    /// `Result<_, E>` (for a `Result<T, E>` operand with the identical `E`)
+    /// or `Option<_>` (for an `Option<T>` operand); its value is the `T`. It
+    /// adds no effect of its own.
+    fn propagate(
+        &mut self,
+        operand: &Expression,
+        question: Span,
+    ) -> Result<ExpressionInfo, Diagnostic> {
+        let operand_info = self.expression(operand)?;
+        let Propagation {
+            name,
+            family,
+            error,
+            return_type,
+        } = match self.exits.last().cloned() {
+            Some(ExitContext::Propagates(propagation)) => propagation,
+            Some(ExitContext::Refused(refusal)) => {
+                return Err(propagation_refused(&refusal, question));
+            }
+            None => return Err(propagation_refused(&Refusal::TopLevel, question)),
+        };
+        let found = self.resolve_head(&operand_info.ty);
+        let ty = match (family, found, error) {
+            (VariantFamily::Option, InferType::Option(value), _) => *value,
+            (VariantFamily::Result, InferType::Result(value, found_error), Some(error)) => {
+                // The failure arm rebuilds the `Err` around the error value,
+                // so an opaque error type is rejected as it is for `Err(x)`.
+                self.constraints.push(TypeConstraint {
+                    ty: error.clone(),
+                    span: question,
+                    kind: ConstraintKind::StructuralValue,
+                });
+                self.unify(error, *found_error, question, "`?` error")
+                    .map_err(|mismatch| {
+                        if mismatch.code() != "K3001" {
+                            return mismatch;
+                        }
+                        Diagnostic::new(
+                            "K3013",
+                            format!(
+                                "`?` cannot return this `Err` from `{name}`: its error type \
+                                 differs from the declared `{return_type}`"
+                            ),
+                            question,
+                        )
+                        .with_note(
+                            "`?` passes the error on unchanged, so both error types must be \
+                             identical; `match` the value to convert the error",
+                        )
+                    })?;
+                *value
+            }
+            (family, InferType::Variable(_), error) => {
+                let value = self.fresh_type();
+                let expected = match (family, error) {
+                    (VariantFamily::Result, Some(error)) => {
+                        self.constraints.push(TypeConstraint {
+                            ty: error.clone(),
+                            span: question,
+                            kind: ConstraintKind::StructuralValue,
+                        });
+                        InferType::Result(Box::new(value.clone()), Box::new(error))
+                    }
+                    _ => InferType::Option(Box::new(value.clone())),
+                };
+                self.unify(expected, operand_info.ty, question, "`?` operand")?;
+                value
+            }
+            (family, found @ (InferType::Option(_) | InferType::Result(_, _)), _) => {
+                let (found_family, expected_family) = match family {
+                    VariantFamily::Option => ("a `Result`", "an `Option`"),
+                    VariantFamily::Result => ("an `Option`", "a `Result`"),
+                };
+                return Err(Diagnostic::new(
+                    "K3013",
+                    format!(
+                        "`?` on {found_family} value cannot return from `{name}`, which \
+                         returns `{return_type}`",
+                    ),
+                    question,
+                )
+                .with_note(format!(
+                    "`?` returns the family it unwraps; `match` the `{}` to build \
+                     {expected_family}, or declare {found_family} return type",
+                    self.render_type(&found)
+                )));
+            }
+            (_, found, _) => {
+                return Err(Diagnostic::new(
+                    "K3001",
+                    format!(
+                        "`?` applies to a `Result` or `Option` value, found `{}`",
+                        self.render_type(&found)
+                    ),
+                    question,
+                ));
+            }
+        };
+        Ok(ExpressionInfo {
+            ty,
+            effects: operand_info.effects,
+        })
+    }
+
+    /// Analyzes the `match` at `span`.
+    ///
+    /// After the subject, the arms' patterns are checked against each other
+    /// ([`patterns::check_arms`]), typed against the subject's type in arm
+    /// order, and checked for exhaustiveness ([`patterns::check_exhaustive`]).
+    /// Each arm's value is then analyzed in a scope of its own that holds the
+    /// pattern's binders, and every arm's value has the match's type.
     fn match_expression(
         &mut self,
         subject: &Expression,
-        kind: &MatchKind,
+        arms: &[MatchArm],
         span: Span,
     ) -> Result<ExpressionInfo, Diagnostic> {
         let subject = self.expression(subject)?;
-        match kind {
-            MatchKind::List {
-                empty_case,
-                head_name,
-                head_span,
-                tail_name,
-                tail_span,
-                cons_case,
-            } => {
-                if head_name == tail_name && head_name != DISCARD {
-                    return Err(Diagnostic::new(
-                        "K2002",
-                        format!("duplicate match binding `{tail_name}`"),
-                        span,
-                    ));
-                }
-                let element = self.fresh_type();
-                self.expect_match_type(
-                    subject.ty,
-                    InferType::List(Box::new(element.clone())),
-                    span,
-                    "List",
-                )?;
-                let empty = self.expression(empty_case)?;
-                self.push_scope();
-                self.define_symbol(
-                    head_name,
-                    element.clone(),
-                    *head_span,
-                    SymbolKind::Match,
-                    false,
-                );
-                self.define_symbol(
-                    tail_name,
-                    InferType::List(Box::new(element)),
-                    *tail_span,
-                    SymbolKind::Match,
-                    false,
-                );
-                let cons = self.expression(cons_case)?;
-                self.pop_scope();
-                let ty = self.unify(empty.ty, cons.ty, span, "list match arms")?;
-                let mut effects = subject.effects;
-                effects.union(empty.effects);
-                effects.union(cons.effects);
-                Ok(ExpressionInfo { ty, effects })
-            }
-            MatchKind::Variants { family, arms } => {
-                self.variant_match(subject, *family, arms, span)
-            }
-        }
-    }
-
-    fn variant_match(
-        &mut self,
-        subject: ExpressionInfo,
-        family: VariantFamily,
-        arms: &[crate::VariantArm],
-        span: Span,
-    ) -> Result<ExpressionInfo, Diagnostic> {
-        self.verify_variant_arms(family, arms, span)?;
-        let first = self.fresh_type();
-        let second = self.fresh_type();
-        let expected = match family {
-            VariantFamily::Option => InferType::Option(Box::new(first.clone())),
-            VariantFamily::Result => {
-                InferType::Result(Box::new(first.clone()), Box::new(second.clone()))
-            }
+        let known_family = match self.resolve_head(&subject.ty) {
+            InferType::Option(_) => Some(patterns::Family::Option),
+            InferType::Result(_, _) => Some(patterns::Family::Result),
+            InferType::List(_) => Some(patterns::Family::List),
+            _ => None,
         };
-        self.expect_match_type(
-            subject.ty,
-            expected,
-            span,
-            match family {
-                VariantFamily::Option => "Option",
-                VariantFamily::Result => "Result",
-            },
-        )?;
+        patterns::check_arms(arms, known_family)?;
+        let mut positions = PatternPositions::new(subject.ty);
+        let mut arm_bindings = Vec::with_capacity(arms.len());
+        for arm in arms {
+            arm_bindings.push(self.pattern_bindings(&arm.pattern, &mut positions, span)?);
+        }
+        patterns::check_exhaustive(arms, span)?;
 
         let mut result_type = None;
         let mut effects = subject.effects;
-        for arm in arms {
+        for (arm, bindings) in arms.iter().zip(arm_bindings) {
             self.push_scope();
-            if let Some(binding) = &arm.binding {
-                let payload = match arm.variant {
-                    VariantName::Some | VariantName::Ok => first.clone(),
-                    VariantName::Err => second.clone(),
-                    VariantName::None => {
-                        self.pop_scope();
-                        return Err(Diagnostic::new(
-                            "K3005",
-                            "`None` cannot bind a payload",
-                            arm.span,
-                        ));
-                    }
-                };
-                self.define_symbol(binding, payload, arm.span, SymbolKind::Match, false);
+            for PatternBinding { name, span, ty } in bindings {
+                self.define_symbol(&name, ty, span, SymbolKind::Match, false);
             }
-            let arm_info = self.expression(&arm.value)?;
+            let arm_info = self.expression(&arm.value);
             self.pop_scope();
+            let arm_info = arm_info?;
             effects.union(arm_info.effects);
             result_type = Some(if let Some(result_type) = result_type {
-                self.unify(result_type, arm_info.ty, arm.span, "variant match arms")?
+                self.unify(result_type, arm_info.ty, arm.span, "match arms")?
             } else {
                 arm_info.ty
             });
@@ -2039,6 +2409,211 @@ impl Analyzer {
             ty: result_type.unwrap_or_else(|| self.fresh_type()),
             effects,
         })
+    }
+
+    /// Types `pattern`, an arm of the match at `span`, against the types of
+    /// the match's `positions` and returns the names and `_` it binds, in
+    /// source order, each with the type of the value at its position.
+    ///
+    /// Patterns are paths, so this walks one iteratively, from the subject's
+    /// position down through each variant pattern's payload.
+    fn pattern_bindings(
+        &mut self,
+        pattern: &Pattern,
+        positions: &mut PatternPositions,
+        span: Span,
+    ) -> Result<Vec<PatternBinding>, Diagnostic> {
+        let mut position = PatternPositions::SUBJECT;
+        let mut current = pattern;
+        let mut nested = false;
+        loop {
+            match &current.kind {
+                PatternKind::Binder(name) => {
+                    return Ok(vec![PatternBinding {
+                        name: name.clone(),
+                        span: current.span,
+                        ty: positions.types[position].clone(),
+                    }]);
+                }
+                PatternKind::Wildcard => {
+                    return Ok(vec![PatternBinding {
+                        name: DISCARD.to_owned(),
+                        span: current.span,
+                        ty: positions.types[position].clone(),
+                    }]);
+                }
+                PatternKind::EmptyList => {
+                    self.type_position(
+                        positions,
+                        position,
+                        patterns::Family::List,
+                        current,
+                        nested,
+                        span,
+                    )?;
+                    return Ok(Vec::new());
+                }
+                PatternKind::Cons { head, tail } => {
+                    let PositionPayloads::List { element, list } = self.type_position(
+                        positions,
+                        position,
+                        patterns::Family::List,
+                        current,
+                        nested,
+                        span,
+                    )?
+                    else {
+                        unreachable!("a `List` position has list payloads");
+                    };
+                    if let (PatternKind::Binder(head_name), PatternKind::Binder(tail_name)) =
+                        (&head.kind, &tail.kind)
+                        && head_name == tail_name
+                    {
+                        return Err(Diagnostic::new(
+                            "K2002",
+                            format!("duplicate match binding `{tail_name}`"),
+                            current.span,
+                        ));
+                    }
+                    // `patterns::check_arms` made the head and tail names or
+                    // `_`.
+                    return Ok([(head, element), (tail, list)]
+                        .into_iter()
+                        .map(|(part, ty)| PatternBinding {
+                            name: match &part.kind {
+                                PatternKind::Binder(name) => name.clone(),
+                                _ => DISCARD.to_owned(),
+                            },
+                            span: part.span,
+                            ty,
+                        })
+                        .collect());
+                }
+                PatternKind::Variant { variant, payload } => {
+                    let family = match variant.family() {
+                        VariantFamily::Option => patterns::Family::Option,
+                        VariantFamily::Result => patterns::Family::Result,
+                    };
+                    let payloads =
+                        self.type_position(positions, position, family, current, nested, span)?;
+                    let Some(payload) = payload else {
+                        return Ok(Vec::new());
+                    };
+                    position = match (payloads, variant) {
+                        (PositionPayloads::Option { some }, VariantName::Some)
+                        | (PositionPayloads::Result { ok: some, .. }, VariantName::Ok)
+                        | (PositionPayloads::Result { err: some, .. }, VariantName::Err) => some,
+                        _ => unreachable!("a variant's position has its family's payloads"),
+                    };
+                    current = payload;
+                    nested = true;
+                }
+            }
+        }
+    }
+
+    /// Requires `family` at `position` for the variant or list pattern
+    /// `pattern` of the match at `span`, and returns what that family gives
+    /// the patterns below it.
+    ///
+    /// The first pattern of a family to reach a position unifies the type
+    /// there with the family over fresh payload types (`K3005` for another
+    /// type: at the match for the subject, or at `pattern` when it is
+    /// `nested` in a payload); every later pattern of that family at the
+    /// position reuses them, so a position is typed once however many arms
+    /// reach it. A pattern of another family is typed afresh and fails.
+    fn type_position(
+        &mut self,
+        positions: &mut PatternPositions,
+        position: usize,
+        family: patterns::Family,
+        pattern: &Pattern,
+        nested: bool,
+        span: Span,
+    ) -> Result<PositionPayloads, Diagnostic> {
+        if let Some(payloads) = &positions.payloads[position]
+            && payloads.family() == family
+        {
+            return Ok(payloads.clone());
+        }
+        let (expected, payloads, name) = match family {
+            patterns::Family::Option => {
+                let some = self.fresh_type();
+                (
+                    InferType::Option(Box::new(some.clone())),
+                    PositionPayloads::Option {
+                        some: positions.add(some),
+                    },
+                    "Option",
+                )
+            }
+            patterns::Family::Result => {
+                let ok = self.fresh_type();
+                let err = self.fresh_type();
+                (
+                    InferType::Result(Box::new(ok.clone()), Box::new(err.clone())),
+                    PositionPayloads::Result {
+                        ok: positions.add(ok),
+                        err: positions.add(err),
+                    },
+                    "Result",
+                )
+            }
+            patterns::Family::List => {
+                let element = self.fresh_type();
+                let list = InferType::List(Box::new(element.clone()));
+                (
+                    list.clone(),
+                    PositionPayloads::List { element, list },
+                    "List",
+                )
+            }
+        };
+        self.expect_pattern_type(
+            positions.types[position].clone(),
+            expected,
+            name,
+            nested.then_some(pattern),
+            span,
+        )?;
+        positions.payloads[position] = Some(payloads.clone());
+        Ok(payloads)
+    }
+
+    /// Requires a pattern of `family` to match a value of type `actual`,
+    /// unifying it with `expected` (`K3005` for another type): the subject of
+    /// the match at `span`, or the payload that `nested` matches.
+    fn expect_pattern_type(
+        &mut self,
+        actual: InferType,
+        expected: InferType,
+        family: &str,
+        nested: Option<&Pattern>,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let Some(pattern) = nested else {
+            return self.expect_match_type(actual, expected, span, family);
+        };
+        let resolved = self.resolve_head(&actual);
+        if !matches!(
+            (&resolved, &expected),
+            (InferType::Variable(_), _)
+                | (InferType::List(_), InferType::List(_))
+                | (InferType::Option(_), InferType::Option(_))
+                | (InferType::Result(_, _), InferType::Result(_, _))
+        ) {
+            let article = if family == "Option" { "an" } else { "a" };
+            return Err(Diagnostic::new(
+                "K3005",
+                format!(
+                    "the pattern `{pattern}` requires {article} `{family}` value, found `{}`",
+                    self.render_type(&resolved)
+                ),
+                pattern.span,
+            ));
+        }
+        self.unify(expected, actual, pattern.span, "match pattern")?;
+        Ok(())
     }
 
     fn binary(
@@ -2143,47 +2718,6 @@ impl Analyzer {
                 SymbolKind::Parameter,
                 false,
             );
-        }
-        Ok(())
-    }
-
-    fn verify_variant_arms(
-        &self,
-        family: VariantFamily,
-        arms: &[crate::VariantArm],
-        span: Span,
-    ) -> Result<(), Diagnostic> {
-        let expected = match family {
-            VariantFamily::Option => [VariantName::Some, VariantName::None],
-            VariantFamily::Result => [VariantName::Ok, VariantName::Err],
-        };
-        if arms.len() != expected.len()
-            || expected
-                .iter()
-                .any(|variant| arms.iter().filter(|arm| arm.variant == *variant).count() != 1)
-            || arms.iter().any(|arm| !expected.contains(&arm.variant))
-        {
-            return Err(Diagnostic::new(
-                "K3005",
-                format!(
-                    "{} match must contain exactly its two variant arms",
-                    match family {
-                        VariantFamily::Option => "Option",
-                        VariantFamily::Result => "Result",
-                    }
-                ),
-                span,
-            ));
-        }
-        for arm in arms {
-            let should_bind = arm.variant != VariantName::None;
-            if should_bind != arm.binding.is_some() {
-                return Err(Diagnostic::new(
-                    "K3005",
-                    format!("invalid `{}` match binding", arm.variant.as_str()),
-                    arm.span,
-                ));
-            }
         }
         Ok(())
     }
@@ -3857,6 +4391,77 @@ impl<'a> TypeNormalizer<'a> {
     }
 }
 
+/// Decides whether `?` may exit the named function `name`, declared with
+/// `return_type` (analyzed as `declared`).
+fn named_exit_context(
+    name: &str,
+    return_type: Option<&TypeAnnotation>,
+    declared: &InferType,
+) -> ExitContext {
+    let Some(annotation) = return_type else {
+        return ExitContext::Refused(Refusal::Undeclared {
+            name: name.to_owned(),
+        });
+    };
+    let (family, error) = match declared {
+        InferType::Result(_, error) => (VariantFamily::Result, Some(error.as_ref().clone())),
+        InferType::Option(_) => (VariantFamily::Option, None),
+        _ => {
+            return ExitContext::Refused(Refusal::Other {
+                name: name.to_owned(),
+                return_type: annotation.to_string(),
+            });
+        }
+    };
+    ExitContext::Propagates(Propagation {
+        name: name.to_owned(),
+        family,
+        error,
+        return_type: annotation.to_string(),
+    })
+}
+
+/// `K3012`: the `?` at `question` has no function it may return from, for
+/// the reason `refusal`.
+fn propagation_refused(refusal: &Refusal, question: Span) -> Diagnostic {
+    let (message, note) = match refusal {
+        Refusal::TopLevel => (
+            "`?` is not allowed at the top level".to_owned(),
+            "`?` returns early from the enclosing named function; at the top level, \
+             handle the value with `match`"
+                .to_owned(),
+        ),
+        Refusal::Closure => (
+            "`?` is not allowed in an anonymous function".to_owned(),
+            "`?` returns only from a named function; handle the value with `match` here, \
+             or move the code into a named `fn` that returns `Result` or `Option`"
+                .to_owned(),
+        ),
+        Refusal::Webhook => (
+            "`?` is not allowed in a webhook entrypoint, which returns `HttpResponse`".to_owned(),
+            "bind each fallible step with let-else here, as in \
+             `let Ok(value) = step else Err(error) => response;`, or move the steps into a \
+             helper `fn` that returns `Result<HttpResponse, String>` and use `?` there"
+                .to_owned(),
+        ),
+        Refusal::Undeclared { name } => (
+            format!("`?` is not allowed in `{name}`, which has no declared return type"),
+            format!(
+                "declare the return type of `{name}`, as in `-> Result<T, E>` or \
+                 `-> Option<T>`; `?` returns its `Err` or `None` from there"
+            ),
+        ),
+        Refusal::Other { name, return_type } => (
+            format!("`?` is not allowed in `{name}`, which returns `{return_type}`"),
+            format!(
+                "`?` returns an `Err` or `None` early, so `{name}` must return `Result<_, E>` \
+                 or `Option<_>`; otherwise handle the value with `match`"
+            ),
+        ),
+    };
+    Diagnostic::new("K3012", message, question).with_note(note)
+}
+
 /// The source spelling of a method call's receiver when it is a name or a
 /// short field path (`s`, `request.body`), for use in a fix; `None` for any
 /// other expression.
@@ -4533,39 +5138,65 @@ mod tests {
     }
 
     #[test]
-    fn defensively_rejects_non_exhaustive_variant_ast() {
-        let subject = Expression {
-            kind: ExpressionKind::Variable("None".to_owned()),
-            span: Span::new(6, 10),
-        };
-        let arm_value = Expression {
-            kind: ExpressionKind::Literal(ValueLiteral::Integer(0)),
-            span: Span::new(21, 22),
-        };
-        let expression = Expression {
-            kind: ExpressionKind::Match {
-                subject: Box::new(subject),
-                kind: MatchKind::Variants {
-                    family: VariantFamily::Option,
-                    arms: vec![crate::VariantArm {
-                        variant: VariantName::None,
-                        binding: None,
+    fn rejects_non_exhaustive_and_malformed_pattern_ast() {
+        let program_with = |pattern: Pattern| {
+            let subject = Expression {
+                kind: ExpressionKind::Variable("None".to_owned()),
+                span: Span::new(6, 10),
+            };
+            let arm_value = Expression {
+                kind: ExpressionKind::Literal(ValueLiteral::Integer(0)),
+                span: Span::new(21, 22),
+            };
+            let expression = Expression {
+                kind: ExpressionKind::Match {
+                    subject: Box::new(subject),
+                    arms: vec![MatchArm {
+                        pattern,
                         value: arm_value,
                         span: Span::new(13, 22),
                     }],
                 },
-            },
-            span: Span::new(0, 24),
+                span: Span::new(0, 24),
+            };
+            Program {
+                statements: vec![Statement {
+                    kind: StatementKind::Expression(expression),
+                    span: Span::new(0, 25),
+                }],
+            }
         };
-        let program = Program {
-            statements: vec![Statement {
-                kind: StatementKind::Expression(expression),
-                span: Span::new(0, 25),
-            }],
+        let leaf = |kind| Pattern {
+            kind,
+            span: Span::new(13, 17),
         };
 
-        let error = analyze(&program).expect_err("invalid AST should fail defensively");
+        let none = leaf(PatternKind::Variant {
+            variant: VariantName::None,
+            payload: None,
+        });
+        let error = analyze(&program_with(none)).expect_err("one arm is not exhaustive");
         assert_eq!(error.code(), "K3005");
+        assert_eq!(error.message(), "non-exhaustive match; missing: `Some(_)`");
+
+        for malformed in [
+            PatternKind::Variant {
+                variant: VariantName::None,
+                payload: Some(Box::new(leaf(PatternKind::Wildcard))),
+            },
+            PatternKind::Variant {
+                variant: VariantName::Some,
+                payload: None,
+            },
+            PatternKind::Cons {
+                head: Box::new(leaf(PatternKind::EmptyList)),
+                tail: Box::new(leaf(PatternKind::Wildcard)),
+            },
+        ] {
+            let error = analyze(&program_with(leaf(malformed)))
+                .expect_err("a pattern the parser never builds should fail defensively");
+            assert_eq!(error.code(), "K1003");
+        }
     }
 
     #[test]
@@ -5200,5 +5831,648 @@ mod tests {
         // A field that exists but does not hold a function is a call error.
         let (code, _, _) = error_notes("let item = record { a: 1 };\nitem.a();");
         assert_eq!(code, "K3002");
+    }
+
+    /// The type and effects analysis recorded for the expression spelled
+    /// `snippet` in `text`.
+    fn expression_fact(text: &str, snippet: &str) -> (String, String) {
+        let analysis = check(text).unwrap_or_else(|error| panic!("{text}: {error:?}"));
+        let start = text
+            .find(snippet)
+            .expect("snippet should occur in the text");
+        let fact = analysis
+            .expression(Span::new(start, start + snippet.len()))
+            .expect("the snippet should be an analyzed expression");
+        (fact.ty().to_string(), fact.effects().to_string())
+    }
+
+    #[test]
+    fn postfix_question_marks_unwrap_results_and_options() {
+        let text = "fn digit(text: String) -> Result<Int, String> { Err(text) }\n\
+                    fn total(text: String) -> Result<Int, String> { Ok(digit(text)? + 1) }";
+        assert_eq!(
+            expression_fact(text, "digit(text)?"),
+            ("Int".to_owned(), "{}".to_owned())
+        );
+        let text = "fn first(items: List<String>) -> Option<String> {\n\
+                    match items { [] => None, [head, .._] => Some(head) }\n}\n\
+                    fn twice(items: List<String>) -> Option<String> { Some(first(items)? + \"!\") }";
+        assert_eq!(
+            expression_fact(text, "first(items)?"),
+            ("String".to_owned(), "{}".to_owned())
+        );
+
+        // `?` adds no effect: the operand's effects are its effects.
+        let text = "fn logged() -> Option<Int> { println(1); Some(1) }\n\
+                    fn use_it() -> Option<Int> { Some(logged()?) }";
+        assert_eq!(
+            expression_fact(text, "logged()?"),
+            ("Int".to_owned(), "{io.stdout}".to_owned())
+        );
+
+        // An operand of unknown type takes the declared family and error type.
+        let text = "fn pass(value) -> Result<Bool, String> { Ok(value?) }";
+        let analysis = check(text).expect("an inferred operand should check");
+        assert_eq!(
+            analysis.bindings()[0].ty().to_string(),
+            "fn(Result<Bool, String>) -> Result<Bool, String> effects {}"
+        );
+        check("fn pass(value) -> Option<Int> { Some(value? + 1) }")
+            .expect("an inferred Option operand should check");
+
+        // Entrypoints that return `Result<String, String>` accept `?`, and the
+        // innermost named function decides.
+        check(
+            "queue \"jobs\" fn work(job: QueueJob) -> Result<String, String> {\n\
+             Ok(config_string(\"agent.model\")? + job.body)\n}",
+        )
+        .expect("a queue entrypoint should accept `?`");
+        check(
+            "schedule \"tick\" fn tick(event: ScheduleEvent) -> Result<String, String> {\n\
+             Ok(config_string(\"agent.model\")?)\n}",
+        )
+        .expect("a schedule entrypoint should accept `?`");
+        check(
+            "fn outer() -> Int {\n\
+             fn inner(value: Option<Int>) -> Option<Int> { Some(value? + 1) }\n\
+             match inner(Some(1)) { Some(x) => x, None => 0 }\n}",
+        )
+        .expect("a nested named function returning Option should accept `?`");
+    }
+
+    #[test]
+    fn postfix_question_marks_need_a_function_that_returns_their_family() {
+        for (text, code, message) in [
+            (
+                "let x = Some(1)?;",
+                "K3012",
+                "`?` is not allowed at the top level",
+            ),
+            (
+                "fn f(x: Option<Int>) -> Option<Int> { let g = fn() -> Option<Int> { Some(x?) };\n\
+                 g() }",
+                "K3012",
+                "`?` is not allowed in an anonymous function",
+            ),
+            (
+                "webhook fn handle(request: HttpRequest) -> HttpResponse {\n\
+                 let model = config_string(\"agent.model\")?;\n\
+                 record { status: 200, headers: [], body: model }\n}",
+                "K3012",
+                "`?` is not allowed in a webhook entrypoint, which returns `HttpResponse`",
+            ),
+            (
+                "fn f(x: Option<Int>) { x? }",
+                "K3012",
+                "`?` is not allowed in `f`, which has no declared return type",
+            ),
+            (
+                "fn f(x: Option<Int>) -> Int { x? }",
+                "K3012",
+                "`?` is not allowed in `f`, which returns `Int`",
+            ),
+            (
+                "fn f(x: Option<Int>) -> Option<Int> { fn g(y: Option<Int>) -> Int { y? }\n\
+                 Some(g(x)) }",
+                "K3012",
+                "`?` is not allowed in `g`, which returns `Int`",
+            ),
+            (
+                "fn f(x: Result<Int, Int>) -> Result<Int, String> { Ok(x?) }",
+                "K3013",
+                "`?` cannot return this `Err` from `f`: its error type differs from the \
+                 declared `Result<Int, String>`",
+            ),
+            (
+                "fn f(x: Option<Int>) -> Result<Int, String> { Ok(x?) }",
+                "K3013",
+                "`?` on an `Option` value cannot return from `f`, which returns \
+                 `Result<Int, String>`",
+            ),
+            (
+                "fn f(x: Result<Int, String>) -> Option<Int> { Some(x?) }",
+                "K3013",
+                "`?` on a `Result` value cannot return from `f`, which returns `Option<Int>`",
+            ),
+        ] {
+            let error = check(text).expect_err("misplaced `?` should not check");
+            assert_eq!(error.code(), code, "{text}");
+            assert_eq!(error.message(), message, "{text}");
+            assert_eq!(error.notes().len(), 1, "{text}");
+            let question = text.rfind('?').expect("text has a `?`");
+            assert_eq!(error.span(), Span::new(question, question + 1), "{text}");
+        }
+
+        let error = check("fn f(x: Int) -> Option<Int> { Some(x?) }").expect_err("not a variant");
+        assert_eq!(error.code(), "K3001");
+        // Propagating rebuilds the `Err`, so an opaque error type is refused.
+        let error = check(
+            "fn g() -> Result<Int, Secret> { Ok(1) }\n\
+             fn f() -> Result<Int, Secret> { Ok(g()?) }",
+        )
+        .expect_err("a Secret error should not propagate");
+        assert_eq!(error.code(), "K3009");
+        // The operand is checked before the `?`.
+        let error = check("let x = missing?;").expect_err("undefined operand");
+        assert_eq!(error.code(), "K2001");
+    }
+
+    /// The span of `snippet`, which occurs once in `text`.
+    fn span_of(text: &str, snippet: &str) -> Span {
+        let start = text
+            .find(snippet)
+            .expect("snippet should occur in the text");
+        assert_eq!(
+            text.rfind(snippet),
+            Some(start),
+            "snippet should occur once"
+        );
+        Span::new(start, start + snippet.len())
+    }
+
+    #[test]
+    fn let_else_binds_the_payload_and_types_its_arm_as_the_function_result() {
+        let statement = "let Ok(value) = digit(text) else Err(error) => 0;";
+        let text = format!(
+            "fn digit(text: String) -> Result<Int, String> {{ Err(text) }}\n\
+             fn total(text: String) -> Int {{\n    {statement}\n    value + 1\n}}"
+        );
+        let analysis = check(&text).expect("let-else should check");
+        // The pattern's binder is a `let` binding at the statement, and the
+        // arm's binder a match binding at the arm.
+        let value = analysis
+            .symbol(span_of(&text, statement), "value", SymbolKind::Let)
+            .expect("the binder should be a let symbol");
+        assert_eq!(value.ty().to_string(), "Int");
+        assert!(!value.is_top_level());
+        let error = analysis
+            .symbol(
+                span_of(&text, "Err(error) => 0"),
+                "error",
+                SymbolKind::Match,
+            )
+            .expect("the arm binder should be a match symbol");
+        assert_eq!(error.ty().to_string(), "String");
+        assert!(
+            analysis
+                .bindings()
+                .iter()
+                .any(|binding| binding.name() == "value" && binding.ty().to_string() == "Int")
+        );
+
+        // The arm's value is the function's return value, so it decides an
+        // undeclared result type, and the annotation types the value.
+        let function_type = |text: &str, name: &str| {
+            check(text)
+                .unwrap_or_else(|error| panic!("{text} should check: {error:?}"))
+                .bindings()
+                .iter()
+                .find(|binding| binding.name() == name)
+                .expect("the function should have a binding")
+                .ty()
+                .to_string()
+        };
+        let text =
+            "fn pick(value) {\n    let Some(found) = value else None => \"none\";\n    found\n}";
+        assert_eq!(
+            function_type(text, "pick"),
+            "fn(Option<String>) -> String effects {}"
+        );
+        let text = "fn decode(raw: String) -> String {\n    \
+                    let Ok(text): Result<String, String> = json_decode(raw) else Err(e) => e;\n    \
+                    text\n}";
+        check(text).expect("an annotated value should check");
+
+        // The effects of the value and the arm are the statement's effects.
+        let text = "fn noisy(x: Option<Int>) -> Int {\n    \
+                    let Some(v) = x else None => { println(0); 0 };\n    v\n}";
+        assert_eq!(
+            function_type(text, "noisy"),
+            "fn(Option<Int>) -> Int effects {io.stdout}"
+        );
+
+        // Either variant may come first, `_` may repeat, and every named
+        // function body accepts let-else, including entrypoints and nested
+        // named functions.
+        for text in [
+            "fn f(r: Result<Int, String>) -> String {\n    let Err(e) = r else Ok(v) => \"ok\";\n    e\n}",
+            "fn f(o: Option<Int>) -> Int {\n    let None = o else Some(v) => v;\n    0\n}",
+            "fn f(r: Result<Int, String>) -> Int {\n    let Ok(_) = r else Err(_) => 0;\n    let Ok(_) = r else Err(_) => 1;\n    2\n}",
+            "webhook fn handle(request: HttpRequest) -> HttpResponse {\n    \
+             let Ok(model) = config_string(\"agent.model\") else\n        \
+             Err(error) => record { status: 500, headers: [], body: error };\n    \
+             record { status: 200, headers: [], body: model }\n}",
+            "queue \"jobs\" fn work(job: QueueJob) -> Result<String, String> {\n    \
+             let Ok(model) = config_string(\"agent.model\") else Err(error) => Err(error);\n    \
+             Ok(model + job.body)\n}",
+            "fn outer() -> Int {\n    fn inner(o: Option<Int>) -> Int {\n        \
+             let Some(v) = o else None => 0;\n        v\n    }\n    inner(Some(1))\n}",
+            "fn f(x: Option<Int>) -> Int {\n    let Some(x) = x else None => 0;\n    x\n}",
+        ] {
+            let report = analyze_with_warnings(
+                &parse_source(&Source::new("test.krit", text)).expect("text should parse"),
+            );
+            report
+                .result
+                .unwrap_or_else(|error| panic!("{text} should check: {error:?}"));
+            assert!(report.warnings.is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn let_else_is_a_direct_statement_of_a_named_function_body() {
+        for (text, head, message) in [
+            (
+                "let Ok(x) = Ok(1) else Err(e) => 0;",
+                "let Ok(x)",
+                "let-else is not allowed at the top level",
+            ),
+            (
+                "let v = {\n    let Some(x) = Some(1) else None => 0;\n    x\n};",
+                "let Some(x)",
+                "let-else is not allowed at the top level",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let g = fn() -> Int {\n        \
+                 let Ok(x) = r else Err(e) => 0;\n        x\n    };\n    g()\n}",
+                "let Ok(x)",
+                "let-else is not allowed in an anonymous function",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let y = {\n        \
+                 let Ok(x) = r else Err(e) => 0;\n        x\n    };\n    y\n}",
+                "let Ok(x)",
+                "let-else must be a statement of the function body itself, not of a nested block",
+            ),
+            (
+                "fn f(r: Result<Int, String>, c: Bool) -> Int {\n    if c {\n        \
+                 let Ok(x) = r else Err(e) => 0;\n        x\n    } else {\n        1\n    }\n}",
+                "let Ok(x)",
+                "let-else must be a statement of the function body itself, not of a nested block",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let Ok(x) = r else None => 0;\n    x\n}",
+                "None => 0",
+                "the arm of a let-else on `Ok` must match `Err`, found `None`",
+            ),
+            (
+                "fn f(o: Option<Int>) -> Int {\n    let Some(x) = o else Some(y) => y;\n    x\n}",
+                "Some(y) => y",
+                "the arm of a let-else on `Some` must match `None`, found `Some`",
+            ),
+        ] {
+            let error = check(text).expect_err("misplaced let-else should not check");
+            assert_eq!(error.code(), "K3014", "{text}");
+            assert_eq!(error.message(), message, "{text}");
+            assert_eq!(error.notes().len(), 1, "{text}");
+            assert_eq!(error.span(), span_of(text, head), "{text}");
+        }
+
+        for (text, code, at) in [
+            // The value belongs to the pattern's family.
+            (
+                "fn f(r: Int) -> Int {\n    let Ok(x) = r else Err(e) => 0;\n    x\n}",
+                "K3005",
+                "r else",
+            ),
+            (
+                "fn f(r: Option<Int>) -> Int {\n    let Ok(x) = r else Err(e) => 0;\n    x\n}",
+                "K3005",
+                "r else",
+            ),
+            // The arm has the function's result type.
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let Ok(x) = r else Err(e) => e;\n    x\n}",
+                "K3001",
+                "e;",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    \
+                 let Ok(x): Option<Int> = r else Err(e) => 0;\n    x\n}",
+                "K3001",
+                "Option<Int>",
+            ),
+            // The pattern's binder is declared in the body's scope, after the arm.
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let x = 1;\n    \
+                 let Ok(x) = r else Err(e) => 0;\n    x\n}",
+                "K2002",
+                "let Ok(x)",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> Int {\n    let Ok(x) = r else Err(e) => x;\n    x\n}",
+                "K2001",
+                "x;\n    x",
+            ),
+            (
+                "fn f(r: Result<Int, String>) -> String {\n    let Ok(x) = r else Err(e) => e;\n    e\n}",
+                "K2001",
+                "e\n}",
+            ),
+        ] {
+            let error = check(text).expect_err("ill-typed let-else should not check");
+            assert_eq!(error.code(), code, "{text}");
+            assert_eq!(error.span().start, span_of(text, at).start, "{text}");
+        }
+    }
+
+    #[test]
+    fn nested_patterns_bind_payload_types_in_any_arm_order() {
+        let text = "fn describe(value: Result<Option<String>, Int>) -> String {\n    \
+                    match value {\n        Err(code) => \"error\",\n        \
+                    Ok(None) => \"missing\",\n        Ok(Some(text)) => text,\n    }\n}\n\
+                    fn first(items) {\n    match items {\n        [_, ..rest] => rest,\n        \
+                    [] => [1],\n    }\n}";
+        let analysis = check(text).unwrap_or_else(|error| panic!("{error:?}"));
+        for (snippet, name, ty) in [
+            ("code", "code", "Int"),
+            ("text)", "text", "String"),
+            ("rest]", "rest", "List<Int>"),
+        ] {
+            let start = text.find(snippet).expect("binder should occur");
+            let span = Span::new(start, start + name.len());
+            let symbol = analysis
+                .symbol(span, name, SymbolKind::Match)
+                .unwrap_or_else(|| panic!("`{name}` should be a match symbol at its own span"));
+            assert_eq!(symbol.ty().to_string(), ty, "{name}");
+        }
+        // `_` is a wildcard for the arm rules, and it binds the discard name
+        // at its own span like any binder.
+        let start = text.find("_,").expect("the head `_` should occur");
+        let discard = analysis
+            .symbol(Span::new(start, start + 1), "_", SymbolKind::Match)
+            .expect("`_` should be a match symbol at its own span");
+        assert_eq!(discard.ty().to_string(), "Int");
+    }
+
+    #[test]
+    fn non_exhaustive_matches_list_every_missing_pattern() {
+        for (text, missing) in [
+            (
+                "fn f(v: Result<Option<String>, String>) -> Int { match v { Ok(Some(t)) => 1, Err(e) => 2 } }",
+                "`Ok(None)`",
+            ),
+            (
+                "fn f(v: Result<Option<String>, String>) -> Int { match v { Ok(Some(t)) => 1 } }",
+                "`Ok(None)`, `Err(_)`",
+            ),
+            (
+                "fn f(v: Option<Result<List<Int>, String>>) -> Int { match v { Some(Ok([])) => 1, None => 0 } }",
+                "`Some(Ok([_, .._]))`, `Some(Err(_))`",
+            ),
+            (
+                "fn f(v: List<Int>) -> Int { match v { [_, ..rest] => 1 } }",
+                "`[]`",
+            ),
+            ("fn f(v) -> Int { match v { None => 1 } }", "`Some(_)`"),
+        ] {
+            let (code, message, notes) = error_notes(text);
+            assert_eq!(code, "K3005", "{text}");
+            assert_eq!(
+                message,
+                format!("non-exhaustive match; missing: {missing}"),
+                "{text}"
+            );
+            assert_eq!(notes.len(), 1, "{text}");
+            assert!(
+                notes[0].starts_with("add an arm for each missing pattern: `"),
+                "{notes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catch_all_arms_are_rejected_with_the_outcomes_to_name() {
+        for (text, at, note) in [
+            (
+                "fn f(v: Result<Option<String>, String>) -> Int { match v { Ok(Some(t)) => 1, _ => 2 } }",
+                "_ =>",
+                "name every outcome: replace `_ => ...` with `Ok(None) => ...` and `Err(_) => ...`",
+            ),
+            (
+                "fn f(v: Result<Int, String>) -> Int { match v { other => 2 } }",
+                "other",
+                "name every outcome: replace `other => ...` with `Ok(_) => ...` and `Err(_) => ...`",
+            ),
+            (
+                "fn f(v: Option<Int>) -> Int { match v { _ => 0, Some(x) => x, None => 1 } }",
+                "_ =>",
+                "name every outcome: the other arms already do, so remove `_ => ...`",
+            ),
+            (
+                "fn f(v) -> Int { match v { _ => 2 } }",
+                "_ =>",
+                "name every outcome with its own arm, such as `Some(value)` and `None`, \
+                 `Ok(value)` and `Err(error)`, or `[]` and `[head, ..tail]`",
+            ),
+        ] {
+            let error = check(text).expect_err(text);
+            assert_eq!(error.code(), "K3005", "{text}");
+            assert_eq!(error.span().start, span_of(text, at).start, "{text}");
+            assert!(
+                error
+                    .message()
+                    .starts_with("a match arm cannot match every value")
+            );
+            assert_eq!(error.notes(), [note], "{text}");
+        }
+        // A catch-all inside a payload names its variant and is allowed.
+        check("fn f(v: Result<Option<Int>, String>) -> Int { match v { Ok(Some(x)) => x, Ok(None) => 0, Err(_) => 1 } }")
+            .expect("a payload `_` is not a catch-all arm");
+    }
+
+    #[test]
+    fn duplicate_unreachable_overlapping_and_mixed_arms_are_rejected() {
+        for (text, at, message, note) in [
+            (
+                "fn f(v: Option<Int>) -> Int { match v { Some(t) => 1, Some(u) => 3, None => 2 } }",
+                "Some(u)",
+                "duplicate match arm: `Some(u)` matches exactly what the earlier arm `Some(t)` matches",
+                Some("remove one of the two arms"),
+            ),
+            (
+                "fn f(v: Result<Option<Int>, Int>) -> Int { match v { Ok(x) => 1, Ok(Some(t)) => 3, Err(e) => 2 } }",
+                "Ok(Some(t))",
+                "unreachable match arm: the earlier arm `Ok(x)` already matches every value `Ok(Some(t))` matches",
+                Some("remove this arm"),
+            ),
+            (
+                "fn f(v: Option<Option<Int>>) -> Int { match v { Some(Some(t)) => 1, Some(None) => 3, Some(x) => 4, None => 2 } }",
+                "Some(x)",
+                "unreachable match arm: earlier arms already match every value `Some(x)` matches",
+                Some("remove this arm"),
+            ),
+            (
+                "fn f(v: Result<Option<Option<Int>>, Int>) -> Int { match v { Ok(Some(Some(t))) => 1, Ok(x) => 3, Err(e) => 2 } }",
+                "Ok(x)",
+                "match arm `Ok(x)` overlaps the earlier arm `Ok(Some(Some(t)))`: arms may not overlap",
+                Some(
+                    "name each remaining outcome instead: replace `Ok(x) => ...` with `Ok(Some(None)) => ...` and `Ok(None) => ...`",
+                ),
+            ),
+            (
+                "fn f(v: Option<Int>) -> Int { match v { Some(value) => value, Err(error) => error } }",
+                "Err(error)",
+                "`Err(error)` is a `Result` pattern, but the earlier arm `Some(value)` matches an `Option` value here",
+                None,
+            ),
+            (
+                "fn f(v) -> Int { match v { Some(Ok(t)) => 1, Some(None) => 3, None => 2 } }",
+                "None) =>",
+                "`None` is an `Option` pattern, but the earlier arm `Some(Ok(t))` matches a `Result` value here",
+                None,
+            ),
+            (
+                "fn f(v) -> Int { match v { [] => 1, None => 3 } }",
+                "None",
+                "`None` is an `Option` pattern, but the earlier arm `[]` matches a `List` value here",
+                None,
+            ),
+        ] {
+            let error = check(text).expect_err(text);
+            assert_eq!(error.code(), "K1003", "{text}");
+            assert_eq!(error.span().start, span_of(text, at).start, "{text}");
+            assert_eq!(error.message(), message, "{text}");
+            match note {
+                Some(note) => assert_eq!(error.notes(), [note], "{text}"),
+                None => assert_eq!(error.notes().len(), 1, "{text}"),
+            }
+        }
+    }
+
+    #[test]
+    fn typing_a_match_unifies_each_position_once_however_many_arms_reach_it() {
+        // An exhaustive match over `Result<Result<..>, Result<..>>` nested
+        // `depth` deep has 2^depth arms, each `depth` patterns long, but only
+        // 2^(depth + 1) - 1 positions; typing creates the payload types of
+        // each position once, not once per arm that passes through it.
+        let depth = 8;
+        let mut ty = "Int".to_owned();
+        for _ in 0..depth {
+            ty = format!("Result<{ty}, {ty}>");
+        }
+        let arms = (0..1_u32 << depth)
+            .map(|index| {
+                let mut pattern = "x".to_owned();
+                for level in 0..depth {
+                    let variant = if index >> level & 1 == 0 { "Ok" } else { "Err" };
+                    pattern = format!("{variant}({pattern})");
+                }
+                format!("{pattern} => {index}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let text = format!("fn f(v: {ty}) -> Int {{ match v {{ {arms} }} }}");
+        let program = parse_source(&Source::new("wide.krit", text.as_str()))
+            .expect("the wide match should parse");
+        let mut analyzer = Analyzer::new();
+        analyzer
+            .program(&program)
+            .expect("the wide match should check");
+        let positions = (1_u32 << (depth + 1)) - 1;
+        let variables = analyzer.next_type_variable;
+        assert!(
+            variables <= 2 * positions,
+            "{variables} type variables for {positions} positions"
+        );
+    }
+
+    #[test]
+    fn nested_patterns_are_typed_against_the_payload() {
+        for (text, code, at) in [
+            (
+                "fn f(v: Option<Int>) -> Int { match v { Some(Ok(t)) => 1, Some(Err(e)) => 3, None => 2 } }",
+                "K3005",
+                "Ok(t)",
+            ),
+            (
+                "fn f(v: Option<Int>) -> Int { match v { Some([]) => 1, Some([h, ..t]) => 3, None => 2 } }",
+                "K3005",
+                "[]",
+            ),
+            (
+                "fn f(v: Int) -> Int { match v { Some(x) => 1, None => 2 } }",
+                "K3005",
+                "match",
+            ),
+            (
+                "fn f(v: Result<Option<String>, Int>) -> Int { match v { Ok(Some(t)) => t, Ok(None) => 0, Err(e) => e } }",
+                "K3001",
+                "Ok(None)",
+            ),
+        ] {
+            let error = check(text).expect_err(text);
+            assert_eq!(error.code(), code, "{text}");
+            assert_eq!(error.span().start, span_of(text, at).start, "{text}");
+        }
+        // An unresolved subject takes the patterns' families.
+        let text = "fn f(v) { match v { Ok(Some(t)) => t + 1, Ok(None) => 0, Err(e) => e } }";
+        let analysis = check(text).expect("an unresolved subject should check");
+        let parameter = analysis
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name() == "v")
+            .expect("parameter");
+        assert_eq!(parameter.ty().to_string(), "Result<Option<Int>, Int>");
+    }
+
+    #[test]
+    fn reading_a_pattern_discard_warns_and_reads_the_value_at_its_position() {
+        // Edition 2026 keeps 0.2's meaning: a pattern `_` binds the value at
+        // its position like `let _`, so reading it sees the most recent `_`
+        // (the tail of `[_, .._]`, and the pattern's `_` over an outer one),
+        // with K2003. Each annotation holds only for that binding.
+        for (text, warnings) in [
+            (
+                "fn f(v: Option<Int>) -> Int { match v { Some(_) => _ + 1, None => 0 } }",
+                1,
+            ),
+            (
+                "fn f(_: String, v: Option<Int>) -> Int { match v { Some(_) => _, None => 0 } }",
+                1,
+            ),
+            (
+                "let _ = 1;\nlet x: List<String> = match [\"a\"] { [] => [], [_, .._] => _ };",
+                1,
+            ),
+            (
+                "fn f(r: Result<Bool, Int>) -> Int {\n    let Ok(_) = r else Err(_) => _;\n    \
+                 if _ { 1 } else { 0 }\n}",
+                2,
+            ),
+            (
+                "fn f(_: String, r: Result<Int, Int>) -> Int {\n    \
+                 let Ok(_) = r else Err(e) => e;\n    _\n}",
+                1,
+            ),
+            (
+                "fn f(_: String, v: Option<Int>) -> String { match v { Some(x) => _, None => \"\" } }",
+                1,
+            ),
+        ] {
+            let report = check_with_warnings(text);
+            report
+                .result
+                .unwrap_or_else(|error| panic!("{text} should check: {error:?}"));
+            assert_eq!(
+                warning_codes(&report.warnings),
+                vec!["K2003"; warnings],
+                "{text}"
+            );
+        }
+
+        // The read has the type of the value at the `_`'s position.
+        let text = "fn f(v: Result<Option<String>, Int>) -> String {\n    match v {\n        \
+                    Ok(Some(_)) => _,\n        Ok(None) => \"\",\n        Err(_) => \"\",\n    }\n}";
+        let analysis = check(text).expect("reading a nested `_` should check");
+        let read = text.find("=> _").expect("the read should occur") + 3;
+        assert_eq!(
+            analysis
+                .expression(Span::new(read, read + 1))
+                .expect("the read should have facts")
+                .ty()
+                .to_string(),
+            "String"
+        );
     }
 }

@@ -10,6 +10,7 @@ mod habits;
 mod lexer;
 mod limits;
 mod parser;
+mod patterns;
 mod source;
 mod token;
 
@@ -19,9 +20,9 @@ pub use analysis::{
     SymbolAnalysis, SymbolId, SymbolKind, Type, analyze, analyze_with_warnings,
 };
 pub use ast::{
-    BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program, RecordField,
-    RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind, UnaryOperator,
-    ValueLiteral, VariantArm, VariantFamily, VariantName,
+    BinaryOperator, Block, Expression, ExpressionKind, MatchArm, Parameter, Pattern, PatternKind,
+    Program, RecordField, RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind,
+    UnaryOperator, ValueLiteral, VariantArm, VariantFamily, VariantName, VariantPattern,
 };
 pub use builtin::{Builtin, BuiltinCategory};
 pub use core::{

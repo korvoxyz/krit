@@ -1,0 +1,6 @@
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    let Ok(previous) = object_get("render-output", job.id) else Err(error) => Err(error);
+    let None = previous else Some(rendered) => Ok(rendered);
+    let Ok(_) = object_put("render-output", job.id, job.body) else Err(error) => Err(error);
+    Ok(job.id)
+}

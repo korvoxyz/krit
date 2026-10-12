@@ -1,0 +1,7 @@
+fn token() -> Result<Int, Secret> {
+    Ok(1)
+}
+
+fn forward() -> Result<Int, Secret> {
+    Ok(token()? + 1)
+}

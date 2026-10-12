@@ -1,0 +1,8 @@
+fn describe(input: Option<String>, loud: Bool) -> String {
+    if loud {
+        let Some(text) = input else None => "NONE";
+        text
+    } else {
+        "quiet"
+    }
+}

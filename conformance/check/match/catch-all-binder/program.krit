@@ -1,0 +1,6 @@
+fn describe(stored: Option<String>) -> String {
+    match stored {
+        Some(value) => value,
+        other => "nothing",
+    }
+}

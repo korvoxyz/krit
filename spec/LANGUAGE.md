@@ -59,9 +59,9 @@ comment     = "//", non-line-break* ;
 Integer separators cannot be leading, trailing, or repeated. Integers are
 signed through unary `-`; the sign is not part of the token.
 
-`?` is a token of its own. Edition 2026 gives it no meaning, so it appears in
-no valid program; the parser uses it only to recognize another language's
-conditional operator (section 4.2).
+`?` is a token of its own: the postfix error-propagation operator (section
+8.2). After an operand, the parser also uses it to recognize another
+language's conditional operator (section 4.2).
 
 Strings support these escapes:
 
@@ -77,11 +77,18 @@ Other escapes and invalid Unicode scalar values are lexical errors.
 program         = item* ;
 
 item            = let-declaration
+                | let-else
                 | function-declaration
                 | webhook-declaration
                 | expression, ";" ;
 
 let-declaration = "let", identifier, (":", type)?, "=", expression, ";" ;
+
+let-else        = "let", variant-pattern, (":", type)?, "=", expression,
+                  "else", let-else-arm, ";" ;
+let-else-arm    = variant-pattern, "=>", expression ;
+variant-pattern = ("Some" | "Ok" | "Err"), "(", identifier, ")"
+                | "None" ;
 
 function-declaration
                 = "fn", identifier, "(", parameters?, ")",
@@ -97,6 +104,7 @@ parameter       = identifier, (":", type)? ;
 block           = "{", statement*, expression?, "}" ;
 
 statement       = let-declaration
+                | let-else
                 | function-declaration
                 | expression, ";" ;
 
@@ -112,7 +120,7 @@ term            = factor, (("+" | "-"), factor)* ;
 factor          = unary, (("*" | "/" | "%"), unary)* ;
 unary           = ("!" | "-"), unary | call ;
 call            = primary,
-                  ("(", arguments?, ")" | ".", identifier)* ;
+                  ("(", arguments?, ")" | ".", identifier | "?")* ;
 arguments       = expression, (",", expression)*, ","? ;
 
 primary         = integer
@@ -140,19 +148,16 @@ function-expression
                 = "fn", "(", parameters?, ")", ("->", type)?, block ;
 
 match-expression
-                = list-match | option-match | result-match ;
-list-match      = "match", expression, "{",
-                  "[", "]", "=>", expression, ",",
-                  "[", identifier, ",", "..", identifier, "]",
-                  "=>", expression, ","?, "}" ;
-option-match    = "match", expression, "{",
-                  option-arm, ",", option-arm, ","?, "}" ;
-option-arm      = "Some", "(", identifier, ")", "=>", expression
-                | "None", "=>", expression ;
-result-match    = "match", expression, "{",
-                  result-arm, ",", result-arm, ","?, "}" ;
-result-arm      = "Ok", "(", identifier, ")", "=>", expression
-                | "Err", "(", identifier, ")", "=>", expression ;
+                = "match", expression, "{",
+                  match-arm, (",", match-arm)*, ","?, "}" ;
+match-arm       = pattern, "=>", expression ;
+pattern         = binder
+                | "_"
+                | ("Some" | "Ok" | "Err"), "(", pattern, ")"
+                | "None"
+                | "[", "]"
+                | "[", (binder | "_"), ",", "..", (binder | "_"), "]" ;
+binder          = identifier ;   (* other than "_" *)
 
 type            = "Int" | "Bool" | "String" | "Unit"
                 | "HttpHeader" | "HttpRequest" | "HttpResponse"
@@ -170,7 +175,10 @@ record-type-field
 Assignments and mutable bindings do not exist in edition 2026. Neither do
 `return`, loops, classes, modules, `async`, exceptions, indexing, arrow
 functions, the conditional operator, or `switch`; section 4.2 specifies how
-the parser reports them.
+the parser reports them. The two early exits are postfix `?` (section 8.2)
+and let-else (section 8.3), which the grammar accepts wherever a `let`
+declaration may appear and checking accepts only as a statement of a named
+function's body.
 
 A `webhook` declaration is valid only as a direct program item. A source
 module contains zero or one webhook. Nested or duplicate webhook declarations
@@ -193,10 +201,16 @@ A source file may nest syntax at most **256 levels** deep. Each of the
 following opens one level for what it contains:
 
 - a parenthesized expression, a block, a list literal, and a record literal
-- the argument list of a call, and each call or field-access link of a
-  postfix chain (`a.b(c).d` opens three levels for what follows `a`)
+- the argument list of a call, and each call, field-access, or `?` link of a
+  postfix chain (`a.b(c)?.d` opens four levels for what follows `a`)
 - the operand of a unary operator
-- the condition of an `if`, and the subject and the arm list of a `match`
+- the condition of an `if`, the subject and the arm list of a `match`, and
+  the arm of a let-else (section 8.3)
+- the payload of a `Some`, `Ok`, or `Err` pattern; and the value of a `match`
+  arm, once for each variant or list pattern its pattern holds inside a
+  payload, since Core IR decides each of them with one more nested match
+  (`Ok(Some(v)) => value` nests `value` one level deeper than
+  `Ok(v) => value`)
 - the argument list of `List<…>`, `Option<…>`, or `Result<…, …>`, and the
   field list of `Record { … }`
 
@@ -205,8 +219,8 @@ chain of binary operators such as `a + b + c` stays at the level of its first
 operand, so long flat chains are not nesting. They still nest in the
 program's syntax tree, so a separate **structural depth** limit applies: the
 nesting level of any point plus the number of `else if` continuations, binary
-operators, and call or field-access links above it in the tree may not exceed
-**4,096**.
+operators, and call, field-access, or `?` links above it in the tree may not
+exceed **4,096**.
 
 Operator and postfix chains nest to the left: their first operand lies below
 every operator or link of the chain. Parentheses group without changing that,
@@ -292,14 +306,29 @@ These constructs are reported wherever they occur:
 - `K1109`: an identifier or a parenthesized group followed by `=>`
   (`x => e`, `(x, y) => e`, `(x: Int) => e`, `() => e`). No expression is
   ever followed by `=>`; only match patterns are.
-- `K1110`: a `?` after an operand, followed by an expression and then `:`
-  (`ready ? 1 : 2`). When the tokens after the `?` start an expression that
-  does not parse, the `?` is still `K1110` if a `:` follows it at the same
-  bracket depth before the end of the file, a closing bracket opened before
-  the `?`, or the first `;`, `,`, or `let` at that depth
-  (`ready ? items[0] : None`, `ok ? { status: 200 } : { status: 500 }`). The
-  parser examines the tokens after the `?` without consuming them. A `?` in
-  any other position is an unexpected token (`K1001`).
+- `K1110`: a `?` after an operand that starts another language's
+  conditional operator. Call a `:` a **branch end** for the `?` when it
+  follows the `?` at the same bracket depth before the end of the file, a
+  closing bracket opened before the `?`, or the first `;`, `,`, or `let` at
+  that depth; no valid program has one, since a first branch contains none of
+  those outside brackets. What follows the `?` decides:
+  - A token that can only start an operand, as above (`ready ? 1 : 2`): the
+    `?` is `K1110` when the tokens after it are an expression and then `:`,
+    or start an expression that does not parse and a branch end follows
+    (`ready ? items[0] : None`, `c ? return 1 : 2`). Otherwise it is an
+    unexpected token (`K1001`) when that token is on the same line
+    (`ready ? 1`), and a postfix `?` followed by a missing `;` or `,`, which
+    the parser reports next, when it is on a later line.
+  - `-`, `(`, `[`, or `{`, which may also continue a postfix `?`
+    (`count? - 1`, `pick()?(1)`, `if ready? {`): the `?` is `K1110` exactly
+    when a branch end follows (`sign ? -1 : 1`,
+    `ok ? { status: 200 } : { status: 500 }`), and the tokens between are
+    never parsed.
+  - Any other token (`;`, `)`, `.`, `?`, a binary operator other than `-`):
+    the `?` is the postfix operator.
+
+  The parser examines the tokens after the `?` without consuming them, and a
+  `?` where an operand should start is an unexpected token (`K1001`).
 - `K1112`: `else` followed by `return` and a token that can only start an
   operand, as above, either as the first tokens of its block or directly
   (`else { return 0; }`, `else return 0;`).
@@ -313,9 +342,11 @@ Where a habit word could still be an ordinary name (`return;`,
 checking reports `K2001` with the construct's fix. Parsing stops at the first
 error, so the first construct reached in source order is the one reported,
 with two exceptions inside the first branch of a conditional operator: a
-conditional operator there is reported in place of the outer one
-(`a ? b ? c : d : e` reports `? c :`), and so is a nesting limit (`K1005`)
-crossed there.
+conditional operator there that ends at the same branch end is reported in
+place of the outer one (`a ? b ? c : d : e` and `a ? -b ? c : d : e` report
+`? c :`, while in `a ? (b ? c[0] : d) : e` the inner one ends inside the
+brackets and the outer one is reported), and so is a nesting limit (`K1005`)
+crossed in a first branch that the parser parses.
 
 ## 5. Program and block values
 
@@ -378,14 +409,23 @@ by checking first (section 14).
 
 The identifier `_` alone is the discard name. It is exempt from the
 one-declaration rule: any number of `let` bindings, function declarations,
-parameters, and match binders in one scope may use it, including both names of
-one `[_, .._]` list pattern. A program should bind `_` only for a value it
+parameters, and pattern binders in one scope may use it, including both names
+of one `[_, .._]` list pattern. A program should bind `_` only for a value it
 does not use. Reading `_` as a value, that is, an identifier expression `_`
 that resolves to a binding, is valid in edition 2026 and refers to the most
 recent `_` binding in scope, exactly as shadowing does, but checking reports
 warning `K2003`; edition 2027 makes it an error. An identifier expression `_`
 with no `_` binding in scope is an undefined name (`K2001`). Warnings never
 change whether a program checks or runs (`DIAGNOSTICS.md`).
+
+In a pattern (sections 8.3 and 11), `_` is also a wildcard: the rules that
+keep a `match`'s arms disjoint and exhaustive treat it as matching any value
+without naming an outcome, so `Err(_)` names `Err` and `_ =>` is a catch-all.
+In edition 2026 a pattern's `_` still binds the value at its position as a
+discard binding, as in 0.2, so reading `_` in the arm of a `match` or
+let-else, or after a let-else pattern, refers to the pattern's own `_` (in
+`[_, .._]`, the later one, the tail) with warning `K2003`. Edition 2027 makes
+every read of `_` an error, which leaves a pattern's `_` a pure wildcard.
 
 A lexical binding shadows a built-in name of the same spelling for the
 binding's whole scope, in checking and evaluation alike. `let`, function, and
@@ -406,6 +446,11 @@ Krit uses lexical scope. A function expression captures bindings from the
 environment where it is created, not where it is called.
 
 Duplicate parameters are a compile error, except for the discard name `_`.
+
+A let-else (section 8.3) declares its pattern's binder exactly as `let`
+declares its name: in the scope of the enclosing block, from the following
+statement to the end of that block, under the same one-declaration rule. The
+binder of its arm is visible only in the arm.
 
 ## 8. Functions and calls
 
@@ -472,6 +517,146 @@ Header order is preserved and duplicate header names are representable.
 type error. Status-range validation belongs to the component HTTP host, not the
 static type checker. These built-ins do not add general user-defined type
 alias syntax.
+
+## 8.2 Error propagation
+
+Postfix `?` unwraps a `Result` or an `Option` and returns its failure from the
+enclosing function:
+
+```krit
+fn review(input: String) -> Result<String, String> {
+    let model = config_string("agent.model")?;
+    let answer = ai_invoke("reviewer", model + ": " + input)?;
+    Ok("reviewed: " + answer)
+}
+```
+
+`?` binds like a call or a field access: `load()?.body`, `pick()?(1)`, and
+`nested??` chain, `-count?` negates `count?`, and `count? + 1` adds to it.
+
+If `e` has type `Result<T, E>`, `e?` has type `T`; if `e` has type
+`Option<T>`, `e?` has type `T`. `?` is valid in any expression position of the
+body of a named function, including a `queue` or `schedule` entrypoint, whose
+declared return type is `Result<U, E>` with the identical error type `E` (for
+a `Result` operand) or `Option<U>` (for an `Option` operand); `U` need not be
+`T`. There is no error conversion. The innermost enclosing function decides;
+`?` never reaches through it to an outer one. Everywhere else `?` is `K3012`:
+
+- at the top level;
+- in an anonymous function `fn(...) { ... }`, even one with a declared
+  `Result` or `Option` return type;
+- in a `webhook` entrypoint, which returns `HttpResponse`: bind each
+  fallible step with let-else (section 8.3), or move the steps into a helper
+  that returns `Result<HttpResponse, String>`, use `?` there, and `match` the
+  helper's result in the webhook;
+- in a named function without a declared return type, or whose declared
+  return type is neither a `Result` nor an `Option`.
+
+A `Result` operand in a function that returns `Option`, an `Option` operand in
+a function that returns `Result`, and a `Result` operand whose error type
+differs from the declared one are `K3013`; `K3012` and `K3013` each carry one
+note with the fix. An operand of any other type is `K3001`, and an operand
+whose type is not yet known takes the declared family and error type.
+Propagating rebuilds
+`Err(error)` at the function's return type, so an error type that contains
+`Secret` or `DatabaseTransaction` is rejected exactly as `Err(error)` is
+(`K3009`, `K3010`).
+
+`e` evaluates first. If it is `Ok(v)` or `Some(v)`, `e?` evaluates to `v`. If
+it is `Err(x)` or `None`, the enclosing function returns `Err(x)` or `None`
+immediately: nothing after the `?` in that function call evaluates, including
+the remaining operands and arguments of the expressions around it, while
+effects that already happened stay performed. In `f(println("a"), g()?)`,
+`a` is printed, then `g()` is called, and when it fails `f` is never called.
+`?` adds no effect and no capability requirement of its own.
+
+Core IR lowers `e?` to a variant match on `e`. The `Ok` or `Some` arm yields
+the payload; the `Err` or `None` arm rebuilds the failure at the function's
+return type and ends with a verified function exit (`TYPES-AND-EFFECTS.md`,
+"Error propagation"), which components lower to a WebAssembly `return`
+(`WASM-SANDBOX.md`).
+
+## 8.3 Let-else
+
+A let-else binds the payload of one variant and makes the enclosing function
+return when the value is the other variant:
+
+```krit
+fn failure(error: String) -> HttpResponse {
+    record { status: 502, headers: [], body: error }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let Ok(repository) = config_string("reference.repository") else Err(error) => failure(error);
+    let Ok(stored) = state_get("agent-work", request.path) else Err(error) => failure(error);
+    let Some(summary) = stored else None => record { status: 404, headers: [], body: "" };
+    record { status: 200, headers: [], body: repository + ": " + summary }
+}
+```
+
+A let-else is `let PATTERN (: TYPE)? = value else ARM;`, where the arm is a
+pattern, `=>`, and an expression, as in a `match`. Its two patterns are the
+two variants of one built-in family, in either order: `Ok(p)` and `Err(q)`, or
+`Some(p)` and `None`. A pattern's payload binder is an identifier or the
+wildcard `_`, a discard binding that the program should not read (section 7:
+reading it is warning `K2003`); `None` binds nothing. Unlike a `match`
+pattern, a let-else pattern does not nest (`K3014`, below). A `Some`, `Ok`, or
+`Err` written after `let` without `(` is still a binding of that reserved name
+(`K2002`), and a variant pattern without an `else` arm is `K1002`.
+
+It is exactly
+
+```text
+match value { PATTERN => { rest of the block }, ARM }
+```
+
+where the rest of the block is every statement after the let-else and the
+block's final expression, except that the pattern's binder is declared in
+the enclosing block as a `let` binding is (section 7). The value evaluates
+first. If it is the pattern's variant, the binder names its payload for the
+rest of the block. If it is the arm's variant, the arm's binder names its
+payload, the arm's expression evaluates, and the enclosing function returns
+its value immediately: nothing after the let-else in that function call
+evaluates, while effects that already happened stay performed.
+
+The annotation, when present, is the type of the value, as it is in a `let`
+declaration; the value must be an `Option` (for `Some` and `None`) or a
+`Result` (for `Ok` and `Err`), otherwise checking reports `K3005`. Because the
+arm's value is the function's return value, it must have the function's
+return type, declared or inferred (`K3001` otherwise). A let-else adds the
+effects and capability requirements of its value and its arm, and nothing of
+its own.
+
+`K3014` reports a let-else that cannot work this way, with one note naming
+the fix:
+
+- it is not a direct statement of the body block of a named function
+  (including a `webhook`, `queue`, or `schedule` entrypoint): at the top level,
+  in an anonymous function, or in a nested block such as a block expression,
+  an `if` branch, or a `match` arm, it would leave an expression rather than
+  return from a function;
+- its two patterns are not the two variants of one family;
+- a pattern nests another variant or list pattern in its payload
+  (`let Ok(Some(x)) = ...`): bind the payload, then decide it with another
+  let-else or a `match` (section 11), whose patterns nest;
+- its value ends in `}`, such as an `if`, `match`, block, `record`, or
+  anonymous function: in `let Ok(x) = if c { a } else { b } else Err(e) =>
+  ...`, the first `else` would read as part of the let-else. Bind the value
+  with `let` first, or wrap it in parentheses.
+
+Unlike `?`, a let-else works in a webhook entrypoint, which returns
+`HttpResponse`, and in any named function whatever its return type. An
+`else` followed by another language's guard clause, `else { return value; }`,
+is `K1112` (section 4.2), and any other block after `else` is `K1003`, with a
+note showing the arm to write instead.
+
+Core IR lowers a let-else to a variant match on the value in the enclosing
+block, followed by the binding of its result. The pattern's arm yields the
+payload (unit for `None`); the other arm binds the arm's binder, evaluates its
+expression, and ends with a verified function exit (`TYPES-AND-EFFECTS.md`,
+"Let-else"), which components lower to a WebAssembly `return`
+(`WASM-SANDBOX.md`). A body of many let-else statements therefore nests no
+deeper than one of them.
 
 ## 9. Operators
 
@@ -550,7 +735,7 @@ List literal:
 [1, 2, 3]
 ```
 
-The only list decomposition construct in edition 2026 is exhaustive matching:
+The only list decomposition construct in edition 2026 is matching:
 
 ```krit
 match items {
@@ -559,36 +744,64 @@ match items {
 }
 ```
 
-The subject evaluates once and must be a list.
-
-- The `[]` arm is selected for an empty list.
-- The `[head, ..tail]` arm is selected for a non-empty list.
-- `head` receives the first element.
-- `tail` receives the remaining immutable list.
-- Pattern bindings exist only in the non-empty arm.
-
-The two pattern names must differ unless both are the discard name `_`
-(section 7). Both arms are mandatory and their order is fixed, making the
-match visibly exhaustive.
-
-`Option` and `Result` matches contain exactly the two variants of one family.
-Their arms may appear in either order:
+A `match` evaluates its subject once, then the value of the one arm whose
+pattern matches the subject's value:
 
 ```krit
-match possible_name {
-    Some(name) => name,
-    None => "anonymous",
-}
-
-match connector_result {
-    Err(message) => message,
-    Ok(response) => response.body,
+match state_get("agent-work", key) {
+    Ok(Some(saved)) => saved,
+    Ok(None) => "missing",
+    Err(error) => "failed: " + error,
 }
 ```
 
-`Some`, `Ok`, and `Err` bind their single payload. `None` binds nothing.
-Missing, duplicate, unknown, or mixed-family arms are `K1003` syntax errors.
-The subject evaluates once and must belong to the matched variant family.
+| Pattern | Matches | Binds |
+|---|---|---|
+| `name` | any value | `name`, to the value |
+| `_` | any value | nothing to read: a discard binding (section 7) |
+| `Some(p)`, `Ok(p)`, `Err(p)` | that variant, when its payload matches `p` | what `p` binds |
+| `None` | `None` | nothing |
+| `[]` | the empty list | nothing |
+| `[head, ..tail]` | a non-empty list | `head` to the first element, `tail` to the remaining immutable list |
+
+A variant pattern's payload is a pattern, so patterns nest through the
+built-in families: `Ok(Some(value))`, `Some(Err(_))`, `Ok([head, ..rest])`.
+The head and tail of a list pattern are each a name or `_` (`K1003`
+otherwise); to look inside the head, match it in the arm. A name binds the
+value at its position for the arm's value only, and the head and tail cannot
+be the same name (`K2002`). `_` is a discard binding, which the program
+should not read: reading it is warning `K2003` (section 7). There are no
+literal patterns, guards, or record patterns: compare values with `if` and
+`==`. Other tokens where a pattern starts, an unknown variant such as
+`Foo(x)`, `None(x)`, a `Some`, `Ok`, or `Err` without its parenthesized
+payload, and list patterns of any other shape are `K1003` syntax errors.
+
+The arms of a match name every outcome exactly once. Checking enforces four
+rules:
+
+- **One family at each position.** The patterns that reach the same position
+  of the value are all `Some` and `None`, all `Ok` and `Err`, or all `[]` and
+  `[head, ..tail]` (`K1003`), and that family must be the static type at the
+  position, the subject's type or a payload type (`K3005`).
+- **No overlap.** No value matches two arms. An arm that only matches values
+  that earlier arms already match is a duplicate or unreachable arm, and an
+  arm that also matches what an earlier arm matches overlaps it: both are
+  `K1003`. `Ok(Some(v)) => a, Ok(other) => b` is rejected with a note to name
+  the remaining outcome instead: `Ok(None) => b`.
+- **No catch-all arm.** An arm whose whole pattern is a name or `_` would
+  stand for every outcome the other arms leave unnamed, so it is `K3005`, with
+  a note naming the arms to write instead. A name or `_` inside a payload
+  (`Err(_)`, `Some(value)`) names its variant and is allowed.
+- **Exhaustive.** Every value of the subject's type matches some arm.
+  Otherwise checking reports `K3005`, whose message lists every missing
+  pattern verbatim, with `_` for whatever no arm distinguishes, such as
+  ``non-exhaustive match; missing: `Ok(None)`, `Err(_)` ``.
+
+Because arms never overlap, their order never changes what a match means, and
+they may appear in any order, including `[head, ..tail]` before `[]`. Every
+arm's value has the match's type. A match adds the effects and capability
+requirements of its subject and of every arm's value, and nothing of its own.
+`TYPES-AND-EFFECTS.md` ("Matching") gives the order of these checks.
 
 ## 12. Built-in output
 
@@ -814,6 +1027,13 @@ Checking reports these, so a program containing one is never evaluated:
 - non-literal configuration, secret, HTTP-origin, AI-adapter, log-event,
   state-store, checkpoint, or replay-operation resource
 - printing, comparing, encoding, or structurally storing an opaque secret
+- `?` outside a named function that returns its operand's family, or with a
+  different error type (section 8.2)
+- a let-else that is not a direct statement of a named function's body, whose
+  patterns are not the two variants of one family, or whose value ends in `}`
+  (section 8.3)
+- `match` arms that mix families at a position, overlap, include a top-level
+  catch-all, or leave an outcome unnamed (section 11)
 
 Evaluation reports these:
 
@@ -832,7 +1052,9 @@ evaluator keeps its own kind, callee, arity, comparison, and encoding checks
 (`K4001`, `K4002`, `K4003`, `K4006`, `K4008`). In a checked program only a
 decoded JSON value can fail one of them; otherwise they make a program
 evaluated without checking, which `krit run` never does, fail with a
-diagnostic.
+diagnostic. Such a program also fails with `K3012` when a `?` outside every
+function meets `Err` or `None`, and with `K3014` when a let-else outside every
+function meets its arm's variant.
 
 The direct-evaluation limits count active frames, not total work: sequential
 calls that each recurse 9,000 levels deep are valid. A typical recursive
@@ -872,8 +1094,17 @@ grammar-permitted trailing commas, not expression order or program semantics.
   contains no tabs or trailing spaces.
 - Output uses LF line endings and exactly one final line feed.
 - Binary operators, `=`, `=>`, `->`, and type/value colons use stable spacing.
-  Calls, field access, unary operators, and generic type brackets remain
-  compact.
+  Calls, field access, postfix `?`, unary operators, generic type brackets,
+  and patterns remain compact (`load(id)?.body`, `-count? - 1`,
+  `let Ok(value) =`, `Ok(Some(value)) =>`, `[_, ..rest] =>`). Match arms keep
+  their source order.
+- A let-else stays on one line when the rest of the statement, from `else`
+  through `;`, fits on the line where `else` ends without wrapping:
+  `let Ok(x) = load(id) else Err(e) => handle(e);`. Otherwise the line breaks
+  after `else` and the arm continues on the next line, indented one level. An
+  arm that holds a block, a `match`, or a comment always breaks. A value that
+  wraps on its own keeps a fitting arm after its closing delimiter
+  (`) else Err(e) => handle(e);`).
 - Non-empty blocks and every match are multiline. Short lists, records,
   parameter lists, argument lists, and record types remain on one line when
   readable.

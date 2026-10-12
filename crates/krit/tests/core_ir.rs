@@ -4,7 +4,7 @@ use std::{
 };
 
 use krit::{
-    Analysis, Block, Expression, ExpressionKind, MatchKind, Source, StatementKind, analyze, lower,
+    Analysis, Block, Expression, ExpressionKind, Source, StatementKind, analyze, lower,
     parse_source,
 };
 
@@ -422,6 +422,10 @@ fn assert_statement_names_resolved(statement: &krit::Statement, analysis: &Analy
         StatementKind::Let { value, .. } | StatementKind::Expression(value) => {
             assert_expression_names_resolved(value, analysis);
         }
+        StatementKind::LetElse { value, arm, .. } => {
+            assert_expression_names_resolved(value, analysis);
+            assert_expression_names_resolved(&arm.value, analysis);
+        }
         StatementKind::Function { body, .. }
         | StatementKind::Webhook { body, .. }
         | StatementKind::QueueConsumer { body, .. }
@@ -484,25 +488,13 @@ fn assert_expression_names_resolved(expression: &Expression, analysis: &Analysis
                 assert_expression_names_resolved(argument, analysis);
             }
         }
-        ExpressionKind::Match { subject, kind } => {
+        ExpressionKind::Match { subject, arms } => {
             assert_expression_names_resolved(subject, analysis);
-            match kind {
-                MatchKind::List {
-                    empty_case,
-                    cons_case,
-                    ..
-                } => {
-                    assert_expression_names_resolved(empty_case, analysis);
-                    assert_expression_names_resolved(cons_case, analysis);
-                }
-                MatchKind::Variants { arms, .. } => {
-                    for arm in arms {
-                        assert_expression_names_resolved(&arm.value, analysis);
-                    }
-                }
+            for arm in arms {
+                assert_expression_names_resolved(&arm.value, analysis);
             }
         }
-        ExpressionKind::Unary { operand, .. } => {
+        ExpressionKind::Unary { operand, .. } | ExpressionKind::Propagate { operand, .. } => {
             assert_expression_names_resolved(operand, analysis);
         }
         ExpressionKind::Binary { left, right, .. } => {

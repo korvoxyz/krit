@@ -1,0 +1,29 @@
+let _ = "outer";
+
+fn payload(stored: Option<Int>) -> Int {
+    match stored {
+        Some(_) => _ + 1,
+        None => 0,
+    }
+}
+
+fn found(stored: Result<Option<String>, String>) -> String {
+    match stored {
+        Ok(Some(_)) => "found " + _,
+        Ok(None) => "missing",
+        Err(_) => "failed " + _,
+    }
+}
+
+fn doubled(stored: Result<Int, String>) -> Int {
+    let Ok(_) = stored else Err(_) => 0;
+    _ * 2
+}
+
+println(payload(Some(7)));
+println(found(Ok(Some("a"))));
+println(found(Ok(None)));
+println(found(Err("b")));
+println(doubled(Ok(21)));
+println(doubled(Err("c")));
+println(_);

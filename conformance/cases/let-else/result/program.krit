@@ -1,0 +1,22 @@
+fn digit(text: String) -> Result<Int, String> {
+    if text == "1" {
+        Ok(1)
+    } else {
+        Err("not a digit: " + text)
+    }
+}
+
+fn describe(text: String) -> String {
+    let Ok(value) = digit(text) else Err(error) => "failed: " + error;
+    "value " + json_encode(value + 1)
+}
+
+fn problem(text: String) -> String {
+    let Err(error) = digit(text) else Ok(_) => "no problem";
+    "problem: " + error
+}
+
+println(describe("1"));
+println(describe("x"));
+println(problem("1"));
+println(problem("y"));

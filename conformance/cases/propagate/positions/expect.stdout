@@ -1,0 +1,5 @@
+Ok("some {\"items\":[1,1],\"size\":2}")
+Ok("none")
+Err("empty")
+Err("empty")
+Err("empty")

@@ -1,0 +1,3 @@
+let configured = Some(1)?;
+
+println(configured);

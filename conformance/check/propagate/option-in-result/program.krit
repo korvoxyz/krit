@@ -1,0 +1,10 @@
+fn first(items: List<Int>) -> Option<Int> {
+    match items {
+        [] => None,
+        [head, .._] => Some(head),
+    }
+}
+
+fn required(items: List<Int>) -> Result<Int, String> {
+    Ok(first(items)?)
+}

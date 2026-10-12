@@ -1,0 +1,3 @@
+fn pick(ready: Bool) -> Int {
+    ready ? 1
+}

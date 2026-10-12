@@ -1,0 +1,26 @@
+fn failing(label: String) -> Result<Int, String> {
+    println(label);
+    Err(label)
+}
+
+fn ordered() -> Int {
+    println("a");
+    let Ok(value) = failing("b") else
+        Err(error) => {
+            println("arm " + error);
+            0
+        };
+    println("never");
+    value
+}
+
+fn chained(first: Option<Int>, second: Option<Int>) -> Int {
+    let Some(a) = first else None => -1;
+    let Some(b) = second else None => -2;
+    a + b
+}
+
+println(ordered());
+println(chained(Some(1), Some(2)));
+println(chained(None, Some(2)));
+println(chained(Some(1), None));

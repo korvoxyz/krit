@@ -1,0 +1,7 @@
+fn describe(input: Option<String>) -> String {
+    let pick = fn() -> String {
+        let Some(text) = input else None => "none";
+        text
+    };
+    pick()
+}

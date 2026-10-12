@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    Block, Diagnostic, Expression, ExpressionKind, MatchKind, Program, Source, Span, Statement,
-    StatementKind, TypeAnnotation, TypeKind,
+    Block, Diagnostic, Expression, ExpressionKind, Pattern, PatternKind, Program, Source, Span,
+    Statement, StatementKind, TypeAnnotation, TypeKind,
     lexer::{Comment, lex_with_comments},
     parser,
     token::{Token, TokenKind},
@@ -70,6 +70,12 @@ struct Formatter {
     type_tokens: Vec<bool>,
     generic_commas: Vec<bool>,
     breaks_after: HashMap<usize, usize>,
+    /// For the `else` token of each let-else, the token index of the `;`
+    /// that ends the statement.
+    let_else_arms: HashMap<usize, usize>,
+    /// The `;` of each let-else whose arm was moved to its own, indented
+    /// line, innermost last; the indentation ends after it.
+    let_else_indents: Vec<usize>,
     active_groups: Vec<ActiveGroup>,
     closing_group: Option<ActiveGroup>,
     writer: Writer,
@@ -87,11 +93,14 @@ impl Formatter {
             &comments,
             &syntax.block_spans,
             &syntax.call_group_spans,
+            &syntax.pattern_group_spans,
         );
         Self {
             type_tokens: syntax.type_tokens,
             generic_commas: syntax.generic_commas,
             breaks_after: syntax.breaks_after,
+            let_else_arms: syntax.let_else_arms,
+            let_else_indents: Vec::new(),
             tokens,
             token_text,
             comments,
@@ -250,6 +259,18 @@ impl Formatter {
     }
 
     fn request_break_after(&mut self, index: usize) {
+        if let Some(semicolon) = self.let_else_arms.get(&index).copied() {
+            if self.let_else_arm_breaks(index, semicolon) {
+                self.writer.indent += 1;
+                self.let_else_indents.push(semicolon);
+                self.request_break(1);
+            }
+            return;
+        }
+        if self.let_else_indents.last() == Some(&index) {
+            self.let_else_indents.pop();
+            self.writer.indent = self.writer.indent.saturating_sub(1);
+        }
         if let Some(lines) = self.breaks_after.get(&self.tokens[index].span.end) {
             self.request_break(*lines);
             return;
@@ -265,6 +286,52 @@ impl Formatter {
         if statement_end || multiline_item_end {
             self.request_break(1);
         }
+    }
+
+    /// Whether the arm of the let-else whose `else` token was just written at
+    /// `else_index` moves to its own line, indented one level: unless the
+    /// rest of the statement, through the `;` at `semicolon`, fits on the
+    /// current line exactly as it would render there.
+    ///
+    /// A comment or an always-multiline group (a block or a `match`) in the
+    /// arm never fits, and neither does a delimited group that would wrap on
+    /// its own, so an arm that stays on the line is rendered flat.
+    fn let_else_arm_breaks(&self, else_index: usize, semicolon: usize) -> bool {
+        let start = self.tokens[else_index].span.end;
+        let end = self.tokens[semicolon].span.start;
+        // Comments are in source order.
+        let first_comment = self
+            .comments
+            .partition_point(|comment| comment.span.start < start);
+        if self
+            .comments
+            .get(first_comment)
+            .is_some_and(|comment| comment.span.end <= end)
+        {
+            return true;
+        }
+        let mut column = self.writer.column();
+        for index in else_index + 1..=semicolon {
+            if token_pair_needs_space(
+                &self.tokens,
+                &self.groups,
+                &self.close_to_open,
+                &self.type_tokens,
+                index - 1,
+                index,
+                |_| false,
+            ) {
+                column += 1;
+            }
+            column += self.token_text[index].chars().count();
+            if let Some(group) = self.groups[index]
+                && (group.forced_multiline
+                    || column.saturating_add(group.flat_width) > FORMAT_LINE_WIDTH)
+            {
+                return true;
+            }
+        }
+        column > FORMAT_LINE_WIDTH
     }
 
     fn request_break(&mut self, lines: usize) {
@@ -391,9 +458,13 @@ impl Writer {
 struct SyntaxMap {
     block_spans: HashSet<(usize, usize)>,
     call_group_spans: HashSet<(usize, usize)>,
+    /// The parentheses and brackets of patterns, including those of
+    /// let-else patterns and nested patterns, which are not followed by `=>`.
+    pattern_group_spans: HashSet<(usize, usize)>,
     type_tokens: Vec<bool>,
     generic_commas: Vec<bool>,
     breaks_after: HashMap<usize, usize>,
+    let_else_arms: HashMap<usize, usize>,
 }
 
 impl SyntaxMap {
@@ -435,6 +506,40 @@ impl SyntaxMap {
                 (open.span.start, close.span.end)
             })
             .collect();
+        // Tokens are in source order, so each token is found by binary search.
+        let index_ending = |end: usize| {
+            let index = tokens.partition_point(|token| token.span.end < end);
+            debug_assert_eq!(tokens[index].span.end, end);
+            index
+        };
+        let pattern_group_spans = collector
+            .pattern_spans
+            .iter()
+            .map(|span| {
+                // A binding pattern is a variant name, `(`, its payload, and
+                // the `)` that ends it.
+                let open =
+                    &tokens[tokens.partition_point(|token| token.span.start < span.start) + 1];
+                debug_assert!(matches!(open.kind, TokenKind::LeftParen));
+                (open.span.start, span.end)
+            })
+            .chain(
+                collector
+                    .list_pattern_spans
+                    .iter()
+                    .map(|span| (span.start, span.end)),
+            )
+            .collect();
+        let let_else_arms = collector
+            .let_else_spans
+            .iter()
+            .map(|(else_span, statement_span)| {
+                (
+                    index_ending(else_span.end),
+                    index_ending(statement_span.end),
+                )
+            })
+            .collect();
 
         let mut breaks_after = collector.breaks_after;
         for (index, statement) in program.statements.iter().enumerate() {
@@ -450,8 +555,10 @@ impl SyntaxMap {
                 is_declaration(&current.kind) || is_declaration(&next.kind);
             let changes_between_declaration_and_expression = !matches!(
                 (&current.kind, &next.kind),
-                (StatementKind::Let { .. }, StatementKind::Let { .. })
-                    | (StatementKind::Expression(_), StatementKind::Expression(_))
+                (
+                    StatementKind::Let { .. } | StatementKind::LetElse { .. },
+                    StatementKind::Let { .. } | StatementKind::LetElse { .. }
+                ) | (StatementKind::Expression(_), StatementKind::Expression(_))
             );
             if has_function_declaration || changes_between_declaration_and_expression {
                 2
@@ -473,9 +580,11 @@ impl SyntaxMap {
         Self {
             block_spans: collector.block_spans,
             call_group_spans,
+            pattern_group_spans,
             type_tokens,
             generic_commas,
             breaks_after,
+            let_else_arms,
         }
     }
 }
@@ -487,6 +596,13 @@ struct SyntaxCollector {
     type_spans: Vec<Span>,
     result_separator_spans: Vec<Span>,
     breaks_after: HashMap<usize, usize>,
+    /// Each variant pattern with a payload: the pattern after `let` of a
+    /// let-else, and every such pattern of a `match` arm.
+    pattern_spans: Vec<Span>,
+    /// Each `[]` or `[head, ..tail]` pattern of a `match` arm.
+    list_pattern_spans: Vec<Span>,
+    /// The `else` keyword and the whole statement of each let-else.
+    let_else_spans: Vec<(Span, Span)>,
 }
 
 /// One syntax-tree node awaiting collection.
@@ -509,7 +625,7 @@ impl SyntaxCollector {
             .collect::<Vec<_>>();
         while let Some(node) = pending.pop() {
             match node {
-                SyntaxNode::Statement(statement) => Self::statement(statement, &mut pending),
+                SyntaxNode::Statement(statement) => self.statement(statement, &mut pending),
                 SyntaxNode::Block(block) => self.block(block, &mut pending),
                 SyntaxNode::Expression(expression) => self.expression(expression, &mut pending),
                 SyntaxNode::Annotation(annotation) => self.annotation(annotation, &mut pending),
@@ -517,7 +633,7 @@ impl SyntaxCollector {
         }
     }
 
-    fn statement<'a>(statement: &'a Statement, pending: &mut Vec<SyntaxNode<'a>>) {
+    fn statement<'a>(&mut self, statement: &'a Statement, pending: &mut Vec<SyntaxNode<'a>>) {
         match &statement.kind {
             StatementKind::Let {
                 annotation, value, ..
@@ -526,6 +642,23 @@ impl SyntaxCollector {
                     pending.push(SyntaxNode::Annotation(annotation));
                 }
                 pending.push(SyntaxNode::Expression(value));
+            }
+            StatementKind::LetElse {
+                pattern,
+                annotation,
+                value,
+                else_span,
+                arm,
+            } => {
+                if pattern.binding.is_some() {
+                    self.pattern_spans.push(pattern.span);
+                }
+                self.let_else_spans.push((*else_span, statement.span));
+                if let Some(annotation) = annotation {
+                    pending.push(SyntaxNode::Annotation(annotation));
+                }
+                pending.push(SyntaxNode::Expression(value));
+                pending.push(SyntaxNode::Expression(&arm.value));
             }
             StatementKind::Function {
                 parameters,
@@ -625,28 +758,41 @@ impl SyntaxCollector {
                 pending.push(SyntaxNode::Expression(callee));
                 pending.extend(arguments.iter().map(SyntaxNode::Expression));
             }
-            ExpressionKind::Match { subject, kind } => {
+            ExpressionKind::Match { subject, arms } => {
                 pending.push(SyntaxNode::Expression(subject));
-                match kind {
-                    MatchKind::List {
-                        empty_case,
-                        cons_case,
-                        ..
-                    } => {
-                        pending.push(SyntaxNode::Expression(empty_case));
-                        pending.push(SyntaxNode::Expression(cons_case));
-                    }
-                    MatchKind::Variants { arms, .. } => {
-                        pending.extend(arms.iter().map(|arm| SyntaxNode::Expression(&arm.value)));
-                    }
+                for arm in arms {
+                    self.match_pattern(&arm.pattern);
+                    pending.push(SyntaxNode::Expression(&arm.value));
                 }
             }
-            ExpressionKind::Unary { operand, .. } => {
+            ExpressionKind::Unary { operand, .. } | ExpressionKind::Propagate { operand, .. } => {
                 pending.push(SyntaxNode::Expression(operand));
             }
             ExpressionKind::Binary { left, right, .. } => {
                 pending.push(SyntaxNode::Expression(left));
                 pending.push(SyntaxNode::Expression(right));
+            }
+        }
+    }
+
+    /// Records the delimiters of `pattern` and of every pattern nested in it.
+    /// Patterns are paths, so this walks one iteratively.
+    fn match_pattern(&mut self, pattern: &Pattern) {
+        let mut current = pattern;
+        loop {
+            match &current.kind {
+                PatternKind::Binder(_) | PatternKind::Wildcard => return,
+                PatternKind::EmptyList | PatternKind::Cons { .. } => {
+                    self.list_pattern_spans.push(current.span);
+                    return;
+                }
+                PatternKind::Variant { payload, .. } => {
+                    let Some(payload) = payload else {
+                        return;
+                    };
+                    self.pattern_spans.push(current.span);
+                    current = payload;
+                }
             }
         }
     }
@@ -696,6 +842,7 @@ fn build_groups(
     comments: &[Comment],
     block_spans: &HashSet<(usize, usize)>,
     call_group_spans: &HashSet<(usize, usize)>,
+    pattern_group_spans: &HashSet<(usize, usize)>,
 ) -> (Vec<Option<GroupInfo>>, Vec<Option<usize>>) {
     let mut pairs = vec![None; tokens.len()];
     let mut close_to_open = vec![None; tokens.len()];
@@ -720,7 +867,14 @@ fn build_groups(
         let Some(close) = pairs[open] else {
             continue;
         };
-        let kind = classify_group(open, close, tokens, block_spans, call_group_spans);
+        let kind = classify_group(
+            open,
+            close,
+            tokens,
+            block_spans,
+            call_group_spans,
+            pattern_group_spans,
+        );
         let has_comment = comments.iter().any(|comment| {
             comment.span.start >= tokens[open].span.end
                 && comment.span.end <= tokens[close].span.start
@@ -769,6 +923,7 @@ fn classify_group(
     tokens: &[Token],
     block_spans: &HashSet<(usize, usize)>,
     call_group_spans: &HashSet<(usize, usize)>,
+    pattern_group_spans: &HashSet<(usize, usize)>,
 ) -> GroupKind {
     match tokens[open].kind {
         TokenKind::LeftBrace => {
@@ -783,6 +938,7 @@ fn classify_group(
         TokenKind::LeftBracket => {
             if token_after(close, tokens)
                 .is_some_and(|token| matches!(token.kind, TokenKind::FatArrow))
+                || pattern_group_spans.contains(&(tokens[open].span.start, tokens[close].span.end))
             {
                 GroupKind::Pattern
             } else {
@@ -792,6 +948,7 @@ fn classify_group(
         TokenKind::LeftParen => {
             if token_after(close, tokens)
                 .is_some_and(|token| matches!(token.kind, TokenKind::FatArrow))
+                || pattern_group_spans.contains(&(tokens[open].span.start, tokens[close].span.end))
             {
                 GroupKind::Pattern
             } else if is_parameter_group(open, tokens) {
@@ -936,6 +1093,7 @@ fn token_pair_needs_space(
             | TokenKind::Semicolon
             | TokenKind::Dot
             | TokenKind::Colon
+            | TokenKind::Question
     ) || matches!(previous_kind, TokenKind::Dot | TokenKind::DotDot)
     {
         return false;
@@ -1009,7 +1167,10 @@ fn token_pair_needs_space(
     is_word(previous_kind) && is_word(current_kind)
         || matches!(
             previous_kind,
-            TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace
+            TokenKind::RightParen
+                | TokenKind::RightBracket
+                | TokenKind::RightBrace
+                | TokenKind::Question
         ) && is_word(current_kind)
 }
 
@@ -1079,6 +1240,7 @@ fn can_end_expression(kind: &TokenKind) -> bool {
             | TokenKind::RightParen
             | TokenKind::RightBracket
             | TokenKind::RightBrace
+            | TokenKind::Question
     )
 }
 
@@ -1151,6 +1313,103 @@ mod tests {
         assert_eq!(
             formatted,
             "fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n\nlet values = [1, 2, 3];\n\nprintln(add(1, 2));\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+    }
+
+    #[test]
+    fn formats_postfix_question_marks_as_tight_call_links() {
+        let source = "fn f(a,pick,flag)->Option<Int>{let b=a ?;let c=pick( ) ? (1) ? .x;\n\
+                      if flag ? {Some(- b ?? - c)}else{Some(a? -1)}}";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "fn f(a, pick, flag) -> Option<Int> {\n    let b = a?;\n    let c = pick()?(1)?.x;\n    \
+             if flag? {\n        Some(-b?? - c)\n    } else {\n        Some(a? - 1)\n    }\n}\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+    }
+
+    #[test]
+    fn formats_nested_and_wildcard_patterns_compactly() {
+        let source = "fn f(r,items)->Int{match r{Ok( Some( v ) )=>v,Ok(None)=>match items{\n\
+                      [ _ , .. rest ]=>0,[ ]=>1},Err( _ )=>2}}";
+        let expected = "fn f(r, items) -> Int {\n    match r {\n        Ok(Some(v)) => v,\n        \
+                        Ok(None) => match items {\n            [_, ..rest] => 0,\n            \
+                        [] => 1,\n        },\n        Err(_) => 2,\n    }\n}\n";
+        assert_eq!(format(source), expected);
+        assert_eq!(format(expected), expected);
+        // A nested list pattern is a pattern, not a list literal: it neither
+        // gains a trailing comma nor a space before a nested payload.
+        let nested = "fn f(r) -> Int {\n    match r {\n        Ok([head, ..tail]) => head,\n        \
+                      Ok([]) => 0,\n        Err(Some(_)) => 1,\n        Err(None) => 2,\n    }\n}\n";
+        assert_eq!(format(nested), nested);
+    }
+
+    #[test]
+    fn formats_let_else_on_one_line_or_breaks_after_else() {
+        let source = "fn f(r,o)->Int{let Ok ( v ):Result<Int,String> =r else Err( e )=>0;\n\
+                      let None=o?else Some(x)=>x;v}";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "fn f(r, o) -> Int {\n    let Ok(v): Result<Int, String> = r else Err(e) => 0;\n    \
+             let None = o? else Some(x) => x;\n    v\n}\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+
+        // The arm stays on the line exactly when the rest of the statement
+        // fits within 100 columns there.
+        let fits = format!(
+            "fn f(r) -> Int {{\n    let Ok(value) = r else Err(error) => {};\n    value\n}}\n",
+            "x".repeat(100 - 4 - "let Ok(value) = r else Err(error) => ;".len())
+        );
+        assert_eq!(format(&fits), fits);
+        let long_name = "x".repeat(101 - 4 - "let Ok(value) = r else Err(error) => ;".len());
+        assert_eq!(
+            format(&format!(
+                "fn f(r) -> Int {{ let Ok(value) = r else Err(error) => {long_name}; value }}"
+            )),
+            format!(
+                "fn f(r) -> Int {{\n    let Ok(value) = r else\n        Err(error) => {long_name};\n    \
+                 value\n}}\n"
+            )
+        );
+
+        // A block or a comment in the arm always moves it to its own line,
+        // and a group that would wrap on its own line moves it too.
+        let formatted = format(
+            "fn f(r) -> Int { let Ok(v) = r else Err(e) => { println(e); 0 }; v }\n\
+             fn g(r) -> Int { let Ok(v) = r else // fallback\nErr(e) => 0; v }",
+        );
+        assert_eq!(
+            formatted,
+            "fn f(r) -> Int {\n    let Ok(v) = r else\n        Err(e) => {\n            println(e);\n            \
+             0\n        };\n    v\n}\n\nfn g(r) -> Int {\n    let Ok(v) = r else // fallback\n        \
+             Err(e) => 0;\n    v\n}\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+        let call = format!("handle({})", "a".repeat(60));
+        let formatted = format(&format!(
+            "fn f(r) -> Int {{ let Ok(value) = r else Err(error) => {call}; value }}"
+        ));
+        assert!(
+            formatted.contains(&format!("else\n        Err(error) => {call};\n")),
+            "{formatted}"
+        );
+        assert_eq!(format(&formatted), formatted);
+
+        // A value that wraps keeps a short arm after its closing delimiter.
+        let argument = "a".repeat(90);
+        let formatted = format(&format!(
+            "fn f() -> Int {{ let Ok(value) = load({argument}) else Err(error) => 0; value }}"
+        ));
+        assert_eq!(
+            formatted,
+            format!(
+                "fn f() -> Int {{\n    let Ok(value) = load(\n        {argument},\n    ) else Err(error) => 0;\n    \
+                 value\n}}\n"
+            )
         );
         assert_eq!(format(&formatted), formatted);
     }

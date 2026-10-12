@@ -1,0 +1,28 @@
+fn forward(request: HttpRequest) -> Result<HttpResponse, String> {
+    let model = config_string("agent.model")?;
+    let outbound: HttpRequest = record {
+        method: "POST",
+        path: "/v1/review",
+        query: "",
+        headers: [record { name: "x-model", value: model }],
+        body: request.body,
+    };
+    let response = http_request(
+        "https://api.example.com",
+        outbound,
+        Some(secret("upstream-token")?),
+    )?;
+    let summary = if response.status == 200 {
+        "reviewed: " + response.body
+    } else {
+        "upstream " + config_string("agent.fallback")?
+    };
+    Ok(record { status: 200, headers: [], body: summary })
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match forward(request) {
+        Ok(response) => response,
+        Err(error) => record { status: 502, headers: [], body: error },
+    }
+}

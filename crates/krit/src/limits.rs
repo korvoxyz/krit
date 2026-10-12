@@ -13,8 +13,11 @@ use crate::{Diagnostic, Span};
 /// Maximum syntactic nesting depth of a source file (`K1005`).
 ///
 /// Parenthesized expressions, blocks, list and record literals, call argument
-/// lists, field-access and call links, unary operands, `if` conditions,
-/// `match` subjects and arms, and type argument lists each open one level.
+/// lists, field-access, call, and `?` links, unary operands, `if` conditions,
+/// `match` subjects and arms, let-else arms, the payloads of variant patterns,
+/// and type argument lists each open one level, and a `match` arm's value
+/// opens one more for each variant or list pattern nested in a payload of its
+/// pattern, since Core IR decides each with one more nested match.
 /// An `else if` continuation and a chained binary operator do not.
 ///
 /// Analysis applies the same bound to the resolved type of every type
@@ -26,10 +29,11 @@ pub const MAX_NESTING_DEPTH: usize = 256;
 /// Maximum structural depth of a source file (`K1005`).
 ///
 /// The structural depth of a point is its syntactic nesting depth plus the
-/// number of `else if` continuations, binary operators, and call and
-/// field-access links above it in the syntax tree. Operator and postfix
-/// chains nest to the left, so in `(a + b) + c` the operand `a` sits below
-/// both operators; parenthesizing a chain therefore cannot hide its length.
+/// number of `else if` continuations, binary operators, and call,
+/// field-access, and `?` links above it in the syntax tree. Operator and
+/// postfix chains nest to the left, so in `(a + b) + c` the operand `a` sits
+/// below both operators; parenthesizing a chain therefore cannot hide its
+/// length.
 /// The parser checks this depth for every point of the tree it builds, so it
 /// bounds the height of every accepted syntax tree, and with it the recursion
 /// of every later stage, including Core IR and the WebAssembly compilers,
@@ -158,7 +162,7 @@ pub(crate) fn structural_error(span: Span) -> Diagnostic {
         "K1005",
         format!(
             "nesting depth limit exceeded: nesting plus the `else if` continuations, operators, \
-             and call or field-access links above any point may reach at most \
+             and call, field-access, or `?` links above any point may reach at most \
              {MAX_STRUCTURAL_DEPTH} levels"
         ),
         span,

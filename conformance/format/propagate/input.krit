@@ -1,0 +1,5 @@
+fn load(text:String)->Result<Int,String>{if text=="" {Err("empty")} else {Ok(1)}}
+fn total(a:String,b:String)->Result<Int,String>{let first=load(a) ?;
+let pick=fn(x:Int){x};
+Ok(pick(first)+load(b) ? - 1)}
+fn shape(items:List<Option<Int>>)->Option<Int>{match items{[]=>None,[head,..rest]=>if head ? >0 {Some(head ?)} else {None}}}

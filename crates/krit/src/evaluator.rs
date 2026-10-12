@@ -3,8 +3,9 @@ use std::{fmt, io::Write, ops::Deref, rc::Rc};
 use crate::{
     Diagnostic, Span,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
-        Statement, StatementKind, UnaryOperator, ValueLiteral, VariantFamily, VariantName,
+        BinaryOperator, Block, Expression, ExpressionKind, MatchArm, Parameter, Pattern,
+        PatternKind, Program, Statement, StatementKind, UnaryOperator, ValueLiteral, VariantArm,
+        VariantFamily, VariantName, VariantPattern,
     },
     limits::{MAX_CALL_DEPTH, MAX_EVALUATION_DEPTH, MAX_VALUE_DEPTH},
 };
@@ -409,6 +410,34 @@ pub fn execute(program: &Program, output: &mut dyn Write) -> Result<Value, Diagn
     .program(program)
 }
 
+/// Why the evaluation of an expression stopped without producing its value.
+enum Interrupt {
+    /// Evaluation failed.
+    Error(Diagnostic),
+    /// The innermost enclosing function call returns `value` at once.
+    Exit { value: Value, exit: Exit },
+}
+
+/// The construct that makes a function return early.
+#[derive(Clone, Copy)]
+enum Exit {
+    /// A postfix `?` at this span met an `Err` or `None` value, which is
+    /// returned.
+    Question(Span),
+    /// A let-else whose `let` and pattern are at this span met the variant
+    /// of its arm, whose value is returned.
+    LetElse(Span),
+}
+
+impl From<Diagnostic> for Interrupt {
+    fn from(diagnostic: Diagnostic) -> Self {
+        Self::Error(diagnostic)
+    }
+}
+
+/// The outcome of evaluating an expression, block, or statement.
+type Flow<T> = Result<T, Interrupt>;
+
 struct Evaluator<'a> {
     output: &'a mut dyn Write,
     /// Nested expression and block evaluations currently active.
@@ -421,20 +450,51 @@ impl Evaluator<'_> {
     fn program(&mut self, program: &Program) -> Result<Value, Diagnostic> {
         let mut environment = Environment::empty();
         for statement in &program.statements {
-            environment = self.statement(statement, &environment)?;
+            environment = match self.statement(statement, &environment) {
+                Ok(environment) => environment,
+                Err(Interrupt::Error(diagnostic)) => return Err(diagnostic),
+                // Analysis accepts `?` and let-else only inside a named
+                // function, so only a program evaluated without analysis gets
+                // here.
+                Err(Interrupt::Exit {
+                    exit: Exit::Question(question),
+                    ..
+                }) => {
+                    return Err(Diagnostic::new(
+                        "K3012",
+                        "`?` is not allowed at the top level",
+                        question,
+                    ));
+                }
+                Err(Interrupt::Exit {
+                    exit: Exit::LetElse(head),
+                    ..
+                }) => {
+                    return Err(Diagnostic::new(
+                        "K3014",
+                        "let-else is not allowed at the top level",
+                        head,
+                    ));
+                }
+            };
         }
         Ok(Value::Unit)
     }
 
-    fn statement(
-        &mut self,
-        statement: &Statement,
-        environment: &Environment,
-    ) -> Result<Environment, Diagnostic> {
+    fn statement(&mut self, statement: &Statement, environment: &Environment) -> Flow<Environment> {
         match &statement.kind {
             StatementKind::Let { name, value, .. } => {
                 let value = self.expression(value, environment)?;
                 Ok(environment.extend(name.clone(), value))
+            }
+            StatementKind::LetElse {
+                pattern,
+                value,
+                arm,
+                ..
+            } => {
+                let head = Span::new(statement.span.start, pattern.span.end);
+                self.let_else(head, pattern, value, arm, environment)
             }
             StatementKind::Function {
                 name,
@@ -470,6 +530,62 @@ impl Evaluator<'_> {
         }
     }
 
+    /// Evaluates the let-else whose `let` and pattern are at `head`: `value`
+    /// evaluates first. When it is the variant of `pattern`, the pattern's
+    /// binder names its payload for the rest of the block; when it is the
+    /// arm's variant, the arm's value evaluates with the arm's binder and the
+    /// innermost enclosing function call returns it.
+    fn let_else(
+        &mut self,
+        head: Span,
+        pattern: &VariantPattern,
+        value: &Expression,
+        arm: &VariantArm,
+        environment: &Environment,
+    ) -> Flow<Environment> {
+        let subject = self.expression(value, environment)?;
+        let family = pattern.variant.family();
+        let Value::Variant { name, payload } = subject else {
+            return Err(Diagnostic::new(
+                "K4001",
+                format!(
+                    "expected {} for let-else, found {}",
+                    variant_family_name(family),
+                    subject.kind()
+                ),
+                value.span,
+            )
+            .into());
+        };
+        // A binder `_` binds the discard name like any other binder.
+        let bind = |binding: &Option<String>| match (binding, &payload) {
+            (Some(binding), Some(payload)) => {
+                environment.extend(binding.clone(), Value::clone(payload))
+            }
+            _ => environment.clone(),
+        };
+        if name == pattern.variant {
+            return Ok(bind(&pattern.binding));
+        }
+        if name != arm.variant {
+            let message = if variant_family(name) == family {
+                format!("no let-else pattern matches `{}`", name.as_str())
+            } else {
+                format!(
+                    "expected {} for let-else, found {}",
+                    variant_family_name(family),
+                    variant_family_name(variant_family(name))
+                )
+            };
+            return Err(Diagnostic::new("K4001", message, value.span).into());
+        }
+        let value = self.expression(&arm.value, &bind(&arm.binding))?;
+        Err(Interrupt::Exit {
+            value,
+            exit: Exit::LetElse(head),
+        })
+    }
+
     fn enter(&mut self, span: Span) -> Result<(), Diagnostic> {
         if self.depth >= MAX_EVALUATION_DEPTH {
             return Err(Diagnostic::new(
@@ -485,18 +601,14 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    fn block(&mut self, block: &Block, environment: &Environment) -> Result<Value, Diagnostic> {
+    fn block(&mut self, block: &Block, environment: &Environment) -> Flow<Value> {
         self.enter(block.span)?;
         let value = self.block_contents(block, environment);
         self.depth -= 1;
         value
     }
 
-    fn block_contents(
-        &mut self,
-        block: &Block,
-        environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    fn block_contents(&mut self, block: &Block, environment: &Environment) -> Flow<Value> {
         let mut local = environment.clone();
         for statement in &block.statements {
             local = self.statement(statement, &local)?;
@@ -507,11 +619,7 @@ impl Evaluator<'_> {
             .map_or(Ok(Value::Unit), |tail| self.expression(tail, &local))
     }
 
-    fn expression(
-        &mut self,
-        expression: &Expression,
-        environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    fn expression(&mut self, expression: &Expression, environment: &Environment) -> Flow<Value> {
         self.enter(expression.span)?;
         let value = self.expression_contents(expression, environment);
         self.depth -= 1;
@@ -522,10 +630,10 @@ impl Evaluator<'_> {
         &mut self,
         expression: &Expression,
         environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         match &expression.kind {
-            ExpressionKind::Literal(literal) => self.literal(literal, expression.span),
-            ExpressionKind::Variable(name) => variable(name, environment, expression.span),
+            ExpressionKind::Literal(literal) => Ok(self.literal(literal, expression.span)?),
+            ExpressionKind::Variable(name) => Ok(variable(name, environment, expression.span)?),
             // Operands on the recursive evaluation path are collected with
             // plain loops: iterator adapters add several native frames per
             // nested evaluation in unoptimized builds.
@@ -534,7 +642,7 @@ impl Evaluator<'_> {
                 for element in elements {
                     values.push(self.expression(element, environment)?);
                 }
-                Value::list(values, expression.span)
+                Ok(Value::list(values, expression.span)?)
             }
             ExpressionKind::Record(fields) => {
                 let mut values = Vec::with_capacity(fields.len());
@@ -544,11 +652,11 @@ impl Evaluator<'_> {
                         self.expression(&field.value, environment)?,
                     ));
                 }
-                Value::record(values, expression.span)
+                Ok(Value::record(values, expression.span)?)
             }
             ExpressionKind::FieldAccess { value, field } => {
                 let value = self.expression(value, environment)?;
-                field_value(value, field, expression.span)
+                Ok(field_value(value, field, expression.span)?)
             }
             ExpressionKind::Block(block) => self.block(block, environment),
             ExpressionKind::If { .. } => self.if_chain(expression, environment),
@@ -558,8 +666,12 @@ impl Evaluator<'_> {
             ExpressionKind::Call { callee, arguments } => {
                 self.call(callee, arguments, environment, expression.span)
             }
-            ExpressionKind::Match { subject, kind } => {
-                self.match_expression(subject, kind, environment)
+            ExpressionKind::Propagate { operand, question } => {
+                let value = self.expression(operand, environment)?;
+                propagate(value, *question)
+            }
+            ExpressionKind::Match { subject, arms } => {
+                self.match_expression(subject, arms, environment)
             }
             ExpressionKind::Unary { operator, operand } => {
                 self.unary(*operator, operand, environment, expression.span)
@@ -571,22 +683,18 @@ impl Evaluator<'_> {
     fn match_expression(
         &mut self,
         subject: &Expression,
-        kind: &MatchKind,
+        arms: &[MatchArm],
         environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let subject_value = self.expression(subject, environment)?;
         let (arm, arm_environment) =
-            select_match_arm(subject_value, subject.span, kind, environment)?;
+            select_match_arm(&subject_value, subject.span, arms, environment)?;
         self.expression(arm, &arm_environment)
     }
 
     /// Evaluates an `if` expression and its `else if` chain iteratively, so a
     /// long chain does not deepen evaluation.
-    fn if_chain(
-        &mut self,
-        expression: &Expression,
-        environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    fn if_chain(&mut self, expression: &Expression, environment: &Environment) -> Flow<Value> {
         let mut current = expression;
         loop {
             let ExpressionKind::If {
@@ -607,11 +715,7 @@ impl Evaluator<'_> {
 
     /// Evaluates a left-nested chain of binary operators such as `a + b + c`
     /// iteratively, left to right, so a long chain does not deepen evaluation.
-    fn binary_chain(
-        &mut self,
-        expression: &Expression,
-        environment: &Environment,
-    ) -> Result<Value, Diagnostic> {
+    fn binary_chain(&mut self, expression: &Expression, environment: &Environment) -> Flow<Value> {
         let mut spine = Vec::new();
         let mut current = expression;
         while let ExpressionKind::Binary { left, .. } = &current.kind {
@@ -647,14 +751,14 @@ impl Evaluator<'_> {
         arguments: &[Expression],
         environment: &Environment,
         span: Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let callee_value = self.expression(callee, environment)?;
         match callee_value {
             Value::Function(function) => {
                 self.call_function(&function, arguments, environment, span)
             }
             Value::Builtin(builtin) => self.call_builtin(builtin, arguments, environment, span),
-            value => Err(not_callable(&value, callee.span)),
+            value => Err(not_callable(&value, callee.span).into()),
         }
     }
 
@@ -664,13 +768,9 @@ impl Evaluator<'_> {
         arguments: &[Expression],
         environment: &Environment,
         span: Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         if arguments.len() != function.parameters.len() {
-            return Err(arity_error(
-                function.parameters.len(),
-                arguments.len(),
-                span,
-            ));
+            return Err(arity_error(function.parameters.len(), arguments.len(), span).into());
         }
 
         let mut values = Vec::with_capacity(arguments.len());
@@ -692,12 +792,19 @@ impl Evaluator<'_> {
                     "call depth limit exceeded: more than {MAX_CALL_DEPTH} nested function calls"
                 ),
                 span,
-            ));
+            )
+            .into());
         }
         self.calls += 1;
         let value = self.block(&function.body, &call_environment);
         self.calls -= 1;
-        value
+        // A `?` in the body that met `Err` or `None`, or a let-else in it
+        // that met its arm's variant, returns from this call; a `?` in an
+        // argument above belongs to the caller.
+        match value {
+            Err(Interrupt::Exit { value, .. }) => Ok(value),
+            value => value,
+        }
     }
 
     fn call_builtin(
@@ -706,19 +813,19 @@ impl Evaluator<'_> {
         arguments: &[Expression],
         environment: &Environment,
         span: Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let expected_arity = builtin_arity(builtin);
         if arguments.len() != expected_arity {
-            return Err(arity_error(expected_arity, arguments.len(), span));
+            return Err(arity_error(expected_arity, arguments.len(), span).into());
         }
         if let Some(message) = unavailable_builtin_message(builtin) {
             for argument in arguments {
                 self.expression(argument, environment)?;
             }
-            return Err(Diagnostic::new("K5003", message, span));
+            return Err(Diagnostic::new("K5003", message, span).into());
         }
         let value = self.expression(&arguments[0], environment)?;
-        self.apply_builtin(builtin, value, span)
+        Ok(self.apply_builtin(builtin, value, span)?)
     }
 
     /// Applies a pure or output built-in to its evaluated argument.
@@ -787,14 +894,14 @@ impl Evaluator<'_> {
         operand: &Expression,
         environment: &Environment,
         span: Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         if operator == UnaryOperator::Negate
             && let ExpressionKind::Literal(ValueLiteral::Integer(value)) = &operand.kind
         {
-            return negate_literal(*value, span);
+            return Ok(negate_literal(*value, span)?);
         }
         let value = self.expression(operand, environment)?;
-        apply_unary(operator, value, span)
+        Ok(apply_unary(operator, value, span)?)
     }
 
     fn binary(
@@ -804,7 +911,7 @@ impl Evaluator<'_> {
         right: &Expression,
         environment: &Environment,
         span: Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         if operator == BinaryOperator::And {
             return if expect_boolean(left_value, span)? {
                 let right = self.expression(right, environment)?;
@@ -823,7 +930,7 @@ impl Evaluator<'_> {
         }
 
         let right_value = self.expression(right, environment)?;
-        apply_binary(operator, left_value, right_value, span)
+        Ok(apply_binary(operator, left_value, right_value, span)?)
     }
 }
 
@@ -1123,75 +1230,162 @@ fn container_depth<'a>(
     Ok(depth)
 }
 
-/// Selects the match arm for an evaluated subject and returns it with the
-/// environment that binds its pattern names.
+/// Selects the arm whose pattern matches an evaluated subject and returns its
+/// value with the environment that binds its pattern names.
+///
+/// Analysis guarantees that exactly one arm matches; arms are tried in order,
+/// and a program evaluated without analysis whose arms match nothing fails
+/// with `K4001`.
 fn select_match_arm<'a>(
-    subject_value: Value,
+    subject_value: &Value,
     subject_span: Span,
-    kind: &'a MatchKind,
+    arms: &'a [MatchArm],
     environment: &Environment,
 ) -> Result<(&'a Expression, Environment), Diagnostic> {
-    match kind {
-        MatchKind::List {
-            empty_case,
-            head_name,
-            tail_name,
-            cons_case,
-            ..
-        } => {
-            let Value::List(values) = subject_value else {
-                return Err(Diagnostic::new(
-                    "K4001",
-                    format!("expected list, found {}", subject_value.kind()),
-                    subject_span,
-                ));
-            };
-            if values.is_empty() {
-                Ok((empty_case, environment.clone()))
-            } else {
-                let with_head = environment.extend(head_name.clone(), values[0].clone());
-                // The tail nests no deeper than the list it came from.
-                let tail = Value::list(values[1..].to_vec(), subject_span)?;
-                let with_tail = with_head.extend(tail_name.clone(), tail);
-                Ok((cons_case, with_tail))
-            }
+    for arm in arms {
+        if let Some(bound) = match_pattern(&arm.pattern, subject_value, subject_span, environment)?
+        {
+            return Ok((&arm.value, bound));
         }
-        MatchKind::Variants { family, arms } => {
-            let Value::Variant { name, payload } = subject_value else {
-                return Err(Diagnostic::new(
-                    "K4001",
-                    format!(
-                        "expected {} for variant match, found {}",
-                        variant_family_name(*family),
-                        subject_value.kind()
-                    ),
-                    subject_span,
-                ));
-            };
-            if variant_family(name) != *family {
-                return Err(Diagnostic::new(
-                    "K4001",
-                    format!(
-                        "expected {} for variant match, found {}",
-                        variant_family_name(*family),
-                        variant_family_name(variant_family(name))
-                    ),
-                    subject_span,
-                ));
+    }
+    let shape = match subject_value {
+        Value::Variant { name, .. } => format!("`{}`", name.as_str()),
+        Value::List(values) if values.is_empty() => "an empty list".to_owned(),
+        Value::List(_) => "a non-empty list".to_owned(),
+        value => value.kind().to_owned(),
+    };
+    Err(Diagnostic::new(
+        "K4001",
+        format!("no match arm matches {shape}"),
+        subject_span,
+    ))
+}
+
+/// Matches `value` against `pattern` and returns `environment` extended with
+/// the pattern's names, or `None` when the pattern does not match. A value
+/// of another kind than the pattern's family is `K4001` at the subject's
+/// `span`. Patterns are paths, so this walks one iteratively.
+///
+/// A `_` binds the discard name like a name does, so that reading `_`
+/// (warning `K2003`) sees the most recent `_` binding, as checking resolves
+/// it: in `[_, .._]`, the tail.
+fn match_pattern(
+    pattern: &Pattern,
+    value: &Value,
+    span: Span,
+    environment: &Environment,
+) -> Result<Option<Environment>, Diagnostic> {
+    let mut current = pattern;
+    let mut value = value.clone();
+    loop {
+        match &current.kind {
+            PatternKind::Binder(_) | PatternKind::Wildcard => {
+                return Ok(Some(environment.extend(binder_name(current), value)));
             }
-            let arm = arms
-                .iter()
-                .find(|arm| arm.variant == name)
-                .expect("parser guarantees exhaustive variant arms");
-            let arm_environment = match (&arm.binding, payload) {
-                (Some(binding), Some(payload)) => {
-                    environment.extend(binding.clone(), Value::clone(&payload))
+            PatternKind::EmptyList | PatternKind::Cons { .. } => {
+                let Value::List(values) = value else {
+                    return Err(Diagnostic::new(
+                        "K4001",
+                        format!("expected list, found {}", value.kind()),
+                        span,
+                    ));
+                };
+                return match (&current.kind, values.first()) {
+                    (PatternKind::EmptyList, None) => Ok(Some(environment.clone())),
+                    (PatternKind::Cons { head, tail }, Some(first)) => {
+                        // The tail nests no deeper than the list it came from.
+                        let rest = Value::list(values[1..].to_vec(), span)?;
+                        Ok(Some(
+                            environment
+                                .extend(binder_name(head), first.clone())
+                                .extend(binder_name(tail), rest),
+                        ))
+                    }
+                    _ => Ok(None),
+                };
+            }
+            PatternKind::Variant { variant, payload } => {
+                let family = variant.family();
+                let Value::Variant {
+                    name,
+                    payload: carried,
+                } = value
+                else {
+                    return Err(Diagnostic::new(
+                        "K4001",
+                        format!(
+                            "expected {} for variant match, found {}",
+                            variant_family_name(family),
+                            value.kind()
+                        ),
+                        span,
+                    ));
+                };
+                if variant_family(name) != family {
+                    return Err(Diagnostic::new(
+                        "K4001",
+                        format!(
+                            "expected {} for variant match, found {}",
+                            variant_family_name(family),
+                            variant_family_name(variant_family(name))
+                        ),
+                        span,
+                    ));
                 }
-                (None, None) => environment.clone(),
-                _ => unreachable!("variant payload shape is fixed"),
-            };
-            Ok((&arm.value, arm_environment))
+                if name != *variant {
+                    return Ok(None);
+                }
+                match (payload, carried) {
+                    (Some(payload), Some(carried)) => {
+                        current = payload;
+                        value = Value::clone(&carried);
+                    }
+                    (None, None) => return Ok(Some(environment.clone())),
+                    _ => {
+                        return Err(Diagnostic::new(
+                            "K4001",
+                            format!("`{}` pattern has the wrong payload shape", name.as_str()),
+                            span,
+                        ));
+                    }
+                }
+            }
         }
+    }
+}
+
+/// The name a name or `_` pattern binds: the name itself, or the discard
+/// name `_`. Checking makes the head and tail of a list pattern, the only
+/// other places this is asked, names or `_`.
+fn binder_name(pattern: &Pattern) -> String {
+    match &pattern.kind {
+        PatternKind::Binder(name) => name.clone(),
+        _ => "_".to_owned(),
+    }
+}
+
+/// Applies the postfix `?` at `question` to its evaluated operand: `Ok` and
+/// `Some` yield their payload, and `Err` and `None` stop evaluation so that
+/// the innermost enclosing function call returns that same value.
+fn propagate(value: Value, question: Span) -> Flow<Value> {
+    match value {
+        Value::Variant {
+            name: VariantName::Ok | VariantName::Some,
+            payload: Some(payload),
+        } => Ok(Value::clone(&payload)),
+        Value::Variant {
+            name: VariantName::Err | VariantName::None,
+            ..
+        } => Err(Interrupt::Exit {
+            value,
+            exit: Exit::Question(question),
+        }),
+        value => Err(Diagnostic::new(
+            "K4001",
+            format!("expected result or option for `?`, found {}", value.kind()),
+            question,
+        )
+        .into()),
     }
 }
 
@@ -1761,6 +1955,248 @@ mod tests {
     }
 
     #[test]
+    fn evaluates_nested_patterns_and_wildcards_in_any_arm_order() {
+        let source = r#"
+            fn describe(stored: Result<Option<String>, String>) -> String {
+                match stored {
+                    Err(_) => "failed",
+                    Ok(None) => "missing",
+                    Ok(Some(value)) => "found " + value,
+                }
+            }
+            fn second(items: List<Int>) -> Option<Int> {
+                match items {
+                    [_, ..rest] => match rest { [value, .._] => Some(value), [] => None },
+                    [] => None,
+                }
+            }
+            println(describe(Ok(Some("a"))));
+            println(describe(Ok(None)));
+            println(describe(Err("b")));
+            println(second([1, 2, 3]));
+            println(second([1]));
+            println(match Some(Ok([4])) {
+                Some(Ok([head, .._])) => head,
+                Some(Ok([])) => 0,
+                Some(Err(_)) => 0 - 1,
+                None => 0 - 2,
+            });
+            "#;
+        for run in [run as Run, run_unchecked] {
+            let (output, _) = run(source).expect("nested patterns should run");
+            assert_eq!(output, "found a\nmissing\nfailed\nSome(2)\nNone\n4\n");
+        }
+    }
+
+    #[test]
+    fn reading_a_pattern_discard_reads_the_value_at_its_position() {
+        // Reading `_` is warning K2003 in edition 2026, and it reads the most
+        // recent `_` binding: a pattern's `_` over an outer one, and the tail
+        // of `[_, .._]`.
+        let source = r#"
+            let _ = "outer";
+            fn found(stored: Result<Option<String>, String>) -> String {
+                match stored {
+                    Ok(Some(_)) => "found " + _,
+                    Ok(None) => "missing",
+                    Err(_) => "failed " + _,
+                }
+            }
+            fn doubled(stored: Result<Int, Int>) -> Int {
+                let Ok(_) = stored else Err(_) => _;
+                _ * 2
+            }
+            println(found(Ok(Some("a"))));
+            println(found(Err("b")));
+            println(match [1, 2, 3] { [] => [], [_, .._] => _ });
+            println(doubled(Ok(21)));
+            println(doubled(Err(5)));
+            println(_);
+            "#;
+        let (output, _) = run(source).expect("pattern discards should run");
+        assert_eq!(output, "found a\nfailed b\n[2, 3]\n42\n5\nouter\n");
+    }
+
+    #[test]
+    fn unchecked_matches_that_no_arm_matches_fail_closed() {
+        // Analysis rejects these programs; evaluating them without analysis
+        // reports an error instead of panicking.
+        for (text, message) in [
+            (
+                "match None { Some(x) => x };",
+                "no match arm matches `None`",
+            ),
+            (
+                "match Ok(None) { Ok(Some(x)) => x, Err(e) => e };",
+                "no match arm matches `Ok`",
+            ),
+            (
+                "match [] { [x, ..rest] => x };",
+                "no match arm matches an empty list",
+            ),
+            (
+                "match 1 { Some(x) => x, None => 0 };",
+                "expected option for variant match, found integer",
+            ),
+            (
+                "match Some(Ok(1)) { Some(None) => 0, None => 1 };",
+                "expected option for variant match, found result",
+            ),
+        ] {
+            let error = run_unchecked(text).expect_err(text);
+            assert_eq!(error.code(), "K4001", "{text}");
+            assert_eq!(error.message(), message, "{text}");
+        }
+    }
+
+    #[test]
+    fn postfix_question_marks_return_failures_from_the_enclosing_function() {
+        let (output, _) = run(r#"
+            fn digit(text: String) -> Result<Int, String> {
+                if text == "1" { Ok(1) } else { Err("bad " + text) }
+            }
+            fn sum(left: String, right: String) -> Result<Int, String> {
+                let first = digit(left)?;
+                println("after " + left);
+                Ok(first + digit(right)?)
+            }
+            fn first(items: List<Int>) -> Option<Int> {
+                match items { [] => None, [head, .._] => Some(head) }
+            }
+            fn nested(items: List<Int>) -> Option<Int> {
+                let doubled = if first(items)? > 0 {
+                    match Some(first(items)? * 2) { Some(value) => value, None => 0 }
+                } else {
+                    0
+                };
+                Some(doubled)
+            }
+            println(sum("1", "1"));
+            println(sum("x", "1"));
+            println(sum("1", "y"));
+            println(nested([4]));
+            println(nested([]));
+            "#)
+        .expect("propagation should run");
+        assert_eq!(
+            output,
+            "after 1\nOk(2)\nErr(\"bad x\")\nafter 1\nErr(\"bad y\")\nSome(8)\nNone\n"
+        );
+    }
+
+    #[test]
+    fn postfix_question_marks_keep_left_to_right_order_and_performed_effects() {
+        let (output, _) = run(r#"
+            fn failing(label: String) -> Result<Int, String> {
+                println(label);
+                Err(label)
+            }
+            fn three(a: Unit, b: Int, c: Unit) -> Int { b }
+            fn order() -> Result<Int, String> {
+                Ok(three(println("a"), failing("b")?, println("never")))
+            }
+            println(order());
+            "#)
+        .expect("propagation should run");
+        assert_eq!(output, "a\nb\nErr(\"b\")\n");
+    }
+
+    #[test]
+    fn a_failure_propagated_outside_every_function_is_an_error_without_analysis() {
+        let error = run_unchecked("println(1);\nErr(2)?;\nprintln(3);")
+            .expect_err("an unchecked top-level `?` should fail");
+        assert_eq!(error.code(), "K3012");
+        assert_eq!(error.span().start, 18);
+        let (output, _) = run_unchecked("println(Ok(2)?);").expect("`Ok` unwraps");
+        assert_eq!(output, "2\n");
+        let error = run_unchecked("fn f() { 1? }\nf();").expect_err("not a variant");
+        assert_eq!(error.code(), "K4001");
+        // A closure is a function call too, so its own call returns the
+        // failure.
+        let (output, _) = run_unchecked("let g = fn() { Err(1)?; 2 };\nprintln(g());")
+            .expect("a closure call returns the failure");
+        assert_eq!(output, "Err(1)\n");
+    }
+
+    #[test]
+    fn let_else_binds_the_payload_or_returns_its_arm_from_the_function() {
+        let (output, _) = run(r#"
+            fn digit(text: String) -> Result<Int, String> {
+                if text == "1" { Ok(1) } else { Err("bad " + text) }
+            }
+            fn describe(text: String) -> String {
+                let Ok(value) = digit(text) else Err(error) => "failed: " + error;
+                println("parsed " + text);
+                json_encode(value + 1)
+            }
+            fn first(items: List<Int>) -> Option<Int> {
+                match items { [] => None, [head, .._] => Some(head) }
+            }
+            fn absent(items: List<Int>) -> String {
+                let None = first(items) else Some(found) => "found " + json_encode(found);
+                "absent"
+            }
+            fn problem(text: String) -> String {
+                let Err(error) = digit(text) else Ok(_) => "fine";
+                error
+            }
+            println(describe("1"));
+            println(describe("x"));
+            println(absent([]));
+            println(absent([7]));
+            println(problem("1"));
+            println(problem("z"));
+            "#)
+        .expect("let-else should run");
+        assert_eq!(
+            output,
+            "parsed 1\n2\nfailed: bad x\nabsent\nfound 7\nfine\nbad z\n"
+        );
+    }
+
+    #[test]
+    fn let_else_evaluates_its_value_then_its_arm_and_keeps_performed_effects() {
+        let (output, _) = run(r#"
+            fn failing(label: String) -> Result<Int, String> {
+                println(label);
+                Err(label)
+            }
+            fn order() -> Int {
+                println("a");
+                let Ok(value) = failing("b") else Err(error) => { println("arm " + error); 0 };
+                println("never");
+                value
+            }
+            println(order());
+            "#)
+        .expect("let-else should run");
+        assert_eq!(output, "a\nb\narm b\n0\n");
+    }
+
+    #[test]
+    fn a_let_else_arm_outside_every_function_is_an_error_without_analysis() {
+        let error = run_unchecked("println(1);\nlet Ok(x) = Err(2) else Err(e) => e;\nprintln(3);")
+            .expect_err("an unchecked top-level let-else should fail");
+        assert_eq!(error.code(), "K3014");
+        assert_eq!(error.span(), crate::Span::new(12, 21));
+        let (output, _) = run_unchecked("let Ok(x) = Ok(2) else Err(e) => e;\nprintln(x);")
+            .expect("`Ok` binds its payload");
+        assert_eq!(output, "2\n");
+        // A let-else in a nested block returns from the enclosing call.
+        let (output, _) = run_unchecked(
+            "fn f() { let y = { let Some(x) = None else None => 5; x }; y + 1 }\nprintln(f());",
+        )
+        .expect("the call returns the arm's value");
+        assert_eq!(output, "5\n");
+        let error = run_unchecked("fn f() { let Some(x) = Ok(1) else None => 0; x }\nf();")
+            .expect_err("a value of the other family");
+        assert_eq!(error.code(), "K4001");
+        let error = run_unchecked("fn f() { let Some(x) = None else Some(y) => y; x }\nf();")
+            .expect_err("no arm matches");
+        assert_eq!(error.code(), "K4001");
+    }
+
+    #[test]
     fn functions_nested_in_data_remain_non_comparable() {
         for source in [
             "println(record { callback: fn(value) { value } } == record { callback: fn(value) { value } });",
@@ -1832,14 +2268,10 @@ mod tests {
             println(_);
             fn second(_, _) { _ }
             println(second(3, 4));
-            println(match [5, 6, 7] {
-                [] => [],
-                [_, .._] => _,
-            });
             "#;
         for run in [run as Run, run_unchecked] {
             let (output, _) = run(source).expect("repeated discards should run");
-            assert_eq!(output, "2\n4\n[6, 7]\n");
+            assert_eq!(output, "2\n4\n");
         }
     }
 

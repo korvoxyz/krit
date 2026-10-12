@@ -1,0 +1,4 @@
+fn describe(loud: Bool) -> String {
+    let Ok(text) = if loud { Ok("LOUD") } else { Err("quiet") } else Err(error) => error;
+    text
+}
