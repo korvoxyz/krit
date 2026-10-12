@@ -1,22 +1,50 @@
 # Krit
 
 Krit is an open, human-auditable programming language for small sandboxed
-agents, bots, and integration APIs written with AI and trusted by people.
+agents, bots, and integration APIs written with AI and trusted by people. A
+Krit program compiles to a WebAssembly component that can reach only the
+origins, secrets, models, and stores its manifest grants, and every one of
+them is written as a literal in the source.
 
 ```krit
-fn sum(items) {
-    match items {
-        [] => 0,
-        [head, ..tail] => head + sum(tail),
-    }
+/// Summarizes one GitHub issue with a model and returns the summary.
+fn review(request: HttpRequest) -> Result<HttpResponse, String> {
+    let repository = config_string("reference.repository")?;
+    let token = secret("github-token")?;
+    let issue = http_request(
+        "https://github.example.invalid",
+        HttpRequest {
+            method: "GET",
+            path: "/repos/example/issues/1",
+            headers: ["x-reference-repository": repository],
+        },
+        Some(token),
+    )?;
+    // Model output is raw, nondeterministic, untrusted text.
+    let summary = ai_invoke("reviewer", issue.body)?;
+    log_info("review.completed", ["delivery": request.path])?;
+    Ok(HttpResponse { status: 200, body: summary })
 }
 
-println(sum([10, 20, 12]));
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match review(request) {
+        Ok(response) => response,
+        Err(reason) => {
+            log_error("review.failed", ["reason": reason]);
+            HttpResponse { status: 502, body: "review failed" }
+        },
+    }
+}
 ```
 
-```text
-42
-```
+Every fallible step is visible: `?` passes a failure up to `handle`, which
+names both outcomes. `krit check` proves that this file builds into a
+component. `krit explain` lists the exact capabilities it needs,
+`ai.invoke("reviewer")`, `config.read("reference.repository")`,
+`http.request("https://github.example.invalid")`, and
+`secret.read("github-token")`, plus the `observe.log` effect. `krit build`
+refuses a package whose manifest does not grant them, and the host refuses to
+send `github-token` to any origin its manifest binding does not list.
 
 Krit favors readable source, deterministic behavior, immutable values,
 explicit authority, and machine-readable compiler facts. Natural language can
@@ -26,90 +54,134 @@ Krit and the Krit language are owned by Akshay Bhardwaj.
 
 ## Status
 
-Krit 0.2 is an early Rust bootstrap implementing the normative dynamic core:
+Krit 0.3 ("Honest and flat") is an early release for people who let AI write
+small bots and integrations and must approve them. It makes Krit **honest**
+(what checks is what ships, failures are diagnostics, authority is bound) and
+**flat** (the happy path reads top to bottom). What 0.3 makes possible:
 
-- UTF-8 source with precise byte and human positions
-- familiar expressions, blocks, functions, calls, and operators
-- immutable lexical bindings and closures
-- checked 64-bit integer arithmetic
-- booleans, strings, unit, immutable lists, and ordered records
-- built-in `Option` and `Result` values with exhaustive matching
-- value annotations enforced by `krit check` and deterministic JSON conversion
-- lexical name resolution and deterministic static type inference/checking
-- sorted `io.stdout` effect inference with function and call propagation
-- one explicit typed `webhook fn` source entrypoint with fixed HTTP contract
-  aliases and deterministic request/response JSON Schemas
-- literal-resource `config.read` and `secret.read` effects plus separate
-  sorted capability requirements
-- direct normalized-origin `http_request` with exact `http.request` resource
-  facts and bearer-only opaque secret consumption
-- provider-neutral `ai_invoke` with exact adapter facts and one host-side
-  deterministic `http-json` adapter
-- ordered typed `log_info`/`log_error` events with bounded buffering,
-  key/value redaction, and stderr-only JSON Lines publication
-- reusable stateful `AgentHost` policy for bounded retries, per-resource rate
-  limits, embedding cancellation, process-local or opt-in durable idempotency,
-  and default-deny AI/bearer approval
-- capability-scoped transactional SQLite state, named checkpoints, completed
-  HTTP/AI replay, and process-restart recovery
-- opaque `Secret` compiler/Core identity with static non-disclosure rules
-- name-resolved, inferred typed Core IR with deterministic IDs and explicit
-  evaluation order
-- verified closures, recursive self bindings, captures, branches, and matches
-- stable human and schema-1 JSON compiler explanations
-- deterministic validator-accepted WebAssembly Component Model artifacts for
-  the initial layout-concrete Core subset
-- effect-selected `krit:runtime@0.2.0` pure and stdout WIT worlds
-- explicit fail-closed Wasm feature/import policy, schema-1 adjacent metadata,
-  and exact-byte BLAKE3 digests
-- reusable-engine, fresh-Store Wasmtime component hosting with fuel, epoch
-  deadline, stack, StoreLimits, host-call, and buffered-output bounds
-- `krit sandbox` execution and artifact-aware effective permission reports
-- typed webhook Component Model exports with exact effect-selected config,
-  secrets, anonymous/authenticated HTTP, AI, logging, and optional stdout
-  imports
-- bounded webhook invocation, immutable host configuration, zeroizing
-  host-side secret storage, DNS-pinned no-redirect outbound HTTP/TLS, and
-  loopback `serve --once`
-- deterministic fixture-driven `krit invoke --request FILE` with all outbound
-  access still constrained by exact host policy
-- typed `queue "name" fn` and `schedule "name" fn` entrypoints with fixed
-  `QueueJob`/`ScheduleEvent` contracts and `Result<String, String>` outcomes
-- durable queues with owner leases, bounded attempts, capped backoff, and
-  terminal dead letters, plus host-owned UTC scheduled triggers with bounded
-  catch-up and duplicate-proof fire identities
-- capability-scoped bounded object buckets that commit with the delivery
-  acknowledgement in one transaction
-- bounded `krit worker --once` and `krit schedule --once` dispatch with
-  host-supplied wall time
-- opaque `DatabaseTransaction` handles with explicit begin/commit/rollback,
-  host-catalogued parameterized statements, and no guest SQL, path, DSN, or
-  credential
-- bounded optional TTL caches and provider-neutral text/vector search with
-  explicit cache miss and outage handling
-- recursive function declarations
-- exhaustive empty/cons list matching
-- deterministic comment-preserving canonical source formatting
-- deterministic human and JSON diagnostics
-- offline `krit lsp` diagnostics, formatting, hover, completion, symbols, and
-  schema-1 compiler/package/permission facts
-- optional `krit assist` provider-neutral suggestions with explicit context
-  inspection, canonical diff review, compiler checks, permission approval, and
-  atomic acceptance
-- implementation-neutral conformance cases
-- strict package manifest validation
+- **What checks is what ships.** For a file with a webhook, queue, or
+  schedule entrypoint, `krit check` runs the complete WebAssembly build
+  pipeline with the output discarded and reports every `K7001`/`K7002` that
+  `krit build` would, at its source span, so a clean check means the file
+  builds. `krit run` refuses every program `krit check` refuses. Deep
+  nesting and runaway recursion are diagnostics (`K1005`, `K4010`), never a
+  crash.
+- **Strings deploy.** Routing on `request.method == "POST"`, composing text
+  with `+`, interpolation (`"\(name)"`), and `"""` text blocks build into
+  components, and so does the first standard library: `int_to_string`,
+  `url_path_segment`, `url_query`, and five string predicates.
+- **Flat code.** Postfix `?`, let-else, nested patterns with `_` and
+  exhaustiveness checking, named construction with defaults
+  (`HttpResponse { status: 200 }`), entry lists (`["accept": "text/plain"]`),
+  the unit value `()`, and `///` doc comments. All are additive in edition
+  2026, defined by their meaning in the core language, and deployable where
+  the underlying types are.
+- **Bound authority.** A manifest binds each secret to the origins it may
+  reach (`[secrets.github-token] origins = ["https://api.github.com"]`), and
+  the host refuses to send it anywhere else (`K5006`) before a byte leaves.
+  `krit permissions` labels a legacy unbound secret
+  `UNBOUND (any granted origin)`. Declared dependencies fail closed (`K6003`),
+  and request paths that a server could normalize into another resource are
+  refused; `url_path_segment` encodes untrusted text so it fails as a value
+  instead.
+- **Repairable.** Constructs that models import from other languages
+  (`return`, `for`, assignment, `class`, `import`, `await`, `throw`,
+  indexing, arrow functions, `?:`, `switch`, `else { return … }`) each report
+  their own code (`K1101`-`K1112`) with a one-line fix; undefined names get a
+  did-you-mean; warnings (`K2003`, `K9013`) are reported without failing.
+- **Upgradeable.** The 0.3 runtime loads artifacts built by earlier
+  toolchains inside a published compatibility window (0.2.0 artifacts are
+  tested); the host runs Wasmtime 48 LTS, and the minimum Rust version is
+  1.95.
 
-Phase 6 is complete for bounded local single-host coordination: transactional
-state, checkpoints, replay, durable idempotency, typed durable queues with
-leases, retries, and dead letters, host-owned scheduled triggers, and
-capability-scoped bounded object storage. The checked reference flow calls a
-GitHub-like origin, one neutral AI adapter, and one messaging-like origin with
-exact permissions and approval requirements; interrupted worker deliveries
-resume without repeating recorded external operations.
-General composite Wasm layouts beyond the documented webhook subset, modules,
-dependency resolution, build caching, broader autonomous editing, and
-production multi-tenant OS isolation are also future work. Krit is not
-production-ready.
+In 0.2, every fallible host call cost a two-arm `match`, and the reference
+agent nested 15 levels deep. The same step from that agent, before:
+
+```krit
+fn fetch_issue() -> Result<HttpResponse, String> {
+    match config_string("reference.repository") {
+        Ok(repository) => match secret("github-token") {
+            Ok(token) => http_request(
+                "https://github.example.invalid",
+                record {
+                    method: "GET",
+                    path: "/repos/example/issues/1",
+                    query: "",
+                    headers: [record { name: "x-reference-repository", value: repository }],
+                    body: "",
+                },
+                Some(token),
+            ),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+```
+
+and after, in 0.3:
+
+```krit
+fn fetch_issue() -> Result<HttpResponse, String> {
+    let repository = config_string("reference.repository")?;
+    let token = secret("github-token")?;
+    http_request(
+        "https://github.example.invalid",
+        HttpRequest {
+            method: "GET",
+            path: "/repos/example/issues/1",
+            headers: ["x-reference-repository": repository],
+        },
+        Some(token),
+    )
+}
+```
+
+Both mean the same thing; the old spelling still compiles.
+
+Krit is **not production-ready**. Known limits in 0.3:
+
+- No user-defined `type` or `enum`, generics, modules, list functions, or
+  schema-directed `json_parse` yet: model output is decoded with
+  `json_decode` and validated by hand. The compiler reports one error at a
+  time. Multi-error reporting is planned for 0.4, and the language features
+  follow it ([master plan](docs/roadmap.md)).
+- Components support a bounded subset of the checked language: user records
+  and lists, capturing closures, and general JSON shapes fail closed with
+  `K7001`/`K7002` instead of building
+  ([deployable subset](spec/WASM-SANDBOX.md#implemented-backend-support)).
+- The checker does not yet prove which secret reaches which origin; the host
+  enforces bindings at run time.
+- Durable state, queues, schedules, objects, the database connector, and the
+  cache are local and single-host; no distributed exactly-once behavior is
+  claimed. Multi-tenant deployments need OS isolation that Krit does not
+  provide.
+- On Windows, host mode refuses secrets and durable state, and
+  guided-assistance acceptance is unavailable.
+
+What else is in the box:
+
+- **Language:** immutable lexical bindings and closures, checked 64-bit
+  integers, strings, lists, ordered records, built-in `Option` and `Result`,
+  exhaustive matching, deterministic JSON conversion, and static type, effect,
+  and literal-resource inference with no annotations required inside
+  functions.
+- **Entrypoints and host operations:** a typed `webhook fn` with fixed HTTP
+  contracts and JSON Schemas; `queue` and `schedule` handlers; configuration,
+  opaque secrets, exact-origin HTTP, a provider-neutral AI call, structured
+  redacted logs, transactional state, checkpoints, HTTP/AI replay, durable
+  queues and scheduled triggers, object buckets, catalogued database
+  transactions, an optional TTL cache, and search connectors.
+- **Artifacts and host:** deterministic Component Model artifacts with
+  least-authority WIT worlds, adjacent metadata, and BLAKE3 digests; a
+  Wasmtime host with fuel, memory, stack, deadline, host-call, and output
+  bounds, a fresh store per invocation, DNS-pinned no-redirect HTTP/TLS, and
+  default-deny approval for AI and bearer calls.
+- **Tooling:** `krit check`, `run`, `build`, `explain`, `fmt`, `permissions`,
+  `sandbox`, `invoke`, `serve`, `worker`, and `schedule`; human and JSON Lines
+  diagnostics; an offline language server; optional review-gated AI
+  suggestions (`krit assist`); a provider-neutral generation prompt
+  (`krit prompt`); and implementation-neutral conformance cases.
 
 ## Install a prebuilt release
 
@@ -323,11 +395,13 @@ and edition are supported; see
 Artifact policy 1 supports `Int`, `Bool`, `Unit`, recursive and higher-order
 non-capturing functions, blocks, conditionals/short circuit, checked integer
 operators, primitive comparisons, and scalar `print`/`println`. The bounded
-webhook policy-2 path additionally supports strings, the fixed HTTP records,
-header lists, Result/Option matching, static non-capturing helper references,
-config, opaque secrets, outbound HTTP, neutral AI calls, ordered log fields,
-and `json_decode` into `String` (every JSON escape) used to validate the
-reference model output. Other composites, general JSON shapes, data
+entrypoint policy-2 path additionally supports strings with `+`, `==`, `!=`,
+ordering, interpolation, and text blocks; the fixed HTTP records, written as
+records or by named construction; header and log-field lists, entry lists
+included; Result/Option matching with nested patterns; postfix `?` and
+let-else; the standard library; static non-capturing helper references; every
+host operation; and `json_decode` into `String` (every JSON escape) used to
+validate model output. User records and lists, general JSON shapes, data
 captures, and unresolved parametric layouts fail closed with stable
 `K7001`/`K7002` diagnostics or a bounded guest trap; helpers the entrypoint
 never reaches are eliminated first, so an unused generic helper does not fail
@@ -428,38 +502,46 @@ Schema-1 manifests request logical stores:
 state = ["agent-work"]
 ```
 
-Edition 2026 provides bounded string operations:
+Edition 2026 provides bounded string operations. This webhook remembers the
+first body it sees:
 
 ```krit
-let previous = state_get("agent-work", "last-body");
-let saved = state_put("agent-work", "last-body", request.body);
-let checkpoint = checkpoint_get("agent-work", "processed-request");
-let marked = checkpoint_put(
-    "agent-work",
-    "processed-request",
-    request.body,
-);
+/// Stores the first body this webhook sees and answers with it afterwards.
+fn remember(body: String) -> Result<String, String> {
+    match checkpoint_get("agent-work", "processed-request")? {
+        Some(previous) => Ok(previous),
+        None => {
+            state_put("agent-work", "last-body", body)?;
+            checkpoint_put("agent-work", "processed-request", body)?;
+            Ok(body)
+        },
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match remember(request.body) {
+        Ok(body) => HttpResponse { status: 200, body },
+        Err(error) => HttpResponse { status: 500, body: error },
+    }
+}
 ```
 
-`state_delete` removes a key. State/checkpoint mutations are invocation-local
+`state_get` reads a key and `state_delete` removes one. State/checkpoint mutations are invocation-local
 and commit only after valid successful guest completion; traps, cancellation,
 deadline, response failure, or revision conflict roll them back.
 
 External work can use stable completed-operation replay:
 
 ```krit
-let fetched = replay_http(
-    "agent-work",
-    "fetch-issue",
-    "https://api.example.com",
-    outbound_request,
-);
-let summary = replay_ai(
-    "agent-work",
-    "summarize-issue",
-    "reviewer",
-    input,
-);
+fn summarize() -> Result<String, String> {
+    let issue = replay_http(
+        "agent-work",
+        "fetch-issue",
+        "https://api.example.com",
+        HttpRequest { method: "GET", path: "/issues/1" },
+    )?;
+    replay_ai("agent-work", "summarize-issue", "reviewer", issue.body)
+}
 ```
 
 `replay_http` is anonymous and requires GET/HEAD or one valid ordinary
@@ -497,8 +579,8 @@ An ingress webhook enqueues without any consume or state authority:
 ```krit
 webhook fn handle(request: HttpRequest) -> HttpResponse {
     match queue_publish("render-jobs", request.body) {
-        Ok(id) => record { status: 202, headers: [], body: id },
-        Err(error) => record { status: 500, headers: [], body: error },
+        Ok(id) => HttpResponse { status: 202, body: id },
+        Err(error) => HttpResponse { status: 500, body: error },
     }
 }
 ```
@@ -507,10 +589,8 @@ A worker declares the queue it consumes and returns a typed outcome:
 
 ```krit
 queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
-    match object_put("render-output", job.id, job.body) {
-        Ok(stored) => Ok(job.id),
-        Err(error) => Err(error),
-    }
+    object_put("render-output", job.id, job.body)?;
+    Ok(job.id)
 }
 ```
 
@@ -565,26 +645,24 @@ readOnlyDatabases = ["reference"]    # database.read only
 ```
 
 ```krit
+fn failure(status: Int, error: String) -> HttpResponse {
+    HttpResponse { status, body: error }
+}
+
 webhook fn handle(request: HttpRequest) -> HttpResponse {
-    match db_begin_write("catalog") {
-        Ok(transaction) => match db_execute(transaction, "record-visit", [request.path]) {
-            Ok(changed) => match db_query(transaction, "count-visits", []) {
-                Ok(rows) => match db_commit(transaction) {
-                    Ok(committed) => record { status: 200, headers: [], body: rows },
-                    Err(error) => record { status: 500, headers: [], body: error },
-                },
-                Err(error) => match db_rollback(transaction) {
-                    Ok(undone) => record { status: 500, headers: [], body: error },
-                    Err(fatal) => record { status: 500, headers: [], body: fatal },
-                },
-            },
-            Err(error) => match db_rollback(transaction) {
-                Ok(undone) => record { status: 500, headers: [], body: error },
-                Err(fatal) => record { status: 500, headers: [], body: fatal },
-            },
-        },
-        Err(error) => record { status: 503, headers: [], body: error },
-    }
+    let Ok(transaction) = db_begin_write("catalog") else Err(error) => failure(503, error);
+    let Ok(_) = db_execute(transaction, "record-visit", [request.path]) else
+        Err(error) => match db_rollback(transaction) {
+            Ok(_) => failure(500, error),
+            Err(fatal) => failure(500, fatal),
+        };
+    let Ok(rows) = db_query(transaction, "count-visits", []) else
+        Err(error) => match db_rollback(transaction) {
+            Ok(_) => failure(500, error),
+            Err(fatal) => failure(500, fatal),
+        };
+    let Ok(_) = db_commit(transaction) else Err(error) => failure(500, error);
+    HttpResponse { status: 200, body: rows }
 }
 ```
 
@@ -776,7 +854,7 @@ krit prompt
 
 See [ai/README.md](ai/README.md) for the generation and diagnostic-repair
 workflow. Prompt material contains only currently implemented syntax so models
-cannot confuse draft agent APIs with compilable Krit 0.2 code.
+cannot confuse draft agent APIs with compilable Krit 0.3 code.
 
 ### Agent contract authoring
 
@@ -784,16 +862,11 @@ Krit can check and explain a minimal webhook agent boundary:
 
 ```krit
 webhook fn handle(request: HttpRequest) -> HttpResponse {
-    match secret("github-token") {
-        Ok(token) => match http_request(
-            "https://api.example.com",
-            request,
-            Some(token),
-        ) {
-            Ok(response) => response,
-            Err(error) => record { status: 502, headers: [], body: error },
-        },
-        Err(error) => record { status: 500, headers: [], body: error },
+    let Ok(token) = secret("github-token") else
+        Err(error) => HttpResponse { status: 500, body: error };
+    match http_request("https://api.example.com", request, Some(token)) {
+        Ok(response) => response,
+        Err(error) => HttpResponse { status: 502, body: error },
     }
 }
 ```
@@ -803,11 +876,15 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
 `Result<HttpResponse, String>`. `ai_invoke("adapter", input)` returns raw
 `Result<String, String>`. `log_info` and `log_error` accept a canonical event
 literal plus an ordered `List<LogField>`, where `LogField` is
-`Record { name: String, value: String }`. Resource names and normalized HTTP
+`Record { name: String, value: String }`, usually written as an entry list
+such as `["delivery": request.path]`. Resource names and normalized HTTP
 origins must be direct literals so `krit explain`, metadata, and permission
 review can report exact authority. `Secret` cannot be revealed or
 structurally stored; only direct `Some(secret)` in the bearer position is
-accepted.
+accepted, and the host injects it only into an origin its manifest binding
+lists (`K5006` otherwise). A webhook returns `HttpResponse`, so it binds each
+fallible step with let-else, whose arm is the response for the failure; a
+helper that returns `Result` passes failures on with `?`.
 
 ## Language tour
 
@@ -870,6 +947,88 @@ println(length(["human", "and", "AI"]));
 The two list shapes are visible and mandatory. Pattern names exist only in the
 non-empty branch.
 
+### Strings and the standard library
+
+```krit
+let name = "Krit";
+let greeting = "Hello, \(name)!";
+
+println(greeting);
+println(string_starts_with(greeting, "Hello"));
+println(int_to_string(40 + 2) + " is the answer");
+```
+
+```text
+Hello, Krit!
+true
+42 is the answer
+```
+
+`\(name)` inserts a `String` value; an `Int` is converted explicitly with
+`int_to_string`, since nothing converts implicitly.
+
+### Early exits
+
+```krit
+fn parse_port(text: String) -> Result<Int, String> {
+    if text == "443" {
+        Ok(443)
+    } else if text == "80" {
+        Ok(80)
+    } else {
+        Err("unknown port \(text)")
+    }
+}
+
+fn origin(port: String) -> Result<String, String> {
+    let number = parse_port(port)?;
+    Ok("https://example.com:" + int_to_string(number))
+}
+
+fn describe(port: String) -> String {
+    let Ok(text) = origin(port) else Err(reason) => "invalid: \(reason)";
+    text
+}
+
+println(describe("443"));
+println(describe("8080"));
+```
+
+```text
+https://example.com:443
+invalid: unknown port 8080
+```
+
+`?` returns a failure from the enclosing function unchanged; let-else binds
+the success and names what the function returns otherwise. Both exits are
+visible on the line where they happen.
+
+### Nested patterns
+
+```krit
+fn label(value: Result<Option<String>, String>) -> String {
+    match value {
+        Ok(Some(text)) => "found \(text)",
+        Ok(None) => "missing",
+        Err(error) => "failed: \(error)",
+    }
+}
+
+println(label(Ok(Some("cache"))));
+println(label(Ok(None)));
+println(label(Err("timeout")));
+```
+
+```text
+found cache
+missing
+failed: timeout
+```
+
+Every outcome is named exactly once. A missing arm is a compile error that
+lists it (``non-exhaustive match; missing: `Err(_)` ``), and a catch-all
+`_ =>` arm is rejected.
+
 See [spec/LANGUAGE.md](spec/LANGUAGE.md) for complete normative syntax and
 runtime semantics.
 
@@ -901,18 +1060,22 @@ will follow [spec/PACKAGES.md](spec/PACKAGES.md).
 The specification is the semantic authority:
 
 - [Language charter](spec/CHARTER.md)
-- [Krit 0.2 language](spec/LANGUAGE.md)
-- [Diagnostic contract](spec/DIAGNOSTICS.md)
+- [Krit 0.3 language](spec/LANGUAGE.md) — grammar, sugar and its meaning,
+  standard library, and runtime semantics
+- [Diagnostic contract](spec/DIAGNOSTICS.md) — every code with its severity
 - [Webhook agent contracts](spec/WEBHOOK-CONTRACTS.md) — compiler contracts
   and bounded HTTP runtime
-- [AI and observability policy](spec/AI-OBSERVABILITY.md) — normative Phase 4
-  AI, logs, reliability, idempotency, cancellation, and approval
+- [AI and observability policy](spec/AI-OBSERVABILITY.md) — AI, logs,
+  reliability, idempotency, cancellation, and approval
 - [Agent application model](spec/AGENT-APPLICATIONS.md) — draft
-- [Types and effects](spec/TYPES-AND-EFFECTS.md) — implemented Phase 4 subset
-- [Capabilities](spec/CAPABILITIES.md) — bounded Phase 4 host implemented
-- [Modules and packages](spec/PACKAGES.md) — draft
-- [WebAssembly sandbox](spec/WASM-SANDBOX.md) — policy-1 artifact and bounded
-  host implemented
+- [Types and effects](spec/TYPES-AND-EFFECTS.md) — static types, exits,
+  exhaustiveness, effects, and lints
+- [Capabilities](spec/CAPABILITIES.md) — grants, secret-to-origin binding,
+  and fail-closed dependencies
+- [Modules and packages](spec/PACKAGES.md) — single-package manifests
+  implemented; modules and dependencies draft
+- [WebAssembly sandbox](spec/WASM-SANDBOX.md) — deployable subset, artifact
+  compatibility window, and the bounded host
 - [Guided AI authoring](spec/GUIDED-AUTHORING.md) — implemented deterministic
   LSP and review-gated provider-neutral assistance baseline
 - [Durable state and replay](spec/DURABLE-STATE.md) — transactional local
@@ -924,7 +1087,9 @@ The specification is the semantic authority:
 - [Cache and search](spec/CACHE-AND-SEARCH.md) — bounded optional cache and
   provider-neutral connectors
 - [Narrow product MVP](docs/mvp.md)
-- [Agent platform roadmap](docs/agent-roadmap.md)
+- [Agent platform roadmap](docs/agent-roadmap.md) — delivered phases
+- [Krit master plan](docs/roadmap.md) and the
+  [0.3 requirements](docs/prd-0.3.md) — what comes next
 - [Rust technical design](docs/technical-design.md)
 - [Performance methodology](docs/performance.md)
 - [Initial measured baseline](benchmarks/baseline.json)
@@ -944,8 +1109,10 @@ cargo test --workspace --all-targets --locked
 cargo build --workspace --release --locked
 ```
 
-The conformance suite runs through the Rust tests. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the language-change process.
+The conformance suite runs through the Rust tests, and so does a check of
+every Krit example in this README and in `spec/`. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the language-change process and
+developer notes such as reclaiming disk space with `scripts/clean.sh`.
 
 ## Direction
 
@@ -973,14 +1140,22 @@ The accepted implementation path is:
     for the local SQLite connector)
 12. cache and search services (complete for bounded optional local cache and
     provider-neutral connectors)
+13. 0.3 "Honest and flat": one honest check across `check`, `run`, and
+    `build`; deployable strings; secret-to-origin binding; flat code with `?`,
+    let-else, nested patterns, named construction, entry lists,
+    interpolation, and text blocks; standard library v0; habit diagnostics;
+    and the artifact compatibility window
 
 Performance claims follow [docs/performance.md](docs/performance.md), not
 implementation-language assumptions.
 
-The next priority is consolidation: complete applications, reviewable authoring,
-recovery under failure, and measured performance before more service breadth.
-Completed implementation phases do not make Krit production-ready or remove
-the documented backend, package-system, and OS-isolation limitations.
+What comes next is planned in the [master plan](docs/roadmap.md): 0.4 "One
+semantics" brings a single Core interpreter, multi-error diagnostics,
+`krit test`, durable protocol 1.1, and compiler-proven secret pairs, followed
+by user-defined `type` and `enum`, `json_parse`, and the first deployable
+repository bot. Completed implementation phases do not make Krit
+production-ready or remove the documented backend, package-system, and
+OS-isolation limitations.
 
 ## Security
 

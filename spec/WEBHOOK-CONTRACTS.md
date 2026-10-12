@@ -8,9 +8,21 @@
 
 A source module contains zero or one direct top-level declaration:
 
-```krit
+```text
 webhook fn NAME(request: HttpRequest) -> HttpResponse {
     // checked application logic
+}
+```
+
+For example, a webhook that routes on the method and composes its response:
+
+```krit
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    if request.method == "POST" {
+        HttpResponse { status: 202, body: "queued \(request.path)" }
+    } else {
+        HttpResponse { status: 405, headers: ["allow": "POST"] }
+    }
 }
 ```
 
@@ -44,6 +56,12 @@ These are built-in closed aliases, not user-defined type syntax. Header list
 order is preserved and duplicate names are representable. A response must
 contain exactly its three fields. The HTTP host validates status range,
 request limits, and protocol syntax.
+
+Source builds these records by name with spec-fixed defaults
+(`HttpRequest { method, path }` defaults `query: ""`, `headers: []`, and
+`body: ""`; `HttpResponse { status }` defaults `headers: []` and `body: ""`)
+and writes header lists as entry lists (`["accept": "application/json"]`);
+both mean exactly the full records (`LANGUAGE.md` sections 8.4 and 11).
 
 ## Request paths and queries
 
@@ -241,14 +259,14 @@ object semantics.
 
 ## Host-operation identities
 
-```krit
+```text
 config_string("agent.model") // Result<String, String>
 secret("github-token")       // Result<Secret, String>
 ```
 
 Outbound HTTP is the single fallible operation:
 
-```krit
+```text
 http_request(
     "https://api.example.com",
     request,
@@ -335,11 +353,15 @@ host at invocation time with `K5006`.
 Direct `krit run` rejects webhook/config/secret/HTTP hosts with `K5003`;
 runtime access is only through a validated component.
 
-The bounded policy-2 compiler supports the fixed HTTP records, strings, header
-lists, Result/Option matching, direct host calls, and static non-capturing
-helper references needed by the reference webhook. Unsupported composites,
-JSON, data captures, and residual layouts remain stable `K7001`/`K7002`
-failures.
+The bounded policy-2 compiler supports the fixed HTTP records (written as
+records or by named construction), strings with `+`, `==`, `!=`, ordering,
+interpolation, and text blocks, header lists (entry lists included),
+Result/Option matching with nested patterns, postfix `?` in helpers, let-else
+in the webhook body itself, the standard library, `json_decode` into
+`String`, direct host calls, and static non-capturing helper references
+(`WASM-SANDBOX.md`, "Implemented backend support"). User records and lists,
+other JSON shapes, data captures, and residual layouts remain stable
+`K7001`/`K7002` failures.
 
 `krit invoke --request FILE` accepts the exact request JSON schema and prints
 only the exact response JSON after a successful fresh invocation.

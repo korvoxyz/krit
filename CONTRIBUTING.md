@@ -59,12 +59,53 @@ Do not preserve behavior merely because the archived Racket prototype had it.
 
 ## Conformance cases
 
-Portable language behavior belongs in `conformance/cases/`. Every case has
-Krit source, expected status, optional exact standard output, and optional
-diagnostic codes. Keep each case small and independent of host state.
+Portable language behavior belongs in the conformance suite:
+`conformance/cases/` for evaluation, `conformance/check/` for static checking
+(including build-target diagnostics), `conformance/format/` for canonical
+formatting, and `conformance/package/` for manifest validation. Every case has
+Krit source and its expected status, output, and diagnostic and warning codes;
+[conformance/README.md](conformance/README.md) describes each harness. Keep
+each case small and independent of host state.
 
 Implementation regressions that do not define language behavior belong in
 crate unit or integration tests.
+
+## Documentation examples
+
+Every `krit` code block in `README.md` and `spec/*.md` must be a complete
+program that `krit check` accepts without diagnostics, and a `krit` block
+followed directly by a `text` block must print exactly that text under
+`krit run`. `crates/krit-cli/tests/doc_examples.rs` enforces both, so run it
+after editing an example:
+
+```sh
+cargo test -p krit-cli --test doc_examples
+```
+
+Write signatures and fragments as `text` blocks, and format examples with
+`krit fmt` before pasting them, so the documentation shows canonical source.
+
+## Developer notes
+
+Builds and tests are disk-hungry: debug test binaries for the whole workspace
+take several gigabytes, and every git worktree has its own `target/`.
+`scripts/clean.sh` reclaims that space. It is a dry run by default: it prints
+what it would remove and how much space that frees, and it deletes only when
+given `--yes`. Everything it removes is regenerable.
+
+```sh
+scripts/clean.sh                    # report debug, intermediates, dist, scratch
+scripts/clean.sh --yes              # delete them, keeping target/release/krit
+scripts/clean.sh --yes examples     # remove local example state and data
+scripts/clean.sh --help             # list every category
+```
+
+The categories are `debug` (`target/debug`), `intermediates` (release build
+intermediates, keeping the `krit` binary), `release`, `dist` (packaged
+archives), `scratch` (other entries at the top of `target/`), `examples`
+(`examples/target`, `examples/state`, and `examples/data`), `worktrees` (the
+`target/` of every other git worktree of this repository), and `all`. Do not
+clean `worktrees` while builds are running in them.
 
 ## Release workflow
 

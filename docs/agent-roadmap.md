@@ -1,10 +1,16 @@
 # Agent platform roadmap
 
-**Status:** Accepted delivery order
+**Status:** Accepted delivery order; Phases 0-7 are complete and the 0.3
+language and runtime work is implemented
 
 Krit develops agent infrastructure only when the previous layer supports a
 complete, reviewable application. A service is exposed as a narrow typed
 capability implemented by the host, never as ambient process access.
+
+This document records the platform phases as they were delivered. What comes
+next is planned in the master plan, [roadmap.md](roadmap.md), and the current
+release's requirements are in [prd-0.3.md](prd-0.3.md) with progress in
+[tracker-0.3.md](tracker-0.3.md).
 
 ## Phase 0: language baseline
 
@@ -341,6 +347,44 @@ service performance baselines. General Wasm layouts, schema-directed JSON,
 modules/build caching, distributed coordination, and multi-tenant OS isolation
 remain outside this completed scope. New service breadth must be justified by
 application evidence rather than by the roadmap's phase count.
+
+## Krit 0.3: honest and flat
+
+**Status:** Implemented on the bounded local platform above; the release
+gate is tracked in [tracker-0.3.md](tracker-0.3.md)
+
+0.3 adds no service. It makes the existing platform honest and its programs
+flat, measured against realistic agent programs that passed `krit check` and
+then failed `krit build`:
+
+- **One language.** `krit run` performs exactly the checking of `krit check`
+  and refuses what it refuses. `krit check --target component|module` runs the
+  complete WebAssembly pipeline with the output discarded and reports every
+  `K7001`/`K7002` that `krit build` would, at source spans, and entrypoint
+  files get that target check by default. Depth guards in every stage turn
+  deep nesting and runaway recursion into `K1005` and `K4010`.
+- **Deployable strings.** String `==`, `!=`, ordering, and `+` lower to guest
+  code, and so do interpolation, text blocks, `json_decode` into `String`
+  with every JSON escape, and standard library v0.
+- **Bound authority.** `[secrets.<name>] origins = [...]` bindings, refused by
+  the host with `K5006`; `[dependencies]` rejected with `K6003`; dot-segment
+  and encoded-separator request paths refused, with requests sent exactly as
+  validated.
+- **Flat code.** Postfix `?` and let-else lower to a verified Core `exit`;
+  nested patterns are checked for exhaustiveness; named construction, entry
+  lists, `()`, `///` doc comments, interpolation, and text blocks are
+  additive sugar in edition 2026 (`spec/LANGUAGE.md`, section 4.3).
+- **Repairable diagnostics.** Severities and a warnings channel (`K2003`,
+  `K9013`), habit codes `K1101`-`K1112` with fixes, did-you-mean for
+  undefined names, and method-call hints (`K3011`).
+- **Upgradeable artifacts.** Artifacts load by membership in supported sets
+  and a toolchain window; a golden 0.2.0 artifact runs on the 0.3 runtime.
+  The host moved to Wasmtime 48 LTS, and the minimum Rust version to 1.95.
+
+Gate: the release gate in [prd-0.3.md](prd-0.3.md) (section 5). Deferred to
+0.4 "One semantics" (PRD section 9): the NodeId refactor, multi-error
+diagnostics, a Core interpreter replacing the direct evaluator, `krit test`,
+durable protocol 1.1, and compiler-proven secret pairs.
 
 ## Deferred platform work
 

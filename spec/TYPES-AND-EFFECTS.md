@@ -1,7 +1,7 @@
 # Static types and effects
 
-**Status:** Implemented through bounded Phase 4 host contracts
-**Target:** Krit 0.2 bootstrap
+**Status:** Normative for the implemented checker; open decisions are draft
+**Target:** Krit 0.3, edition 2026
 
 ## Goals
 
@@ -32,17 +32,22 @@ HttpHeader
 HttpRequest
 HttpResponse
 LogField
+QueueJob
+ScheduleEvent
 Secret
+DatabaseTransaction
 fn(A, B) -> C
 ```
 
 The public Rust analysis API represents unresolved inference variables as
 `Type::Variable` and renders them as stable lowercase names such as `'a`.
 Source-level generic declaration syntax is not yet accepted. `HttpHeader`,
-`HttpRequest`, `HttpResponse`, and `LogField` are stable built-in aliases for
-the closed record structures in `LANGUAGE.md`; they retain their nominal names
-at public entrypoint and Core boundaries while participating in structural
-record checking. `Secret` is a distinct opaque type, never a `String` alias.
+`HttpRequest`, `HttpResponse`, `LogField`, `QueueJob`, and `ScheduleEvent` are
+stable built-in aliases for the closed record structures in `LANGUAGE.md`
+(sections 8.1 and 13.2); they retain their nominal names at public entrypoint
+and Core boundaries while participating in structural record checking.
+`Secret` and `DatabaseTransaction` are distinct opaque types, never `String`
+aliases.
 
 A named construction such as `HttpResponse { status: 200, body }`
 (`LANGUAGE.md` section 8.4) has its contract's closed structural record type,
@@ -120,7 +125,10 @@ parameters, and function return values:
 let fallback: Option<String> = None;
 
 fn total(items: List<Int>) -> Int {
-    // ...
+    match items {
+        [] => 0,
+        [head, ..tail] => head + total(tail),
+    }
 }
 ```
 
@@ -128,15 +136,16 @@ The exact implemented annotation grammar is normative in `LANGUAGE.md`.
 `krit check` enforces annotations without evaluating source. `krit run`
 performs the same checking first and evaluates only a program that passes it,
 reporting check's diagnostic and exit status otherwise (`LANGUAGE.md`
-section 14). Ordinary public declarations,
-source-level generic declarations, and effect annotation syntax are still
-future work. A webhook declaration is the one implemented public boundary and
-requires the exact annotated `(HttpRequest) -> HttpResponse` signature.
+section 14). Ordinary public declarations, source-level generic
+declarations, and effect annotation syntax are still future work. Entrypoint declarations are the implemented public boundaries
+and require exact annotated signatures (`K3007`): `(HttpRequest) ->
+HttpResponse` for a webhook, and `(QueueJob) -> Result<String, String>` or
+`(ScheduleEvent) -> Result<String, String>` for a queue or schedule handler.
 
-The bootstrap checker uses deterministic constraints and unification. It
-supports recursive functions, closures, empty lists, `None`, structural
-records, and matches over nested Option, Result, and list patterns. An unresolved variable may remain generic;
-a known contradiction is always rejected. Full Hindley-Milner generalization
+The checker uses deterministic constraints and unification. It supports
+recursive functions, closures, empty lists, `None`, structural records, and
+matches over nested Option, Result, and list patterns. An unresolved variable
+may remain generic; a known contradiction is always rejected. Full Hindley-Milner generalization
 across independently polymorphic uses is still draft.
 
 ## Error propagation
@@ -294,6 +303,8 @@ The representation is extensible to these effects:
 io.stdout
 io.stdin
 config.read
+observe.log
+state.transaction
 fs.read
 fs.write
 http.request
@@ -401,7 +412,8 @@ A dependency may declare required effects but cannot grant capabilities.
 ## Opaque-secret restrictions
 
 The checker rejects `Secret` anywhere an operation could reveal, duplicate,
-serialize, or turn the handle into ordinary application data:
+serialize, or turn the handle into ordinary application data (`K3009`;
+`DatabaseTransaction` follows the same rules with `K3010`):
 
 - `print` and `println`
 - equality or inequality
@@ -415,6 +427,12 @@ serialize, or turn the handle into ordinary application data:
 operation result, not permission to construct arbitrary secret-containing
 data. Binding or pattern-matching the opaque handle is allowed so a future
 approved connector can consume it without revealing its contents.
+
+The checker does not track which secret reaches which origin. That binding is
+a manifest fact the host enforces on every bearer injection, refusing a
+misdirected pairing with `K5006` before a byte is sent (`CAPABILITIES.md`,
+"Secret binding"); compiler-proven secret/origin pairs are planned work
+(`docs/prd-0.3.md`, section 9).
 
 ## Inference algorithm
 
@@ -465,10 +483,14 @@ did-you-mean note chosen from the names visible at the reference.
 
 ## Lints
 
-After analysis accepts a program, lints (`K9000`-`K9999`, `DIAGNOSTICS.md`)
-examine its syntax with the analysis facts: resolved names and inferred
-types. They report warnings only, never change the analysis, and do not run
-when analysis rejects the program.
+Diagnostics carry a severity (`DIAGNOSTICS.md`). Analysis reports at most one
+error, the first it finds, and any number of warnings: reading the discard
+name `_` is warning `K2003` wherever it happens, and analysis continues after
+it. After analysis accepts a program, lints (`K9000`-`K9999`) examine its
+syntax with the analysis facts: resolved names and inferred types. They
+report warnings only, never change the analysis, and do not run when analysis
+rejects the program. Warnings never change whether a program checks, runs, or
+builds.
 
 `K9013` guards the path and query of an outbound request. It examines the
 `path` and `query` values of every `HttpRequest` the program builds, written

@@ -1,7 +1,7 @@
 # Capability model
 
-**Status:** Implemented bounded Phase 6 local host
-**Target:** Krit 0.4
+**Status:** Normative for the implemented local host; open decisions are draft
+**Target:** Krit 0.3
 
 ## Rule
 
@@ -154,9 +154,10 @@ legacy secret may serve any adapter or connector whose origin is granted.
 
 ## Bounded host operations
 
-The edition-2026 source contracts are:
+The edition-2026 source contracts include (`LANGUAGE.md` section 13.1 lists
+every host operation):
 
-```krit
+```text
 config_string("agent.model") // Result<String, String>
 secret("github-token")       // Result<Secret, String>
 http_request(
@@ -229,7 +230,10 @@ The effective grant is the intersection of:
 2. command-line or embedding-host grants
 3. operating-system sandbox restrictions
 
-Dependencies contribute required effects but cannot add grants.
+Dependencies contribute required effects but cannot add grants. Krit 0.3
+does not resolve dependencies at all: a manifest that declares any
+`[dependencies]` is rejected with `K6003` before source is read, so no
+unreviewed package can contribute code or authority (`PACKAGES.md`).
 
 `krit permissions` without an artifact displays the unchanged requested plan.
 `krit permissions --artifact PATH` validates the artifact and displays
@@ -263,9 +267,10 @@ same `secretBindings` when any secret is granted.
 
 ## Development mode
 
-Standalone source execution may receive `io.stdout` only. A source containing
-a webhook entrypoint or configuration/secret/HTTP host call fails with
-`K5003`; there is no fallback value or `--allow` escape hatch. `krit invoke`
+Standalone source execution may receive `io.stdout` only. `krit run` checks
+the source first and then refuses a program that declares a webhook, queue,
+or schedule entrypoint or calls any host operation with `K5003`; there is no
+fallback value or `--allow` escape hatch. `krit invoke`
 and `krit serve` load only an existing validated artifact and explicit host
 inputs.
 
