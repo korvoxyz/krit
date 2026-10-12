@@ -23,16 +23,19 @@ license = "Apache-2.0"
 repository = "https://github.com/korvoxyz/krit"
 
 [workspace.dependencies]
-krit = { path = "crates/krit" }
-krit-assist = { path = "crates/krit-assist" }
-krit-capability = { path = "crates/krit-capability" }
-krit-cache = { path = "crates/krit-cache" }
-krit-database = { path = "crates/krit-database" }
-krit-lsp = { path = "crates/krit-lsp" }
-krit-package = { path = "crates/krit-package" }
-krit-runtime = { path = "crates/krit-runtime" }
-krit-state = { path = "crates/krit-state" }
-krit-wasm = { path = "crates/krit-wasm" }
+# Workspace crates carry a version requirement as well as a path so that
+# `cargo deny` can deny wildcard requirements outright (deny.toml). Raise it
+# with the workspace version on every minor or major release.
+krit = { path = "crates/krit", version = "0.3" }
+krit-assist = { path = "crates/krit-assist", version = "0.3" }
+krit-capability = { path = "crates/krit-capability", version = "0.3" }
+krit-cache = { path = "crates/krit-cache", version = "0.3" }
+krit-database = { path = "crates/krit-database", version = "0.3" }
+krit-lsp = { path = "crates/krit-lsp", version = "0.3" }
+krit-package = { path = "crates/krit-package", version = "0.3" }
+krit-runtime = { path = "crates/krit-runtime", version = "0.3" }
+krit-state = { path = "crates/krit-state", version = "0.3" }
+krit-wasm = { path = "crates/krit-wasm", version = "0.3" }
 blake3 = "1.8.7"
 crossbeam-channel = "=0.5.16"
 curl = { version = "=0.4.50", default-features = false, features = [

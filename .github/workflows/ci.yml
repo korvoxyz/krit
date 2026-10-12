@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
   workflow_call:
   workflow_dispatch:
@@ -58,6 +58,34 @@ jobs:
       - name: Run documentation tests
         run: cargo test --workspace --doc --locked
 
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.95.0
+
+      # Built from source at exact versions with their own lockfiles; keep the
+      # versions in step with scripts/gate.sh.
+      - name: Install cargo-deny and cargo-audit
+        run: |
+          cargo install --locked --version 0.20.2 cargo-deny
+          cargo install --locked --version 0.22.2 cargo-audit
+
+      - name: Check advisories, bans, licenses, and sources
+        run: cargo deny --locked check
+
+      - name: Audit Cargo.lock against the RustSec database
+        run: cargo audit
+
   current-stable:
     name: Current stable Rust (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
@@ -95,7 +123,7 @@ jobs:
 
   packages:
     name: Package ${{ matrix.target }}
-    needs: [quality, current-stable]
+    needs: [quality, supply-chain, current-stable]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:

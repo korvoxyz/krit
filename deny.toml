@@ -1,0 +1,65 @@
+# cargo-deny policy for the Krit workspace.
+#
+# CI's supply-chain job and scripts/gate.sh both run `cargo deny --locked
+# check` against this file with cargo-deny 0.20.2. Every check fails closed:
+# an advisory, a license, or a source this file does not name is an error.
+#
+# The graph is the whole lockfile for every target, so a crate that only a
+# target Krit does not release for uses is still checked. License checks
+# skip crates reached only through dev-dependencies, which no Krit artifact
+# contains; the other checks cover them too.
+
+[advisories]
+# Vulnerabilities are always errors. Unmaintained and unsound crates are
+# errors too, whether they are workspace crates or dependencies, and so are
+# yanked versions.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+# An ignore must be removed once the advisory no longer applies.
+unused-ignored-advisory = "deny"
+# Empty. A future entry must be a table with the advisory id and a reason
+# that gives the date it was added and whether Krit's use is affected, and
+# ends with "expires at the <version> tag", naming the release that must not
+# ship with it; cargo audit then needs the same ignore. RUSTSEC-2026-0285 was
+# fixed by moving to rustls 0.23.45, not ignored.
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+# Every dependency, including the workspace's own path dependencies, names a
+# version requirement; `*` is never accepted.
+wildcards = "deny"
+
+[licenses]
+# Exactly the licenses the dependency graph needs, each OSI-approved and
+# compatible with distributing Krit under Apache-2.0. Licenses that appear
+# only as an unused alternative of an OR expression, such as CC0-1.0,
+# MIT-0, Unlicense, BSD-2-Clause, and LGPL-2.1-or-later, are not listed,
+# and an entry that stops being needed is an error.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+unused-allowed-license = "deny"
+exceptions = [
+    # Mozilla's root certificate list, as data. CDLA-Permissive-2.0 is a
+    # permissive data license, not an OSI software license, so it is allowed
+    # for this crate only. rustls-platform-verifier depends on it only for
+    # wasm32 targets, which Krit does not build, so no Krit binary or
+    # container contains it.
+    { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
+]
+unused-license-exception = "deny"
+
+[sources]
+# crates.io only: any other registry and every git source is an error.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
