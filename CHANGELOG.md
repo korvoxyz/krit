@@ -24,9 +24,9 @@ in it.
 
 ### Fixed
 
-- The Rust 1.95 quality job passes Clippy again: the runtime host's
-  `cache.write` grant check, flagged by `collapsible_match`, is now a match
-  guard with the same behavior
+- The Rust 1.95 quality job passes Clippy (it had never passed in CI; the
+  0.3.0 run was its first): the runtime host's `cache.write` grant check,
+  flagged by `collapsible_match`, is now a match guard with the same behavior
 - krit-runtime's library tests compile on Windows, where curl's `CURLcode` is
   `i32` rather than `u32`
 - Compiler warnings: two Windows-only ones in krit-assist (an unused
