@@ -2284,7 +2284,7 @@ fn prints_the_versioned_generation_prompt() {
     assert!(
         output
             .stdout
-            .starts_with(b"# Krit 0.2 code-generation instruction\n")
+            .starts_with(b"# Krit 0.3 code-generation instruction\n")
     );
     assert!(
         output
@@ -2292,7 +2292,24 @@ fn prints_the_versioned_generation_prompt() {
             .windows(b"Never invent syntax".len())
             .any(|window| window == b"Never invent syntax")
     );
+    assert_eq!(
+        output.stdout,
+        fs::read(repository_root().join("crates/krit-cli/assets/KRIT-0.3-SYSTEM.md"))
+            .expect("the shipped prompt should be readable"),
+        "`krit prompt` must print the shipped prompt asset byte for byte"
+    );
     assert!(output.stderr.is_empty());
+
+    let rejected = krit()
+        .args(["prompt", "--format", "card"])
+        .output()
+        .expect("Krit should start");
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(rejected.stdout.is_empty());
+    assert_eq!(
+        rejected.stderr,
+        b"krit: `prompt` does not accept arguments\n"
+    );
 }
 
 #[test]

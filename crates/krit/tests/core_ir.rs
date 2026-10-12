@@ -352,7 +352,7 @@ fn lower_every_valid_program() {
             .unwrap_or_else(|error| panic!("{} should verify: {error}", path.display()));
     }
 
-    let prompt = fs::read_to_string(repository.join("crates/krit-cli/assets/KRIT-0.2-SYSTEM.md"))
+    let prompt = fs::read_to_string(repository.join("crates/krit-cli/assets/KRIT-0.3-SYSTEM.md"))
         .expect("prompt should be readable");
     let mut remaining = prompt.as_str();
     let mut count = 0;
@@ -363,7 +363,7 @@ fn lower_every_valid_program() {
         count += 1;
         remaining = &code[end + "\n```".len()..];
     }
-    assert_eq!(count, 12);
+    assert_eq!(count, 13);
 }
 
 #[test]
