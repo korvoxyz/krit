@@ -113,108 +113,121 @@ fields and must reject an unknown schema number.
 | `K8000`-`K8999` | Formatter and tooling errors |
 | `K9000`-`K9999` | Lints: warnings by default |
 
-Codes outside the lint range are errors unless the table below gives them
-another severity, and that severity is part of the code's contract within an
-edition. Lints report readability, safety, and authority hazards in programs
+The table below gives every code's severity: codes outside the lint range are
+errors unless it says otherwise (`K2003` is a warning and `K8003` is the
+language server's `info` notice), and that severity is part of the code's
+contract within an edition. Lints report readability, safety, and authority hazards in programs
 that are otherwise valid. A lint is a warning by default; a project profile or
 command mode may configure a different severity for a specific lint, and that
 configuration is then part of the profile's or mode's contract. No profile or
 mode configures lint severity yet, so every lint is currently a warning.
 
-Initial required codes:
+## Codes
 
-| Code | Meaning |
+Every code the implementation can report appears exactly once below. The
+severity is part of each code's contract within an edition.
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `K0001` | error | Invalid source character, malformed integer (repeated or trailing `_` separator, or digits touching a letter) |
+| `K0002` | error | Unterminated string or text block |
+| `K0003` | error | Invalid string escape, including `\` at the end of a text-block line |
+| `K0004` | error | Text block layout is invalid: text after the opening `"""` on its line, a content line that does not begin with the closing delimiter's indentation, or `"""` inside a content line |
+| `K1001` | error | Unexpected token, including a `?` followed on its line by an operand that does not form a conditional operator (`K1110`), a named construction written directly as an `if` condition or `match` subject, a list literal that mixes `key: value` entries with plain elements, and `[:]` |
+| `K1002` | error | Expected token not found |
+| `K1003` | error | Invalid match pattern or arm list (including a `match` without arms and a block after a let-else's `else`), or `match` arms that mix families at one position, repeat an arm, or overlap (including an unreachable arm) |
+| `K1004` | error | A `webhook`, `queue`, or `schedule` entrypoint declaration inside a block: entrypoints are top-level items |
+| `K1005` | error | Nesting depth limit exceeded: syntax nests more than 256 levels, nesting plus the `else if` continuations, operators, and call, field-access, or `?` links above a point exceeds 4,096, or an inferred type would nest more than 256 levels |
+| `K1101` | error | `return`: a block's value is its final expression |
+| `K1102` | error | `for`, `while`, `loop`, or `do` loop |
+| `K1103` | error | Assignment, compound assignment (`+=`, `-=`, `*=`, `/=`, `%=`), `++` or `--`, `mut`, `var`, or `const` |
+| `K1104` | error | `struct`, `class`, `impl`, `trait`, or `interface` declaration |
+| `K1105` | error | `import`, `use`, `require`, or `from`: modules are not available |
+| `K1106` | error | `async` or `await` |
+| `K1107` | error | `try`, `catch`, `throw`, `raise`, `except`, or `finally` |
+| `K1108` | error | Indexing `a[i]` |
+| `K1109` | error | Arrow function `(x) => e` or `x => e` |
+| `K1110` | error | Conditional operator `c ? a : b` |
+| `K1111` | error | `switch`, `case`, or `default` |
+| `K1112` | error | `return` opening an `else` block: an early exit |
+| `K2001` | error | Undefined name; a note suggests the closest visible name, `None` for a spelling of null, or the fix for a construct from another language |
+| `K2002` | error | Duplicate declaration, parameter, record field, record type field, or list-pattern binding (the discard name `_` is exempt); a `let`, function, or parameter that reuses a built-in name; or a second entrypoint in one module |
+| `K2003` | warning | The discard name `_` is read as a value, including a pattern's `_`; this becomes an error in edition 2027 |
+| `K3001` | error | Static type mismatch or invalid typed operator |
+| `K3002` | error | Statically known non-function call target |
+| `K3003` | error | Static function argument count mismatch |
+| `K3004` | error | Invalid record field access |
+| `K3005` | error | Match subject or pattern of the wrong type, a catch-all `match` arm, or a non-exhaustive `match` (the message lists every missing pattern) |
+| `K3006` | error | Type is not comparable or JSON-encodable |
+| `K3007` | error | Entrypoint signature is not exactly `(HttpRequest) -> HttpResponse` for a webhook, or `(QueueJob) -> Result<String, String>` or `(ScheduleEvent) -> Result<String, String>` for a queue or schedule handler |
+| `K3008` | error | Host capability resource or entrypoint name is not a direct, valid canonical string literal |
+| `K3009` | error | Opaque secret is used by a revealing or structural operation |
+| `K3010` | error | Opaque database transaction handle is used outside a database operation |
+| `K3011` | error | Method call `value.name(...)` on a value that has no field `name`: Krit values have no methods |
+| `K3012` | error | Postfix `?` where it cannot return: at the top level, in an anonymous function or a webhook entrypoint, or in a named function whose declared return type is missing or is neither a `Result` nor an `Option` |
+| `K3013` | error | Postfix `?` whose operand's family or error type differs from the enclosing function's declared `Result<_, E>` or `Option<_>` |
+| `K3014` | error | let-else that is not a direct statement of a named function's body, whose two patterns are not the two variants of one family, whose pattern nests another pattern, or whose value ends in `}` |
+| `K3015` | error | Invalid interpolation hole: its content is not a name followed by field accesses (reported while the source is read), or its value is not a `String` |
+| `K3016` | error | Named construction of a contract record writes a field the contract does not have, writes a field more than once, or omits a required field |
+| `K4001` | error | Generic guest trap, wrong runtime value kind, or HTTP request/response the host refuses (including a request path that breaks the rule in `WEBHOOK-CONTRACTS.md`, "Request paths and queries") |
+| `K4002` | error | Calling a non-function in direct evaluation (checking reports `K3002` first) |
+| `K4003` | error | Function argument count mismatch in direct evaluation (checking reports `K3003` first) |
+| `K4004` | error | Division or remainder by zero |
+| `K4005` | error | Integer overflow, or an integer literal outside the signed 64-bit range |
+| `K4006` | error | Function comparison in direct evaluation (checking reports `K3006` first) |
+| `K4007` | error | Output operation failed |
+| `K4008` | error | Value cannot be encoded as JSON in direct evaluation (checking reports `K3006` first) |
+| `K4009` | error | Invalid or unsupported JSON input, in direct evaluation or a component's `json_decode` into `String` |
+| `K4010` | error | Direct-evaluation depth limit exceeded: more than 10,000 active function calls, 100,000 nested evaluations, or 10,000 levels of list, record, and variant value nesting |
+| `K5001` | error | Required capability not granted by the manifest, or a host configuration that a non-Unix host cannot protect (secrets, durable state, jobs, or databases) |
+| `K5002` | error | Artifact import/world does not match the authorized host interface |
+| `K5003` | error | `krit run` refuses an entrypoint or host operation: direct source execution has no host other than standard output |
+| `K5006` | error | Secret would be injected into an origin its manifest binding does not list |
+| `K5101` | error | Wasm fuel budget exhausted |
+| `K5102` | error | Wasm wall-clock deadline exceeded |
+| `K5103` | error | Wasm memory, table, instance, stack, or host resource limit exceeded |
+| `K5104` | error | Host-call limit exceeded |
+| `K5105` | error | Buffered output-byte limit exceeded |
+| `K5106` | error | Embedding cancellation requested before guest execution |
+| `K5201` | error | Durable state database, schema, corruption, migration, or I/O failure |
+| `K5202` | error | Durable state transaction conflict, configured state/queue/schedule/object limit exceeded, or an unrepresentable delivery instant |
+| `K5203` | error | Replay operation is unsafe, in progress, expired incorrectly, or conflicts with recorded input |
+| `K5204` | error | Durable inbound idempotency reservation or completion failed |
+| `K5205` | error | Durable delivery lease, acknowledgement, or outcome detail is invalid |
+| `K5301` | error | Application database file, schema, catalog, or connection is invalid |
+| `K5302` | error | Database transaction lifecycle, handle, or lock-safety rule was violated |
+| `K5303` | error | Configured database count, byte, row, time, or busy bound was exceeded |
+| `K5401` | error | Cache namespace is not configured, or refuses the requested operation |
+| `K5402` | error | Configured cache key, value, entry, byte, or time-to-live bound was exceeded |
+| `K5403` | error | Cache backend is unavailable |
+| `K5404` | error | Search connector is missing, misconfigured, or returned invalid output |
+| `K6001` | error | Invalid package manifest |
+| `K6003` | error | Manifest declares dependencies, but dependency resolution is not supported |
+| `K7001` | error | Residual or unresolved type requires specialization before layout |
+| `K7002` | error | Core semantics or concrete layout is unsupported by the artifact target |
+| `K7003` | error | WebAssembly emission, validation, metadata attachment, artifact or input-file loading, host configuration, or output failed |
+| `K7004` | error | Artifact metadata, byte size, or content digest mismatch, or adjacent metadata outside the runtime's supported compatibility sets or toolchain window |
+| `K8001` | error | Source is not canonically formatted in formatter check mode |
+| `K8002` | error | Language-server input, open-document state, or a document's published diagnostics exceed a bounded limit |
+| `K8003` | info | The language server left a document's remaining warnings out of its published diagnostics at the bounded limit |
+| `K8101` | error | Authoring assistance is disabled or provider configuration is invalid |
+| `K8102` | error | Authoring context, range, path, ignore, redaction, or privacy validation failed |
+| `K8103` | error | Authoring provider transport or strict response decoding failed |
+| `K8104` | error | Authoring request, response, edit, proposal, digest, or stale precondition is invalid |
+| `K8105` | error | Proposed source failed canonical formatting or compiler checking |
+| `K8106` | error | Required authority expansion lacks exact review approval or a manifest grant |
+| `K8107` | error | Proposal or accepted-source atomic I/O failed |
+| `K9013` | warning | A piece of an `HttpRequest` `path` or `query` built by interpolation or `+` is not a literal, a direct call of `url_path_segment`, `url_query`, or `int_to_string`, a postfix `?` on a `url_path_segment` result, or a name bound to such a result |
+
+### Reserved codes
+
+These codes are allocated but no 0.3 command reports them. Codes planned for
+later releases are allocated in `docs/roadmap.md` (section 9.2) and are not
+listed until they ship.
+
+| Code | Reserved for |
 |---|---|
-| `K0001` | Invalid source character or token |
-| `K0002` | Unterminated string or text block |
-| `K0003` | Invalid string escape, including `\` at the end of a text-block line |
-| `K0004` | Text block layout is invalid: text after the opening `"""` on its line, a content line that does not begin with the closing delimiter's indentation, or `"""` inside a content line |
-| `K1001` | Unexpected token, including a `?` followed on its line by an operand that does not form a conditional operator (`K1110`), a named construction written directly as an `if` condition or `match` subject, a list literal that mixes `key: value` entries with plain elements, and `[:]` |
-| `K1002` | Expected token not found |
-| `K1003` | Invalid match pattern, or `match` arms that mix families at one position, repeat an arm, or overlap (including an unreachable arm) |
-| `K1004` | Webhook declaration is nested or otherwise misplaced |
-| `K1005` | Nesting depth limit exceeded: syntax nests more than 256 levels, nesting plus the `else if` continuations, operators, and call, field-access, or `?` links above a point exceeds 4,096, or an inferred type would nest more than 256 levels |
-| `K1101` | `return`: a block's value is its final expression |
-| `K1102` | `for`, `while`, `loop`, or `do` loop |
-| `K1103` | Assignment, compound assignment (`+=`, `-=`, `*=`, `/=`, `%=`), `++` or `--`, `mut`, `var`, or `const` |
-| `K1104` | `struct`, `class`, `impl`, `trait`, or `interface` declaration |
-| `K1105` | `import`, `use`, `require`, or `from`: modules are not available |
-| `K1106` | `async` or `await` |
-| `K1107` | `try`, `catch`, `throw`, `raise`, `except`, or `finally` |
-| `K1108` | Indexing `a[i]` |
-| `K1109` | Arrow function `(x) => e` or `x => e` |
-| `K1110` | Conditional operator `c ? a : b` |
-| `K1111` | `switch`, `case`, or `default` |
-| `K1112` | `return` opening an `else` block: an early exit |
-| `K2001` | Undefined name; a note suggests the closest visible name, `None` for a spelling of null, or the fix for a construct from another language |
-| `K2002` | Duplicate binding or parameter; the discard name `_` is exempt |
-| `K2003` | Warning: the discard name `_` is read as a value, including a pattern's `_`; this becomes an error in edition 2027 |
-| `K3001` | Static type mismatch or invalid typed operator |
-| `K3002` | Statically known non-function call target |
-| `K3003` | Static function argument count mismatch |
-| `K3004` | Invalid record field access |
-| `K3005` | Match subject or pattern of the wrong type, a catch-all `match` arm, or a non-exhaustive `match` (the message lists every missing pattern) |
-| `K3006` | Type is not comparable or JSON-encodable |
-| `K3007` | Webhook signature is not exactly `(HttpRequest) -> HttpResponse` |
-| `K3008` | Host capability resource is not a direct valid string literal |
-| `K3009` | Opaque secret is used by a revealing or structural operation |
-| `K3010` | Opaque database transaction handle is used outside a database operation |
-| `K3011` | Method call `value.name(...)` on a value that has no field `name`: Krit values have no methods |
-| `K3012` | Postfix `?` where it cannot return: at the top level, in an anonymous function or a webhook entrypoint, or in a named function whose declared return type is missing or is neither a `Result` nor an `Option` |
-| `K3013` | Postfix `?` whose operand's family or error type differs from the enclosing function's declared `Result<_, E>` or `Option<_>` |
-| `K3014` | let-else that is not a direct statement of a named function's body, whose two patterns are not the two variants of one family, whose pattern nests another pattern, or whose value ends in `}` |
-| `K3015` | Invalid interpolation hole: its content is not a name followed by field accesses (reported while the source is read), or its value is not a `String` |
-| `K3016` | Named construction of a contract record writes a field the contract does not have, writes a field more than once, or omits a required field |
-| `K4001` | Generic guest trap, wrong runtime value kind, or HTTP request/response the host refuses (including a request path that breaks the rule in `WEBHOOK-CONTRACTS.md`, "Request paths and queries") |
-| `K4002` | Calling a non-function |
-| `K4003` | Function argument count mismatch |
-| `K4004` | Division or remainder by zero |
-| `K4005` | Integer overflow |
-| `K4006` | Function comparison |
-| `K4007` | Output operation failed |
-| `K4008` | Value cannot be encoded as JSON |
-| `K4009` | Invalid or unsupported JSON input, in direct evaluation or a component's `json_decode` into `String` |
-| `K4010` | Direct-evaluation depth limit exceeded: more than 10,000 active function calls, 100,000 nested evaluations, or 10,000 levels of list, record, and variant value nesting |
-| `K5001` | Required capability not granted |
-| `K5002` | Artifact import/world does not match the authorized host interface |
-| `K5003` | Required host contract is unavailable in direct source execution |
-| `K5006` | Secret would be injected into an origin its manifest binding does not list |
-| `K5101` | Wasm fuel budget exhausted |
-| `K5102` | Wasm wall-clock deadline exceeded |
-| `K5103` | Wasm memory, table, instance, stack, or host resource limit exceeded |
-| `K5104` | Host-call limit exceeded |
-| `K5105` | Buffered output-byte limit exceeded |
-| `K5106` | Embedding cancellation requested before guest execution |
-| `K5201` | Durable state database, schema, corruption, migration, or I/O failure |
-| `K5202` | Durable state transaction conflict, configured state/queue/schedule/object limit exceeded, or an unrepresentable delivery instant |
-| `K5203` | Replay operation is unsafe, in progress, expired incorrectly, or conflicts with recorded input |
-| `K5204` | Durable inbound idempotency reservation or completion failed |
-| `K5205` | Durable delivery lease, acknowledgement, or outcome detail is invalid |
-| `K5301` | Application database file, schema, catalog, or connection is invalid |
-| `K5302` | Database transaction lifecycle, handle, or lock-safety rule was violated |
-| `K5303` | Configured database count, byte, row, time, or busy bound was exceeded |
-| `K5401` | Cache namespace is not configured, or refuses the requested operation |
-| `K5402` | Configured cache key, value, entry, byte, or time-to-live bound was exceeded |
-| `K5403` | Cache backend is unavailable |
-| `K5404` | Search connector is missing, misconfigured, or returned invalid output |
-| `K6001` | Invalid package manifest |
-| `K6002` | Lockfile is stale or invalid |
-| `K6003` | Manifest declares dependencies, but dependency resolution is not supported |
-| `K7001` | Residual or unresolved type requires specialization before layout |
-| `K7002` | Core semantics or concrete layout is unsupported by the artifact target |
-| `K7003` | WebAssembly emission, validation, metadata attachment, artifact loading, or output failed |
-| `K7004` | Artifact metadata, byte size, or content digest mismatch, or adjacent metadata outside the runtime's supported compatibility sets or toolchain window |
-| `K8001` | Source is not canonically formatted in formatter check mode |
-| `K8002` | Language-server input, open-document state, or a document's published diagnostics exceed a bounded limit |
-| `K8003` | Info: the language server left a document's remaining warnings out of its published diagnostics at the bounded limit |
-| `K8101` | Authoring assistance is disabled or provider configuration is invalid |
-| `K8102` | Authoring context, range, path, ignore, redaction, or privacy validation failed |
-| `K8103` | Authoring provider transport or strict response decoding failed |
-| `K8104` | Authoring request, response, edit, proposal, digest, or stale precondition is invalid |
-| `K8105` | Proposed source failed canonical formatting or compiler checking |
-| `K8106` | Required authority expansion lacks exact review approval or a manifest grant |
-| `K8107` | Proposal or accepted-source atomic I/O failed |
-| `K9013` | Warning (lint): a piece of an `HttpRequest` `path` or `query` built by interpolation or `+` is not a literal, a direct call of `url_path_segment`, `url_query`, or `int_to_string`, a postfix `?` on a `url_path_segment` result, or a name bound to such a result |
+| `K6002` | Lockfile is stale or invalid (lockfiles arrive with dependency resolution, `PACKAGES.md`) |
 
 ## Build-target diagnostics
 

@@ -39,7 +39,9 @@ async-runtime, TLS, SDK, or memory-management infrastructure.
 ## Required runtime work
 
 - one WebAssembly component artifact backend (implemented for policy-1 scalar
-  Core and the bounded policy-2 reference shapes)
+  Core and the bounded policy-2 entrypoint subset: strings, the contract
+  records, Option/Result matching, `?` and let-else, and the standard
+  library)
 - one Rust component host (implemented)
 - typed HTTP request/response interface (implemented)
 - outbound exact-origin HTTP allow-list (implemented)
@@ -55,9 +57,11 @@ async-runtime, TLS, SDK, or memory-management infrastructure.
 
 ## Required authoring work
 
-- canonical formatter (implemented in the 0.2 bootstrap)
-- parser, name, type, effect, and capability diagnostics (implemented)
-- `krit check` (implemented)
+- canonical formatter (implemented)
+- parser, name, type, effect, and capability diagnostics, with fix hints for
+  constructs from other languages (implemented)
+- `krit check`, including the build-target check for entrypoint files
+  (implemented)
 - `krit explain` (typed Core/type/effect/resource facts implemented)
 - `krit permissions` (requested and artifact-effective reports implemented)
 - `krit sandbox` (policy-1 execution implemented)
@@ -117,7 +121,11 @@ and explicit inspect/suggest/review/accept assistance workflow. Assistance
 remains optional and disabled without explicit provider configuration.
 Phase 6 now provides bounded local transactional state, checkpoints, replay,
 and optional durable inbound idempotency. Rate state remains process-local,
-and no distributed exactly-once claim is made.
+and no distributed exactly-once claim is made. Krit 0.3 makes the reference
+application read top to bottom (postfix `?`, let-else, named construction,
+entry lists, interpolation) and makes its check honest: a clean
+`krit check` of the webhook means it builds, and each secret is bound to the
+origins it may reach.
 
 Implementation gates do not establish the product's usability or performance.
 Time to a first working agent, human review effort relative to an equivalent

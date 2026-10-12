@@ -1,8 +1,11 @@
 # Modules and packages
 
-**Status:** Draft package system; state grants implemented
+**Status:** Draft package system. Implemented in Krit 0.3: single-package
+schema-1 manifests, capability grants, secret bindings, local builds, and
+fail-closed dependencies (`K6003`). Dependency resolution, lockfiles,
+modules, registries, and build caching remain draft design.  
 **Manifest schema:** 1  
-**Lockfile schema:** 1
+**Lockfile schema:** 1 (design only; no lockfile is read or written yet)
 
 ## Goals
 
@@ -223,9 +226,10 @@ is rejected by checksum rather than executed.
 Every source file is a module. The path below `src/` determines its local
 module name.
 
-Proposed import and export syntax:
+Proposed import and export syntax (not accepted today: `use` is reported as
+`K1105`, a construct from another language):
 
-```krit
+```text
 use helpers::{sum, total};
 
 pub fn answer() -> Int {
@@ -237,7 +241,7 @@ Wildcard imports are not allowed because they hide authority and name
 origins. Imports are static and top-level. Module initialization is pure;
 effects begin only through an explicit entry function.
 
-The exact syntax remains draft and is not accepted by the 0.2 parser.
+The exact syntax remains draft and is not accepted by the 0.3 parser.
 
 ## Publishing
 
@@ -286,17 +290,19 @@ krit publish
 All mutating package commands support `--dry-run`. Resolution and build plans
 have stable JSON output for agent use.
 
-The bootstrap implements
+The bootstrap implements `krit package check [MANIFEST]`,
 `krit build [--manifest PATH] [--output PATH] [--diagnostic-format human|json]`,
 `krit sandbox [--manifest PATH] [--artifact PATH]`, and
-`krit permissions --artifact PATH [--json] [MANIFEST]` for one local package.
+`krit permissions [--artifact PATH] [--json] [MANIFEST]` for one local
+package.
 The default build/sandbox artifact is
 `target/krit/<package-name>.wasm` beside the manifest, with schema-1 metadata
 at `<component>.json`. Entry paths are package-relative and must resolve inside
 the package. Missing inferred authority fails before output replacement or
 execution. Sandbox never builds or falls back to source evaluation.
-Registry, publishing, workspaces, dependency resolution, caching, and the
-full-language/agent component runtime remain deferred.
+Registry, publishing, workspaces, dependency resolution, and build caching
+remain deferred, as do component layouts for the full checked language
+(`WASM-SANDBOX.md`).
 
 ## Open decisions
 

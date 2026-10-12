@@ -1,6 +1,7 @@
 # WebAssembly sandbox
 
-**Status:** Policy-1 scalar path and Phase 6 policy-2 durable host implemented
+**Status:** Normative for Krit 0.3: policy-1 module programs and the
+bounded policy-2 entrypoint ABI with the durable, data, and service hosts
 **Artifact metadata schema:** 1
 **Validation policy:** 1
 
@@ -49,8 +50,12 @@ Krit targets the WebAssembly Component Model and canonical typed interfaces.
 The exact supported version is recorded in the compiler and artifact metadata.
 Unknown component features fail closed.
 
-The checked-in package `krit:runtime@0.2.0` defines two buildable versioned
-policy-1 worlds. `pure-program` exports `run: func()` with no imports.
+The checked-in package `krit:runtime@0.2.0` is the host interface of Krit
+0.3. Krit 0.3 changed no host interface: guest strings, function exits, and
+the standard library compile to guest code, so the package version stays
+0.2.0 and 0.2 artifacts keep linking (see [Artifact
+compatibility](#artifact-compatibility)). The package defines two buildable
+versioned policy-1 worlds. `pure-program` exports `run: func()` with no imports.
 `program` exports the same function and imports only
 `krit:runtime/stdout@0.2.0`:
 
@@ -173,7 +178,7 @@ interface schedule {
 }
 ```
 
-Phase 7 adds one further import interface:
+Phase 7 adds the database, cache, and search import interfaces:
 
 ```wit
 interface database {
@@ -260,6 +265,18 @@ not inside, the hashed bytes. `krit check --target` runs the same pipeline
 with the output discarded (see [Target checks](#target-checks)).
 
 ## Implemented backend support
+
+In Krit 0.3 an entrypoint program (webhook, queue, or schedule) builds when
+everything its entrypoint can reach uses integers, booleans, unit, strings
+(with `+`, `==`, `!=`, and ordering), the fixed contract records written as
+records or named constructions, header and log-field lists written as lists
+or entry lists, the Option/Result shapes of the host operations, `match` with nested
+patterns, postfix `?`, let-else, the standard library, `json_decode` into
+`String`, and direct calls of host operations and non-capturing helpers. A
+module program builds when it uses only integers, booleans, unit, and
+non-capturing functions. Everything else fails `krit build`, and the target
+check of `krit check` (by default for entrypoint files, or with `--target`),
+alike with `K7001` or `K7002` at its source span; the detailed rules follow.
 
 Policy 1 represents `Int` as core `i64`, `Bool` as core `i32`, `Unit` as a
 zero-width value, and non-capturing function values as bounded-table `i32`
@@ -757,19 +774,18 @@ validation, documentation, and a changelog entry.
 URL parsing is pinned to `url` 2.5.8, HTTP types to `http` 1.5.0, the blocking
 HTTP/TLS client to `curl` 0.4.50, secret clearing to `zeroize` 1.9.0, and CLI
 serving to `tiny_http` 0.12.0. Unix secret opens use `rustix` 1.1.4 with
-`O_NOFOLLOW`. Default features are disabled except curl's rustls and static-libcurl
-backends. The ignored `trusted_public_https_smoke_test` exercises platform
+`O_NOFOLLOW`. Default features are disabled except curl's rustls and
+static-libcurl backends. The ignored `trusted_public_https_smoke_test`
+exercises platform roots when public DNS/network access is available. Every
+curl/libcurl upgrade requires an audited `CURLOPT_RESOLVE`, proxy, redirect,
+TLS, timeout, and ordered-header review plus the complete network test suite.
+
 Durable state, queues, schedules, and object buckets use locked `rusqlite`
-0.40.2 with bundled SQLite through the isolated `krit-state` crate. Application
-databases use the same locked bundled SQLite through the separate
+0.40.2 with bundled SQLite through the isolated `krit-state` crate.
+Application databases use the same locked bundled SQLite through the separate
 `krit-database` crate, which shares no schema, table, or migration logic with
-`krit-state`; Phase 7 adds no new dependency. SQLite paths
-are never guest-visible and no system SQLite linkage is used. Phase 6 jobs and
-object storage add no new dependency. The ignored `trusted_public_https_smoke_test` exercises platform
-roots when public DNS/network access is available. Every curl/libcurl upgrade requires an audited
-`CURLOPT_RESOLVE`, proxy, redirect, TLS, timeout, and ordered-header review
-plus the complete network test suite. Exact resolved transitive versions
-remain in `Cargo.lock`.
+`krit-state`. SQLite paths are never guest-visible and no system SQLite
+linkage is used. Exact resolved transitive versions remain in `Cargo.lock`.
 
 ## Resource limits
 
@@ -1014,8 +1030,10 @@ Effective authority is the intersection of:
 4. host interface restrictions
 5. operating-system restrictions
 
-Unused capability requests are warnings. Missing grants prevent instantiation
-or fail at a documented optional-operation boundary.
+Unused capability requests grant nothing: an artifact imports only what its
+checked effects require, and `krit permissions --artifact` shows requested and
+required authority side by side. Missing grants prevent instantiation or fail
+at a documented optional-operation boundary.
 
 Handles are unforgeable host resources. Raw secret values, sockets, file
 descriptors, cloud credentials, and provider clients are not placed in
@@ -1066,9 +1084,10 @@ Secret data is excluded from:
 
 ## Small artifacts
 
-The component contains application logic, required language support, public
-interfaces, and source maps selected by the build profile. It does not bundle
-the host runtime, TLS stack, connector implementations, or provider SDKs.
+The component contains application logic, required language support, and
+public interfaces. It carries no source map in 0.3, so a guest trap is
+reported at the artifact rather than at a source span. It does not bundle the
+host runtime, TLS stack, connector implementations, or provider SDKs.
 
 The compiler uses section-level dead elimination and shares host functionality
 through imports. Size goals are established only from measured reference

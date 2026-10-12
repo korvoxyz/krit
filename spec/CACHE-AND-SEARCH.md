@@ -1,6 +1,6 @@
 # Cache and Search
 
-Status: normative for Krit 0.2, protocol 1.
+Status: normative since Krit 0.2 (unchanged in 0.3), protocol 1.
 
 This specification defines two *optional* capabilities: a bounded namespaced
 TTL cache, and provider-neutral search and vector connectors.
@@ -55,7 +55,7 @@ grants; it can never widen it.
 
 ## Source API
 
-```krit
+```text
 cache_get(namespace: String, key: String) -> Result<Option<String>, String>
 cache_put(namespace: String, key: String, value: String, ttlSeconds: Int)
     -> Result<Unit, String>

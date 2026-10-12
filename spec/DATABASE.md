@@ -48,7 +48,7 @@ credential, isolation level, statement text, or schema.
 
 ## Source API
 
-```krit
+```text
 db_begin_read("catalog")                          // Result<DatabaseTransaction, String>
 db_begin_write("catalog")                         // Result<DatabaseTransaction, String>
 db_query(transaction, "count-visits", [])         // Result<String, String>

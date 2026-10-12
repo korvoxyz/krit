@@ -1,6 +1,6 @@
 # Krit Rust technical design
 
-**Status:** Accepted; bounded Phase 6 durable execution and Phase 7 data services implemented
+**Status:** Accepted; describes the Krit 0.3 implementation (Wasmtime 48 LTS, Rust 1.95)
 **Owner:** Akshay Bhardwaj
 
 ## Decision
@@ -17,64 +17,67 @@ The specification and conformance suite define the language.
 UTF-8 source
     |
     v
-source database -> lexer -> parser -> AST
-                                |
-                                v
-                     name and module resolution
-                                |
-                                v
-                       type + effect checking
-                                |
-                                v
-                          typed HIR
-                                |
-                                v
-                  normalized Core IR (ANF)
-                       /                \
-                      v                  v
-             Wasm component         explanation data
-                      |
-                      v
-            validator + component host
-                      |
-                      v
-             capability interfaces
+lexer (tokens, holes, text blocks, comment trivia)
+    |
+    v
+parser -> AST            nesting limits (K1005), habit codes (K1101-K1112)
+    |
+    v
+analysis                 names, types, effects, literal-resource
+    |                    requirements, `?`/let-else rules, exhaustiveness
+    |                    -> first error, plus warnings (K2003)
+    v
+lints                    warnings only (K9013), on accepted programs
+    |                    (the language server stops here)
+    v
+typed Core IR (ANF)      verified; `exit` for `?` and let-else
+    |
+    +--> explanation facts (`krit explain`)
+    +--> direct evaluator (`krit run`): evaluates the checked AST,
+    |    standard output only
+    v
+WebAssembly backend      dead-function elimination, support check
+    |                    (all K7001/K7002 at spans), emission, validation
+    v
+component + metadata --> Wasmtime host --> typed capability interfaces
 ```
 
-The Rust bootstrap implements source, lexer, parser, AST, diagnostics, name
-resolution, type/effect analysis, a verified typed Core IR, a direct evaluator
-that establishes runtime semantics, and `krit-wasm`, a strict Core-to-component
-artifact backend, plus `krit-runtime`, a bounded component host and `krit-lsp`,
-a deterministic editor boundary. `krit build` emits validated artifacts,
-`krit sandbox` executes only those artifacts, `krit run` checks source like
-`krit check` and then evaluates it directly, and `krit lsp` never executes
+Every command shares the front end, so they accept one language: `krit check`
+runs the stages through Core verification, adds the backend's target check for
+entrypoint files or with `--target`, and reports warnings beside any error;
+`krit run` performs the same checking (without the target check) and evaluates
+only programs that pass it; `krit build` runs the full pipeline; and the
+language server stops after analysis and lints. `krit sandbox`, `invoke`,
+`serve`, `worker`, and `schedule` execute only validated artifacts and never
 source.
 
 ## Workspace
 
 ```text
 crates/
-  krit-capability/   shared resource-name and normalized-origin policy
-  krit-source/       source files, spans, line maps
-  krit-syntax/       tokens, lexer, AST, parser
-  krit-diagnostics/  codes, rendering, JSON schema
-  krit-semantics/    names, types, effects, HIR
-  krit-ir/           normalized Core IR
-  krit-wasm/         Core IR to WebAssembly component lowering
+  krit/              source and spans, lexer, parser and AST, habit codes,
+                     analysis (names, types, effects, patterns), lints,
+                     typed Core IR and verifier, direct evaluator, formatter,
+                     and diagnostics with severities
+  krit-capability/   shared resource-name, normalized-origin, and request
+                     path/query policy (also used by the standard library)
+  krit-wasm/         Core IR to WebAssembly component lowering, guest string
+                     runtime, artifact metadata and validation
   krit-state/        transactional SQLite state, replay, idempotency, queue,
                      schedule, and object records
   krit-cache/        bounded namespaced TTL cache backend
   krit-database/     capability-scoped parameterized application database access
-  krit-runtime/      component runtime, limits, and capability handles
-  krit-package/      manifests, lockfiles, resolver, store
-  krit-cli/          user command and orchestration
+  krit-runtime/      Wasmtime component host, limits, and capability handles
+  krit-package/      strict manifests, grants, and secret bindings
+  krit-cli/          the `krit` command, host configuration, and orchestration
   krit-lsp/          deterministic compiler facts and editor operations
   krit-assist/       optional provider-neutral LLM edit suggestions
-  krit-conformance/  implementation-neutral suite runner
 ```
 
-The bootstrap may combine crates when an interface has not stabilized.
-Splitting requires a measurable build, ownership, or dependency benefit.
+The front end is one `krit` crate while its interfaces settle; the master plan
+(`docs/roadmap.md`, section 7.1) splits it after the NodeId refactor.
+Splitting requires a measurable build, ownership, or dependency benefit. The
+conformance suite runs through the crates' integration tests.
 
 Dependency direction is one-way down the list of compiler stages. The runtime
 does not depend on parser internals. Package code orchestrates compiler inputs
@@ -106,10 +109,13 @@ exposes formatter-only line-comment trivia with exact comment text, source
 order, and standalone/end-of-line placement. Identifier interning begins only
 when profiling shows a memory or comparison benefit.
 
-The parser is handwritten recursive descent with Pratt/precedence parsing for
-expressions. Error recovery synchronizes at `;`, `}`, and declaration
-keywords. The first implementation may stop after one error, but its
-diagnostic code and primary span must match the specification.
+The parser is handwritten recursive descent with one function per precedence
+level. It stops at the first error, whose code and primary span match the
+specification; multi-error recovery is planned for 0.4. It counts nesting as
+it descends and reports `K1005` before any construct could exhaust the native
+stack, and every later stage counts its own recursion too. Constructs from
+other languages are recognized only where no valid program could use their
+tokens and reported with their own codes and a one-line fix.
 
 The canonical formatter validates with the normal parser, then renders the
 parsed token stream with AST-derived block, type, and statement boundaries.
@@ -134,6 +140,12 @@ source-name lookup. Original names survive only as optional debug metadata.
 The checker emits public analysis facts from the AST: inferred binding,
 symbol, expression, and block types; resolved name facts; source spans; sorted
 effects; and separate sorted `(capability, literal-resource)` requirements.
+It records, per function body, whether `?` and let-else may exit it, checks
+match exhaustiveness over the nested built-in patterns, and reports at most
+one error plus any number of warnings, each with a severity. Lints run only on
+accepted programs and add warnings, never errors. Sugar is analyzed natively
+at the sub-spans of its source (holes, entries, construction fields), so
+analysis facts stay keyed by unique source spans until the NodeId refactor.
 Core lowering consumes these normalized facts instead of re-running
 inference. Types retain shared `Arc` substructure so repeated Core
 boundaries do not expand the inference DAG. A normalized inference type can
@@ -153,7 +165,10 @@ expression-oriented and in administrative normal form:
 - calls evaluate the callee and arguments left to right; lists and records
   evaluate elements and fields left to right
 - short-circuit operators, blocks, conditionals, list matches, and
-  Option/Result matches contain explicit nested blocks
+  Option/Result matches contain explicit nested blocks; a match with nested
+  patterns becomes nested two-arm matches over its decision tree
+- postfix `?` and let-else lower to a variant match whose failure arm ends in
+  a verified `exit` operation, the function's early return
 - recursive functions have an explicit self value and lexical closures have
   explicit typed capture parameters and closure arguments
 - built-ins identify stdout host effects, pure variant constructors, and pure
@@ -164,9 +179,9 @@ expression-oriented and in administrative normal form:
 - source spans survive lowering without becoming executable names
 
 Standalone source lowers to the stable synthetic `module-init` entrypoint.
-An optional top-level webhook lowers to a second named `webhook` entrypoint
-with the exact `HttpRequest -> HttpResponse` boundary. It is a compiler/export
-fact, not an ambient listener.
+An optional top-level webhook, queue, or schedule declaration lowers to a
+second named entrypoint with its exact contract boundary. It is a
+compiler/export fact, not an ambient listener.
 
 Built-in identity defines intrinsic behavior. Constructing any built-in
 function value is pure; stdout built-ins require `io.stdout` when called, while
@@ -213,12 +228,13 @@ The implemented policy-1 artifact is a small WebAssembly component that
 selects one of two checked-in `krit:runtime@0.2.0` worlds from checked effects.
 `krit:runtime/pure-program@0.2.0` exports `run: func()` with no imports.
 `krit:runtime/program@0.2.0` exports the same function and imports the typed
-`krit:runtime/stdout@0.2.0` interface. Policy 2 selects one finite webhook
-world from the exact `io.stdout`, `config.read`, `secret.read`, and
-`http.request`, `ai.invoke`, and `observe.log` effect set. Anonymous HTTP uses
-a separate interface so it does not implicitly import secret acquisition;
-bearer HTTP borrows the opaque secret resource. AI-only and log-only
-components import exactly their one typed interface.
+`krit:runtime/stdout@0.2.0` interface. Policy 2 selects one least-authority
+webhook, job, or schedule world from the exact effect set: stdout, config,
+secrets, HTTP, AI, logs, state, queues, objects, databases, cache, and search
+each add their own interface only when used. Anonymous HTTP uses a separate
+interface so it does not implicitly import secret acquisition; bearer HTTP
+borrows the opaque secret resource. Krit 0.3 added no host interface, so the
+WIT package stays at 0.2.0 and 0.2 artifacts keep linking.
 
 Krit does not grant a general WASI environment. Files, sockets, processes,
 environment variables, clocks, randomness, secrets, state, and AI calls are
@@ -230,11 +246,14 @@ bounded-table `i32` slots for non-capturing functions. It supports recursive
 and higher-order calls, Core blocks/conditionals, checked integer operations,
 primitive comparisons, and scalar stdout. The bounded webhook path adds
 guest-memory canonical strings, fixed HTTP records, header lists, selected
-Result/Option layouts and matching, static helper references, config,
-resource secrets, and HTTP. A generated guest string runtime lowers String
-concatenation, equality, and byte-lexicographic ordering. It still rejects
-residual types, data captures, general composites, general JSON conversion,
-and unknown built-ins before emission. Phase 4 additionally lowers neutral AI
+Result/Option layouts and matching (nested patterns included), static helper
+references, config, resource secrets, and HTTP. A generated guest string
+runtime lowers String concatenation, equality, and byte-lexicographic
+ordering, and generated helpers implement the standard library without any
+host import. `exit` lowers to a core `return` with the function's own result
+layout. It still rejects residual types, data captures, general composites,
+general JSON conversion, and built-ins used as values before emission,
+reporting every finding at its source span. Phase 4 additionally lowers neutral AI
 string results, ordered `LogField` lists, and fallible structured logging. A
 generated guest decoder lowers `json_decode` into `String` with every RFC 8259
 escape; the runtime reports a rejection inside that named decoder as `K4009`.
@@ -313,8 +332,12 @@ security and artifact surface without helping prove the initial agent product.
 
 ## Runtime values and memory
 
-The bootstrap evaluator uses safe Rust enums and reference-counted immutable
-objects. The component backend uses explicit canonical interface types for
+The bootstrap evaluator walks the checked AST with safe Rust enums and
+reference-counted immutable objects; the master plan replaces it with a Core
+interpreter in 0.4. It runs on a dedicated thread with a 1 GiB stack
+reservation and bounds active calls, nested evaluations, and value nesting
+(`K4010`), so deep recursion is a diagnostic rather than a native stack
+overflow. The component backend uses explicit canonical interface types for
 records, variants, strings, lists, options, and results. Host pointers and
 credentials never become guest values.
 
@@ -332,10 +355,13 @@ not assumed linked lists.
 
 ## Capabilities
 
-Core evaluation cannot call operating-system APIs directly. Effect
-instructions call a `Host` interface containing opaque capability handles.
-The current policy-1 CLI constructs only the exact stdout grant set from the
-local manifest. Future deployment hosts will additionally intersect user or
+Core evaluation cannot call operating-system APIs directly. The direct
+evaluator provides only standard output, and `krit run` refuses any program
+that needs more (`K5003`). Components reach the host only through their typed
+imports, which validation re-derives from the artifact, and every call is
+checked against both the manifest grant and the artifact's own requirements.
+Bearer injection is also checked against the secret's manifest origin binding
+(`K5006`). Future deployment hosts will additionally intersect user or
 deployment policy and OS sandbox support; artifact permission reports label
 that layer `not-evaluated` today.
 
@@ -344,8 +370,9 @@ not serializable into components or cache artifacts.
 
 ## Package and build system
 
-The bootstrap implements strict local manifests, entry containment,
-deterministic component artifacts, and safe artifact replacement. Module
+The bootstrap implements strict local manifests, secret-to-origin bindings,
+entry containment, deterministic component artifacts, and safe artifact
+replacement. A declared dependency fails closed with `K6003`. Module
 resolution, lockfile generation, incremental builds, and build caching remain
 planned; the following describes that target architecture, not shipped
 functionality.

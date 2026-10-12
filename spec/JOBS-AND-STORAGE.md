@@ -63,10 +63,8 @@ Edition 2026 adds one entrypoint form per delivery kind and four built-ins.
 
 ```krit
 queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
-    match object_put("render-output", job.id, job.body) {
-        Ok(stored) => Ok(job.id),
-        Err(error) => Err(error),
-    }
+    object_put("render-output", job.id, job.body)?;
+    Ok(job.id)
 }
 ```
 
@@ -76,7 +74,9 @@ schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String
 }
 ```
 
-```krit
+The four built-ins are:
+
+```text
 queue_publish("render-jobs", body)
 // Result<String, String> — the durable job identity
 
@@ -96,7 +96,7 @@ and record fields keep those spellings.
 
 ### Fixed typed contracts
 
-```krit
+```text
 QueueJob {
     queue: String,
     id: String,

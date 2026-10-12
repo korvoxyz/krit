@@ -158,9 +158,11 @@ Phase 4 now implements this bounded reference boundary: typed webhook/config/
 secret/HTTP interfaces, provider-neutral AI invocation, structured redacted
 logs, retries, finite rates, cancellation, process-local idempotency, and
 default-deny sensitive-operation approval. The reference acceptance flow is
-covered with local mocks and exact artifact permission facts. Durable state,
-distributed rate policy, and deployment approval evaluation remain future
-work.
+covered with local mocks and exact artifact permission facts. Phase 6 added
+local durable state, and Krit 0.3 makes the reference source flat (postfix
+`?`, let-else, named construction, entry lists) and binds each secret to the
+origins it may reach. Distributed rate policy and deployment approval
+evaluation remain future work.
 
 ## Success measures
 

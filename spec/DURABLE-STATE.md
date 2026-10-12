@@ -44,7 +44,7 @@ checkpointed, replayed, encoded, logged, or included in state metadata.
 
 Edition 2026 adds these built-ins:
 
-```krit
+```text
 state_get("agent-work", key)
 // Result<Option<String>, String>
 

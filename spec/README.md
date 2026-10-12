@@ -15,24 +15,29 @@ infer semantics from historical interpreter behavior.
 | Document | Status | Scope |
 |---|---|---|
 | [CHARTER.md](CHARTER.md) | Normative | Product and language principles |
-| [LANGUAGE.md](LANGUAGE.md) | Normative | Krit 0.2 source syntax and runtime semantics |
-| [DIAGNOSTICS.md](DIAGNOSTICS.md) | Normative | Human and machine diagnostic contract |
-| [WEBHOOK-CONTRACTS.md](WEBHOOK-CONTRACTS.md) | Normative bounded runtime | Typed webhook, config, opaque secrets, and exact-origin HTTP |
+| [LANGUAGE.md](LANGUAGE.md) | Normative | Krit 0.3 source syntax, grammar, sugar and its meaning, standard library, and runtime semantics (edition 2026) |
+| [DIAGNOSTICS.md](DIAGNOSTICS.md) | Normative | Every diagnostic code with its severity, the human and JSON Lines formats, fix hints, and exit statuses |
+| [TYPES-AND-EFFECTS.md](TYPES-AND-EFFECTS.md) | Normative (open decisions draft) | Static types, `?` and let-else typing, match exhaustiveness, effects, capability requirements, and lints |
+| [WASM-SANDBOX.md](WASM-SANDBOX.md) | Normative | Deployable subset (policy 1 modules; policy 2 entrypoints with strings, `?` exits, nested matches, and the standard library), artifact compatibility window, and the Wasmtime 48 LTS host |
+| [CAPABILITIES.md](CAPABILITIES.md) | Normative (open decisions draft) | Authority model, manifest grants, secret-to-origin binding (`K5006`), and fail-closed dependencies (`K6003`) |
+| [WEBHOOK-CONTRACTS.md](WEBHOOK-CONTRACTS.md) | Normative | Typed webhook, config, opaque secrets, exact-origin HTTP, and the request path rule |
 | [AI-OBSERVABILITY.md](AI-OBSERVABILITY.md) | Normative bounded runtime | Neutral AI invocation, structured logs, retries, rate, cancellation, idempotency, and approval |
+| [DURABLE-STATE.md](DURABLE-STATE.md) | Normative bounded local host | Transactional local state, checkpoints, replay, and durable idempotency |
+| [JOBS-AND-STORAGE.md](JOBS-AND-STORAGE.md) | Normative bounded local host | Durable queues, host-owned scheduled triggers, and bounded object storage |
+| [DATABASE.md](DATABASE.md) | Normative bounded local host | Capability-scoped catalogued parameterized database transactions |
+| [CACHE-AND-SEARCH.md](CACHE-AND-SEARCH.md) | Normative bounded local host | Bounded namespaced TTL cache and provider-neutral search and vector connectors |
+| [GUIDED-AUTHORING.md](GUIDED-AUTHORING.md) | Implemented baseline | Offline LSP facts, repair-oriented diagnostics, and review-gated provider-neutral suggestions |
+| [PACKAGES.md](PACKAGES.md) | Draft (single-package manifests implemented) | Manifests and secret bindings (implemented); modules, lockfiles, and registries (draft) |
 | [AGENT-APPLICATIONS.md](AGENT-APPLICATIONS.md) | Draft | Agent, bot, backend, and integration application model |
-| [TYPES-AND-EFFECTS.md](TYPES-AND-EFFECTS.md) | Implemented baseline | Static types and effect checking |
-| [CAPABILITIES.md](CAPABILITIES.md) | Implemented bounded HTTP host | Runtime authority and sandbox boundaries |
-| [PACKAGES.md](PACKAGES.md) | Draft | Modules, manifests, lockfiles, and registries |
-| [WASM-SANDBOX.md](WASM-SANDBOX.md) | Implemented Phase 4 | Policy-1 scalar and bounded stateless webhook components |
-| [GUIDED-AUTHORING.md](GUIDED-AUTHORING.md) | Implemented Phase 5 baseline | Offline LSP facts and review-gated provider-neutral suggestions |
-| [DURABLE-STATE.md](DURABLE-STATE.md) | Normative bounded Phase 6 | Transactional local state, checkpoints, replay, and durable idempotency |
-| [JOBS-AND-STORAGE.md](JOBS-AND-STORAGE.md) | Normative bounded Phase 6 | Durable queues, host-owned scheduled triggers, and bounded object storage |
-| [DATABASE.md](DATABASE.md) | Normative bounded Phase 7 | Capability-scoped catalogued parameterized database transactions |
-| [CACHE-AND-SEARCH.md](CACHE-AND-SEARCH.md) | Normative bounded Phase 7 | Bounded namespaced TTL cache and provider-neutral search and vector connectors |
 
 `LANGUAGE.md` deliberately defines a new readable syntax for the Rust
 implementation. The S-expression syntax in the archived Racket prototype is
-not part of Krit 0.2.
+not part of Krit.
+
+Every `krit` code block in these documents, apart from the layout examples
+of the formatter section of `LANGUAGE.md`, is a complete program that
+`krit check` accepts without warnings; `crates/krit-cli/tests/doc_examples.rs`
+checks them. Signatures and fragments are written as `text` blocks instead.
 
 ## Authority
 

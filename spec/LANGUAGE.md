@@ -1,29 +1,49 @@
-# Krit 0.2 language specification
+# Krit 0.3 language specification
 
 **Status:** Normative  
-**Edition:** 2026
+**Edition:** 2026  
+**Language version:** 0.3
 
 ## 1. Scope
 
-This document defines the syntax and runtime behavior required by the initial
-Rust implementation. The bootstrap static checker is specified in
-`TYPES-AND-EFFECTS.md`, and the evaluator-independent typed Core form is
-described in `docs/technical-design.md`. This milestone also defines
-typed webhook entrypoints, configuration reads, opaque secret acquisition,
-exact-origin outbound HTTP, provider-neutral AI invocation, and structured
-logging, transactional durable string state, checkpoints, and explicit
-HTTP/AI replay. The direct evaluator remains intentionally hostless; these
-operations execute only through the bounded Component Model runtime. General
-component generation remains narrower than the full checked language.
+This document defines the source syntax and the meaning of Krit programs in
+edition 2026 as implemented by Krit 0.3. It is normative together with:
 
-The historical Racket S-expression syntax is not accepted by Krit 0.2.
+- `TYPES-AND-EFFECTS.md`: static types, effects, capability requirements,
+  and the typed Core form that checking produces;
+- `DIAGNOSTICS.md`: every diagnostic code, its severity, and its fix hints;
+- `WASM-SANDBOX.md`: which checked programs build into WebAssembly
+  components, and how those components run;
+- `WEBHOOK-CONTRACTS.md`, `AI-OBSERVABILITY.md`, `DURABLE-STATE.md`,
+  `JOBS-AND-STORAGE.md`, `DATABASE.md`, and `CACHE-AND-SEARCH.md`: the host
+  operations and entrypoint contracts that section 13 summarizes.
+
+One program has one meaning. `krit check` decides whether a program is valid,
+and every other command accepts exactly the programs it accepts: `krit run`
+checks first and refuses what checking refuses (section 14), and
+`krit check --target component` reports exactly the build diagnostics that
+`krit build` would (`DIAGNOSTICS.md`, Build-target diagnostics). The direct
+evaluator provides no host other than standard output, so host operations and
+entrypoints run only through a validated component. Component generation
+supports a documented subset of the checked language and refuses the rest
+with a diagnostic, never with a different meaning: where both can run a
+program, they agree on its result, apart from the fail-closed JSON decoding
+specialization in section 13.
+
+Edition 2026 includes, since Krit 0.3, early exits with postfix `?` and
+let-else, nested patterns with `_`, named construction of the contract
+records, entry lists, the unit value `()`, doc comments, string interpolation,
+text blocks, and the first standard library. Each is defined in terms of the
+core language (section 4.3).
+
+The historical Racket S-expression syntax is not Krit.
 
 ## 2. Source text
 
 A source file is UTF-8 and conventionally ends in `.krit`.
 
 - Keywords and identifiers are case-sensitive.
-- Version 0.2 identifiers use ASCII letters, digits, and `_`.
+- Identifiers use ASCII letters, digits, and `_`.
 - An identifier starts with a letter or `_`.
 - `//` begins a comment ending at the next line break. A comment that begins
   with exactly three slashes, `///`, is a doc-comment line (section 2.1);
@@ -46,7 +66,20 @@ Err None Ok Some ai_invoke cache_delete cache_get cache_put checkpoint_get check
 
 A binding cannot use a keyword or reserved built-in name.
 
-## 2.1 Doc comments
+Some identifiers have a meaning only in one position and stay ordinary names
+everywhere else:
+
+- `queue` and `schedule` start an entrypoint declaration when a string
+  literal and `fn` follow them (section 13.2);
+- `HttpRequest`, `HttpResponse`, `HttpHeader`, and `LogField` start a named
+  construction when `{` follows them (section 8.4);
+- type names such as `Int`, `String`, `List`, and `Result` are recognized
+  only where a type is expected (section 4);
+- the words of constructs from other languages, such as `return` and `for`,
+  are reported with their own codes only where no valid program could use
+  them (section 4.2).
+
+### 2.1 Doc comments
 
 The **doc comment** of an item is the run of `///` lines directly before it.
 Items are function declarations, nested ones included, and `webhook`,
@@ -55,9 +88,13 @@ Items are function declarations, nested ones included, and `webhook`,
 ```krit
 /// Labels one issue.
 ///
-/// Fails when the model's answer is not a known label.
-fn label(issue: String) -> Result<String, String> {
-    // ...
+/// Fails when the title is empty.
+fn label(title: String) -> Result<String, String> {
+    if string_is_empty(title) {
+        Err("the issue has no title")
+    } else {
+        Ok("triage: " + title)
+    }
 }
 ```
 
@@ -80,27 +117,63 @@ doc comment when hovering over its declaration or a use of it.
 
 ## 3. Lexical grammar
 
-The grammar uses EBNF. `*` means zero or more, `?` means optional, and quoted
-text is literal.
+Both grammars use EBNF. `,` separates the parts of a sequence, `|`
+separates alternatives, `*` means zero or more, `?` means optional, quoted
+text is literal, `(* ... *)` is a comment, and `? ... ?` describes a set of
+characters in prose.
+
+Source text is a sequence of tokens separated by whitespace and comments.
+The lexer always reads the longest token that can start at a position, so
+`==` is one token, not two `=`, and `..` is not two `.`.
 
 ```text
-identifier  = (letter | "_"), (letter | digit | "_")* ;
-integer     = digit, (digit | "_")* ;
-string      = '"', (string-character | hole)*, '"' ;
-hole        = "\(", identifier, (".", identifier)*, ")" ;
-text-block  = '"""', line-break,
-              (text-block-line, line-break)*,
-              indentation, '"""' ;
-text-block-line
-            = (text-block-character | hole)* ;
-indentation = (" " | "\t")* ;
+token       = keyword | identifier | integer | string | text-block
+            | punctuator ;
+
+letter      = "A" | ... | "Z" | "a" | ... | "z" ;
+digit       = "0" | ... | "9" ;
+hex-digit   = digit | "A" | ... | "F" | "a" | ... | "f" ;
 line-break  = "\n" | "\r\n" | "\r" ;
-comment     = "//", non-line-break* ;
-doc-comment = "///", (non-slash-non-line-break, non-line-break*)? ;
+whitespace  = ? any Unicode White_Space character ? ;
+
+keyword     = "else" | "false" | "fn" | "if" | "let" | "match"
+            | "record" | "true" | "webhook" ;
+identifier  = (letter | "_"), (letter | digit | "_")* ;
+                                    (* other than a keyword *)
+integer     = digit, ("_"?, digit)* ;
+
+string      = '"', (string-character | escape | hole)*, '"' ;
+string-character
+            = ? any character other than '"', "\", or a line break ? ;
+escape      = "\", ( '"' | "\" | "n" | "r" | "t" | "0"
+                   | "u{", hex-digit, hex-digit?, hex-digit?, hex-digit?,
+                     hex-digit?, hex-digit?, "}" ) ;
+hole        = "\(", identifier, (".", identifier)*, ")" ;
+
+text-block  = '"""', line-break,
+              (content-line, line-break)*,
+              indentation, '"""' ;
+content-line
+            = (text-block-character | escape | hole)* ;
+text-block-character
+            = ? any character other than "\" or a line break ? ;
+indentation = (" " | "\t")* ;
+
+comment     = "//", comment-character* ;
+doc-comment = "///", (? any character other than "/" or a line break ?,
+                      comment-character*)? ;
+comment-character
+            = ? any character other than a line break ? ;
+
+punctuator  = "(" | ")" | "{" | "}" | "[" | "]" | "," | ":" | ";"
+            | "." | ".." | "?" | "=" | "=>" | "->"
+            | "==" | "!=" | "<" | "<=" | ">" | ">=" | "!"
+            | "+" | "-" | "*" | "/" | "%" | "&&" | "||" ;
 ```
 
 A `doc-comment` is a `comment` too: both are trivia, which the syntactic grammar
-does not mention.
+does not mention. Any other character outside a string, text block, or
+comment, including a lone `&` or `|`, is `K0001`.
 
 A `hole` inside a string or text block is written without whitespace, and its
 identifiers are not keywords. A string that contains at least one hole is an
@@ -157,65 +230,54 @@ signed through unary `-`; the sign is not part of the token.
 8.2). After an operand, the parser also uses it to recognize another
 language's conditional operator (section 4.2).
 
-Strings and text blocks support these escapes:
-
-```text
-\"  \\  \n  \r  \t  \0  \u{hex-scalar}
-```
-
-`\(` starts a hole instead. Other escapes and invalid Unicode scalar values
-are lexical errors (`K0003`).
+Strings and text blocks support the escapes of `escape`: `\"`, `\\`, `\n`,
+`\r`, `\t`, `\0`, and `\u{...}` with one to six hex digits naming a Unicode
+scalar value. `\(` starts a hole instead. Other escapes and invalid Unicode
+scalar values are lexical errors (`K0003`). A one-line string cannot contain
+a line break (`K0002`); a text block holds several lines.
 
 ## 4. Syntactic grammar
 
 ```text
 program         = item* ;
-
-item            = let-declaration
-                | let-else
-                | function-declaration
+item            = statement
                 | webhook-declaration
-                | expression, ";" ;
-
-let-declaration = "let", identifier, (":", type)?, "=", expression, ";" ;
-
-let-else        = "let", variant-pattern, (":", type)?, "=", expression,
-                  "else", let-else-arm, ";" ;
-let-else-arm    = variant-pattern, "=>", expression ;
-variant-pattern = ("Some" | "Ok" | "Err"), "(", identifier, ")"
-                | "None" ;
-
-function-declaration
-                = "fn", identifier, "(", parameters?, ")",
-                  ("->", type)?, block ;
-
-webhook-declaration
-                = "webhook", "fn", identifier, "(", parameters?, ")",
-                  ("->", type)?, block ;
-
-parameters      = parameter, (",", parameter)*, ","? ;
-parameter       = identifier, (":", type)? ;
-
-block           = "{", statement*, expression?, "}" ;
+                | delivery-declaration ;
 
 statement       = let-declaration
                 | let-else
                 | function-declaration
                 | expression, ";" ;
+block           = "{", statement*, expression?, "}" ;
 
-expression      = assignment-free-expression ;
+let-declaration = "let", identifier, (":", type)?, "=", expression, ";" ;
+let-else        = "let", variant-pattern, (":", type)?, "=", expression,
+                  "else", variant-pattern, "=>", expression, ";" ;
+variant-pattern = ("Some" | "Ok" | "Err"), "(", identifier, ")"
+                | "None" ;
 
-assignment-free-expression
-                = logical-or ;
+function-declaration
+                = "fn", identifier, signature, block ;
+webhook-declaration
+                = "webhook", "fn", identifier, signature, block ;
+delivery-declaration
+                = ("queue" | "schedule"), direct-string, "fn", identifier,
+                  signature, block ;
+direct-string   = string ;                   (* without holes *)
+signature       = "(", parameters?, ")", ("->", type)? ;
+parameters      = parameter, (",", parameter)*, ","? ;
+parameter       = identifier, (":", type)? ;
+
+expression      = logical-or ;
 logical-or      = logical-and, ("||", logical-and)* ;
 logical-and     = equality, ("&&", equality)* ;
 equality        = comparison, (("==" | "!="), comparison)* ;
 comparison      = term, (("<" | "<=" | ">" | ">="), term)* ;
 term            = factor, (("+" | "-"), factor)* ;
 factor          = unary, (("*" | "/" | "%"), unary)* ;
-unary           = ("!" | "-"), unary | call ;
-call            = primary,
-                  ("(", arguments?, ")" | ".", identifier | "?")* ;
+unary           = ("!" | "-"), unary
+                | call ;
+call            = primary, ("(", arguments?, ")" | ".", identifier | "?")* ;
 arguments       = expression, (",", expression)*, ","? ;
 
 primary         = integer
@@ -223,6 +285,8 @@ primary         = integer
                 | text-block
                 | "true"
                 | "false"
+                | "(", ")"
+                | "(", expression, ")"
                 | identifier
                 | list
                 | record
@@ -230,9 +294,7 @@ primary         = integer
                 | block
                 | if-expression
                 | match-expression
-                | function-expression
-                | "(", ")"
-                | "(", expression, ")" ;
+                | function-expression ;
 
 list            = "[", (arguments | entries)?, "]" ;
 entries         = entry, (",", entry)*, ","? ;
@@ -240,7 +302,6 @@ entry           = expression, ":", expression ;
 record          = "record", "{", record-fields?, "}" ;
 record-fields   = record-field, (",", record-field)*, ","? ;
 record-field    = identifier, ":", expression ;
-
 construction    = contract-name, "{", construction-fields?, "}" ;
 contract-name   = "HttpRequest" | "HttpResponse" | "HttpHeader" | "LogField" ;
 construction-fields
@@ -248,15 +309,12 @@ construction-fields
 construction-field
                 = identifier, (":", expression)? ;
 
-if-expression   = "if", expression, block, "else",
-                  (block | if-expression) ;
-
+if-expression   = "if", expression, block, "else", (block | if-expression) ;
 function-expression
-                = "fn", "(", parameters?, ")", ("->", type)?, block ;
-
+                = "fn", signature, block ;
 match-expression
-                = "match", expression, "{",
-                  match-arm, (",", match-arm)*, ","?, "}" ;
+                = "match", expression, "{", match-arm, (",", match-arm)*,
+                  ","?, "}" ;
 match-arm       = pattern, "=>", expression ;
 pattern         = binder
                 | "_"
@@ -264,11 +322,11 @@ pattern         = binder
                 | "None"
                 | "[", "]"
                 | "[", (binder | "_"), ",", "..", (binder | "_"), "]" ;
-binder          = identifier ;   (* other than "_" *)
+binder          = identifier ;               (* other than "_" *)
 
-type            = "Int" | "Bool" | "String" | "Unit"
-                | "HttpHeader" | "HttpRequest" | "HttpResponse"
-                | "LogField" | "Secret"
+type            = "Int" | "Bool" | "String" | "Unit" | "Secret"
+                | "HttpHeader" | "HttpRequest" | "HttpResponse" | "LogField"
+                | "QueueJob" | "ScheduleEvent" | "DatabaseTransaction"
                 | "List", "<", type, ">"
                 | "Option", "<", type, ">"
                 | "Result", "<", type, ",", type, ">"
@@ -278,6 +336,44 @@ record-type-fields
 record-type-field
                 = identifier, ":", type ;
 ```
+
+The grammar is complete: every program `krit check` accepts is derived from
+`program`, and the rules below only restrict which derivations are valid or
+decide between two readings of the same tokens.
+
+- **Statements end with `;`.** Every expression statement ends with `;`,
+  including an `if`, `match`, or block written for its effects
+  (`if ready { log() } else { () };`). Only the final expression of a block,
+  which is the block's value, has none. A program has no final expression:
+  every top-level expression is a statement.
+- **Precedence.** From loosest to tightest: `||`; `&&`; `==` and `!=`; `<`,
+  `<=`, `>`, and `>=`; `+` and `-`; `*`, `/`, and `%`; unary `!` and `-`;
+  then the postfix call, field-access, and `?` links of `call`. Every binary
+  operator associates to the left, so `a - b - c` is `(a - b) - c`, and
+  `a < b < c` parses as `(a < b) < c`, which checking rejects because it
+  orders a `Bool` (`K3001`).
+- **`fn` and `let`.** In statement position, `fn` followed by a name is a
+  function declaration and `fn` followed by `(` is a function expression. A
+  `let` followed by `None`, or by `Some`, `Ok`, or `Err` and then `(`, is a
+  let-else; any other `let` is a let declaration.
+- **Names.** `identifier` excludes the keywords of section 2; `queue`,
+  `schedule`, the contract names, and the type names are identifiers that
+  have a meaning only in the positions this grammar gives them (section 2).
+  Any other identifier where a type is expected is `K1002`.
+- **Entrypoints.** A `webhook` or delivery (`queue`, `schedule`) declaration
+  is valid only as a program item: inside a block it is `K1004`. A module
+  declares at most one entrypoint of any kind (`K2002`). `queue` and
+  `schedule` start a delivery declaration only when a string and `fn` follow
+  them; that string must be a direct string literal, and an interpolated
+  string or text block there is `K1002` (section 13.2).
+- **let-else patterns.** The payload of a let-else pattern is a name or `_`.
+  A variant or list pattern there is `K3014`, a let-else without its `else`
+  arm is `K1002`, and a block after its `else` is `K1003`, each with a note
+  (section 8.3).
+- **Match arms.** A `match` has at least one arm (`K1003`), and arms are
+  separated by commas even when an arm's value is a block.
+- **Conditionals.** Every `if` has an `else`; an `if` without one is
+  `K1002`. `else if` continues a chain (section 10).
 
 `()` is the unit value (section 5). A list whose first element is an
 `entry` is an entry list (section 11); every element after it must be an
@@ -302,19 +398,18 @@ start a block, the parser reports `K1001` with a note to add the parentheses;
 Assignments and mutable bindings do not exist in edition 2026. Neither do
 `return`, loops, classes, modules, `async`, exceptions, indexing, arrow
 functions, the conditional operator, or `switch`; section 4.2 specifies how
-the parser reports them. The two early exits are postfix `?` (section 8.2)
-and let-else (section 8.3), which the grammar accepts wherever a `let`
-declaration may appear and checking accepts only as a statement of a named
-function's body.
+the parser reports them. The early exits are postfix `?` (section 8.2) and
+let-else (section 8.3): the grammar accepts a let-else wherever a `let`
+declaration may appear, and checking accepts it only as a direct statement of
+a named function's body.
 
-A `webhook` declaration is valid only as a direct program item. A source
-module contains zero or one webhook. Nested or duplicate webhook declarations
-are errors. The parser retains its written parameter and result annotations;
-the static checker requires exactly:
+A source module contains zero or one webhook. The parser retains its written
+parameter and result annotations; the static checker requires exactly one
+`HttpRequest` parameter and an `HttpResponse` result (`K3007` otherwise):
 
 ```krit
-webhook fn name(request: HttpRequest) -> HttpResponse {
-    // ...
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    HttpResponse { status: 200, body: request.path }
 }
 ```
 
@@ -322,7 +417,7 @@ The source name is a compiler fact. The component host exports the declaration
 through the canonical `krit:runtime/webhook@0.2.0` interface's `handle`
 operation; the name does not create an ambient network listener.
 
-## 4.1 Nesting limits
+### 4.1 Nesting limits
 
 A source file may nest syntax at most **256 levels** deep. Each of the
 following opens one level for what it contains:
@@ -381,7 +476,7 @@ later stages also count their own recursion, to reject syntax trees built
 without the parser; every tree within the limits above stays inside those
 internal bounds, so a source program only ever sees the limits stated here.
 
-## 4.2 Constructs from other languages
+### 4.2 Constructs from other languages
 
 Constructs that other languages have and Krit does not are reported with
 their own codes (`K1101`-`K1112`), each with a one-line fix in the
@@ -482,6 +577,45 @@ place of the outer one (`a ? b ? c : d : e` and `a ? -b ? c : d : e` report
 brackets and the outer one is reported), and so is a nesting limit (`K1005`)
 crossed in a first branch that the parser parses.
 
+### 4.3 Sugar and its meaning
+
+Edition 2026 has a small core: literals, names, operators, calls, field
+access, `let`, functions, blocks, `if`, `match` over the built-in families,
+lists, and records. Every other form is sugar, defined by the translation into
+the core in the table below. A translation gives the form its meaning: the
+sugared program evaluates exactly as its translation does, in the same order
+and with the same effects, and checking gives it the same types, effects, and
+capability requirements. Translations are not textual rewrites. Diagnostics
+refer to the source as written, the formatter keeps the sugar, and an
+implementation may represent a form natively when the meaning is the same;
+Krit's Core IR, for example, represents the early exit of `?` and let-else
+with a verified `exit` operation (`TYPES-AND-EFFECTS.md`).
+
+Two pseudo-forms appear only in translations: `return v` ends the call of the
+innermost enclosing named function with the value `v`, and `rest` stands for
+the statements and final expression that follow a statement in its block.
+Names that start with `$` are fresh names the program can neither write nor
+see (Core IR uses the same debug names); `P` and `Q` stand for patterns,
+`a` and `b` for the program's own binders, and the other letters for
+expressions.
+
+| Sugar | Meaning | Section |
+|---|---|---|
+| `e?`, where `e` is a `Result` | `match e { Ok($value) => $value, Err($error) => return Err($error) }` | 8.2 |
+| `e?`, where `e` is an `Option` | `match e { Some($value) => $value, None => return None }` | 8.2 |
+| `let P = e else Q => r; rest` | `match e { P => { rest }, Q => return r }`, with `P`'s binder declared in the enclosing block as a `let` declares its name | 8.3 |
+| `match e { Ok(Some(a)) => x, Ok(None) => y, Err(b) => z }` | `match e { Ok($payload) => match $payload { Some(a) => x, None => y }, Err(b) => z }`: one match per position of a nested pattern | 11 |
+| `HttpResponse { status: s, body }` | `record { status: s, headers: [], body: body }`: every field of the contract record in its declared order, with the spec-fixed default for each field not written; written values evaluate in source order | 8.4 |
+| `["k": v, "l": w]` | `[record { name: "k", value: v }, record { name: "l", value: w }]` | 11 |
+| `"a\(x.y)b"` | `"a" + x.y + "b"` | 9.1 |
+| a text block | the string of its content lines, dedented and joined by `\n`, with its holes translated as in an interpolated string | 3, 9.1 |
+| `if a { x } else if b { y } else { z }` | `if a { x } else { if b { y } else { z } }`, without the extra nesting level | 4.1, 10 |
+
+In a pattern, `_` names no outcome, so a match stays exhaustive and disjoint
+(section 11); in edition 2026 it still binds a discard (section 7). The unit
+value `()` is a literal of the core, not sugar, and a doc comment `///` is
+trivia with no meaning in evaluation (section 2.1).
+
 ## 5. Program and block values
 
 Items execute in source order.
@@ -490,7 +624,10 @@ Items execute in source order.
 - An expression followed by `;` evaluates for effects and then produces unit.
 - A block's final expression without `;` is the block value.
 - An empty block or a block ending in a statement produces unit.
-- A file's value is not printed automatically.
+- A file has no value and prints nothing by itself; output comes only from
+  `print` and `println` (section 12).
+- A `?` or let-else exit ends the enclosing function call early (sections
+  8.2 and 8.3); the statements after it in that call do not run.
 
 The unit value is written `()`, in source and when printed. Statements and
 empty blocks produce it too. `()` evaluates to unit with no effect and is
@@ -509,11 +646,12 @@ The normative runtime value kinds are:
 - immutable record
 - built-in `Option` variant (`Some` or `None`)
 - built-in `Result` variant (`Ok` or `Err`)
-- opaque host secret handle
+- opaque host secret handle (`Secret`)
+- opaque host database transaction handle (`DatabaseTransaction`)
 - function closure
 
-Integer overflow is a runtime error. Division truncates toward zero. Division
-or remainder by zero is a runtime error.
+Integer overflow is a runtime error (`K4005`). Division truncates toward
+zero. Division or remainder by zero is a runtime error (`K4004`).
 
 The elements of a list share one static type (`TYPES-AND-EFFECTS.md`).
 
@@ -527,7 +665,10 @@ composition: it cannot be printed, compared, JSON-encoded, or placed in a
 list, record, or user-constructed `Result`. The sole `Option` exception is a
 direct `Some(secret)` bearer argument to `http_request`; no other
 `Option<Secret>` storage is accepted. The host injects the credential without
-exposing bytes to guest code.
+exposing bytes to guest code, and only into an origin the manifest binds the
+secret to (`CAPABILITIES.md`, "Secret binding"). A `DatabaseTransaction` is
+opaque in the same way and may appear only as the first argument of a
+database operation (section 13.1).
 
 ## 7. Bindings and scope
 
@@ -558,7 +699,7 @@ In a pattern (sections 8.3 and 11), `_` is also a wildcard: the rules that
 keep a `match`'s arms disjoint and exhaustive treat it as matching any value
 without naming an outcome, so `Err(_)` names `Err` and `_ =>` is a catch-all.
 In edition 2026 a pattern's `_` still binds the value at its position as a
-discard binding, as in 0.2, so reading `_` in the arm of a `match` or
+discard binding, so reading `_` in the arm of a `match` or
 let-else, or after a let-else pattern, refers to the pattern's own `_` (in
 `[_, .._]`, the later one, the tail) with warning `K2003`. Edition 2027 makes
 every read of `_` an error, which leaves a pattern's `_` a pure wildcard.
@@ -570,13 +711,14 @@ reuse a built-in name that the parser does not reserve, such as `state_get`,
 and within its arm the name refers to the binder.
 
 Function declarations are visible from their declaration to the end of their
-containing scope and may call themselves recursively. Mutually recursive
-declarations are not supported in the dynamic baseline.
+containing scope and may call themselves recursively. A function is not
+visible before its declaration, so two functions cannot call each other: the
+earlier one's reference to the later one is an undefined name (`K2001`).
 
-Webhook declarations introduce a function binding with the same lexical
-visibility and recursion rules as an ordinary function declaration. The
-`webhook` modifier additionally marks that function as the source module's
-single exported host entrypoint.
+Entrypoint declarations (`webhook`, `queue`, and `schedule`) introduce a
+function binding with the same lexical visibility and recursion rules as an
+ordinary function declaration. The modifier additionally marks that function
+as the source module's single exported host entrypoint.
 
 Krit uses lexical scope. A function expression captures bindings from the
 environment where it is created, not where it is called.
@@ -600,19 +742,25 @@ let add_one = fn(value) {
 };
 ```
 
-Arguments evaluate from left to right. The argument count must equal the
-parameter count, and only a function can be called; checking reports either
-violation before evaluation (section 14).
+A call evaluates its callee, then its arguments from left to right, then the
+function's body with each parameter bound to its argument. The argument count
+must equal the parameter count (`K3003`), and only a function can be called
+(`K3002`); checking reports either violation before evaluation (section 14).
+A function's value is its body block's value, unless a `?` or let-else in
+that body exits early (sections 8.2 and 8.3).
 
-Function values and opaque `Secret` values cannot be compared, including when
-nested in an ordinary structural value.
+Function values and the opaque `Secret` and `DatabaseTransaction` values
+cannot be compared, including when nested in an ordinary structural value
+(`K3006`, `K3009`, `K3010`).
 
 Annotations may be written on let bindings, parameters, and function return
 values:
 
 ```krit
-let request: Record { path: String, retry: Option<Int> } =
-    record { path: "/events", retry: Some(2) };
+let request: Record { path: String, retry: Option<Int> } = record {
+    path: "/events",
+    retry: Some(2),
+};
 
 fn attempt(value: Int) -> Result<Int, String> {
     Ok(value)
@@ -624,10 +772,10 @@ them through static analysis without executing the program. `krit run`
 performs the same checking before it evaluates anything and refuses a
 program that fails it (section 14), so annotations hold in direct evaluation
 too. It then refuses checked programs that need an entrypoint or host
-contract so unavailable hosts fail explicitly rather than fabricating a
-value. Static checking is specified in `TYPES-AND-EFFECTS.md`.
+contract (`K5003`), so unavailable hosts fail explicitly rather than
+fabricating a value. Static checking is specified in `TYPES-AND-EFFECTS.md`.
 
-## 8.1 Webhook contract types
+### 8.1 Webhook contract types
 
 The edition-2026 built-in names below are fixed aliases with stable public
 names and closed structural shapes:
@@ -652,9 +800,11 @@ Header order is preserved and duplicate header names are representable.
 `HttpResponse` is exact: a response with a missing or additional field is a
 type error. Status-range validation belongs to the component HTTP host, not the
 static type checker. These built-ins do not add general user-defined type
-alias syntax.
+alias syntax. `LogField` (section 13.1) has the same shape as `HttpHeader`,
+and the delivery contracts `QueueJob` and `ScheduleEvent` are defined in
+section 13.2.
 
-## 8.2 Error propagation
+### 8.2 Error propagation
 
 Postfix `?` unwraps a `Result` or an `Option` and returns its failure from the
 enclosing function:
@@ -712,7 +862,7 @@ return type and ends with a verified function exit (`TYPES-AND-EFFECTS.md`,
 "Error propagation"), which components lower to a WebAssembly `return`
 (`WASM-SANDBOX.md`).
 
-## 8.3 Let-else
+### 8.3 Let-else
 
 A let-else binds the payload of one variant and makes the enclosing function
 return when the value is the other variant:
@@ -794,14 +944,20 @@ expression, and ends with a verified function exit (`TYPES-AND-EFFECTS.md`,
 (`WASM-SANDBOX.md`). A body of many let-else statements therefore nests no
 deeper than one of them.
 
-## 8.4 Named construction
+### 8.4 Named construction
 
 The contract records `HttpRequest`, `HttpResponse`, `HttpHeader`, and
 `LogField` (section 13.1) can be built by name:
 
 ```krit
+fn ready(body: String) -> HttpResponse {
+    HttpResponse { status: 200, body }
+}
+
 let fetch = HttpRequest { method: "GET", path: "/issues/1" };
-let response = HttpResponse { status: 200, body };
+
+println(fetch.query == "");
+println(ready("done").headers == []);
 ```
 
 A field written as its name alone is punned: `body` means `body: body`, a
@@ -838,7 +994,9 @@ record, including these four.
 
 ## 9. Operators
 
-Operators evaluate left to right.
+A binary operator evaluates its left operand and then its right one, except
+that `&&` and `||` short-circuit. Precedence and associativity follow the
+grammar (section 4).
 
 | Operator | Operands | Result |
 |---|---|---|
@@ -853,12 +1011,16 @@ Operators evaluate left to right.
 | `!` | boolean | boolean |
 | `&&`, `||` | booleans | boolean |
 
-`&&` and `||` short-circuit. All other binary operators evaluate both
-operands.
+`&&` evaluates its right operand only when the left one is `true`, and `||`
+only when it is `false`. All other binary operators evaluate both operands.
 
 Equality is structural for integers, booleans, strings, unit, lists, records,
-`Option`, and `Result`. Comparing a function directly or inside any composite
-value is a runtime error.
+`Option`, and `Result`. Comparing a function, a `Secret`, or a
+`DatabaseTransaction`, directly or inside a composite value, is rejected
+statically (`K3006`, `K3009`, `K3010`). Every operator of this table lowers to
+WebAssembly for the operand kinds that have a component layout, including
+string `+`, `==`, `!=`, and ordering; equality of lists, records, options,
+and results does not build yet (`WASM-SANDBOX.md`, "Support checking").
 
 Strings are ordered byte-lexicographically over their UTF-8 encoding: the
 first differing byte, compared as an unsigned value, decides, and a proper
@@ -873,7 +1035,7 @@ so `a == b` exactly when neither `a < b` nor `b < a`.
 No implicit conversions occur. In particular, integers and strings are not
 automatically converted for `+`, and non-booleans are not truthy.
 
-## 9.1 Interpolated strings and text blocks
+### 9.1 Interpolated strings and text blocks
 
 An interpolated string or a text block (section 3) is an expression of type
 `String`: the concatenation of its text and its holes from left to right.
@@ -897,17 +1059,24 @@ text block with holes means the same concatenation of its dedented lines.
 ## 10. Conditionals
 
 ```krit
-if condition {
-    consequent
-} else {
-    alternative
+fn sign(value: Int) -> String {
+    if value < 0 {
+        "negative"
+    } else if value == 0 {
+        "zero"
+    } else {
+        "positive"
+    }
 }
+
+println(sign(-3));
 ```
 
-The condition must be boolean. Only the selected branch evaluates.
-`else if` is accepted through the grammar above; a continuation does not add
-a nesting level (section 4.1). Both branches should eventually have the same
-static type.
+The condition must be a `Bool` (`K3001`); nothing is truthy. Only the selected
+branch evaluates. Both branches must have the same type, which is the type of
+the `if` (`K3001` otherwise). Every `if` has an `else`. `else if` continues a
+chain: it means an `else` block holding the next `if`, and a continuation does
+not add a nesting level (section 4.1), so a long chain stays flat.
 
 ## 11. Records, lists, and matching
 
@@ -915,6 +1084,7 @@ Record literal and field access:
 
 ```krit
 let response = record { status: 200, body: "ready" };
+
 println(response.status);
 ```
 
@@ -930,17 +1100,24 @@ reports the method call (`K3011`) with the standard-library function
 (section 12.1) to use instead when there is one, such as `string_byte_len(s)`
 for `s.len()`.
 
-List literal:
+A list literal evaluates its elements from left to right:
 
 ```krit
-[1, 2, 3]
+println([1, 2, 3]);
 ```
 
 An **entry list** writes a list of name/value records, such as HTTP headers
 and log fields:
 
 ```krit
-["accept": "application/json", "x-request-id": id]
+let id = "req-1";
+let headers = ["accept": "application/json", "x-request-id": id];
+let spelled = [
+    HttpHeader { name: "accept", value: "application/json" },
+    HttpHeader { name: "x-request-id", value: id },
+];
+
+println(headers == spelled);
 ```
 
 `["k1": v1, "k2": v2]` means
@@ -959,20 +1136,26 @@ cannot mix entries with plain elements (section 4).
 The only list decomposition construct in edition 2026 is matching:
 
 ```krit
-match items {
-    [] => 0,
-    [head, ..tail] => head + sum(tail),
+fn sum(items: List<Int>) -> Int {
+    match items {
+        [] => 0,
+        [head, ..tail] => head + sum(tail),
+    }
 }
+
+println(sum([10, 20, 12]));
 ```
 
 A `match` evaluates its subject once, then the value of the one arm whose
 pattern matches the subject's value:
 
 ```krit
-match state_get("agent-work", key) {
-    Ok(Some(saved)) => saved,
-    Ok(None) => "missing",
-    Err(error) => "failed: " + error,
+fn saved_summary(key: String) -> String {
+    match state_get("agent-work", key) {
+        Ok(Some(saved)) => saved,
+        Ok(None) => "missing",
+        Err(error) => "failed: " + error,
+    }
 }
 ```
 
@@ -1024,41 +1207,61 @@ arm's value has the match's type. A match adds the effects and capability
 requirements of its subject and of every arm's value, and nothing of its own.
 `TYPES-AND-EFFECTS.md` ("Matching") gives the order of these checks.
 
-## 12. Built-in output
+## 12. Built-in functions and output
+
+Every reserved built-in name (section 2) is one of:
+
+- a variant constructor, `Some`, `Ok`, and `Err`, or the value `None`;
+- an output function, `print` or `println` (this section);
+- a standard-library function (section 12.1);
+- a JSON conversion, `json_encode` or `json_decode` (section 13);
+- a host operation, such as `config_string` or `http_request`
+  (section 13.1).
+
+Each built-in is a value: it can be bound and passed like any function, and
+it takes part in checking with a fixed type. Host operations additionally
+require direct literal resources (section 13.1), and component targets
+require every built-in other than `print` and `println` to be called
+directly (`WASM-SANDBOX.md`).
+
+`print` writes its argument without a line break, and `println` writes it
+followed by one line feed. Both return unit, and the argument evaluates
+before anything is written:
 
 ```krit
+let value = 42;
+
 print(value);
 println(value);
 ```
-
-`print` writes without a line break. `println` appends one line feed. Both
-return unit. Arguments evaluate before output.
 
 Output rendering is deterministic:
 
 - booleans: `true` or `false`
 - integers: base ten without separators
-- strings: raw UTF-8 contents
+- strings: raw UTF-8 contents at the top level; a string inside a list,
+  record, or variant is written quoted, with escapes
 - unit: `()`
-- lists: `[item, item]`; nested strings use quoted escaped syntax
-- records: `record { field: value }` in source field order
+- lists: `[item, item]`
+- records: `record { field: value }` in the record's field order
 - variants: `Some(value)`, `None`, `Ok(value)`, or `Err(value)`
 - functions: `<function>` or `<function name>`
 
-Output is the only host effect executable by the direct evaluator. It is
-modeled as `io.stdout`. The component runtime additionally provides bounded
-`config.read`, `secret.read`, `http.request`, `ai.invoke`, and `observe.log`
-interfaces plus `state.transaction`, `queue.publish`, `object.read`,
-`object.write`, `database.read`, `database.write`, `cache.read`, `cache.write`,
-`search.query`, and `search.vector` to typed webhook, queue,
-and schedule artifacts.
+Output is the only host effect the direct evaluator can perform. It is
+modeled as `io.stdout`. The component runtime additionally provides the
+bounded `config.read`, `secret.read`, `http.request`, `ai.invoke`, and
+`observe.log` interfaces plus `state.transaction`, `queue.publish`,
+`object.read`, `object.write`, `database.read`, `database.write`,
+`cache.read`, `cache.write`, `search.query`, and `search.vector` to typed
+webhook, queue, and schedule artifacts (section 13.1).
 
-## 12.1 Standard library
+### 12.1 Standard library
 
-The standard library is a fixed set of built-in functions. Each is pure: it
-has no effect, needs no capability, and returns the same result for the same
-arguments in every implementation and target. Names are flat, prefixed by the
-kind of value they work on:
+The standard library is a fixed set of built-in functions, first shipped in
+Krit 0.3 (standard library v0). Each is pure: it has no effect, needs no
+capability, and returns the same result for the same arguments in every
+implementation and target, in `krit run`, the language server, and every
+component. Names are flat, prefixed by the kind of value they work on:
 
 | Function | Type |
 |---|---|
@@ -1148,6 +1351,10 @@ warning `K9013` (`DIAGNOSTICS.md`); a segment taken from a
 `url_path_segment` result with `?`, let-else, or a `match` counts as
 encoded.
 
+There are no list, option, map, or JSON functions in the standard library
+yet; `docs/roadmap.md` (section 5.6) plans them. Lists are taken apart with
+list patterns (section 11) and recursion.
+
 ## 13. JSON conversion
 
 `json_encode(value)` returns a compact deterministic JSON string.
@@ -1170,9 +1377,16 @@ with exactly one `Some`, `None`, `Ok`, or `Err` key is decoded as that variant.
 Consequently, those four single-key shapes are reserved as JSON variant tags.
 
 JSON numbers must be signed 64-bit integers; floating-point and out-of-range
-numbers are rejected. Encoding a function directly or inside another value is
-`K4008`. `Secret` is rejected statically and can never reach JSON conversion.
-Invalid JSON or JSON without a Krit representation is `K4009`.
+numbers are rejected. Encoding a function, directly or inside another value,
+is rejected statically (`K3006`), and so is encoding a `Secret` (`K3009`) or a
+`DatabaseTransaction` (`K3010`); in a checked program no value reaches
+`json_encode` that it cannot encode. Invalid JSON or JSON without a Krit
+representation is `K4009`.
+
+`json_decode` is not schema-directed: it returns whatever value the JSON
+text holds, and its static type is inferred from how the result is used. A
+decoded value that lacks the kind or fields its use requires fails at that
+use with `K4001` (section 14).
 
 Decoded JSON text may be surrounded by JSON whitespace (space, tab, line
 feed, carriage return). Strings decode every RFC 8259 escape: `\"`, `\\`,
@@ -1190,9 +1404,13 @@ JSON that is not a string, which the evaluator would return unchecked. All
 other component JSON shapes remain `K7002`; there is no evaluator fallback
 (see `WASM-SANDBOX.md`, "Guest JSON string decoding").
 
-## 13.1 Configuration, secret, HTTP, AI, logging, durable-state, queue, and object host contracts
+### 13.1 Host operations
 
-```krit
+Host operations are the only way a program reaches anything outside itself.
+Each is fallible and returns a `Result`, whose `Err` the program must handle
+or pass on with `?`:
+
+```text
 config_string("agent.model") // Result<String, String>
 secret("github-token")       // Result<Secret, String>
 http_request(
@@ -1222,6 +1440,11 @@ db_query(transaction, "count-visits", []) // Result<String, String>
 db_execute(transaction, "record-visit", [path]) // Result<Int, String>
 db_commit(transaction) // Result<Unit, String>
 db_rollback(transaction) // Result<Unit, String>
+cache_get("lookups", key) // Result<Option<String>, String>
+cache_put("lookups", key, value, ttl_seconds) // Result<Unit, String>
+cache_delete("lookups", key) // Result<Unit, String>
+search_query("docs", query, limit) // Result<String, String>
+vector_search("embeddings", vector, limit) // Result<String, String>
 ```
 
 A direct string literal is a one-line string without holes (section 3);
@@ -1238,6 +1461,10 @@ requirements would not be statically knowable. A configuration read has
 effect `config.read` and
 requirement pair `("config.read", "agent.model")`. Secret acquisition has
 effect `secret.read`; outbound HTTP has `http.request` and the exact origin.
+Checking does not relate a secret to the origin it is sent to: the host
+injects a secret only into an origin its manifest binding lists, and refuses
+any other pairing with `K5006` before a byte is sent (`CAPABILITIES.md`,
+"Secret binding").
 
 `ai_invoke` requires a direct canonical adapter-name literal and adds
 `ai.invoke("adapter")`. It returns bounded raw UTF-8 model text. The text is
@@ -1280,13 +1507,28 @@ closed. Query results are bounded deterministic JSON text because protocol 1 has
 no richer typed row value. The complete transaction, catalog, and crash
 semantics are normative in `DATABASE.md`.
 
-## 13.2 Typed delivery entrypoints
+Cache namespaces and search index names are direct canonical literals as
+well. `cache_get` adds `cache.read("namespace")`, `cache_put` and
+`cache_delete` add `cache.write("namespace")`, and `search_query` and
+`vector_search` add `search.query("index")` and `search.vector("index")`.
+Both services are optional: a hit, a miss, and an outage are distinct values
+the program handles, so no result may depend on the cache being available.
+The complete contract is normative in `CACHE-AND-SEARCH.md`.
 
-A module declares at most one `webhook`, `queue`, or `schedule` entrypoint:
+### 13.2 Typed delivery entrypoints
+
+A module declares at most one `webhook`, `queue`, or `schedule` entrypoint.
+A queue consumer handles one durable job:
 
 ```krit
-queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> { Ok(job.id) }
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    Ok(job.id)
+}
+```
 
+A schedule handler handles one host-owned trigger:
+
+```krit
 schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
     Ok(event.id)
 }
@@ -1300,7 +1542,10 @@ name's place is read as a declaration too, and is `K1002` because the name is
 not a direct literal. The declared name is the exact resource of the
 `queue.consume("queue")` or `schedule.trigger("schedule")` requirement.
 
-`QueueJob` is the closed contract
+The signatures are exact: `(QueueJob) -> Result<String, String>` and
+`(ScheduleEvent) -> Result<String, String>` (`K3007` otherwise). `?` and
+let-else work in both bodies (sections 8.2 and 8.3). `QueueJob` is the closed
+contract
 `Record { queue: String, id: String, body: String, attempt: Int, maxAttempts: Int }`.
 `ScheduleEvent` is the closed contract `Record { schedule: String, id: String,
 scheduledAtMillis: Int, firedAtMillis: Int, attempt: Int, maxAttempts: Int }`.
@@ -1312,11 +1557,12 @@ the host retry or dead-letter under its configured policy. `detail` is bounded
 and is never interpreted as control flow.
 
 The source checker does not require a manifest. Package build orchestration
-checks requirements against the schema-1 manifest. The direct evaluator emits
-`K5003` because these host operations are unavailable there; it never
-substitutes an empty string, environment variable, network response, or secret
-bytes. `krit invoke` and `krit serve` execute the separately built component
-with explicit immutable host inputs.
+checks requirements against the schema-1 manifest (`K5001` for a missing
+grant). `krit run` refuses every program that declares an entrypoint or uses
+a host operation with `K5003` before evaluating anything (section 14); it
+never substitutes an empty string, environment variable, network response, or
+secret bytes. `krit invoke`, `krit serve`, `krit worker`, and `krit schedule`
+execute the separately built component with explicit immutable host inputs.
 
 ## 14. Evaluation failure
 
@@ -1326,8 +1572,9 @@ verification. It never runs the WebAssembly target check that `krit check`
 adds for `--target` or for entrypoint files (`DIAGNOSTICS.md`, Build-target
 diagnostics), because direct evaluation builds no artifact. A program that
 fails checking is never evaluated: `run` reports the same diagnostic with the
-same exit status as `check` and writes no program output. Warnings that checking reports, such as `K2003`, are
-printed exactly as `check` prints them and never prevent evaluation.
+same exit status as `check` and writes no program output. Warnings that
+checking reports, such as `K2003` and `K9013`, are printed exactly as `check`
+prints them and never prevent evaluation.
 
 A program that passes checking is still refused before evaluation, with
 `K5003` and exit status 4, when it declares a webhook, queue, or schedule
@@ -1337,17 +1584,24 @@ provides no entrypoint invocation and no host other than standard output.
 The following are errors rather than implementation-defined behavior.
 Checking reports these, so a program containing one is never evaluated:
 
-- malformed UTF-8 or tokens
-- malformed syntax
-- unresolved names
-- wrong operand, condition, subject, or callee kind
+- malformed UTF-8 or tokens, and invalid strings, holes, or text blocks
+- malformed syntax, including constructs from other languages (section 4.2)
+- syntax or inferred types nested past the limits of section 4.1
+- unresolved or duplicate names
+- wrong operand, condition, subject, callee, or annotation type
 - incorrect argument count
-- function comparison
-- missing record field
-- JSON encoding of a function
-- non-literal configuration, secret, HTTP-origin, AI-adapter, log-event,
-  state-store, checkpoint, or replay-operation resource
-- printing, comparing, encoding, or structurally storing an opaque secret
+- comparison of a function or an opaque value
+- missing record field, and unknown, repeated, or missing named-construction
+  fields (section 8.4)
+- an interpolation hole that is not a `String` (section 9.1)
+- JSON encoding of a function or an opaque value
+- a host-operation resource that is not a direct canonical literal: a
+  configuration key, secret, HTTP origin, AI adapter, log event, store,
+  checkpoint, replay operation, queue, bucket, database, statement, cache
+  namespace, or search index
+- printing, comparing, encoding, or structurally storing an opaque `Secret`
+  or `DatabaseTransaction`
+- an entrypoint that is nested, repeated, or has the wrong signature
 - `?` outside a named function that returns its operand's family, or with a
   different error type (section 8.2)
 - a let-else that is not a direct statement of a named function's body, whose
@@ -1359,7 +1613,8 @@ Checking reports these, so a program containing one is never evaluated:
 Evaluation reports these (standard-library calls in a checked program
 never fail, section 12.1):
 
-- integer literal outside signed 64-bit range
+- integer literal outside the signed 64-bit range (`K4005`; a literal too
+  long for the parser's 128-bit reading is `K4005` already when parsing)
 - integer overflow
 - division or remainder by zero
 - invalid or unsupported JSON
@@ -1399,9 +1654,29 @@ stack is exhausted.
 
 ## 15. Determinism
 
-For the same source, compiler version, edition, arguments, standard input, and
-explicit capability responses, a conforming implementation produces the same
-value, output bytes, and diagnostic code.
+For the same source, compiler version, edition, command-line arguments, and
+host inputs (host configuration, the delivered request, job, or trigger, and
+every host response, such as an HTTP response or model output), a conforming
+implementation produces the same value, output bytes, diagnostics, and build
+artifacts:
+
+- Evaluation order is fully specified. Callees, arguments, operands, list
+  elements, entries, and record and construction fields evaluate from left to
+  right in source order; only the selected branch of an `if` or `match`, and
+  the needed operands of `&&` and `||`, evaluate; and a `?` or let-else exit
+  stops evaluation at a defined point (sections 8.2 and 8.3).
+- A program has no ambient inputs: no clock, randomness, environment
+  variables, files, or standard input. Time reaches a program only as
+  host-supplied data, such as the instants of a `ScheduleEvent`.
+- Model output and other host responses are outside data. They may differ
+  between invocations, and the program must validate them; durable replay
+  lets a retry see the result an earlier attempt recorded
+  (`DURABLE-STATE.md`).
+- Diagnostics have deterministic codes, severities, primary spans, messages,
+  and order (`DIAGNOSTICS.md`), and JSON output sorts object keys where this
+  specification says so (section 13).
+- `krit build` writes byte-identical components and metadata for the same
+  package and compiler (`WASM-SANDBOX.md`).
 
 Hash iteration, memory addresses, host paths, timestamps, and stack traces
 must not affect user-visible output.

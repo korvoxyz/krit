@@ -1,7 +1,7 @@
 # Guided AI authoring
 
-**Status:** Implemented Phase 5 baseline
-**Target:** Krit 0.2, authoring protocol 1
+**Status:** Implemented baseline (since Phase 5)
+**Target:** Krit 0.3, authoring protocol 1
 **Deterministic language-server status:** Implemented
 **Review-gated assistance status:** Implemented
 
@@ -48,8 +48,17 @@ Always available and offline:
 
 This layer supplies facts to both people and models.
 
-The 0.2 bootstrap provides the comment-preserving canonical formatter,
-`krit fmt --check`, and the first deterministic language-server milestone.
+Krit 0.3 provides the comment-preserving canonical formatter,
+`krit fmt --check`, and the deterministic language server. Its diagnostics
+are written for repair: constructs that models import from other languages
+(`return`, loops, assignment, `class`, `import`, `await`, `throw`, indexing,
+arrow functions, the conditional operator, `switch`, and
+`else { return ... }`) each have their own code (`K1101`-`K1112`) with a
+one-line fix; undefined names suggest the closest visible name and `None` for
+`null`; method calls name the standard-library function to use; a
+non-exhaustive `match` lists every missing pattern; and warnings (`K2003`,
+`K9013`) are reported without failing the check (`DIAGNOSTICS.md`). Unused
+binding and capability detection are planned lints, not yet implemented.
 `krit lsp` now supplies compiler diagnostics, canonical document edits, a
 format fix action, type/effect/resource hover (with a function's `///` doc
 comment at its declaration and its uses), bounded completion, document
@@ -336,8 +345,9 @@ specific language version and edition. The pack contains:
 Claude, ChatGPT, Gemini, and local models receive the same semantic material.
 Provider adapters change transport, not language rules.
 
-Every embedded Krit example is parsed in CI. Draft features are excluded until
-their compiler support ships. This prevents a model from generating future
+Every embedded Krit example is checked in CI: it must parse, pass analysis
+without warnings, and be canonically formatted. Draft features are excluded
+until their compiler support ships. This prevents a model from generating future
 syntax against the current compiler.
 
 The exact current pack is printable with `krit prompt`. Generated text remains

@@ -24,19 +24,19 @@ milestone and are specified by their later normative documents.
 
 Edition 2026 reserves these fallible host built-ins:
 
-```krit
+```text
 ai_invoke("reviewer", input) // Result<String, String>
 
-log_info(
-    "review.started",
-    [record { name: "delivery", value: delivery }],
-) // Result<Unit, String>
+log_info("review.started", ["delivery": delivery]) // Result<Unit, String>
 
-log_error("review.failed", [record { name: "reason", value: reason }])
-// Result<Unit, String>
+log_error("review.failed", ["reason": reason]) // Result<Unit, String>
 ```
 
-`LogField` is the closed built-in alias:
+A field list is any `List<LogField>`: an entry list such as
+`["delivery": delivery]`, `LogField { name, value }` constructions, or
+`record { name: ..., value: ... }` literals all mean the same list
+(`LANGUAGE.md` sections 8.4 and 11). `LogField` is the closed built-in
+alias:
 
 ```text
 LogField = Record { name: String, value: String }
