@@ -324,11 +324,14 @@ fn system_prompt_maps_every_habit_code_and_documents_the_standard_library() {
     // Every standard-library function and its exact type, as the
     // standard-library section of LANGUAGE.md lists them.
     let language = read("spec/LANGUAGE.md");
+    // The section may be a top-level `##` section or a `###` subsection; it
+    // ends at the next heading of either level.
+    let is_heading = |line: &str| line.starts_with("## ") || line.starts_with("### ");
     let section: Vec<&str> = language
         .lines()
-        .skip_while(|line| !(line.starts_with("## ") && line.contains("Standard library")))
+        .skip_while(|line| !(is_heading(line) && line.contains("Standard library")))
         .skip(1)
-        .take_while(|line| !line.starts_with("## "))
+        .take_while(|line| !is_heading(line))
         .collect();
     assert!(
         !section.is_empty(),
