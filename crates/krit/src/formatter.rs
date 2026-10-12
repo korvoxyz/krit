@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    Block, Diagnostic, Expression, ExpressionKind, Pattern, PatternKind, Program, Source, Span,
-    Statement, StatementKind, StringPart, TypeAnnotation, TypeKind,
+    BinaryOperator, Block, Diagnostic, Expression, ExpressionKind, Pattern, PatternKind, Program,
+    Source, Span, Statement, StatementKind, StringPart, TypeAnnotation, TypeKind,
     lexer::{Comment, lex_with_comments},
     parser,
     token::{TemplatePart, Token, TokenKind},
@@ -15,7 +15,7 @@ pub const FORMAT_LINE_WIDTH: usize = 100;
 pub fn format_source(source: &Source) -> Result<String, Diagnostic> {
     let lexed = lex_with_comments(source)?;
     let program = parser::parse(source, lexed.tokens.clone())?;
-    Ok(Formatter::new(lexed.tokens, lexed.comments, &program).format())
+    Ok(Formatter::new(source.text(), lexed.tokens, lexed.comments, &program).format())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,6 +60,19 @@ struct ActiveGroup {
     multiline: bool,
 }
 
+/// A binary operator chain: operands joined by the operators of one
+/// precedence level, such as `a + b - c` or `x && y && z`. Each operand may
+/// hold chains of its own, of a higher level or in parentheses.
+#[derive(Clone, Debug)]
+struct OperatorChain {
+    /// The first token of the first operand.
+    first: usize,
+    /// The last token of the last operand.
+    last: usize,
+    /// The operator tokens, in source order.
+    operators: Vec<usize>,
+}
+
 struct Formatter {
     tokens: Vec<Token>,
     /// Tokens the canonical form leaves out: the `: name` of a construction
@@ -79,6 +92,22 @@ struct Formatter {
     /// The `;` of each let-else whose arm was moved to its own, indented
     /// line, innermost last; the indentation ends after it.
     let_else_indents: Vec<usize>,
+    chains: Vec<OperatorChain>,
+    /// The chains that start at each token, outermost first.
+    chain_starts: HashMap<usize, Vec<usize>>,
+    /// The chains that end at each token.
+    chain_ends: HashMap<usize, Vec<usize>>,
+    /// The chain each operator token belongs to.
+    chain_operators: HashMap<usize, usize>,
+    /// For each token, the innermost chain whose operands hold it.
+    innermost_chains: Vec<Option<usize>>,
+    /// For each chain, the innermost chain whose operands hold it.
+    parent_chains: Vec<Option<usize>>,
+    /// Whether each chain breaks before every operator; decided when its
+    /// first token is written.
+    broken_chains: Vec<bool>,
+    /// The indentation each broken chain adds to its continuation lines.
+    chain_indents: Vec<usize>,
     active_groups: Vec<ActiveGroup>,
     closing_group: Option<ActiveGroup>,
     writer: Writer,
@@ -87,9 +116,41 @@ struct Formatter {
 }
 
 impl Formatter {
-    fn new(tokens: Vec<Token>, mut comments: Vec<Comment>, program: &Program) -> Self {
-        let token_text = tokens.iter().map(canonical_token_text).collect::<Vec<_>>();
+    fn new(text: &str, tokens: Vec<Token>, mut comments: Vec<Comment>, program: &Program) -> Self {
+        let token_text = tokens
+            .iter()
+            .map(|token| canonical_token_text(token, text))
+            .collect::<Vec<_>>();
         let syntax = SyntaxMap::new(program, &tokens);
+        let mut chain_starts = HashMap::<usize, Vec<usize>>::new();
+        let mut chain_ends = HashMap::<usize, Vec<usize>>::new();
+        let mut chain_operators = HashMap::new();
+        for (id, chain) in syntax.chains.iter().enumerate() {
+            chain_starts.entry(chain.first).or_default().push(id);
+            chain_ends.entry(chain.last).or_default().push(id);
+            for operator in &chain.operators {
+                chain_operators.insert(*operator, id);
+            }
+        }
+        // Chains that start together nest: the one that ends last holds the
+        // others, and is decided first.
+        for starting in chain_starts.values_mut() {
+            starting.sort_unstable_by_key(|id| std::cmp::Reverse(syntax.chains[*id].last));
+        }
+        // Chains nest or are disjoint, so marking each chain's tokens, outer
+        // chains first, leaves every token marked with its innermost chain.
+        let mut innermost_chains = vec![None; tokens.len()];
+        let mut outer_first = (0..syntax.chains.len()).collect::<Vec<_>>();
+        outer_first.sort_unstable_by_key(|id| {
+            let chain = &syntax.chains[*id];
+            (chain.first, std::cmp::Reverse(chain.last))
+        });
+        let mut parent_chains = vec![None; syntax.chains.len()];
+        for id in outer_first {
+            let chain = &syntax.chains[id];
+            parent_chains[id] = innermost_chains[chain.first];
+            innermost_chains[chain.first..=chain.last].fill(Some(id));
+        }
         canonicalize_doc_comments(&mut comments, &syntax.doc_spans);
         let omitted = punned_tokens(&tokens, &comments, &syntax.pun_values);
         let (groups, close_to_open) = build_groups(
@@ -108,6 +169,14 @@ impl Formatter {
             breaks_after: syntax.breaks_after,
             let_else_arms: syntax.let_else_arms,
             let_else_indents: Vec::new(),
+            broken_chains: vec![false; syntax.chains.len()],
+            chain_indents: vec![0; syntax.chains.len()],
+            chains: syntax.chains,
+            chain_starts,
+            chain_ends,
+            chain_operators,
+            innermost_chains,
+            parent_chains,
             tokens,
             token_text,
             comments,
@@ -132,7 +201,13 @@ impl Formatter {
             if self.close_to_open[index].is_some() {
                 self.insert_trailing_comma_if_needed(index);
             }
+            let breaks_before = self.break_before_chain_operator(index);
             self.emit_comments_before(self.tokens[index].span.start);
+            if breaks_before && let Some(next) = self.tokens.get(index + 1) {
+                // A comment after the operator moves before it, so the
+                // operator still leads its operand's line.
+                self.emit_comments_before(next.span.start);
+            }
 
             if self.omitted[index] || self.should_skip_trailing_comma(index) {
                 continue;
@@ -142,6 +217,7 @@ impl Formatter {
                 self.close_group(index);
             }
 
+            self.decide_chains_starting_at(index);
             self.emit_token(index);
 
             if self.groups[index].is_some() {
@@ -149,6 +225,7 @@ impl Formatter {
             }
 
             self.request_break_after(index);
+            self.end_chains_at(index);
         }
 
         while self.comment_cursor < self.comments.len() {
@@ -204,11 +281,322 @@ impl Formatter {
         self.closing_group = None;
     }
 
+    /// Decides, outermost first, whether each chain that starts at `index`
+    /// breaks: when it holds a comment outside its delimited groups, or when
+    /// a line written with the chain unbroken would pass the width limit
+    /// (`line_end`). A chain inside a single-line group never breaks, since
+    /// that group fits on its line.
+    fn decide_chains_starting_at(&mut self, index: usize) {
+        let Some(chains) = self.chain_starts.get(&index).cloned() else {
+            return;
+        };
+        if self
+            .active_groups
+            .last()
+            .is_some_and(|group| !group.multiline)
+        {
+            return;
+        }
+        self.apply_pending_break();
+        let column = if self.writer.is_line_start() {
+            self.writer.indent * 4
+        } else {
+            self.writer.column() + usize::from(self.needs_space(index))
+        };
+        for chain in chains {
+            let last = self.chains[chain].last;
+            self.broken_chains[chain] = self.chain_has_comment(chain)
+                || self.line_end(index, last, column, None, Some(chain)) > FORMAT_LINE_WIDTH;
+        }
+    }
+
+    /// Whether a comment stands between two tokens of the chain outside every
+    /// delimited group within it.
+    fn chain_has_comment(&self, chain: usize) -> bool {
+        let OperatorChain { first, last, .. } = self.chains[chain];
+        if !self.comment_between(self.tokens[first].span.end, self.tokens[last].span.start) {
+            return false;
+        }
+        let mut depth = 0usize;
+        for index in first..last {
+            if is_open_delimiter(&self.tokens[index].kind) {
+                depth += 1;
+            } else if is_close_delimiter(&self.tokens[index].kind) {
+                depth = depth.saturating_sub(1);
+            }
+            if depth == 0
+                && self.comment_between(
+                    self.tokens[index].span.end,
+                    self.tokens[index + 1].span.start,
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether a comment lies entirely within the source range
+    /// `start..end`.
+    fn comment_between(&self, start: usize, end: usize) -> bool {
+        // Comments are in source order.
+        let first = self
+            .comments
+            .partition_point(|comment| comment.span.start < start);
+        self.comments
+            .get(first)
+            .is_some_and(|comment| comment.span.end <= end)
+    }
+
+    /// Before an operator of a broken chain, breaks the line, so the operator
+    /// leads the continuation line. The first operator indents the chain's
+    /// continuation lines, until the chain ends, one level deeper than the
+    /// line the chain starts on, and one more for each broken chain that
+    /// starts with it and holds it, so a chain that is the first operand of
+    /// another stays apart from the other's operators. Returns whether the
+    /// line breaks.
+    fn break_before_chain_operator(&mut self, index: usize) -> bool {
+        let Some(chain) = self.chain_operators.get(&index).copied() else {
+            return false;
+        };
+        if !self.broken_chains[chain] {
+            return false;
+        }
+        if self.chains[chain].operators.first() == Some(&index) {
+            let first = self.chains[chain].first;
+            let holders = self.chain_starts[&first]
+                .iter()
+                .take_while(|starting| **starting != chain)
+                .filter(|starting| self.broken_chains[**starting])
+                .count();
+            self.chain_indents[chain] = 1 + holders;
+            self.writer.indent += 1 + holders;
+        }
+        self.request_break(1);
+        true
+    }
+
+    /// Ends the continuation indentation of each broken chain that ends at
+    /// `index`. A broken chain that is the condition of an `if` or the
+    /// subject of a `match` puts the `{` that follows on its own line, so the
+    /// continuation lines stay apart from the block's first line.
+    fn end_chains_at(&mut self, index: usize) {
+        let Some(chains) = self.chain_ends.get(&index) else {
+            return;
+        };
+        let indent = chains
+            .iter()
+            .filter(|chain| self.broken_chains[**chain])
+            .map(|chain| self.chain_indents[*chain])
+            .sum::<usize>();
+        if indent == 0 {
+            return;
+        }
+        self.writer.indent = self.writer.indent.saturating_sub(indent);
+        let opens_body = self.tokens.get(index + 1).is_some_and(|token| {
+            matches!(token.kind, TokenKind::LeftBrace)
+                && self.groups[index + 1]
+                    .is_some_and(|group| matches!(group.kind, GroupKind::Block | GroupKind::Match))
+        });
+        if opens_body {
+            self.request_break(1);
+        }
+    }
+
+    /// The widest column that the lines holding the tokens `from..=through`
+    /// reach when those tokens are written as unbroken as they can be,
+    /// starting at `column` after the token `previous` (none for the line's
+    /// first token), or the first column found past the width limit.
+    ///
+    /// Within `from..=through`, a group that breaks wherever it stands, or
+    /// that is too wide to stay on one line from where it opens, breaks as
+    /// `open_group` decides: its line ends after its opening delimiter, and
+    /// the measurement goes on from its closing delimiter, at the start of a
+    /// line. When measuring the chain `chain`, a too-wide group counts as
+    /// passing the limit instead when `breaks_a_chain` says it breaks that
+    /// chain or one within it: one of three or more operands, so its
+    /// operands stay one per line, or one whose last operand holds an
+    /// argument list or parenthesized expression, so the operator leads that
+    /// operand's line instead of the arguments wrapping after it. A text
+    /// block, like a breaking group, goes on after its closing `"""`.
+    ///
+    /// After `through`, the last line goes on up to its next possible break:
+    /// a `,`, `;`, or let-else `else`, which stays on the line; the opening
+    /// delimiter of a group, which decides for itself; an operator of a
+    /// broken chain or the closing delimiter of a multiline group, which
+    /// starts the next line, counting the trailing comma that such a group
+    /// gains; or a comment.
+    fn line_end(
+        &self,
+        from: usize,
+        through: usize,
+        mut column: usize,
+        mut previous: Option<usize>,
+        chain: Option<usize>,
+    ) -> usize {
+        // The indentation of the line the measurement starts on, from which a
+        // text block that does not start a line takes its own.
+        let line_indent = if self.writer.is_line_start() {
+            self.writer.indent
+        } else {
+            self.writer.line_indent
+        };
+        let mut widest = 0;
+        let mut index = from;
+        while column <= FORMAT_LINE_WIDTH && index < self.tokens.len() {
+            let token = &self.tokens[index];
+            if matches!(token.kind, TokenKind::Eof)
+                || previous.is_some_and(|previous| {
+                    self.comment_between(self.tokens[previous].span.end, token.span.start)
+                })
+            {
+                break;
+            }
+            let after = index > through;
+            if after {
+                if self
+                    .chain_operators
+                    .get(&index)
+                    .is_some_and(|chain| self.broken_chains[*chain])
+                {
+                    break;
+                }
+                let closing = self.close_to_open[index].and_then(|open| {
+                    self.active_groups
+                        .iter()
+                        .rev()
+                        .find(|group| group.open == open)
+                });
+                if let Some(group) = closing
+                    && group.multiline
+                {
+                    if group.kind.allows_trailing_comma()
+                        && previous.is_some_and(|previous| {
+                            !matches!(self.tokens[previous].kind, TokenKind::Comma)
+                        })
+                    {
+                        column += 1;
+                    }
+                    break;
+                }
+            }
+            if self.omitted[index] || (!after && self.drops_trailing_comma(index)) {
+                index += 1;
+                continue;
+            }
+            let starts_line = previous.is_none() && self.writer.is_line_start();
+            if let Some(previous) = previous
+                && token_pair_needs_space(
+                    &self.tokens,
+                    &self.groups,
+                    &self.close_to_open,
+                    &self.type_tokens,
+                    previous,
+                    index,
+                    |_| false,
+                )
+            {
+                column += 1;
+            }
+            column += self.token_text[index].chars().count();
+            previous = Some(index);
+            if after {
+                let line_may_break = self.groups[index].is_some()
+                    || matches!(token.kind, TokenKind::Comma) && !self.generic_commas[index]
+                    || matches!(token.kind, TokenKind::Semicolon | TokenKind::Else)
+                    || self.breaks_after.contains_key(&token.span.end)
+                    || matches!(&token.kind, TokenKind::Template(template) if template.text_block.is_some());
+                if line_may_break {
+                    break;
+                }
+                index += 1;
+                continue;
+            }
+            if let TokenKind::Template(template) = &token.kind
+                && template.text_block.is_some()
+            {
+                // `Writer::write_text_block` puts the closing `"""` here.
+                if column > FORMAT_LINE_WIDTH {
+                    break;
+                }
+                widest = widest.max(column);
+                let level = if starts_line {
+                    line_indent
+                } else {
+                    line_indent + 1
+                };
+                column = level * 4 + 3;
+            } else if let Some(group) = self.groups[index] {
+                let too_wide = group.has_content && column + group.flat_width > FORMAT_LINE_WIDTH;
+                if too_wide && !group.forced_multiline && self.breaks_a_chain(index, chain) {
+                    return FORMAT_LINE_WIDTH + 1;
+                }
+                if group.forced_multiline || too_wide {
+                    if column > FORMAT_LINE_WIDTH {
+                        break;
+                    }
+                    // The group's closing delimiter starts a line at the
+                    // current indentation, since nothing before it on this
+                    // line changes the indentation.
+                    widest = widest.max(column);
+                    column = self.writer.indent * 4 + self.token_text[group.close].chars().count();
+                    previous = Some(group.close);
+                    index = group.close;
+                }
+            }
+            index += 1;
+        }
+        widest.max(column)
+    }
+
+    /// Whether a group opening at `index` that is too wide for its line
+    /// breaks the chain `measured` or a chain within it that holds the
+    /// group: one with three or more operands, or one whose last operand
+    /// holds the group when the group opens with `(`, an argument list or a
+    /// parenthesized expression, as in `"text " + int_to_string(` ... `)`.
+    /// A chain of two keeps every other group that wraps joined to its other
+    /// operand: one in its first operand (`f(` ... `) + x`), or a list,
+    /// entry list, record, or named construction in its last (`x == [` ...
+    /// `]`).
+    fn breaks_a_chain(&self, index: usize, measured: Option<usize>) -> bool {
+        let Some(measured) = measured else {
+            return false;
+        };
+        let parenthesized = matches!(self.tokens[index].kind, TokenKind::LeftParen);
+        let mut holder = self.innermost_chains[index];
+        while let Some(chain) = holder {
+            let operators = &self.chains[chain].operators;
+            if operators.len() > 1
+                || parenthesized && operators.last().is_some_and(|last| index > *last)
+            {
+                return true;
+            }
+            if chain == measured {
+                break;
+            }
+            holder = self.parent_chains[chain];
+        }
+        false
+    }
+
     fn open_group(&mut self, index: usize) {
         let info = self.groups[index].expect("opening delimiter should have group information");
-        let projected_width = self.writer.column().saturating_add(info.flat_width);
-        let multiline =
-            info.has_content && (info.forced_multiline || projected_width > FORMAT_LINE_WIDTH);
+        let column = self.writer.column();
+        let projected_width = column.saturating_add(info.flat_width);
+        // Beyond its flat width, a group breaks when the line through it and
+        // what follows it on the line would pass the width limit, such as
+        // `?.body;` after a call. Patterns stay compact, and a group inside
+        // a single-line group fits with it.
+        let multiline = info.has_content
+            && (info.forced_multiline
+                || projected_width > FORMAT_LINE_WIDTH
+                || info.kind != GroupKind::Pattern
+                    && self
+                        .active_groups
+                        .last()
+                        .is_none_or(|group| group.multiline)
+                    && self.line_end(index + 1, info.close, column, Some(index), None)
+                        > FORMAT_LINE_WIDTH);
         self.active_groups.push(ActiveGroup {
             open: index,
             close: info.close,
@@ -534,6 +922,7 @@ struct SyntaxMap {
     breaks_after: HashMap<usize, usize>,
     let_else_arms: HashMap<usize, usize>,
     pun_values: Vec<PunCandidate>,
+    chains: Vec<OperatorChain>,
 }
 
 /// A construction field written `name: name`, which the canonical form
@@ -620,6 +1009,20 @@ impl SyntaxMap {
             })
             .collect();
 
+        let chains = collector
+            .chain_spans
+            .iter()
+            .map(|chain| OperatorChain {
+                first: tokens.partition_point(|token| token.span.start < chain.start),
+                last: index_ending(chain.end),
+                operators: chain
+                    .operators_after
+                    .iter()
+                    .map(|end| tokens.partition_point(|token| token.span.start < *end))
+                    .collect(),
+            })
+            .collect();
+
         let mut breaks_after = collector.breaks_after;
         for (index, statement) in program.statements.iter().enumerate() {
             let lines = program
@@ -666,6 +1069,7 @@ impl SyntaxMap {
             breaks_after,
             let_else_arms,
             pun_values: collector.pun_values,
+            chains,
         }
     }
 }
@@ -750,6 +1154,17 @@ struct SyntaxCollector {
     /// The `else` keyword and the whole statement of each let-else.
     let_else_spans: Vec<(Span, Span)>,
     pun_values: Vec<PunCandidate>,
+    chain_spans: Vec<ChainSpan>,
+}
+
+/// The source extent of one binary operator chain.
+struct ChainSpan {
+    /// The start of the first operand.
+    start: usize,
+    /// The end of the last operand.
+    end: usize,
+    /// For each operator, in source order, the end of the operand before it.
+    operators_after: Vec<usize>,
 }
 
 /// One syntax-tree node awaiting collection.
@@ -951,11 +1366,50 @@ impl SyntaxCollector {
             ExpressionKind::Unary { operand, .. } | ExpressionKind::Propagate { operand, .. } => {
                 pending.push(SyntaxNode::Expression(operand));
             }
-            ExpressionKind::Binary { left, right, .. } => {
-                pending.push(SyntaxNode::Expression(left));
-                pending.push(SyntaxNode::Expression(right));
-            }
+            ExpressionKind::Binary {
+                operator, right, ..
+            } => self.operator_chain(expression, *operator, right.span.end, pending),
         }
+    }
+
+    /// Records the chain whose last operator is that of `root`: `root` and
+    /// the unparenthesized operations of the same precedence level along its
+    /// left spine, which a left-associative parse nests there. Their right
+    /// operands and the first operand are collected as nodes of their own,
+    /// so the spine is walked with a loop.
+    fn operator_chain<'a>(
+        &mut self,
+        root: &'a Expression,
+        operator: BinaryOperator,
+        end: usize,
+        pending: &mut Vec<SyntaxNode<'a>>,
+    ) {
+        let level = precedence(operator);
+        let mut operators_after = Vec::new();
+        let mut node = root;
+        while let ExpressionKind::Binary {
+            left,
+            operator,
+            right,
+        } = &node.kind
+        {
+            // An operation in parentheses spans them, so it starts before
+            // its left operand; it is an operand, not part of this chain.
+            let parenthesized = node.span.start != left.span.start;
+            if precedence(*operator) != level || (parenthesized && !std::ptr::eq(node, root)) {
+                break;
+            }
+            operators_after.push(left.span.end);
+            pending.push(SyntaxNode::Expression(right));
+            node = left;
+        }
+        pending.push(SyntaxNode::Expression(node));
+        operators_after.reverse();
+        self.chain_spans.push(ChainSpan {
+            start: node.span.start,
+            end,
+            operators_after,
+        });
     }
 
     /// Records the delimiters of `pattern` and of every pattern nested in it.
@@ -1016,6 +1470,22 @@ impl SyntaxCollector {
             | TypeKind::DatabaseTransaction
             | TypeKind::Secret => {}
         }
+    }
+}
+
+/// The binding strength of a binary operator; the operators of one level
+/// form one chain.
+const fn precedence(operator: BinaryOperator) -> u8 {
+    match operator {
+        BinaryOperator::Or => 1,
+        BinaryOperator::And => 2,
+        BinaryOperator::Equal | BinaryOperator::NotEqual => 3,
+        BinaryOperator::Less
+        | BinaryOperator::LessEqual
+        | BinaryOperator::Greater
+        | BinaryOperator::GreaterEqual => 4,
+        BinaryOperator::Add | BinaryOperator::Subtract => 5,
+        BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder => 6,
     }
 }
 
@@ -1177,9 +1647,14 @@ fn token_after(index: usize, tokens: &[Token]) -> Option<&Token> {
         .filter(|token| !matches!(token.kind, TokenKind::Eof))
 }
 
-fn canonical_token_text(token: &Token) -> String {
+/// The canonical text of `token`, read from the source `text` it was lexed
+/// from.
+fn canonical_token_text(token: &Token, text: &str) -> String {
     match &token.kind {
-        TokenKind::Identifier(value) | TokenKind::Integer(value) => value.clone(),
+        TokenKind::Identifier(value) => value.clone(),
+        // An integer keeps its spelling, digit separators included
+        // (`1_000_000`): the lexer accepted it, so it denotes the same value.
+        TokenKind::Integer(_) => text[token.span.start..token.span.end].to_owned(),
         TokenKind::String(value) => canonical_string(value),
         // A text block is laid out by `Writer::write_text_block`; within a
         // line it is as wide as its opening delimiter.
@@ -1733,6 +2208,9 @@ mod tests {
     #[test]
     fn distinguishes_grouping_after_function_declarations_from_calls() {
         let long_sum = "1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1";
+        // Inside the broken grouping the sum is 101 columns wide even at the
+        // top level, so it breaks before each `+` as well.
+        let broken_sum = |indent: &str| format!("1{}", format!("\n{indent}+ 1").repeat(24));
 
         let top_level_comment = format("fn helper() -> Int { 1 }\n\n( // grouped\n    1 + 2\n);\n");
         assert_eq!(
@@ -1745,7 +2223,10 @@ mod tests {
         let top_level_width = format(&format!("fn helper() -> Int {{ 1 }}\n\n({long_sum});\n"));
         assert_eq!(
             top_level_width,
-            format!("fn helper() -> Int {{\n    1\n}}\n\n(\n    {long_sum}\n);\n")
+            format!(
+                "fn helper() -> Int {{\n    1\n}}\n\n(\n    {}\n);\n",
+                broken_sum("        ")
+            )
         );
         parse_source(&Source::new("top-level-width.krit", top_level_width))
             .expect("formatted top-level grouping should parse");
@@ -1766,7 +2247,8 @@ mod tests {
         assert_eq!(
             nested_width,
             format!(
-                "fn outer() -> Int {{\n    fn helper() -> Int {{\n        1\n    }}\n    (\n        {long_sum}\n    );\n    0\n}}\n"
+                "fn outer() -> Int {{\n    fn helper() -> Int {{\n        1\n    }}\n    (\n        {}\n    );\n    0\n}}\n",
+                broken_sum("            ")
             )
         );
         parse_source(&Source::new("nested-width.krit", nested_width))
@@ -1985,5 +2467,459 @@ mod tests {
             "{formatted}"
         );
         assert_eq!(format(&formatted), formatted);
+    }
+
+    /// Asserts that `formatted` is a fixed point and that each of its lines
+    /// fits within the width limit.
+    fn assert_canonical_and_fits(formatted: &str) {
+        assert_eq!(format(formatted), formatted);
+        for line in formatted.lines() {
+            assert!(
+                line.chars().count() <= FORMAT_LINE_WIDTH,
+                "{line}\n{formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn breaks_long_plus_chains_before_every_operator() {
+        // A chain that fits stays on its line, in every position.
+        let short =
+            "fn f(a: String, b: String) -> String {\n    println(a + b);\n    a + b + a\n}\n";
+        assert_eq!(format(short), short);
+
+        let operands = [
+            "\"/repos/\"",
+            "owner",
+            "\"/\"",
+            "repository",
+            "\"/issues/\"",
+            "number",
+        ];
+        let flat = operands.join(" + ");
+        let source = format!(
+            "fn f(owner: String, repository: String, number: String) -> HttpRequest {{\n\
+             let path = {flat} + {flat};\n\
+             println({flat} + {flat});\n\
+             HttpRequest {{ method: \"GET\", path: {flat} + {flat} }}\n}}\n"
+        );
+        let formatted = format(&source);
+        let lines = |indent: &str| {
+            let mut text = operands[0].to_owned();
+            for operand in operands[1..].iter().chain(&operands) {
+                text.push_str(&format!("\n{indent}+ {operand}"));
+            }
+            text
+        };
+        assert_eq!(
+            formatted,
+            format!(
+                "fn f(owner: String, repository: String, number: String) -> HttpRequest {{\n    \
+                 let path = {};\n    \
+                 println(\n        {},\n    );\n    \
+                 HttpRequest {{\n        method: \"GET\",\n        path: {},\n    }}\n}}\n",
+                lines("        "),
+                lines("            "),
+                lines("            "),
+            )
+        );
+        assert_canonical_and_fits(&formatted);
+    }
+
+    #[test]
+    fn breaks_condition_chains_and_puts_the_block_brace_on_its_own_line() {
+        let condition = (0..6)
+            .map(|index| format!("string_contains(path, \"/segment-{index}\")"))
+            .collect::<Vec<_>>();
+        let formatted = format(&format!(
+            "fn f(path: String) -> Int {{ if {} {{ 1 }} else {{ 2 }} }}\n",
+            condition.join(" && ")
+        ));
+        assert_eq!(
+            formatted,
+            format!(
+                "fn f(path: String) -> Int {{\n    if {}\n    {{\n        1\n    }} else {{\n        2\n    }}\n}}\n",
+                condition.join("\n        && ")
+            )
+        );
+        assert_canonical_and_fits(&formatted);
+
+        // A chain of two operands keeps a group that wraps joined to it.
+        let list = (0..12)
+            .map(|index| format!("\"item-{index}\""))
+            .collect::<Vec<_>>();
+        let formatted = format(&format!(
+            "fn f(items: List<String>) -> Bool {{ items == [{}] }}\n",
+            list.join(", ")
+        ));
+        assert!(
+            formatted.contains("    items == [\n        \"item-0\",\n"),
+            "{formatted}"
+        );
+        assert!(formatted.contains("    ]\n}\n"), "{formatted}");
+        assert_canonical_and_fits(&formatted);
+    }
+
+    #[test]
+    fn a_chain_of_two_keeps_a_wrapping_group_joined_while_its_last_line_fits() {
+        let body = "b".repeat(40);
+        let wrapped = format!(
+            "json_encode(\n        HttpResponse {{ status: 200, body: \"{body}\" }},\n    )"
+        );
+        let suffix = |length: usize| format!("\"{}\"", "s".repeat(length));
+        // `) + "…"` is 99 columns wide: the chain stays joined.
+        let source = format!(
+            "fn f() -> String {{ json_encode(HttpResponse {{ status: 200, body: \"{body}\" }}) + {} }}\n",
+            suffix(89)
+        );
+        let formatted = format(&source);
+        assert_eq!(
+            formatted,
+            format!("fn f() -> String {{\n    {wrapped} + {}\n}}\n", suffix(89))
+        );
+        assert_canonical_and_fits(&formatted);
+        // At 101 columns the chain breaks before its operator instead.
+        let formatted = format(&source.replace(&suffix(89), &suffix(91)));
+        assert_eq!(
+            formatted,
+            format!(
+                "fn f() -> String {{\n    {wrapped}\n        + {}\n}}\n",
+                suffix(91)
+            )
+        );
+        // The literal alone is too long for its line, which cannot break.
+        assert_eq!(format(&formatted), formatted);
+    }
+
+    #[test]
+    fn a_chain_of_two_breaks_before_an_argument_list_that_wraps_in_its_last_operand() {
+        // Each `"…" + call(…)` passes the limit, so the call's argument list
+        // would wrap; the chain breaks before `+` instead, as a chain of three
+        // does, in a let value, a call argument, and a construction field.
+        let text = |length: usize| format!("\"{}\"", "t".repeat(length));
+        let source = format!(
+            "fn f(name: String, count: Int) -> Result<HttpResponse, String> {{\n\
+             let path = {} + url_path_segment(name)?;\n\
+             println({} + int_to_string(count));\n\
+             let size = {} + int_to_string(string_byte_len(name));\n\
+             let reply = HttpResponse {{ status: 200, body: {} + url_path_segment(name)? }};\n\
+             let grouped = {} + (count * count);\n\
+             Ok(reply)\n}}\n",
+            text(70),
+            text(80),
+            text(60),
+            text(70),
+            text(80),
+        );
+        let formatted = format(&source);
+        assert_eq!(
+            formatted,
+            format!(
+                "fn f(name: String, count: Int) -> Result<HttpResponse, String> {{\n    \
+                 let path = {}\n        + url_path_segment(name)?;\n    \
+                 println(\n        {}\n            + int_to_string(count),\n    );\n    \
+                 let size = {}\n        + int_to_string(string_byte_len(name));\n    \
+                 let reply = HttpResponse {{\n        status: 200,\n        body: {}\n            \
+                 + url_path_segment(name)?,\n    }};\n    \
+                 let grouped = {}\n        + (count * count);\n    \
+                 Ok(reply)\n}}\n",
+                text(70),
+                text(80),
+                text(60),
+                text(70),
+                text(80),
+            )
+        );
+        assert_canonical_and_fits(&formatted);
+        // When the call's arguments do not fit on the continuation line
+        // either, they wrap there.
+        let argument = "a".repeat(80);
+        let formatted = format(&format!(
+            "fn f({argument}: Int) -> String {{ \"count: \" + int_to_string({argument}) }}\n"
+        ));
+        assert_eq!(
+            formatted,
+            format!(
+                "fn f(\n    {argument}: Int,\n) -> String {{\n    \"count: \"\n        \
+                 + int_to_string(\n            {argument},\n        )\n}}\n"
+            )
+        );
+        assert_canonical_and_fits(&formatted);
+        // A list, entry list, or construction stays joined to the other
+        // operand of a chain of two.
+        let items = (0..12)
+            .map(|index| format!("\"item-{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let formatted = format(&format!(
+            "fn f(items: List<String>) -> Bool {{ items == [{items}] }}\n"
+        ));
+        assert!(formatted.contains("    items == [\n"), "{formatted}");
+        assert_canonical_and_fits(&formatted);
+    }
+
+    #[test]
+    fn a_comment_after_a_chain_operator_moves_before_it() {
+        let source = "fn f(a: String, b: String) -> String {\n\
+                      let s = a +\n// note\nb;\n\
+                      let t = a + // after the operator\nb + a;\n\
+                      let u = a // before\n+ // after\nb;\n\
+                      let v = a == b + // inner\na;\n\
+                      s + t + u\n}\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "fn f(a: String, b: String) -> String {\n    \
+             let s = a\n        // note\n        + b;\n    \
+             let t = a // after the operator\n        + b\n        + a;\n    \
+             let u = a // before\n        // after\n        + b;\n    \
+             let v = a\n        == b // inner\n            + a;\n    \
+             s + t + u\n}\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+        assert_eq!(comment_texts(&formatted), comment_texts(source));
+    }
+
+    #[test]
+    fn breaks_chains_of_each_precedence_level_one_level_at_a_time() {
+        let product = ["weight"; 8].join(" * ");
+        let formatted = format(&format!(
+            "fn f(weight: Int, bonus: Int) -> Int {{ {product} + {product} - bonus }}\n"
+        ));
+        assert_eq!(
+            formatted,
+            format!(
+                "fn f(weight: Int, bonus: Int) -> Int {{\n    {product}\n        + {product}\n        - bonus\n}}\n"
+            )
+        );
+        assert_canonical_and_fits(&formatted);
+
+        // Parentheses start a chain of their own.
+        let formatted = format(&format!(
+            "fn f(weight: Int, bonus: Int) -> Int {{ ({product} + {product}) * bonus }}\n"
+        ));
+        assert_eq!(
+            formatted,
+            format!(
+                "fn f(weight: Int, bonus: Int) -> Int {{\n    (\n        {product}\n            + {product}\n    ) * bonus\n}}\n"
+            )
+        );
+        assert_canonical_and_fits(&formatted);
+    }
+
+    #[test]
+    fn a_comment_inside_a_chain_breaks_it_and_keeps_its_place() {
+        let source = "fn f(owner: String, title: String) -> String {\n\
+                      let heading = \"Issue by \" + owner // who\n+ \" titled \" + title;\n\
+                      let detail = \"Read\"\n// then decided\n+ owner;\n\
+                      heading + detail + record { value: owner // inside a group\n}.value\n}\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "fn f(owner: String, title: String) -> String {\n    \
+             let heading = \"Issue by \"\n        + owner // who\n        + \" titled \"\n        + title;\n    \
+             let detail = \"Read\"\n        // then decided\n        + owner;\n    \
+             heading + detail + record {\n        value: owner, // inside a group\n    }.value\n}\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+    }
+
+    #[test]
+    fn keeps_integer_digit_separators_as_written() {
+        let source =
+            "let a=1_000_000;\nlet b = [1_0, 2_00, -4_096, 0_7];\nprintln(a * 1_000 + 86_400);\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "let a = 1_000_000;\nlet b = [1_0, 2_00, -4_096, 0_7];\n\nprintln(a * 1_000 + 86_400);\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+        assert_eq!(output(&formatted), output(source));
+        assert_eq!(output(source), "1000086400\n");
+    }
+
+    #[test]
+    fn breaks_a_group_when_what_follows_it_passes_the_limit() {
+        // Each group fits by its own width, but the line through what follows
+        // it would be 101 columns wide: a return type, `) else`, and `.body;`.
+        let function = "f".repeat(34);
+        let signature = format!(
+            "fn {function}(owner: String, number: Int) -> Result<Option<String>, String> {{"
+        );
+        let value = "v".repeat(50);
+        let let_else = format!("    let Ok({value}) = config_string(\"reference.repo\") else");
+        let name = "n".repeat(46);
+        let construction =
+            format!("let {name} = HttpResponse {{ status: 200, body: \"text\" }}.body;");
+        for line in [&signature, &let_else, &construction] {
+            assert_eq!(line.len(), FORMAT_LINE_WIDTH + 1, "{line}");
+        }
+        let formatted = format(&format!(
+            "{signature} Ok(None) }}\n\
+             fn g(r: Result<String, String>) -> String {{\n{let_else} Err(e) => e;\n    {value}\n}}\n\
+             {construction}\n"
+        ));
+        assert_eq!(
+            formatted,
+            format!(
+                "fn {function}(\n    owner: String,\n    number: Int,\n) -> Result<Option<String>, String> {{\n    \
+                 Ok(None)\n}}\n\n\
+                 fn g(r: Result<String, String>) -> String {{\n    let Ok({value}) = config_string(\n        \
+                 \"reference.repo\",\n    ) else Err(e) => e;\n    {value}\n}}\n\n\
+                 let {name} = HttpResponse {{\n    status: 200,\n    body: \"text\",\n}}.body;\n"
+            )
+        );
+        assert_canonical_and_fits(&formatted);
+        // One column less, each group stays on its line; the let-else arm
+        // moves to the next one.
+        let fits = format!(
+            "{}\n    Ok(None)\n}}\n\nfn g(r: Result<String, String>) -> String {{\n{}\n        Err(e) => e;\n    {}\n}}\n\n{}\n",
+            signature.replacen(&function, &function[1..], 1),
+            let_else.replacen(&value, &value[1..], 1),
+            &value[1..],
+            construction.replacen(&name, &name[1..], 1),
+        );
+        assert_eq!(format(&fits), fits);
+    }
+
+    #[test]
+    fn leaves_lines_that_cannot_break_as_they_are() {
+        let long = "x".repeat(100);
+        let source = format!(
+            "let notice = \"{long}\";\nlet user = record {{ name: \"Ada\" }};\n\
+             let greeting = \"\\(user.name) {long}\";\n\n\
+             // {long}\n\
+             fn f(r: Result<String, String>) -> String {{\n    match r {{\n        Ok(text) => \"{long}\",\n        \
+             Err(reason) => reason,\n    }}\n}}\n"
+        );
+        assert_eq!(format(&source), source);
+        // A call around one holds it on a line of its own.
+        let formatted = format(&format!("println(\"{long}\");\n"));
+        assert_eq!(formatted, format!("println(\n    \"{long}\",\n);\n"));
+        assert_eq!(format(&formatted), formatted);
+    }
+
+    #[test]
+    fn formatted_lines_fit_wherever_a_break_exists() {
+        // Chains of short operands in every position a value can take, at a
+        // range of widths around the limit: every line fits once formatted.
+        let contexts: [fn(&str) -> String; 8] = [
+            |chain| format!("let value = {chain};\n"),
+            |chain| format!("println({chain});\n"),
+            |chain| format!("let r = HttpResponse {{ status: 200, body: {chain} }};\n"),
+            |chain| format!("let l = [\"head\", {chain}];\n"),
+            |chain| format!("let e = [\"key\": {chain}];\n"),
+            |chain| {
+                format!(
+                    "fn f(r: Result<String, String>) -> String {{ match r {{ Ok(v) => {chain}, Err(e) => e }} }}\n"
+                )
+            },
+            |chain| {
+                format!(
+                    "fn f(r: Result<String, String>) -> String {{ let Ok(v) = r else Err(e) => {chain}; v }}\n"
+                )
+            },
+            |chain| {
+                format!(
+                    "fn f(v: String) -> String {{ if string_is_empty({chain}) {{ v }} else {{ {chain} }} }}\n"
+                )
+            },
+        ];
+        for count in 1..14 {
+            let chain = (0..count)
+                .map(|index| format!("\"part-{index}\" + int_to_string({index})"))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            for context in contexts {
+                let source = format!("let v = \"v\";\n{}", context(&chain));
+                let formatted = format(&source);
+                assert_canonical_and_fits(&formatted);
+                assert_eq!(output(&formatted), output(&source));
+            }
+        }
+        // A two-operand string build whose last operand is a call, at widths
+        // around the limit: the chain breaks before `+`, and the call's
+        // argument list never wraps, since its continuation line fits.
+        for length in 40..=75 {
+            let chain = format!(
+                "\"{}\" + int_to_string(string_byte_len(v))",
+                "t".repeat(length)
+            );
+            for context in contexts {
+                let formatted = format(&format!("let v = \"v\";\n{}", context(&chain)));
+                assert_canonical_and_fits(&formatted);
+                assert!(!formatted.contains("int_to_string(\n"), "{formatted}");
+            }
+        }
+    }
+
+    /// The text of each comment, in order, with an attached doc comment's
+    /// one optional space after `///` left out.
+    fn comment_texts(text: &str) -> Vec<String> {
+        lex_with_comments(&Source::new("comments.krit", text))
+            .expect("source should lex")
+            .comments
+            .into_iter()
+            .map(|comment| match parser::doc_line_text(&comment.text) {
+                Some(line) => format!("///{line}"),
+                None => comment.text,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_repository_source_formats_idempotently_and_keeps_its_comments() {
+        crate::run_on_thread(
+            "formatter-repository",
+            crate::COMPILER_STACK_BYTES,
+            format_every_repository_source_twice,
+        )
+        .expect("formatter test thread should start");
+    }
+
+    fn format_every_repository_source_twice() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut directories = vec![root.clone()];
+        let mut formatted_count = 0;
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).expect("directory should be readable") {
+                let path = entry.expect("entry should be readable").path();
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                if path.is_dir() {
+                    if name != "target" && name != ".git" {
+                        directories.push(path);
+                    }
+                    continue;
+                }
+                if path.extension().is_none_or(|extension| extension != "krit") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("source should be readable");
+                let label = path.display().to_string();
+                // Sources that do not parse, such as rejected conformance
+                // cases, have nothing to format.
+                let Ok(once) = format_source(&Source::new(label.clone(), text.as_str())) else {
+                    continue;
+                };
+                let twice = format_source(&Source::new(label.clone(), once.as_str()))
+                    .unwrap_or_else(|error| {
+                        panic!("{label}: formatted source should format: {error:?}")
+                    });
+                assert_eq!(twice, once, "{label}: formatting twice changed it");
+                assert_eq!(
+                    comment_texts(&once),
+                    comment_texts(&text),
+                    "{label}: comments changed"
+                );
+                formatted_count += 1;
+            }
+        }
+        assert!(
+            formatted_count > 200,
+            "only {formatted_count} sources formatted"
+        );
     }
 }

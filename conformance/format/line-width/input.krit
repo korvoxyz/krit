@@ -1,0 +1,22 @@
+fn request()->HttpRequest{HttpRequest{method:"GET",path:"/repos/example/issues/1"}}
+
+fn fetch_review_comments_for_issue(owner:String,repository:String,number:Int)->Result<Option<String>,String>{
+let Ok(configured_repository_name)=config_string("reference.repository.name.for.reviewer") else Err(error)=>Err(error);
+let reply=http_request("https://api.example.invalid",request(),Some(secret("token")?))?.body;
+Ok(Some(reply+configured_repository_name))
+}
+
+fn first_label(stored:Result<Option<String>,String>,fallback:String)->Int{
+match stored{
+Ok(Some(text))=>string_byte_len(text)+string_byte_len(fallback)+string_byte_len(record{x:"label"}.x),
+Ok(None)=>0,
+Err(reason)=>string_byte_len(reason),
+}
+}
+
+fn respond(text:String,status:Int)->String{
+let reply_body_for_the_reviewer_agent_in_staging=HttpResponse{status:200,body:text}.body;
+let headers=["x-owner":"example","x-repository":"reference","x-request":"review-comment","x-n":"1"];
+let summary=record{owner:"example",repository:"reference",status:status,body:reply_body_for_the_reviewer_agent_in_staging};
+summary.body+json_encode(headers)
+}

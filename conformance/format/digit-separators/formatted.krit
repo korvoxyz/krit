@@ -1,0 +1,12 @@
+let budget = 1_000_000;
+let seconds_per_day = 86_400;
+let grouped = [1_0, 2_00, 3_000_000_000, -4_096];
+let plain = 1000000;
+
+fn timeout(retries: Int) -> Int {
+    retries * 30_000 + 5_00
+}
+
+println(budget == plain);
+println(timeout(3));
+println(record { limit: 65_535, count: 0_7 });

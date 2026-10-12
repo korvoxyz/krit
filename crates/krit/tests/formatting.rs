@@ -51,15 +51,20 @@ fn formatting_fixtures_are_canonical_and_idempotent() {
     let fixtures = [
         "comments",
         "cross-features",
+        "digit-separators",
         "doc-comments",
         "edition-2026",
         "entry-lists",
         "interpolation",
         "let-else",
+        "line-width",
         "named-construction",
+        "operator-chains",
         "patterns",
+        "plus-chains",
         "propagate",
         "text-blocks",
+        "unbreakable-lines",
         "unit-literal",
         "webhook",
     ];
@@ -97,6 +102,16 @@ fn formatting_fixtures_are_canonical_and_idempotent() {
         );
         assert!(!formatted.contains('\r'), "{fixture}");
         assert!(!formatted.contains('\t'), "{fixture}");
+        // Only a line with nowhere to break may pass the width limit, and
+        // only the fixture for such lines has any.
+        if fixture != "unbreakable-lines" {
+            for line in formatted.lines() {
+                assert!(
+                    line.chars().count() <= krit::FORMAT_LINE_WIDTH,
+                    "{fixture}: {line}"
+                );
+            }
+        }
         assert!(
             formatted
                 .lines()
@@ -251,6 +266,35 @@ fn deterministic_generated_corpus_preserves_formatting_properties() {
             "text-blocks".to_owned(),
             "fn p(t:String)->String{\n\"\"\"\n\t\tTitle: \\(t)\n\t\t  \"quoted\"\n\n\t\t\"\"\"}\nlet a = p(\"\"\"\r\n  x\r\n  \"\"\");\nlet b = [\"\"\"\n\"\"\", \"\"\"\n\n  \"\"\"];\n"
                 .to_owned(),
+        ),
+        (
+            "digit-separators".to_owned(),
+            "let budget = 1_000_000;\nlet day = 86_400 * 1_0;\nprintln(budget + day);\n".to_owned(),
+        ),
+        (
+            "long-plus-chain".to_owned(),
+            format!(
+                "let owner = \"o\";\nlet path = {};\nprintln(path);\n",
+                ["\"/repos/\" + owner"; 12].join(" + ")
+            ),
+        ),
+        (
+            "plus-chain-argument-and-field".to_owned(),
+            format!(
+                "let owner = \"o\";\nprintln({0});\nlet r = HttpResponse {{ status: 200, body: {0} }};\n",
+                ["\"segment\" + owner"; 10].join(" + ")
+            ),
+        ),
+        (
+            "condition-chain".to_owned(),
+            format!(
+                "let p = \"/repos/\";\nlet v = if {} {{ 1 }} else {{ 2 }};\n",
+                ["string_contains(p, \"/repos/\")"; 5].join(" && ")
+            ),
+        ),
+        (
+            "chain-comments".to_owned(),
+            "let a = \"a\";\nlet s = a // first\n+ a\n// second\n+ a + // third\na;\n".to_owned(),
         ),
         (
             "webhook-contract".to_owned(),
