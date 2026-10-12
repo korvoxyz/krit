@@ -1,7 +1,7 @@
 # Agent platform roadmap
 
-**Status:** Accepted delivery order; Phases 0-7 are complete and the 0.3
-language and runtime work is implemented
+**Status:** Accepted delivery order; Phases 0-7 are complete and Krit 0.3
+"Honest and Flat" is delivered
 
 Krit develops agent infrastructure only when the previous layer supports a
 complete, reviewable application. A service is exposed as a narrow typed
@@ -350,8 +350,8 @@ application evidence rather than by the roadmap's phase count.
 
 ## Krit 0.3: honest and flat
 
-**Status:** Implemented on the bounded local platform above; the release
-gate is tracked in [tracker-0.3.md](tracker-0.3.md)
+**Status:** Delivered in 0.3.0 on the bounded local platform above; every
+release gate passed (see [tracker-0.3.md](tracker-0.3.md))
 
 0.3 adds no service. It makes the existing platform honest and its programs
 flat, measured against realistic agent programs that passed `krit check` and

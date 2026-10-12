@@ -150,7 +150,10 @@ single allocation (roadmap §9.2).
    release-gate audits of `6a862f0` and `aa417b4` reproduced both figures.
    Counting the roadmap's corpus instead (03b in place of 02) gives the same
    2/8 and 5/8.
-   **Owner decision on counting reduced scope:** not yet recorded.
+   **Owner decision (Akshay Bhardwaj, 2026-10-12):** ship 0.3.0 counting the
+   reduced-scope rewrites (5/8), and report both figures plainly — 5/8 with
+   reduced scope and 2/8 with full behavior — with the remaining blockers
+   named as 0.4 work. Gate 8 is met on that basis.
 
 ## 6. Metrics
 

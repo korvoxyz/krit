@@ -61,7 +61,7 @@ documentation, examples, and the release gate.
 | D3 | Conformance ≥ 40 run / 60 check / 8 format | R5.3 | done | counts |
 | D4 | Prompt pack 0.3 with checked examples | R4.5 | done | examples check |
 | D5 | `docs/roadmap.md`, RFC-0007 resource handles (draft), CHANGELOG, README, version 0.3.0 | R5.4 | done | checklist |
-| D6 | Release gate (PRD §5) and grounded-sketch re-measure | §5 | review | all gates |
+| D6 | Release gate (PRD §5) and grounded-sketch re-measure | §5 | done | all gates |
 
 ## Log
 
@@ -140,3 +140,10 @@ documentation, examples, and the release gate.
   and the CLI refusal test pins exactly that instead of accepting any status
   0 or 4; PRD R4.1 lists the `/` and `\` refusals of `url_path_segment` and
   defers to the spec table. D6 stays in review.
+- 2026-10-12 — Owner decision on gate 8: ship counting the reduced-scope
+  rewrites (5/8) and report both figures (5/8 reduced scope, 2/8 full
+  behavior). With that, every PRD §5 gate passes: the third independent audit
+  verified gates 1–7 and the documentation and packaging checks with live
+  evidence (1,021 tests, release binary `Krit 0.3.0`). **0.3.0 is release
+  ready.** Owner chose to prepare the release locally (merge into `main`,
+  annotated tag `v0.3.0`) and push it themselves.
