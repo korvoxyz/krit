@@ -1,5 +1,6 @@
-// Matching makes both possible list shapes visible.
-fn sum(items) {
+/// Adds up a list of integers. Matching makes both possible list shapes
+/// visible: the empty list and a head followed by the rest.
+fn sum(items: List<Int>) -> Int {
     match items {
         [] => 0,
         [head, ..tail] => head + sum(tail),

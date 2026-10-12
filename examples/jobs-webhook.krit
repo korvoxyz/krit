@@ -1,6 +1,9 @@
+/// Enqueues the request body as a render job and answers with the job id.
+/// The webhook holds publish authority only: it cannot consume the queue or
+/// touch the bucket.
 webhook fn handle(request: HttpRequest) -> HttpResponse {
     match queue_publish("render-jobs", request.body) {
-        Ok(id) => record { status: 202, headers: [], body: id },
-        Err(error) => record { status: 500, headers: [], body: error },
+        Ok(id) => HttpResponse { status: 202, body: id },
+        Err(error) => HttpResponse { status: 500, body: error },
     }
 }

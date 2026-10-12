@@ -1,21 +1,22 @@
-webhook fn handle(request: HttpRequest) -> HttpResponse {
-    match db_begin_write("catalog") {
-        Ok(transaction) => match db_execute(transaction, "record-visit", [request.path]) {
-            Ok(changed) => match db_query(transaction, "count-visits", []) {
-                Ok(rows) => match db_commit(transaction) {
-                    Ok(committed) => record { status: 200, headers: [], body: rows },
-                    Err(error) => record { status: 500, headers: [], body: error },
-                },
-                Err(error) => match db_rollback(transaction) {
-                    Ok(undone) => record { status: 500, headers: [], body: error },
-                    Err(fatal) => record { status: 500, headers: [], body: fatal },
-                },
-            },
-            Err(error) => match db_rollback(transaction) {
-                Ok(undone) => record { status: 500, headers: [], body: error },
-                Err(fatal) => record { status: 500, headers: [], body: fatal },
-            },
-        },
-        Err(error) => record { status: 503, headers: [], body: error },
+/// Reports a failed step once its transaction is rolled back: the step's
+/// error, or the rollback's if that failed too.
+fn rolled_back(rollback: Result<Unit, String>, error: String) -> HttpResponse {
+    match rollback {
+        Ok(_) => HttpResponse { status: 500, body: error },
+        Err(fatal) => HttpResponse { status: 500, body: fatal },
     }
+}
+
+/// Records the visit and answers with the visit count, both in one write
+/// transaction that is committed or rolled back before the response.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let Ok(transaction) = db_begin_write("catalog") else
+        Err(error) => HttpResponse { status: 503, body: error };
+    let Ok(_) = db_execute(transaction, "record-visit", [request.path]) else
+        Err(error) => rolled_back(db_rollback(transaction), error);
+    let Ok(rows) = db_query(transaction, "count-visits", []) else
+        Err(error) => rolled_back(db_rollback(transaction), error);
+    let Ok(_) = db_commit(transaction) else
+        Err(error) => HttpResponse { status: 500, body: error };
+    HttpResponse { status: 200, body: rows }
 }

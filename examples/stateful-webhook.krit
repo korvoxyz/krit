@@ -1,23 +1,16 @@
+/// Processes a request body once: stores it as the last body and checkpoints
+/// it, or returns the body an earlier request already checkpointed.
+fn process(body: String) -> Result<String, String> {
+    let None = checkpoint_get("agent-work", "processed-request")? else Some(value) => Ok(value);
+    state_put("agent-work", "last-body", body)?;
+    checkpoint_put("agent-work", "processed-request", body)?;
+    Ok(body)
+}
+
+/// Answers with the processed body, or with the state error that stopped it.
 webhook fn handle(request: HttpRequest) -> HttpResponse {
-    match checkpoint_get("agent-work", "processed-request") {
-        Ok(previous) => match previous {
-            Some(value) => record { status: 200, headers: [], body: value },
-            None => match state_put("agent-work", "last-body", request.body) {
-                Ok(saved) => match checkpoint_put(
-                    "agent-work",
-                    "processed-request",
-                    request.body,
-                ) {
-                    Ok(checkpointed) => record {
-                        status: 200,
-                        headers: [],
-                        body: request.body,
-                    },
-                    Err(error) => record { status: 500, headers: [], body: error },
-                },
-                Err(error) => record { status: 500, headers: [], body: error },
-            },
-        },
-        Err(error) => record { status: 500, headers: [], body: error },
+    match process(request.body) {
+        Ok(body) => HttpResponse { status: 200, body },
+        Err(error) => HttpResponse { status: 500, body: error },
     }
 }
