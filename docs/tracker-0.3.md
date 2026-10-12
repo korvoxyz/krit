@@ -43,23 +43,23 @@ documentation, examples, and the release gate.
 
 | ID | Item | Req | Status | Acceptance check | Depends |
 |---|---|---|---|---|---|
-| L1 | Postfix `?` with Core exit op, K3012/K3013, Wasm `return` | R3.1 | doing | order case; webhook helper builds | wave 1 |
-| L2 | let-else, K3014 | R3.2 | doing | webhook builds | L1 |
-| L3 | Nested built-in patterns, `_`, exhaustiveness, K2003 | R3.3 | doing | 3-arm nested match builds | F3 |
-| L4 | Named construction with punning and defaults, K3016 | R3.4 | doing | examples drop `record` | |
-| L5 | Entry lists, `()`, `///` (formatter + LSP hover) | R3.5 | doing | fmt idempotent | |
-| L6 | Interpolation `\(…)`, `"""` text blocks, K3015 | R3.6 | doing | prompt webhook builds | W2 |
-| L7 | Stdlib v0 (8 functions; `url_path_segment` returns Result) + K9013 lint | R4.1, R4.2 | doing | evaluator/Wasm agreement | W2, F3 |
-| L8 | Formatter polish: `+` chains, digit separators, 100 cols | R3.7 | todo | idempotence suite | L1–L7 |
+| L1 | Postfix `?` with Core exit op, K3012/K3013, Wasm `return` | R3.1 | done | order case; webhook helper builds | wave 1 |
+| L2 | let-else, K3014 | R3.2 | done | webhook builds | L1 |
+| L3 | Nested built-in patterns, `_`, exhaustiveness, K2003 | R3.3 | done | 3-arm nested match builds | F3 |
+| L4 | Named construction with punning and defaults, K3016 | R3.4 | done | examples drop `record` | |
+| L5 | Entry lists, `()`, `///` (formatter + LSP hover) | R3.5 | done | fmt idempotent | |
+| L6 | Interpolation `\(…)`, `"""` text blocks, K3015 | R3.6 | done | prompt webhook builds | W2 |
+| L7 | Stdlib v0 (8 functions; `url_path_segment` returns Result) + K9013 lint | R4.1, R4.2 | done | evaluator/Wasm agreement | W2, F3 |
+| L8 | Formatter polish: `+` chains, digit separators, 100 cols | R3.7 | doing | idempotence suite | L1–L7 |
 
 ## Wave 3 — docs, examples, release
 
 | ID | Item | Req | Status | Acceptance check |
 |---|---|---|---|---|
-| D1 | Spec updates (LANGUAGE, DIAGNOSTICS, TYPES-AND-EFFECTS, WASM-SANDBOX, CAPABILITIES, PACKAGES) | R5.1 | todo | spec matches code |
-| D2 | Examples rewritten; `scripts/metrics.py`; depth ≤ 3 | R5.2 | todo | metrics table |
-| D3 | Conformance ≥ 40 run / 60 check / 8 format | R5.3 | todo | counts |
-| D4 | Prompt pack 0.3 with checked examples | R4.5 | todo | examples check |
+| D1 | Spec updates (LANGUAGE, DIAGNOSTICS, TYPES-AND-EFFECTS, WASM-SANDBOX, CAPABILITIES, PACKAGES) | R5.1 | doing | spec matches code |
+| D2 | Examples rewritten; `scripts/metrics.py`; depth ≤ 3 | R5.2 | doing | metrics table |
+| D3 | Conformance ≥ 40 run / 60 check / 8 format | R5.3 | doing | counts |
+| D4 | Prompt pack 0.3 with checked examples | R4.5 | doing | examples check |
 | D5 | `docs/roadmap.md`, RFC-0007 resource handles (draft), CHANGELOG, README, version 0.3.0 | R5.4 | todo | checklist |
 | D6 | Release gate (PRD §5) and grounded-sketch re-measure | §5 | todo | all gates |
 
@@ -86,3 +86,15 @@ documentation, examples, and the release gate.
   complete: all 15 items approved and merged.**
 - 2026-10-12 — Wave 2 started: control track (L1–L3) and data track
   (L4–L7) in parallel worktrees.
+- 2026-10-12 — Wave 2 complete: all 7 items approved (L1 `?` with a
+  verified Core exit, L2 let-else, L3 nested patterns with exhaustiveness,
+  L4 named construction, L5 entry lists/`()`/`///`, L6 interpolation and
+  text blocks, L7 stdlib v0 + K9013). Both tracks merged; the merge fixed six
+  cross-track interactions (K9013 over `?`/let-else, `?` inside
+  constructions in the evaluator, entry keys vs ternary detection, let-else
+  formatting idempotence, doc lookup for let-else, unchecked format
+  fixtures) and added cross-feature build+invoke tests; an independent
+  reviewer approved after 17 probes.
+- 2026-10-12 — Wave 3 started in four worktrees: formatter polish (L8),
+  examples + metrics + conformance + sketch re-measure (D2, D3), prompt pack
+  0.3 + RFC-0007 resource handles (D4), spec and README consolidation (D1).
