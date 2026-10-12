@@ -1429,12 +1429,16 @@ grammar-permitted trailing commas, not expression order or program semantics.
   wraps on its own keeps a fitting arm after its closing delimiter
   (`) else Err(e) => handle(e);`).
 - A binary operator chain is a run of operands joined by the operators of
-  one precedence level (section 9), such as `a + b - c`, `x && y && z`, or
-  `left == right`; an operand may itself be a chain of a higher level or a
-  parenthesized one. A chain stays on one line when it fits there. Otherwise
-  the line breaks before each of its operators, so every operand after the
-  first starts a continuation line that begins with its operator, indented
-  one level deeper than the line the chain starts on:
+  one precedence level, such as `a + b - c`, `x && y && z`, or
+  `left == right`; an operand may itself be a chain of a tighter level or a
+  parenthesized one. From loosest to tightest, the levels are `||`; `&&`;
+  `==` and `!=`; `<`, `<=`, `>`, and `>=`; `+` and `-`; and `*`, `/`, and
+  `%`. So `a < b == c` is an `==` chain whose first operand is the chain
+  `a < b`, and `x + y * z` is a `+` chain whose second operand is `y * z`.
+  A chain stays on one line when it fits there. Otherwise the line breaks
+  before each of its operators, so every operand after the first starts a
+  continuation line that begins with its operator, indented one level
+  deeper than the line the chain starts on:
 
   ```krit
   fn issue_path(owner: String, repository: String, number: Int) -> Result<String, String> {
@@ -1473,12 +1477,44 @@ grammar-permitted trailing commas, not expression order or program semantics.
   Whether a chain fits is measured with the chain unbroken, up to the first
   delimited group that breaks on its own: one that is always multiline, or
   too wide for the line where it opens; the measurement goes on after that
-  group's closing delimiter. A chain of three or more operands that holds a
-  group too wide for its line breaks instead, so its operands stay one per
-  line; a chain of two keeps such a group joined to its other operand
-  (`fields == [`, one element per line, `]`). A chain inside a group that
-  stays on one line never breaks, and a comment between two operands, outside
-  their delimited groups, always breaks the chain it stands in.
+  group's closing delimiter. A chain breaks instead when it holds a group too
+  wide for its line, directly or within operands that are chains
+  themselves, and it or one of those chains either has three or more
+  operands, so its operands stay one per line, or has the group in its last
+  operand when the group is an argument list or a parenthesized expression.
+  The operator then leads that operand's line, rather than the arguments
+  wrapping after it:
+
+  ```krit
+  fn location(repository: String) -> Result<String, String> {
+      let path = "Comments were posted for the configured repository at the path "
+          + url_path_segment(repository)?;
+      Ok(path)
+  }
+  ```
+
+  A chain of two keeps every other group too wide for its line joined to its
+  other operand: a list, entry list, record, or named construction in its
+  last operand (`labels == [`, one element per line, `]`), or any group in
+  its first operand (`json_encode(`, its argument, `) + " (listed)"`). A
+  chain inside a group that stays on one line never breaks.
+
+  A comment between two operands, outside their delimited groups, always
+  breaks the chain it stands in. A comment that follows an operator is
+  written just before that operator instead, so the operator still leads
+  its operand's line: an end-of-line comment ends the line before, or takes
+  a line of its own when that line already ends with a comment, and a
+  standalone comment keeps a line of its own. Here the comment was written
+  after the first `+`:
+
+  ```krit
+  fn heading(owner: String, title: String) -> String {
+      let label = owner // the owner comes first
+          + " opened "
+          + title;
+      label
+  }
+  ```
 - Non-empty blocks and every match are multiline. Short lists, records,
   parameter lists, argument lists, and record types remain on one line when
   readable. A delimited group also breaks when the line through it and what
@@ -1513,10 +1549,10 @@ grammar-permitted trailing commas, not expression order or program semantics.
   by one blank line.
 - An integer keeps its spelling, digit separators included: `1_000_000`
   stays `1_000_000` and `1000000` stays `1000000`. Strings use direct
-  printable Unicode plus
-  `\"`, `\\`, `\n`, `\r`, `\t`, `\0`, or lowercase `\u{...}` escapes for
-  required control characters. The text of an interpolated string is written
-  the same way, and each hole exactly as written (`\(request.path)`).
+  printable Unicode plus `\"`, `\\`, `\n`, `\r`, `\t`, `\0`, or lowercase
+  `\u{...}` escapes for required control characters. The text of an
+  interpolated string is written the same way, and each hole exactly as
+  written (`\(request.path)`).
 - A text block keeps its delimiters and its content lines exactly as written
   after their indentation, holes, escapes, quotes, tabs, and trailing
   whitespace included; only the indentation changes. The content lines and
@@ -1533,12 +1569,14 @@ grammar-permitted trailing commas, not expression order or program semantics.
   ```
 - Parentheses from the input are retained, including every pair needed to
   preserve evaluation order.
-- Every `//` comment and its text is retained in source order. Standalone
-  comments remain standalone, and end-of-line comments remain after code so
-  they cannot comment out a following token. Whitespace inside comment text is
-  not rewritten, apart from the one space after a doc comment's `///` (above).
-  Formatting therefore never attaches a doc comment to an item or detaches
-  one from it.
+- Every `//` comment and its text is retained in source order; the only
+  comment that moves past a token is one that follows a chain operator,
+  which is written just before it (above). Standalone comments remain
+  standalone, and end-of-line comments remain after code, or take a line of
+  their own in that one case, so they cannot comment out a following token.
+  Whitespace inside comment text is not rewritten, apart from the one space
+  after a doc comment's `///` (above). Formatting therefore never attaches a
+  doc comment to an item or detaches one from it.
 
 The formatter uses a soft 100-column target, counted in Unicode scalar
 values. It breaks a line wherever the grammar gives it a break point and the

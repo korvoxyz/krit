@@ -21,3 +21,15 @@ Ok(text)=>"Stored label for "+owner+" is "+text+", which is what the triage step
 Err(reason)=>"No label for "+owner+": "+reason,
 }
 }
+
+fn location(repository:String,number:Int)->Result<HttpResponse,String>{
+let path="Comments were posted for the configured repository at the path "+url_path_segment(repository)?;
+println("The configured repository for the reviewer agent that runs in staging is "+int_to_string(number));
+let size="The configured repository name for this agent is this many bytes long: "+int_to_string(string_byte_len(repository));
+let response=HttpResponse{status:200,body:"The configured repository for this agent is named "+url_path_segment(repository)?};
+Ok(response)
+}
+
+fn listing(entries:List<String>)->String{
+json_encode(HttpResponse{status:200,body:"The entries listed for the configured repository"})+" (listed)"
+}

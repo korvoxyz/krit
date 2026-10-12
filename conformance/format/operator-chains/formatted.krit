@@ -43,3 +43,25 @@ fn checked(path: String, owner: String) -> Bool {
         && string_starts_with(path, "/repos/")
         && string_ends_with(path, "/issues") == false
 }
+
+fn joined(owner: String, title: String) -> String {
+    let label = owner // the owner comes first
+        + " opened "
+        + title;
+    let note = owner
+        // and then the title
+        + title;
+    label + note
+}
+
+fn expected(labels: List<String>) -> Bool {
+    labels == [
+        "bug",
+        "needs-triage",
+        "good-first-issue",
+        "help-wanted",
+        "documentation",
+        "enhancement",
+        "question",
+    ]
+}

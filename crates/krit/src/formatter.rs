@@ -201,8 +201,13 @@ impl Formatter {
             if self.close_to_open[index].is_some() {
                 self.insert_trailing_comma_if_needed(index);
             }
-            self.break_before_chain_operator(index);
+            let breaks_before = self.break_before_chain_operator(index);
             self.emit_comments_before(self.tokens[index].span.start);
+            if breaks_before && let Some(next) = self.tokens.get(index + 1) {
+                // A comment after the operator moves before it, so the
+                // operator still leads its operand's line.
+                self.emit_comments_before(next.span.start);
+            }
 
             if self.omitted[index] || self.should_skip_trailing_comma(index) {
                 continue;
@@ -348,13 +353,14 @@ impl Formatter {
     /// continuation lines, until the chain ends, one level deeper than the
     /// line the chain starts on, and one more for each broken chain that
     /// starts with it and holds it, so a chain that is the first operand of
-    /// another stays apart from the other's operators.
-    fn break_before_chain_operator(&mut self, index: usize) {
+    /// another stays apart from the other's operators. Returns whether the
+    /// line breaks.
+    fn break_before_chain_operator(&mut self, index: usize) -> bool {
         let Some(chain) = self.chain_operators.get(&index).copied() else {
-            return;
+            return false;
         };
         if !self.broken_chains[chain] {
-            return;
+            return false;
         }
         if self.chains[chain].operators.first() == Some(&index) {
             let first = self.chains[chain].first;
@@ -367,6 +373,7 @@ impl Formatter {
             self.writer.indent += 1 + holders;
         }
         self.request_break(1);
+        true
     }
 
     /// Ends the continuation indentation of each broken chain that ends at
@@ -406,11 +413,12 @@ impl Formatter {
     /// `open_group` decides: its line ends after its opening delimiter, and
     /// the measurement goes on from its closing delimiter, at the start of a
     /// line. When measuring the chain `chain`, a too-wide group counts as
-    /// passing the limit instead when that chain, or a chain within it that
-    /// holds the group, has three or more operands: that chain breaks, so its
-    /// operands stay one per line. Chains of two keep such a group joined to
-    /// the other operand, as in `x == [` ... `]`. A text block, like a
-    /// breaking group, goes on after its closing `"""`.
+    /// passing the limit instead when `breaks_a_chain` says it breaks that
+    /// chain or one within it: one of three or more operands, so its
+    /// operands stay one per line, or one whose last operand holds an
+    /// argument list or parenthesized expression, so the operator leads that
+    /// operand's line instead of the arguments wrapping after it. A text
+    /// block, like a breaking group, goes on after its closing `"""`.
     ///
     /// After `through`, the last line goes on up to its next possible break:
     /// a `,`, `;`, or let-else `else`, which stays on the line; the opening
@@ -543,14 +551,24 @@ impl Formatter {
 
     /// Whether a group opening at `index` that is too wide for its line
     /// breaks the chain `measured` or a chain within it that holds the
-    /// group: one with three or more operands.
+    /// group: one with three or more operands, or one whose last operand
+    /// holds the group when the group opens with `(`, an argument list or a
+    /// parenthesized expression, as in `"text " + int_to_string(` ... `)`.
+    /// A chain of two keeps every other group that wraps joined to its other
+    /// operand: one in its first operand (`f(` ... `) + x`), or a list,
+    /// entry list, record, or named construction in its last (`x == [` ...
+    /// `]`).
     fn breaks_a_chain(&self, index: usize, measured: Option<usize>) -> bool {
         let Some(measured) = measured else {
             return false;
         };
+        let parenthesized = matches!(self.tokens[index].kind, TokenKind::LeftParen);
         let mut holder = self.innermost_chains[index];
         while let Some(chain) = holder {
-            if self.chains[chain].operators.len() > 1 {
+            let operators = &self.chains[chain].operators;
+            if operators.len() > 1
+                || parenthesized && operators.last().is_some_and(|last| index > *last)
+            {
                 return true;
             }
             if chain == measured {
@@ -2574,6 +2592,95 @@ mod tests {
     }
 
     #[test]
+    fn a_chain_of_two_breaks_before_an_argument_list_that_wraps_in_its_last_operand() {
+        // Each `"…" + call(…)` passes the limit, so the call's argument list
+        // would wrap; the chain breaks before `+` instead, as a chain of three
+        // does, in a let value, a call argument, and a construction field.
+        let text = |length: usize| format!("\"{}\"", "t".repeat(length));
+        let source = format!(
+            "fn f(name: String, count: Int) -> Result<HttpResponse, String> {{\n\
+             let path = {} + url_path_segment(name)?;\n\
+             println({} + int_to_string(count));\n\
+             let size = {} + int_to_string(string_byte_len(name));\n\
+             let reply = HttpResponse {{ status: 200, body: {} + url_path_segment(name)? }};\n\
+             let grouped = {} + (count * count);\n\
+             Ok(reply)\n}}\n",
+            text(70),
+            text(80),
+            text(60),
+            text(70),
+            text(80),
+        );
+        let formatted = format(&source);
+        assert_eq!(
+            formatted,
+            format!(
+                "fn f(name: String, count: Int) -> Result<HttpResponse, String> {{\n    \
+                 let path = {}\n        + url_path_segment(name)?;\n    \
+                 println(\n        {}\n            + int_to_string(count),\n    );\n    \
+                 let size = {}\n        + int_to_string(string_byte_len(name));\n    \
+                 let reply = HttpResponse {{\n        status: 200,\n        body: {}\n            \
+                 + url_path_segment(name)?,\n    }};\n    \
+                 let grouped = {}\n        + (count * count);\n    \
+                 Ok(reply)\n}}\n",
+                text(70),
+                text(80),
+                text(60),
+                text(70),
+                text(80),
+            )
+        );
+        assert_canonical_and_fits(&formatted);
+        // When the call's arguments do not fit on the continuation line
+        // either, they wrap there.
+        let argument = "a".repeat(80);
+        let formatted = format(&format!(
+            "fn f({argument}: Int) -> String {{ \"count: \" + int_to_string({argument}) }}\n"
+        ));
+        assert_eq!(
+            formatted,
+            format!(
+                "fn f(\n    {argument}: Int,\n) -> String {{\n    \"count: \"\n        \
+                 + int_to_string(\n            {argument},\n        )\n}}\n"
+            )
+        );
+        assert_canonical_and_fits(&formatted);
+        // A list, entry list, or construction stays joined to the other
+        // operand of a chain of two.
+        let items = (0..12)
+            .map(|index| format!("\"item-{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let formatted = format(&format!(
+            "fn f(items: List<String>) -> Bool {{ items == [{items}] }}\n"
+        ));
+        assert!(formatted.contains("    items == [\n"), "{formatted}");
+        assert_canonical_and_fits(&formatted);
+    }
+
+    #[test]
+    fn a_comment_after_a_chain_operator_moves_before_it() {
+        let source = "fn f(a: String, b: String) -> String {\n\
+                      let s = a +\n// note\nb;\n\
+                      let t = a + // after the operator\nb + a;\n\
+                      let u = a // before\n+ // after\nb;\n\
+                      let v = a == b + // inner\na;\n\
+                      s + t + u\n}\n";
+        let formatted = format(source);
+        assert_eq!(
+            formatted,
+            "fn f(a: String, b: String) -> String {\n    \
+             let s = a\n        // note\n        + b;\n    \
+             let t = a // after the operator\n        + b\n        + a;\n    \
+             let u = a // before\n        // after\n        + b;\n    \
+             let v = a\n        == b // inner\n            + a;\n    \
+             s + t + u\n}\n"
+        );
+        assert_eq!(format(&formatted), formatted);
+        assert_eq!(comment_texts(&formatted), comment_texts(source));
+    }
+
+    #[test]
     fn breaks_chains_of_each_precedence_level_one_level_at_a_time() {
         let product = ["weight"; 8].join(" * ");
         let formatted = format(&format!(
@@ -2728,6 +2835,20 @@ mod tests {
                 let formatted = format(&source);
                 assert_canonical_and_fits(&formatted);
                 assert_eq!(output(&formatted), output(&source));
+            }
+        }
+        // A two-operand string build whose last operand is a call, at widths
+        // around the limit: the chain breaks before `+`, and the call's
+        // argument list never wraps, since its continuation line fits.
+        for length in 40..=75 {
+            let chain = format!(
+                "\"{}\" + int_to_string(string_byte_len(v))",
+                "t".repeat(length)
+            );
+            for context in contexts {
+                let formatted = format(&format!("let v = \"v\";\n{}", context(&chain)));
+                assert_canonical_and_fits(&formatted);
+                assert!(!formatted.contains("int_to_string(\n"), "{formatted}");
             }
         }
     }
