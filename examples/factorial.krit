@@ -1,5 +1,6 @@
-// Function declarations can call themselves recursively.
-fn factorial(number) {
+/// Multiplies every integer from 1 up to `number`. Function declarations can
+/// call themselves recursively.
+fn factorial(number: Int) -> Int {
     if number == 0 {
         1
     } else {

@@ -1,79 +1,47 @@
-fn failure(message: String) -> HttpResponse {
-    log_error("reference.failed", [record { name: "reason", value: message }]);
-    record { status: 502, headers: [], body: "reference flow failed" }
+/// Logs why the reference flow stopped and answers with a generic failure,
+/// so no upstream error text reaches the caller.
+fn failure(reason: String) -> HttpResponse {
+    log_error("reference.failed", ["reason": reason]);
+    HttpResponse { status: 502, body: "reference flow failed" }
 }
 
-webhook fn handle(request: HttpRequest) -> HttpResponse {
-    log_info("reference.received", [record { name: "delivery", value: request.path }]);
-    match config_string("reference.repository") {
-        Ok(repository) => match secret("github-token") {
-            Ok(github_token) => {
-                let github_request: HttpRequest = record {
-                    method: "GET",
-                    path: "/repos/example/issues/1",
-                    query: "",
-                    headers: [record { name: "x-reference-repository", value: repository }],
-                    body: "",
-                };
-                match http_request(
-                    "https://github.example.invalid",
-                    github_request,
-                    Some(github_token),
-                ) {
-                    Ok(github_response) => {
-                        match ai_invoke("reviewer", github_response.body) {
-                            Ok(model_output) => {
-                                // Model output is raw, nondeterministic, untrusted text.
-                                let summary: String = json_decode(model_output);
-                                match secret("message-token") {
-                                    Ok(message_token) => {
-                                        let message_request: HttpRequest = record {
-                                            method: "POST",
-                                            path: "/messages",
-                                            query: "",
-                                            headers: [
-                                                record {
-                                                    name: "idempotency-key",
-                                                    value: "reference-delivery",
-                                                },
-                                            ],
-                                            body: summary,
-                                        };
-                                        match http_request(
-                                            "https://message.example.invalid",
-                                            message_request,
-                                            Some(message_token),
-                                        ) {
-                                            Ok(message_response) => {
-                                                log_info(
-                                                    "reference.completed",
-                                                    [
-                                                        record {
-                                                            name: "adapter",
-                                                            value: "reviewer",
-                                                        },
-                                                    ],
-                                                );
-                                                record {
-                                                    status: 200,
-                                                    headers: message_response.headers,
-                                                    body: summary,
-                                                }
-                                            },
-                                            Err(error) => failure(error),
-                                        }
-                                    },
-                                    Err(error) => failure(error),
-                                }
-                            },
-                            Err(error) => failure(error),
-                        }
-                    },
-                    Err(error) => failure(error),
-                }
-            },
-            Err(error) => failure(error),
+/// Fetches the issue, asks the reviewer model to summarize it, and posts the
+/// summary to the message service. Each `?` passes a failure to the caller.
+fn review() -> Result<HttpResponse, String> {
+    let repository = config_string("reference.repository")?;
+    let github_token = secret("github-token")?;
+    let issue = http_request(
+        "https://github.example.invalid",
+        HttpRequest {
+            method: "GET",
+            path: "/repos/example/issues/1",
+            headers: ["x-reference-repository": repository],
         },
-        Err(error) => failure(error),
+        Some(github_token),
+    )?;
+    // Model output is raw, nondeterministic, untrusted text.
+    let model_output = ai_invoke("reviewer", issue.body)?;
+    let summary: String = json_decode(model_output);
+    let message_token = secret("message-token")?;
+    let message = http_request(
+        "https://message.example.invalid",
+        HttpRequest {
+            method: "POST",
+            path: "/messages",
+            headers: ["idempotency-key": "reference-delivery"],
+            body: summary,
+        },
+        Some(message_token),
+    )?;
+    log_info("reference.completed", ["adapter": "reviewer"]);
+    Ok(HttpResponse { status: 200, headers: message.headers, body: summary })
+}
+
+/// Receives a delivery and runs the reference review flow.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    log_info("reference.received", ["delivery": request.path]);
+    match review() {
+        Ok(response) => response,
+        Err(reason) => failure(reason),
     }
 }

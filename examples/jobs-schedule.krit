@@ -1,6 +1,6 @@
+/// Records each hourly occurrence in the `render-output` bucket under its
+/// fire identity; an `Err` commits nothing and lets the host retry.
 schedule "hourly-sweep" fn handle(event: ScheduleEvent) -> Result<String, String> {
-    match object_put("render-output", event.id, event.schedule) {
-        Ok(stored) => Ok(event.id),
-        Err(error) => Err(error),
-    }
+    object_put("render-output", event.id, event.schedule)?;
+    Ok(event.id)
 }
