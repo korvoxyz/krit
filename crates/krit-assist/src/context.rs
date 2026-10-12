@@ -8,8 +8,8 @@ use std::{
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use krit::{
-    Block, Expression, ExpressionKind, MatchKind, Program, Source, Statement, StatementKind,
-    ValueLiteral, VariantPattern,
+    Block, Expression, ExpressionKind, Program, Source, Statement, StatementKind, ValueLiteral,
+    VariantPattern,
 };
 use krit_package::Manifest;
 use serde::Serialize;
@@ -901,22 +901,10 @@ fn ast_sensitive_literal_spans(
                             collect(source, argument, scopes, visited, targets);
                         }
                     }
-                    ExpressionKind::Match { subject, kind } => {
+                    ExpressionKind::Match { subject, arms } => {
                         collect(source, subject, scopes, visited, targets);
-                        match kind {
-                            MatchKind::List {
-                                empty_case,
-                                cons_case,
-                                ..
-                            } => {
-                                collect(source, empty_case, scopes, visited, targets);
-                                collect(source, cons_case, scopes, visited, targets);
-                            }
-                            MatchKind::Variants { arms, .. } => {
-                                for arm in arms {
-                                    collect(source, &arm.value, scopes, visited, targets);
-                                }
-                            }
+                        for arm in arms {
+                            collect(source, &arm.value, scopes, visited, targets);
                         }
                     }
                     ExpressionKind::Unary { operand, .. }
@@ -1046,22 +1034,10 @@ fn ast_sensitive_literal_spans(
                         }
                     }
                 }
-                ExpressionKind::Match { subject, kind } => {
+                ExpressionKind::Match { subject, arms } => {
                     expression_spans(source, subject, scopes, spans);
-                    match kind {
-                        MatchKind::List {
-                            empty_case,
-                            cons_case,
-                            ..
-                        } => {
-                            expression_spans(source, empty_case, scopes, spans);
-                            expression_spans(source, cons_case, scopes, spans);
-                        }
-                        MatchKind::Variants { arms, .. } => {
-                            for arm in arms {
-                                expression_spans(source, &arm.value, scopes, spans);
-                            }
-                        }
+                    for arm in arms {
+                        expression_spans(source, &arm.value, scopes, spans);
                     }
                 }
                 ExpressionKind::Unary { operand, .. }
@@ -2330,6 +2306,41 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
                 ("private-question", "search-query"),
                 ("lookups", "capability-resource"),
                 ("docs", "capability-resource"),
+            ] {
+                assert!(
+                    spans
+                        .iter()
+                        .any(|(actual, category)| actual == content && *category == expected),
+                    "{content} leaked: {spans:?}"
+                );
+            }
+            assert!(
+                spans.iter().all(|(actual, _)| actual != "unrelated-text"),
+                "an unrelated literal was redacted: {spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_calls_in_nested_pattern_arms_are_redacted() {
+        let source = r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match state_get("agent-work", "k") {
+        Ok(Some(_)) => match cache_put("lookups", "k", "private-payload", 60) {
+            Ok(_) => record { status: 200, headers: [], body: "ok" },
+            Err(problem) => record { status: 500, headers: [], body: problem },
+        },
+        Ok(None) => record { status: 404, headers: [], body: "unrelated-text" },
+        Err(_) => record { status: 500, headers: [], body: "failed" },
+    }
+}
+"#;
+
+        for spans in [redacted(source), redacted_tolerant(source)] {
+            for (content, expected) in [
+                ("private-payload", "cache-value"),
+                ("lookups", "capability-resource"),
+                ("agent-work", "capability-resource"),
             ] {
                 assert!(
                     spans

@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, HashSet};
 use crate::{
     Diagnostic, Source, Span,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
-        RecordField, RecordTypeField, Statement, StatementKind, TypeAnnotation, TypeKind,
-        UnaryOperator, ValueLiteral, VariantArm, VariantFamily, VariantName, VariantPattern,
+        BinaryOperator, Block, Expression, ExpressionKind, MatchArm, Parameter, Pattern,
+        PatternKind, Program, RecordField, RecordTypeField, Statement, StatementKind,
+        TypeAnnotation, TypeKind, UnaryOperator, ValueLiteral, VariantArm, VariantName,
+        VariantPattern,
     },
     habits::Habit,
     limits::{MAX_NESTING_DEPTH, MAX_STRUCTURAL_DEPTH, nesting_error, structural_error},
@@ -1142,137 +1143,221 @@ impl<'source> Parser<'source> {
     fn match_expression(&mut self, start: Span) -> Result<Expression, Diagnostic> {
         let subject = self.nested(start, Self::expression)?;
         let open = self.expect(TokenKind::LeftBrace)?.span;
-        self.nested(open, |parser| {
-            if parser.check(&TokenKind::LeftBracket) {
-                parser.list_match(start, subject)
-            } else {
-                parser.variant_match(start, subject)
-            }
-        })
-    }
-
-    fn list_match(&mut self, start: Span, subject: Expression) -> Result<Expression, Diagnostic> {
-        let empty_pattern_start = self.current().span;
-        if !self.consume(&TokenKind::LeftBracket) || !self.consume(&TokenKind::RightBracket) {
-            return Err(Diagnostic::new(
-                "K1003",
-                "the first match pattern must be `[]`",
-                empty_pattern_start.join(self.current().span),
-            ));
-        }
-        self.expect(TokenKind::FatArrow)?;
-        let empty_case = self.expression()?;
-        self.expect(TokenKind::Comma)?;
-
-        let cons_pattern_start = self.current().span;
-        if !self.consume(&TokenKind::LeftBracket) {
-            return Err(Diagnostic::new(
-                "K1003",
-                "the second match pattern must be `[head, ..tail]`",
-                self.current().span,
-            ));
-        }
-        let (head_name, head_span) = self.binding_name()?;
-        self.expect(TokenKind::Comma)?;
-        if !self.consume(&TokenKind::DotDot) {
-            return Err(Diagnostic::new(
-                "K1003",
-                "the second match pattern must bind a `..tail`",
-                cons_pattern_start.join(self.current().span),
-            ));
-        }
-        let (tail_name, tail_span) = self.binding_name()?;
-        // The discard name `_` may be bound more than once.
-        if head_name == tail_name && head_name != "_" {
-            return Err(Diagnostic::new(
-                "K2002",
-                format!("duplicate match binding `{tail_name}`"),
-                head_span.join(tail_span),
-            ));
-        }
-        self.expect(TokenKind::RightBracket)?;
-        self.expect(TokenKind::FatArrow)?;
-        let cons_case = self.expression()?;
-        self.consume(&TokenKind::Comma);
+        let arms = self.nested(open, Self::match_arms)?;
         let end = self.expect(TokenKind::RightBrace)?.span;
-
         Ok(Expression {
             kind: ExpressionKind::Match {
                 subject: Box::new(subject),
-                kind: MatchKind::List {
-                    empty_case: Box::new(empty_case),
-                    head_name,
-                    head_span,
-                    tail_name,
-                    tail_span,
-                    cons_case: Box::new(cons_case),
-                },
+                arms,
             },
             span: start.join(end),
         })
     }
 
-    fn variant_match(
-        &mut self,
-        start: Span,
-        subject: Expression,
-    ) -> Result<Expression, Diagnostic> {
+    /// Parses the comma-separated arms of a `match`, up to its `}`.
+    ///
+    /// Which patterns may stand together (one family at each position, no
+    /// overlap, no top-level catch-all, every outcome named) is checked by
+    /// analysis. An arm whose pattern nests variant or list patterns inside a
+    /// payload nests its value one level deeper per nested pattern, as Core IR
+    /// nests the matches that decide it.
+    fn match_arms(&mut self) -> Result<Vec<MatchArm>, Diagnostic> {
         let mut arms = Vec::new();
-        let mut seen = HashSet::new();
-
         while !self.check(&TokenKind::RightBrace) {
             if self.check(&TokenKind::Eof) {
-                return Err(self.expected("variant match arm or `}`"));
+                return Err(self.expected("match arm or `}`"));
             }
-            let pattern_start = self.current().span;
-            let (variant, name_span) = self.variant_name()?;
-            if !seen.insert(variant) {
-                return Err(Diagnostic::new(
-                    "K1003",
-                    format!("duplicate `{}` match arm", variant.as_str()),
-                    name_span,
-                ));
-            }
-            let binding = self.variant_binding(variant, name_span)?;
+            let pattern = self.pattern()?;
             self.expect(TokenKind::FatArrow)?;
-            let value = self.expression()?;
-            let arm_span = pattern_start.join(value.span);
-            arms.push(VariantArm {
-                variant,
-                binding,
+            let levels = pattern.constructor_depth().saturating_sub(1);
+            let value = self.nested_levels(levels, pattern.span, Self::expression)?;
+            arms.push(MatchArm {
+                span: pattern.span.join(value.span),
+                pattern,
                 value,
-                span: arm_span,
             });
             if !self.consume(&TokenKind::Comma) && !self.check(&TokenKind::RightBrace) {
                 return Err(self.expected("`,` or `}`"));
             }
         }
-        let end = self.expect(TokenKind::RightBrace)?.span;
-        let family = if seen.len() == 2
-            && seen.contains(&VariantName::Some)
-            && seen.contains(&VariantName::None)
-        {
-            VariantFamily::Option
-        } else if seen.len() == 2
-            && seen.contains(&VariantName::Ok)
-            && seen.contains(&VariantName::Err)
-        {
-            VariantFamily::Result
-        } else {
+        if arms.is_empty() {
             return Err(Diagnostic::new(
                 "K1003",
-                "variant match must contain exactly `Some(name)` and `None`, or exactly `Ok(name)` and `Err(name)`",
-                start.join(end),
+                "a `match` needs an arm for each outcome, found `}`",
+                self.current().span,
             ));
-        };
+        }
+        Ok(arms)
+    }
 
-        Ok(Expression {
-            kind: ExpressionKind::Match {
-                subject: Box::new(subject),
-                kind: MatchKind::Variants { family, arms },
+    /// Parses a `match` pattern: a name, `_`, `Some(p)`, `Ok(p)`, `Err(p)`,
+    /// `None`, `[]`, or `[head, ..tail]`.
+    ///
+    /// The parentheses of a variant pattern open one nesting level for its
+    /// payload.
+    fn pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        let token = self.current().clone();
+        let name = match &token.kind {
+            TokenKind::LeftBracket => return self.list_pattern(),
+            TokenKind::Identifier(name) => name.clone(),
+            _ => {
+                return Err(Diagnostic::new(
+                    "K1003",
+                    format!(
+                        "expected a match pattern, found {}",
+                        token.kind.description()
+                    ),
+                    token.span,
+                )
+                .with_note(
+                    "a pattern is a name, `_`, `Some(p)`, `None`, `Ok(p)`, `Err(p)`, `[]`, or \
+                     `[head, ..tail]`; to compare values, use `if` and `==`",
+                ));
+            }
+        };
+        let follows_paren = matches!(
+            self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+            Some(TokenKind::LeftParen)
+        );
+        let variant = match name.as_str() {
+            "Some" => VariantName::Some,
+            "None" => VariantName::None,
+            "Ok" => VariantName::Ok,
+            "Err" => VariantName::Err,
+            "_" => {
+                self.advance();
+                return Ok(Pattern {
+                    kind: PatternKind::Wildcard,
+                    span: token.span,
+                });
+            }
+            _ if follows_paren => {
+                return Err(Diagnostic::new(
+                    "K1003",
+                    format!("unknown match variant `{name}`"),
+                    token.span,
+                ));
+            }
+            _ => {
+                let (binding, span) = self.binding_name()?;
+                return Ok(Pattern {
+                    kind: PatternKind::Binder(binding),
+                    span,
+                });
+            }
+        };
+        self.advance();
+        if variant == VariantName::None {
+            if self.check(&TokenKind::LeftParen) {
+                return Err(Diagnostic::new(
+                    "K1003",
+                    "`None` does not bind a value",
+                    self.current().span,
+                ));
+            }
+            return Ok(Pattern {
+                kind: PatternKind::Variant {
+                    variant,
+                    payload: None,
+                },
+                span: token.span,
+            });
+        }
+        if !self.check(&TokenKind::LeftParen) {
+            return Err(Diagnostic::new(
+                "K1003",
+                format!("`{}` must bind one value", variant.as_str()),
+                token.span.join(self.current().span),
+            ));
+        }
+        let open = self.advance().span;
+        let payload = self.nested(open, Self::pattern)?;
+        let end = self.expect(TokenKind::RightParen)?.span;
+        Ok(Pattern {
+            kind: PatternKind::Variant {
+                variant,
+                payload: Some(Box::new(payload)),
+            },
+            span: token.span.join(end),
+        })
+    }
+
+    /// Parses `[]` or `[head, ..tail]`, whose head and tail are names or `_`.
+    fn list_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        let start = self.expect(TokenKind::LeftBracket)?.span;
+        if let Some(end) = self.consume_span(&TokenKind::RightBracket) {
+            return Ok(Pattern {
+                kind: PatternKind::EmptyList,
+                span: start.join(end),
+            });
+        }
+        let shape = |parser: &Self| {
+            Diagnostic::new(
+                "K1003",
+                "a list pattern is `[]` or `[head, ..tail]`",
+                start.join(parser.current().span),
+            )
+        };
+        let head = self.list_pattern_part()?;
+        if !self.consume(&TokenKind::Comma) || !self.consume(&TokenKind::DotDot) {
+            return Err(shape(self));
+        }
+        let tail = self.list_pattern_part()?;
+        if let (PatternKind::Binder(head_name), PatternKind::Binder(tail_name)) =
+            (&head.kind, &tail.kind)
+            && head_name == tail_name
+        {
+            return Err(Diagnostic::new(
+                "K2002",
+                format!("duplicate match binding `{tail_name}`"),
+                head.span.join(tail.span),
+            ));
+        }
+        if !self.check(&TokenKind::RightBracket) {
+            return Err(shape(self));
+        }
+        let end = self.advance().span;
+        Ok(Pattern {
+            kind: PatternKind::Cons {
+                head: Box::new(head),
+                tail: Box::new(tail),
             },
             span: start.join(end),
         })
+    }
+
+    /// Parses the head or tail of `[head, ..tail]`: a name or `_`.
+    fn list_pattern_part(&mut self) -> Result<Pattern, Diagnostic> {
+        let token = self.current().clone();
+        match &token.kind {
+            TokenKind::Identifier(name) if name == "_" => {
+                self.advance();
+                Ok(Pattern {
+                    kind: PatternKind::Wildcard,
+                    span: token.span,
+                })
+            }
+            TokenKind::Identifier(name)
+                if !matches!(name.as_str(), "Some" | "None" | "Ok" | "Err") =>
+            {
+                let (binding, span) = self.binding_name()?;
+                Ok(Pattern {
+                    kind: PatternKind::Binder(binding),
+                    span,
+                })
+            }
+            _ => Err(Diagnostic::new(
+                "K1003",
+                format!(
+                    "the head and tail of a list pattern are names or `_`, found {}",
+                    match &token.kind {
+                        TokenKind::Identifier(name) => format!("`{name}`"),
+                        kind => kind.description().to_owned(),
+                    }
+                ),
+                token.span,
+            )),
+        }
     }
 
     /// Parses a variant pattern: `Some(name)`, `Ok(name)`, `Err(name)`, or
@@ -1335,6 +1420,20 @@ impl<'source> Parser<'source> {
                 "K1003",
                 format!("`{}` must bind one value", variant.as_str()),
                 name_span.join(self.current().span),
+            ));
+        }
+        if self.at_variant_pattern() || self.check(&TokenKind::LeftBracket) {
+            return Err(Diagnostic::new(
+                "K3014",
+                format!(
+                    "let-else patterns do not nest: `{}(...)` binds its payload to a name or `_`",
+                    variant.as_str()
+                ),
+                self.current().span,
+            )
+            .with_note(
+                "bind the payload with this let-else, then decide it with another let-else or a \
+                 `match`, whose patterns nest",
             ));
         }
         let (binding, _) = self.binding_name()?;
@@ -1498,6 +1597,25 @@ impl<'source> Parser<'source> {
         result
     }
 
+    /// Parses with `levels` more syntactic nesting levels open, each opened
+    /// by the construct at `span`.
+    fn nested_levels<T>(
+        &mut self,
+        levels: usize,
+        span: Span,
+        parse: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
+    ) -> Result<T, Diagnostic> {
+        let mut opened = 0;
+        let mut entered = Ok(());
+        while opened < levels && entered.is_ok() {
+            opened += 1;
+            entered = self.enter(span);
+        }
+        let result = entered.and_then(|()| parse(self));
+        self.depth -= opened;
+        result
+    }
+
     fn enter(&mut self, span: Span) -> Result<(), Diagnostic> {
         self.depth += 1;
         if self.depth > MAX_NESTING_DEPTH {
@@ -1528,6 +1646,11 @@ impl<'source> Parser<'source> {
 
     fn check(&self, kind: &TokenKind) -> bool {
         self.current().kind == *kind
+    }
+
+    /// Consumes the current token when it is `kind` and returns its span.
+    fn consume_span(&mut self, kind: &TokenKind) -> Option<Span> {
+        self.check(kind).then(|| self.advance().span)
     }
 
     fn consume(&mut self, kind: &TokenKind) -> bool {
@@ -1772,7 +1895,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_record_fields_and_variant_arms() {
+    fn rejects_duplicate_record_fields() {
         let duplicate_field =
             parse_text("record { value: 1, value: 2 };").expect_err("duplicate field should fail");
         assert_eq!(duplicate_field.code(), "K2002");
@@ -1781,11 +1904,6 @@ mod tests {
             parse_text("let value: Record { item: Int, item: Bool } = record {};")
                 .expect_err("duplicate type field should fail");
         assert_eq!(duplicate_type_field.code(), "K2002");
-
-        let duplicate_arm =
-            parse_text("match Some(1) { Some(value) => value, Some(other) => other, None => 0 };")
-                .expect_err("duplicate arm should fail");
-        assert_eq!(duplicate_arm.code(), "K1003");
     }
 
     /// Parses on the stack the CLI gives the compiler pipeline; unoptimized
@@ -2461,15 +2579,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_incomplete_or_mixed_variant_matches() {
-        let missing = parse_text("match None { None => 0 };")
-            .expect_err("non-exhaustive option match should fail");
-        assert_eq!(missing.code(), "K1003");
+    fn arm_patterns(text: &str) -> Vec<String> {
+        let program = parse_text(text).expect("match should parse");
+        let StatementKind::Expression(Expression {
+            kind: ExpressionKind::Match { arms, .. },
+            ..
+        }) = &program.statements[0].kind
+        else {
+            panic!("expected a match statement");
+        };
+        arms.iter().map(|arm| arm.pattern.to_string()).collect()
+    }
 
-        let mixed = parse_text("match Some(1) { Some(value) => value, Err(error) => error };")
-            .expect_err("mixed variant families should fail");
-        assert_eq!(mixed.code(), "K1003");
+    #[test]
+    fn parses_nested_patterns_wildcards_and_arms_in_any_order() {
+        assert_eq!(
+            arm_patterns(
+                "match r { Err( _ ) => 0, Ok( Some( [ head , .. _ ] ) ) => head, Ok(None) => 1 };"
+            ),
+            ["Err(_)", "Ok(Some([head, .._]))", "Ok(None)"]
+        );
+        assert_eq!(
+            arm_patterns("match items { [_, ..rest] => 1, [] => 0 };"),
+            ["[_, ..rest]", "[]"]
+        );
+        // Which patterns may stand together is decided by analysis, so
+        // incomplete, duplicate, mixed, and catch-all arms all parse.
+        for text in [
+            "match None { None => 0 };",
+            "match Some(1) { Some(value) => value, Some(other) => other, None => 0 };",
+            "match Some(1) { Some(value) => value, Err(error) => error };",
+            "match Some(1) { _ => 0 };",
+            "match Some(1) { other => 0 };",
+        ] {
+            parse_text(text).unwrap_or_else(|error| panic!("{text}: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_patterns() {
+        for (text, code, snippet) in [
+            ("match o { } ;", "K1003", "}"),
+            ("match o { 1 => 0 };", "K1003", "1"),
+            ("match o { \"a\" => 0 };", "K1003", "\"a\""),
+            ("match o { Foo(x) => 0 };", "K1003", "Foo"),
+            ("match o { None(x) => 0 };", "K1003", "("),
+            ("match o { Some => 0 };", "K1003", "Some =>"),
+            ("match o { Some() => 0 };", "K1003", ")"),
+            ("match o { Some(x, y) => 0 };", "K1002", ","),
+            ("match o { [x] => 0 };", "K1003", "[x]"),
+            ("match o { [x, y] => 0 };", "K1003", "[x, y"),
+            ("match o { [Some(x), ..t] => 0 };", "K1003", "Some"),
+            ("match o { [h, ..None] => 0 };", "K1003", "None"),
+            ("match o { [h, ..[]] => 0 };", "K1003", "["),
+            ("match o { [x, ..x] => 0 };", "K2002", "x, ..x"),
+            ("match o { Some(print) => 0 };", "K2002", "print"),
+            ("match o { Some(mut x) => 0 };", "K1103", "mut"),
+            ("match o { Some(x) => 0 None => 1 };", "K1002", "None"),
+        ] {
+            let error = parse_text(text).expect_err(text);
+            assert_eq!(error.code(), code, "{text}: {error:?}");
+            let span = error.span();
+            assert_eq!(&text[span.start..span.end], snippet, "{text}");
+        }
+    }
+
+    #[test]
+    fn nested_patterns_count_toward_the_nesting_limit() {
+        // The payload of each variant pattern opens one level.
+        let pattern = |depth: usize| format!("{}x{}", "Some(".repeat(depth), ")".repeat(depth));
+        let at_limit = format!("match o {{ {} => 0 }};", pattern(MAX_NESTING_DEPTH - 1));
+        parse_on_compiler_stack(at_limit).expect("patterns within the limit should parse");
+        let error = parse_on_compiler_stack(format!(
+            "match o {{ {} => 0 }};",
+            pattern(MAX_NESTING_DEPTH)
+        ))
+        .expect_err("patterns beyond the limit should fail");
+        assert_eq!(error.code(), "K1005");
+
+        // An arm's value nests one level deeper per pattern nested in a
+        // payload, as Core IR decides it with one nested match per level.
+        let value = |levels: usize| format!("{}0{}", "(".repeat(levels), ")".repeat(levels));
+        let nested = pattern(3).replace('x', "None");
+        // The arm list opens one level and the nested patterns three more.
+        let fits = MAX_NESTING_DEPTH - 1 - 3;
+        parse_on_compiler_stack(format!("match o {{ {nested} => {} }};", value(fits)))
+            .expect("the arm value should fit");
+        let error =
+            parse_on_compiler_stack(format!("match o {{ {nested} => {} }};", value(fits + 1)))
+                .expect_err("the arm value should cross the limit");
+        assert_eq!(error.code(), "K1005");
     }
 
     #[test]
@@ -2574,6 +2773,18 @@ mod tests {
                 "K1003",
                 "(x)",
                 0,
+            ),
+            (
+                "fn f(r) { let Ok(Some(x)) = r else Err(e) => 0; x }",
+                "K3014",
+                "Some",
+                1,
+            ),
+            (
+                "fn f(r) { let Ok(x) = r else Err([]) => 0; x }",
+                "K3014",
+                "[",
+                1,
             ),
             (
                 "fn f(o) { let Some(mut x) = o else None => 0; x }",

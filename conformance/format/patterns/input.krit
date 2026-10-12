@@ -1,0 +1,15 @@
+fn describe(stored:Result<Option<String>,String>)->String{
+match stored{Ok( Some( value ) )=>"found "+value,Ok(None)=>"missing",Err( _ )=>"failed"}
+}
+
+fn second(items:Result<List<Int>,String>)->Int{
+    match items {
+        Ok( [ _ , .. rest ] ) => match rest { [ value , .._ ] => value, [ ] => 0 },
+        Ok([])=>0 ,
+        Err(_) => 0 ,
+    }
+}
+
+fn depth(value: Option<Option<Option<Int>>>) -> Int {
+    match value { Some(Some(Some(_)))=>3, Some(Some(None))=>2, Some(None)=>1, None=>0, }
+}

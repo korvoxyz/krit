@@ -1,0 +1,7 @@
+fn describe(stored: Option<Result<String, String>>) -> String {
+    match stored {
+        Some(Ok(value)) => value,
+        Some(None) => "missing",
+        None => "none",
+    }
+}

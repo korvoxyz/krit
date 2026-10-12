@@ -657,6 +657,61 @@ queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
 }
 
 #[test]
+fn nested_patterns_decide_object_reads_in_a_queue_worker() {
+    let directory = TestDirectory::new("nested-patterns");
+    let database = directory.database();
+    seed_job(&database, 1, "first");
+    seed_job(&database, 2, "first");
+    let worker = compile(
+        r#"
+queue "render-jobs" fn handle(job: QueueJob) -> Result<String, String> {
+    match object_get("render-output", job.body) {
+        Ok(Some(previous)) => Ok("cached " + previous),
+        Ok(None) => match object_put("render-output", job.body, job.id) {
+            Ok(_) => Ok("rendered " + job.body),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+"#,
+        WORKER_EFFECTS,
+    );
+    let grants = GrantSet::from_manifest(&manifest(WORKER_CAPABILITIES));
+    let dispatch = |now_millis| {
+        Runtime::default()
+            .dispatch_job(DeliveryRequest {
+                bytes: &worker.bytes,
+                metadata: &worker.metadata,
+                grants: &grants,
+                agent_host: &host(durable(database.clone(), Resources::default())),
+                resource: "render-jobs",
+                now_millis,
+                cancellation: &CancellationHandle::new(),
+            })
+            .expect("the job should dispatch")
+    };
+
+    // The first job finds no object (`Ok(None)`) and stores one; the second
+    // finds it (`Ok(Some(previous))`).
+    let first = dispatch(2_000);
+    assert!(matches!(
+        first.outcome,
+        DeliveryOutcome::Completed { attempt: 1, .. }
+    ));
+    assert_eq!(first.detail, "rendered first");
+    let second = dispatch(3_000);
+    assert!(matches!(
+        second.outcome,
+        DeliveryOutcome::Completed { attempt: 1, .. }
+    ));
+    assert!(second.detail.starts_with("cached "), "{}", second.detail);
+    let store = open_store(&database);
+    assert_eq!(store.object_stats("render-output").unwrap().0, 1);
+    assert_eq!(store.queue_stats("render-jobs").unwrap(), (0, 0));
+}
+
+#[test]
 fn exhausted_attempts_dead_letter_and_stop_redelivering() {
     let directory = TestDirectory::new("dead-letter");
     let database = directory.database();

@@ -7,10 +7,11 @@ use std::{
 
 use crate::{
     Analysis, BinaryOperator, Block, Builtin, EffectSet, Expression, ExpressionKind, FunctionType,
-    MatchKind, Parameter, Program, RequirementSet, ResolvedName, Span, Statement, StatementKind,
-    SymbolId, SymbolKind, Type, UnaryOperator, ValueLiteral, VariantArm, VariantFamily,
-    VariantName, VariantPattern,
+    MatchArm, Parameter, Pattern, PatternKind, Program, RequirementSet, ResolvedName, Span,
+    Statement, StatementKind, SymbolId, SymbolKind, Type, UnaryOperator, ValueLiteral, VariantArm,
+    VariantFamily, VariantName, VariantPattern,
     limits::{MAX_CORE_BLOCK_DEPTH, MAX_TREE_DEPTH},
+    patterns,
 };
 
 macro_rules! id_type {
@@ -1011,81 +1012,14 @@ impl<'a> Lowerer<'a> {
                     },
                 ))
             }
-            ExpressionKind::Match { subject, kind } => {
+            ExpressionKind::Match { subject, arms } => {
                 let subject_value = self.lower_expression(subject, operations)?;
-                match kind {
-                    MatchKind::List {
-                        empty_case,
-                        head_name,
-                        head_span,
-                        tail_name,
-                        tail_span,
-                        cons_case,
-                    } => {
-                        let empty = self.lower_expression_block(empty_case, Vec::new())?;
-                        let head_binding =
-                            self.declaration_binding(*head_span, head_name, SymbolKind::Match)?;
-                        let tail_binding =
-                            self.declaration_binding(*tail_span, tail_name, SymbolKind::Match)?;
-                        let head = self.block_parameter(head_binding)?;
-                        let tail = self.block_parameter(tail_binding)?;
-                        let head_id = head.match_binding;
-                        let tail_id = tail.match_binding;
-                        let cons = self.lower_expression_block(cons_case, vec![head, tail])?;
-                        let effects = EffectSet::union([&empty.effects, &cons.effects]);
-                        let requirements =
-                            RequirementSet::union([&empty.requirements, &cons.requirements]);
-                        Ok(self.emit_with_requirements(
-                            operations,
-                            ty,
-                            effects,
-                            requirements,
-                            source,
-                            OperationKind::MatchList {
-                                subject: subject_value,
-                                empty,
-                                head: head_id,
-                                tail: tail_id,
-                                cons,
-                            },
-                        ))
-                    }
-                    MatchKind::Variants { family, arms } => {
-                        let mut lowered_arms = Vec::with_capacity(arms.len());
-                        for arm in arms {
-                            let (binding, parameters) = if let Some(name) = &arm.binding {
-                                let binding =
-                                    self.declaration_binding(arm.span, name, SymbolKind::Match)?;
-                                let parameter = self.block_parameter(binding)?;
-                                (Some(parameter.match_binding), vec![parameter])
-                            } else {
-                                (None, Vec::new())
-                            };
-                            lowered_arms.push(VariantArmBlock {
-                                variant: arm.variant,
-                                binding,
-                                block: self.lower_expression_block(&arm.value, parameters)?,
-                            });
-                        }
-                        let effects =
-                            EffectSet::union(lowered_arms.iter().map(|arm| &arm.block.effects));
-                        let requirements = RequirementSet::union(
-                            lowered_arms.iter().map(|arm| &arm.block.requirements),
-                        );
-                        Ok(self.emit_with_requirements(
-                            operations,
-                            ty,
-                            effects,
-                            requirements,
-                            source,
-                            OperationKind::MatchVariant {
-                                subject: subject_value,
-                                family: *family,
-                                arms: lowered_arms,
-                            },
-                        ))
-                    }
-                }
+                let subject_type = self.expression_fact(subject)?.shared_type();
+                let rows = arms
+                    .iter()
+                    .map(|arm| (arm, &arm.pattern))
+                    .collect::<Vec<_>>();
+                self.lower_decision(subject_value, &subject_type, &rows, &ty, source, operations)
             }
             ExpressionKind::Propagate { operand, question } => {
                 self.lower_propagate(operand, *question, ty, source, operations)
@@ -1105,6 +1039,285 @@ impl<'a> Lowerer<'a> {
             }
             ExpressionKind::Binary { .. } => self.lower_binary_chain(expression, operations),
         }
+    }
+
+    /// Lowers the arms of a match that reach one position of its value to a
+    /// Core match on `value`, of type `value_type`, appended to `operations`,
+    /// and returns the match's result, of the match expression's type `ty`.
+    ///
+    /// Each row is an arm with its pattern at this position. Analysis made
+    /// these variant or list patterns of one family, pairwise disjoint, and
+    /// exhaustive. For each constructor, in the order the arms first use it,
+    /// the Core arm binds the payload: to the source binder when one arm
+    /// matches the payload with a name, through a Core-only binding when it
+    /// matches it with `_` or when the arms match it with further patterns,
+    /// which a nested match on that binding then decides. Every arm's value
+    /// is lowered exactly once, one Core block deeper per nested pattern.
+    fn lower_decision(
+        &mut self,
+        value: ValueId,
+        value_type: &Arc<Type>,
+        rows: &[(&MatchArm, &Pattern)],
+        ty: &Arc<Type>,
+        source: Option<Span>,
+        operations: &mut Vec<CoreOperation>,
+    ) -> Result<ValueId, IrError> {
+        let mut order = Vec::new();
+        for (_, pattern) in rows {
+            let constructor = patterns::constructor(pattern).ok_or_else(|| {
+                IrError::new(format!(
+                    "a catch-all pattern at {:?} shares a position with other arms",
+                    pattern.span
+                ))
+            })?;
+            if !order.contains(&constructor) {
+                order.push(constructor);
+            }
+        }
+        let arm_of = |constructor| -> Vec<(&MatchArm, &Pattern)> {
+            rows.iter()
+                .filter(|(_, pattern)| patterns::constructor(pattern) == Some(constructor))
+                .copied()
+                .collect()
+        };
+        fn single<'r>(
+            rows: &[(&'r MatchArm, &'r Pattern)],
+            source: Option<Span>,
+        ) -> Result<(&'r MatchArm, &'r Pattern), IrError> {
+            if let [row] = rows {
+                Ok(*row)
+            } else {
+                Err(IrError::new(format!(
+                    "{} overlapping list arms at {source:?}",
+                    rows.len()
+                )))
+            }
+        }
+
+        if let Type::List(element) = value_type.as_ref() {
+            let mut empty = None;
+            let mut cons = None;
+            for constructor in order {
+                let (arm, pattern) = single(&arm_of(constructor), source)?;
+                match (constructor, &pattern.kind) {
+                    (patterns::Constructor::Empty, PatternKind::EmptyList) => {
+                        empty = Some(self.lower_expression_block(&arm.value, Vec::new())?);
+                    }
+                    (patterns::Constructor::Cons, PatternKind::Cons { head, tail }) => {
+                        let head_parameter = self.pattern_parameter(head, element)?;
+                        let tail_parameter = self.pattern_parameter(tail, value_type)?;
+                        let (head, tail) =
+                            (head_parameter.match_binding, tail_parameter.match_binding);
+                        let block = self.lower_expression_block(
+                            &arm.value,
+                            vec![head_parameter, tail_parameter],
+                        )?;
+                        cons = Some((head, tail, block));
+                    }
+                    _ => {
+                        return Err(IrError::new(format!(
+                            "pattern at {:?} does not match a list",
+                            pattern.span
+                        )));
+                    }
+                }
+            }
+            let (Some(empty), Some((head, tail, cons))) = (empty, cons) else {
+                return Err(IrError::new(format!(
+                    "list match at {source:?} is not exhaustive"
+                )));
+            };
+            let effects = EffectSet::union([&empty.effects, &cons.effects]);
+            let requirements = RequirementSet::union([&empty.requirements, &cons.requirements]);
+            return Ok(self.emit_with_requirements(
+                operations,
+                Arc::clone(ty),
+                effects,
+                requirements,
+                source,
+                OperationKind::MatchList {
+                    subject: value,
+                    empty,
+                    head,
+                    tail,
+                    cons,
+                },
+            ));
+        }
+
+        let (family, payloads) = match value_type.as_ref() {
+            Type::Option(payload) => (
+                VariantFamily::Option,
+                [
+                    (VariantName::Some, Some(Arc::clone(payload))),
+                    (VariantName::None, None),
+                ],
+            ),
+            Type::Result(payload, error) => (
+                VariantFamily::Result,
+                [
+                    (VariantName::Ok, Some(Arc::clone(payload))),
+                    (VariantName::Err, Some(Arc::clone(error))),
+                ],
+            ),
+            other => {
+                return Err(IrError::new(format!(
+                    "match at {source:?} decides a value of type `{other}`"
+                )));
+            }
+        };
+        let mut arms = Vec::with_capacity(order.len());
+        for constructor in order {
+            let rows = arm_of(constructor);
+            let Some(variant) = constructor.variant() else {
+                return Err(IrError::new(format!(
+                    "list pattern decides a `{value_type}` value at {source:?}"
+                )));
+            };
+            let payload_type = payloads
+                .iter()
+                .find(|(candidate, _)| *candidate == variant)
+                .ok_or_else(|| {
+                    IrError::new(format!(
+                        "`{}` pattern decides a `{value_type}` value at {source:?}",
+                        variant.as_str()
+                    ))
+                })?
+                .1
+                .clone();
+            let payload_patterns = rows
+                .iter()
+                .map(|(arm, pattern)| match &pattern.kind {
+                    PatternKind::Variant { payload, .. } => Ok((*arm, payload.as_deref())),
+                    _ => Err(IrError::new(format!(
+                        "pattern at {:?} is not a variant pattern",
+                        pattern.span
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (binding, block) = match (payload_type, payload_patterns.as_slice()) {
+                (None, [(arm, None)]) => {
+                    (None, self.lower_expression_block(&arm.value, Vec::new())?)
+                }
+                (Some(payload_type), [(arm, Some(payload))]) if payload.is_catch_all() => {
+                    let parameter = self.pattern_parameter(payload, &payload_type)?;
+                    let binding = parameter.match_binding;
+                    (
+                        Some(binding),
+                        self.lower_expression_block(&arm.value, vec![parameter])?,
+                    )
+                }
+                (Some(payload_type), nested) => {
+                    let nested = nested
+                        .iter()
+                        .map(|(arm, payload)| {
+                            payload
+                                .filter(|payload| !payload.is_catch_all())
+                                .map(|payload| (*arm, payload))
+                                .ok_or_else(|| {
+                                    IrError::new(format!(
+                                        "arms of `{}` overlap at {source:?}",
+                                        variant.as_str()
+                                    ))
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let position = nested.first().map(|(_, payload)| payload.span);
+                    let binding = self.synthetic_match_binding(
+                        "$payload",
+                        Arc::clone(&payload_type),
+                        position
+                            .or(source)
+                            .ok_or_else(|| IrError::new("a nested match has no source position"))?,
+                    );
+                    let parameter = self.block_parameter(binding)?;
+                    let match_binding = parameter.match_binding;
+                    let parameter_value = parameter.value;
+                    let id = self.allocate_block();
+                    let mut nested_operations = Vec::new();
+                    // Each nested pattern is one more syntactic level of the
+                    // arm's value, so it counts as one level of lowering.
+                    self.enter(position)?;
+                    let result = self.lower_decision(
+                        parameter_value,
+                        &payload_type,
+                        &nested,
+                        ty,
+                        position,
+                        &mut nested_operations,
+                    );
+                    self.depth -= 1;
+                    let result = result?;
+                    let decided = nested_operations.last().ok_or_else(|| {
+                        IrError::new(format!("nested match at {position:?} emitted nothing"))
+                    })?;
+                    let (effects, requirements) =
+                        (decided.effects.clone(), decided.requirements.clone());
+                    (
+                        Some(match_binding),
+                        CoreBlock {
+                            id,
+                            parameters: vec![parameter],
+                            operations: nested_operations,
+                            result,
+                            ty: Arc::clone(ty),
+                            effects,
+                            requirements,
+                            source: position,
+                        },
+                    )
+                }
+                (None, _) => {
+                    return Err(IrError::new(format!(
+                        "arms of `{}` overlap at {source:?}",
+                        variant.as_str()
+                    )));
+                }
+            };
+            arms.push(VariantArmBlock {
+                variant,
+                binding,
+                block,
+            });
+        }
+        let effects = EffectSet::union(arms.iter().map(|arm| &arm.block.effects));
+        let requirements = RequirementSet::union(arms.iter().map(|arm| &arm.block.requirements));
+        Ok(self.emit_with_requirements(
+            operations,
+            Arc::clone(ty),
+            effects,
+            requirements,
+            source,
+            OperationKind::MatchVariant {
+                subject: value,
+                family,
+                arms,
+            },
+        ))
+    }
+
+    /// The block parameter for a name or `_` that matches a value of type
+    /// `ty`: the source binder's match binding, or a Core-only one for `_`.
+    fn pattern_parameter(
+        &mut self,
+        pattern: &Pattern,
+        ty: &Arc<Type>,
+    ) -> Result<BlockParameter, IrError> {
+        let binding = match &pattern.kind {
+            PatternKind::Binder(name) => {
+                self.declaration_binding(pattern.span, name, SymbolKind::Match)?
+            }
+            PatternKind::Wildcard => {
+                self.synthetic_match_binding("$discard", Arc::clone(ty), pattern.span)
+            }
+            _ => {
+                return Err(IrError::new(format!(
+                    "pattern at {:?} is not a name or `_`",
+                    pattern.span
+                )));
+            }
+        };
+        self.block_parameter(binding)
     }
 
     /// Lowers `operand?`, whose `?` is at `question` and whose value has type
@@ -1325,13 +1538,19 @@ impl<'a> Lowerer<'a> {
         };
         let ty = Arc::clone(&success_block.ty);
 
-        let (failure_binding, failure_parameters) = match &arm.binding {
-            Some(name) => {
+        let (failure_binding, failure_parameters) = match (&arm.binding, payload_of(arm.variant)) {
+            // `_` binds nothing, so its payload has a Core-only binding.
+            (Some(name), Some(payload)) if name == "_" => {
+                let binding = self.synthetic_match_binding("$discard", payload, arm.span);
+                let parameter = self.block_parameter(binding)?;
+                (Some(parameter.match_binding), vec![parameter])
+            }
+            (Some(name), _) => {
                 let binding = self.declaration_binding(arm.span, name, SymbolKind::Match)?;
                 let parameter = self.block_parameter(binding)?;
                 (Some(parameter.match_binding), vec![parameter])
             }
-            None => (None, Vec::new()),
+            (None, _) => (None, Vec::new()),
         };
         let arm_fact = self.expression_fact(&arm.value)?;
         let effects = arm_fact.effects().clone();
@@ -1387,7 +1606,7 @@ impl<'a> Lowerer<'a> {
             },
         );
         match &pattern.binding {
-            Some(name) => {
+            Some(name) if name != "_" => {
                 let binding = self.declaration_binding(span, name, SymbolKind::Let)?;
                 self.emit(
                     operations,
@@ -1401,7 +1620,7 @@ impl<'a> Lowerer<'a> {
                 );
                 self.current_context_mut().define(binding, matched);
             }
-            None => {
+            _ => {
                 self.emit(
                     operations,
                     Arc::new(Type::Unit),
@@ -4079,7 +4298,7 @@ const fn variant_family_name(family: VariantFamily) -> &'static str {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Source, analyze,
+        MAX_NESTING_DEPTH, Source, analyze,
         limits::deepest::{self, Level},
         parse_source,
     };
@@ -4477,6 +4696,99 @@ mod tests {
             arms[1].block.parameters[0].debug_name.as_deref(),
             Some("found")
         );
+    }
+
+    #[test]
+    fn lowers_nested_patterns_to_nested_matches_that_lower_each_arm_once() {
+        let mut module = lowered(
+            "fn describe(stored: Result<Option<String>, String>) -> String {\n    \
+             match stored {\n        Err(_) => \"failed\",\n        \
+             Ok(Some(value)) => value,\n        Ok(None) => \"missing\",\n    }\n}\n\
+             fn count(items: List<Int>) -> Int {\n    match items {\n        \
+             [_, ..rest] => 1 + count(rest),\n        [] => 0,\n    }\n}",
+        );
+        let rendered = module.render_text();
+        assert!(
+            rendered.contains("match $payload: Option<String>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("match $discard: String"), "{rendered}");
+        assert!(rendered.contains("match $discard: Int"), "{rendered}");
+
+        // The arms keep the order in which the source first uses each
+        // variant, and the `Ok` arm decides its payload with a nested match.
+        let arms = match_arms(&mut function_body(&mut module, "describe").operations);
+        assert_eq!(
+            arms.iter().map(|arm| arm.variant).collect::<Vec<_>>(),
+            [VariantName::Err, VariantName::Ok]
+        );
+        let nested = &arms[1].block;
+        assert_eq!(nested.parameters.len(), 1);
+        assert_eq!(nested.parameters[0].debug_name.as_deref(), Some("$payload"));
+        let [
+            CoreOperation {
+                kind:
+                    OperationKind::MatchVariant {
+                        subject,
+                        arms: inner,
+                        ..
+                    },
+                result,
+                ..
+            },
+        ] = nested.operations.as_slice()
+        else {
+            panic!("the `Ok` arm should hold exactly one nested match");
+        };
+        assert_eq!(*subject, nested.parameters[0].value);
+        assert_eq!(nested.result, *result);
+        assert_eq!(
+            inner.iter().map(|arm| arm.variant).collect::<Vec<_>>(),
+            [VariantName::Some, VariantName::None]
+        );
+
+        // Three source arms, three arm values: none is duplicated.
+        let mut strings = 0;
+        visit_operations(function_body(&mut module, "describe"), &mut |operation| {
+            if matches!(
+                operation.kind,
+                OperationKind::Literal(ValueLiteral::String(_))
+            ) {
+                strings += 1;
+            }
+        });
+        assert_eq!(strings, 2);
+    }
+
+    #[test]
+    fn lowers_nested_patterns_at_the_nesting_limit() {
+        // Each level is a match whose arm list opens one level and whose
+        // `Some(Some(x))` arm one more for its value, inside a function body.
+        let source = |levels: usize| {
+            let mut value = String::from("x");
+            for _ in 0..levels {
+                value =
+                    format!("match o {{ None => 0, Some(None) => 0, Some(Some(x)) => {value} }}");
+            }
+            format!(
+                "fn f(o: Option<Option<Int>>) -> Int {{ {value} }}\nprintln(f(Some(Some(1))));\n"
+            )
+        };
+        let fits = (MAX_NESTING_DEPTH - 1) / 2;
+        let (deepest, error) =
+            crate::run_on_thread("core-test", crate::COMPILER_STACK_BYTES, move || {
+                let deepest = lowered(&source(fits)).deepest_block().0;
+                let text = source(fits + 1);
+                let error = parse_source(&Source::new("test.krit", text))
+                    .expect_err("one more level should cross the nesting limit");
+                (deepest, error)
+            })
+            .expect("core test thread should start");
+        assert_eq!(error.code(), "K1005");
+        // The function body, and per level the `Some` arm block and the
+        // nested match's `Some` arm block: one Core block per syntactic level.
+        assert_eq!(deepest, 1 + 2 * fits);
+        assert!(deepest <= MAX_CORE_BLOCK_DEPTH);
     }
 
     #[test]

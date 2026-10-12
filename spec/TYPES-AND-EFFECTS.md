@@ -80,7 +80,7 @@ requires the exact annotated `(HttpRequest) -> HttpResponse` signature.
 
 The bootstrap checker uses deterministic constraints and unification. It
 supports recursive functions, closures, empty lists, `None`, structural
-records, and Option/Result matches. An unresolved variable may remain generic;
+records, and matches over nested Option, Result, and list patterns. An unresolved variable may remain generic;
 a known contradiction is always rejected. Full Hindley-Milner generalization
 across independently polymorphic uses is still draft.
 
@@ -163,6 +163,59 @@ binds `Q`'s source binder, evaluates `r`, and ends with an `exit` of its
 value, verified like every `exit` to have the function's result type. The
 match has `P`'s payload type, so successive let-else statements stay flat in
 the body block.
+
+## Matching
+
+A `match` (`LANGUAGE.md` section 11) is checked in this order, stopping at
+the first error:
+
+1. The subject is analyzed.
+2. The arms' patterns are checked against each other, without types. Each
+   pattern is described by its *path*: the variant and list constructors it
+   requires, from the outside in (`Ok(Some(v))` is `Ok`, `Some`; a name or
+   `_` ends a path, and `None`, `[]`, and `[head, ..tail]` require nothing
+   below them). A pattern matches exactly the values whose constructors
+   start with its path, so two patterns overlap exactly when one path is a
+   prefix of the other. In arm order, skipping top-level catch-alls, walking
+   each path from the outside in: the constructors that follow the same
+   prefix must be of one family (`K1003`); an earlier arm's path may not be
+   a prefix of this one's (`K1003`: a duplicate arm when the paths are equal,
+   an unreachable one otherwise); and this path may not be a proper prefix of
+   earlier arms' paths (`K1003`: an overlapping arm, or an unreachable one
+   when those arms already cover every value it matches).
+3. An arm whose whole pattern is a name or `_` is `K3005`.
+4. Each arm's pattern is typed against the subject's type, walking its path:
+   a variant or list pattern requires its family (`Option<T>`,
+   `Result<T, E>`, or `List<T>`) at its position, unifying an unresolved type
+   with that family over fresh payload types (`K3005` at the match for the
+   subject, or at the nested pattern for a payload). The position below
+   `Some`, `Ok`, or `Err` has type `T`, `T`, or `E`; a list pattern's head
+   has type `T` and its tail `List<T>`.
+5. The paths must be exhaustive: at every proper prefix of a path, each
+   constructor of the next position's family continues some path. Otherwise
+   the match is `K3005`, listing each missing prefix-plus-constructor as a
+   pattern with `_` below it.
+6. Each arm's value is analyzed in a scope of the arm that declares its
+   pattern's names, as match symbols at the names' own spans, with the types
+   of step 4. A `_` declares nothing; it marks `_` as naming no value in that
+   scope, so reading `_` there is `K2001`. The arms' types are unified into
+   the match's type (`K3001`).
+
+Because the paths are pairwise disjoint and exhaustive, every value matches
+exactly one arm, and arm order has no meaning. The match's effects and
+requirements are those of its subject and all of its arms.
+
+Core IR decides a match with nested variant and list matches over the
+decision tree the paths form. At each position, the Core match has one arm
+per constructor, in the order the source first uses it. That arm binds the
+payload to the arm's name when one arm matches the payload with a name; to a
+Core-only match binding (debug name `$discard`) when it matches it with `_`;
+and otherwise to a Core-only binding (debug name `$payload`) that a nested
+match on that binding decides. A list arm binds its head and tail the same
+way. Every arm's value is lowered exactly once, one Core block deeper for
+each pattern nested in a payload, which is why the parser counts those
+patterns as nesting levels of the arm's value (`LANGUAGE.md` section 4.1).
+Core verification applies its ordinary two-arm rules to each nested match.
 
 ## Effects
 

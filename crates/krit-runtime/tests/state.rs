@@ -374,6 +374,68 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
 }
 
 #[test]
+fn nested_patterns_decide_durable_state_reads_in_a_webhook() {
+    let directory = TestDirectory::new("nested-patterns");
+    let database = directory.database();
+    let artifact = compile(
+        r#"
+fn lookup(request: HttpRequest) -> Result<Option<String>, String> {
+    if request.method == "DELETE" {
+        Err("refused " + request.path)
+    } else {
+        state_get("agent-work", request.path)
+    }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    if request.method == "PUT" {
+        match state_put("agent-work", request.path, request.body) {
+            Ok(_) => record { status: 201, headers: [], body: "stored" },
+            Err(_) => record { status: 500, headers: [], body: "not stored" },
+        }
+    } else {
+        match lookup(request) {
+            Ok(Some(value)) => record { status: 200, headers: [], body: "found " + value },
+            Ok(None) => record { status: 404, headers: [], body: "missing " + request.path },
+            Err(error) => record { status: 500, headers: [], body: error },
+        }
+    }
+}
+"#,
+        &["state.transaction"],
+    );
+    let grants = GrantSet::from_manifest(&manifest("state = [\"agent-work\"]"));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default()).unwrap();
+    let state_host = host(inputs, durable(database, false));
+    let send = |method: &str, path: &str, body: &str| {
+        let response = Runtime::default()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &state_host,
+                HttpRequest {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    query: String::new(),
+                    headers: Vec::new(),
+                    body: body.to_owned(),
+                },
+            )
+            .expect("the webhook should run")
+            .response;
+        (response.status, response.body)
+    };
+
+    // `state_get` returns `Result<Option<String>, String>`; each of the three
+    // arms of the nested match is reached.
+    assert_eq!(send("GET", "/a", ""), (404, "missing /a".to_owned()));
+    assert_eq!(send("PUT", "/a", "one"), (201, "stored".to_owned()));
+    assert_eq!(send("GET", "/a", ""), (200, "found one".to_owned()));
+    assert_eq!(send("DELETE", "/a", ""), (500, "refused /a".to_owned()));
+}
+
+#[test]
 fn checkpoint_resume_replays_completed_http_without_repeating_the_mock_call() {
     let directory = TestDirectory::new("checkpoint-replay");
     let database = directory.database();

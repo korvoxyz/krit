@@ -1,0 +1,10 @@
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match state_get("agent-work", request.path) {
+        Ok(Some(stored)) => record { status: 200, headers: [], body: stored },
+        Ok(None) => match state_put("agent-work", request.path, request.body) {
+            Ok(_) => record { status: 201, headers: [], body: "stored" },
+            Err(error) => record { status: 500, headers: [], body: error },
+        },
+        Err(error) => record { status: 500, headers: [], body: error },
+    }
+}

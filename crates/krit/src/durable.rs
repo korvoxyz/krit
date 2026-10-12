@@ -1,6 +1,5 @@
 use crate::{
-    Block, Expression, ExpressionKind, MatchKind, Program, Span, Statement, StatementKind,
-    ValueLiteral,
+    Block, Expression, ExpressionKind, Program, Span, Statement, StatementKind, ValueLiteral,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -188,21 +187,9 @@ fn collect_expression<'a>(
             pending.push(Pending::Expression(callee));
             pending.extend(arguments.iter().map(Pending::Expression));
         }
-        ExpressionKind::Match { subject, kind } => {
+        ExpressionKind::Match { subject, arms } => {
             pending.push(Pending::Expression(subject));
-            match kind {
-                MatchKind::List {
-                    empty_case,
-                    cons_case,
-                    ..
-                } => {
-                    pending.push(Pending::Expression(empty_case));
-                    pending.push(Pending::Expression(cons_case));
-                }
-                MatchKind::Variants { arms, .. } => {
-                    pending.extend(arms.iter().map(|arm| Pending::Expression(&arm.value)));
-                }
-            }
+            pending.extend(arms.iter().map(|arm| Pending::Expression(&arm.value)));
         }
         ExpressionKind::Unary { operand, .. } | ExpressionKind::Propagate { operand, .. } => {
             pending.push(Pending::Expression(operand));

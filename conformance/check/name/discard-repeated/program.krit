@@ -7,7 +7,3 @@ fn second(_, _: Bool) {
 }
 
 let flag: Bool = second(1, true);
-let rest: List<Int> = match [1, 2] {
-    [] => [],
-    [_, .._] => _,
-};

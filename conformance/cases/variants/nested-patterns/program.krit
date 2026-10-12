@@ -1,0 +1,35 @@
+fn describe(stored: Result<Option<String>, String>) -> String {
+    match stored {
+        Ok(Some(value)) => "found " + value,
+        Ok(None) => "missing",
+        Err(error) => "failed: " + error,
+    }
+}
+
+fn status(outcome: Option<Result<Int, String>>) -> Int {
+    match outcome {
+        None => 0,
+        Some(Err(_)) => 500,
+        Some(Ok(code)) => code,
+    }
+}
+
+fn depth(value: Option<Option<Option<Int>>>) -> Int {
+    match value {
+        Some(Some(Some(_))) => 3,
+        Some(Some(None)) => 2,
+        Some(None) => 1,
+        None => 0,
+    }
+}
+
+println(describe(Ok(Some("ready"))));
+println(describe(Ok(None)));
+println(describe(Err("timeout")));
+println(status(Some(Ok(201))));
+println(status(Some(Err("refused"))));
+println(status(None));
+println(depth(Some(Some(Some(7)))));
+println(depth(Some(Some(None))));
+println(depth(Some(None)));
+println(depth(None));

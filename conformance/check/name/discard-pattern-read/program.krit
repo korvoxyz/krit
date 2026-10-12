@@ -1,0 +1,8 @@
+let _ = 0;
+
+fn payload(stored: Option<Int>) -> Int {
+    match stored {
+        Some(_) => _,
+        None => 0,
+    }
+}

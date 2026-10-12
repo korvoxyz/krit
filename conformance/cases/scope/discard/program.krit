@@ -8,10 +8,3 @@ fn second(_, _) {
 }
 
 println(second(3, 4));
-
-let rest = match [5, 6, 7] {
-    [] => [],
-    [_, .._] => _,
-};
-
-println(rest);

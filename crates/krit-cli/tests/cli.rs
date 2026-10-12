@@ -942,6 +942,91 @@ fn let_else_runs_explains_formats_and_reports_misplacement() {
 }
 
 #[test]
+fn nested_patterns_run_explain_format_and_report_missing_outcomes() {
+    let directory = TestDirectory::new("nested-patterns");
+    directory.file(
+        "main.krit",
+        "fn describe(stored: Result<Option<String>, String>) -> String {\n    match stored {\n        \
+         Ok(Some(value)) => \"found \" + value,\n        Ok(None) => \"missing\",\n        \
+         Err(_) => \"failed\",\n    }\n}\n\nprintln(describe(Ok(Some(\"a\"))));\n\
+         println(describe(Ok(None)));\nprintln(describe(Err(\"b\")));\n",
+    );
+    directory.file(
+        "missing.krit",
+        "fn describe(stored: Result<Option<String>, String>) -> String {\n    match stored {\n        \
+         Ok(Some(value)) => value,\n    }\n}\n",
+    );
+    directory.file(
+        "catch-all.krit",
+        "fn describe(stored: Option<String>) -> String {\n    match stored {\n        \
+         Some(value) => value,\n        _ => \"none\",\n    }\n}\n",
+    );
+
+    let run = krit_in(&directory)
+        .args(["run", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"found a\nmissing\nfailed\n");
+
+    let format = krit_in(&directory)
+        .args(["fmt", "--check", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert!(
+        format.status.success(),
+        "{}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+
+    let explain = krit_in(&directory)
+        .args(["explain", "main.krit"])
+        .output()
+        .expect("Krit should start");
+    assert!(explain.status.success());
+    let explanation = String::from_utf8(explain.stdout).expect("explanation should be UTF-8");
+    assert!(explanation.contains("match value: String"), "{explanation}");
+    assert!(
+        explanation.contains("match $payload: Option<String>"),
+        "{explanation}"
+    );
+    assert!(
+        explanation.contains("match $discard: String"),
+        "{explanation}"
+    );
+
+    for (file, expected) in [
+        (
+            "missing.krit",
+            "missing.krit:2:5: error[K3005]: non-exhaustive match; missing: `Ok(None)`, \
+             `Err(_)`\nhelp: add an arm for each missing pattern: `Ok(None) => ...` and \
+             `Err(_) => ...`\n",
+        ),
+        (
+            "catch-all.krit",
+            "catch-all.krit:4:9: error[K3005]: a match arm cannot match every value: `_` would \
+             stand for outcomes it does not name\nhelp: name every outcome: replace `_ => ...` \
+             with `None => ...`\n",
+        ),
+    ] {
+        for command in ["check", "run"] {
+            let refused = krit_in(&directory)
+                .args([command, file])
+                .output()
+                .expect("Krit should start");
+            assert_eq!(refused.status.code(), Some(1), "{command} {file}");
+            assert!(refused.stdout.is_empty(), "{command} {file}");
+            let stderr = String::from_utf8(refused.stderr).expect("diagnostics should be UTF-8");
+            assert_eq!(stderr, expected, "{command} {file}");
+        }
+    }
+}
+
+#[test]
 fn explains_typed_core_facts_as_deterministic_json() {
     let first = krit()
         .args(["explain", "--json", "examples/factorial.krit"])

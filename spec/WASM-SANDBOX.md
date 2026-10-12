@@ -289,7 +289,11 @@ Policy 2 adds a deliberately bounded webhook ABI:
 - fixed `HttpHeader`, `HttpRequest`, and `HttpResponse` records
 - ordered lists of headers
 - the Result/Option shapes returned by config, secrets, and HTTP
-- Result/Option matching and static references to non-capturing helpers
+- Result/Option matching, including nested patterns and `_` over those
+  shapes (`Ok(Some(value))`, `Ok(None)`, and `Err(error)` on the
+  `Result<Option<String>, String>` that `state_get`, `checkpoint_get`,
+  `object_get`, and `cache_get` return), and static references to
+  non-capturing helpers
 - postfix `?` on those Result/Option shapes in helpers and in `queue` and
   `schedule` entrypoints, whenever the function's declared result has a
   layout (for example `Result<HttpResponse, String>`, `Result<String, String>`,
@@ -338,6 +342,18 @@ payload are ordinary policy-2 operations, so a let-else builds exactly where
 the equivalent `match` builds; its value's shape, like a `match` subject's,
 fails with `K7002` when it has no layout, which is always the case in
 policy 1.
+
+### Nested patterns
+
+Core lowers a `match` with nested patterns to nested two-arm variant matches,
+one per position, whose arms bind each payload to the source name or to a
+Core-only binding (`TYPES-AND-EFFECTS.md`, "Matching"). Both code generators
+compile those exactly as they compile the equivalent hand-nested matches, so
+a nested pattern builds wherever every shape it decides has a policy-2
+layout; a shape without one fails with `K7002` at the first pattern that
+decides it, such as the `Some(n)` of `Some(Some(n))` on an
+`Option<Option<Int>>`. List patterns, like every list match, are outside both
+policies.
 
 ### Guest string runtime
 

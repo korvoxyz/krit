@@ -1,0 +1,4 @@
+fn stored(key: String) -> String {
+    let Ok(Some(value)) = state_get("agent-work", key) else Err(error) => error;
+    value
+}

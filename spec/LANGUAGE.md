@@ -148,19 +148,16 @@ function-expression
                 = "fn", "(", parameters?, ")", ("->", type)?, block ;
 
 match-expression
-                = list-match | option-match | result-match ;
-list-match      = "match", expression, "{",
-                  "[", "]", "=>", expression, ",",
-                  "[", identifier, ",", "..", identifier, "]",
-                  "=>", expression, ","?, "}" ;
-option-match    = "match", expression, "{",
-                  option-arm, ",", option-arm, ","?, "}" ;
-option-arm      = "Some", "(", identifier, ")", "=>", expression
-                | "None", "=>", expression ;
-result-match    = "match", expression, "{",
-                  result-arm, ",", result-arm, ","?, "}" ;
-result-arm      = "Ok", "(", identifier, ")", "=>", expression
-                | "Err", "(", identifier, ")", "=>", expression ;
+                = "match", expression, "{",
+                  match-arm, (",", match-arm)*, ","?, "}" ;
+match-arm       = pattern, "=>", expression ;
+pattern         = binder
+                | "_"
+                | ("Some" | "Ok" | "Err"), "(", pattern, ")"
+                | "None"
+                | "[", "]"
+                | "[", (binder | "_"), ",", "..", (binder | "_"), "]" ;
+binder          = identifier ;   (* other than "_" *)
 
 type            = "Int" | "Bool" | "String" | "Unit"
                 | "HttpHeader" | "HttpRequest" | "HttpResponse"
@@ -209,6 +206,11 @@ following opens one level for what it contains:
 - the operand of a unary operator
 - the condition of an `if`, the subject and the arm list of a `match`, and
   the arm of a let-else (section 8.3)
+- the payload of a `Some`, `Ok`, or `Err` pattern; and the value of a `match`
+  arm, once for each variant or list pattern its pattern holds inside a
+  payload, since Core IR decides each of them with one more nested match
+  (`Ok(Some(v)) => value` nests `value` one level deeper than
+  `Ok(v) => value`)
 - the argument list of `List<…>`, `Option<…>`, or `Result<…, …>`, and the
   field list of `Record { … }`
 
@@ -407,14 +409,24 @@ by checking first (section 14).
 
 The identifier `_` alone is the discard name. It is exempt from the
 one-declaration rule: any number of `let` bindings, function declarations,
-parameters, and match binders in one scope may use it, including both names of
-one `[_, .._]` list pattern. A program should bind `_` only for a value it
-does not use. Reading `_` as a value, that is, an identifier expression `_`
-that resolves to a binding, is valid in edition 2026 and refers to the most
-recent `_` binding in scope, exactly as shadowing does, but checking reports
-warning `K2003`; edition 2027 makes it an error. An identifier expression `_`
-with no `_` binding in scope is an undefined name (`K2001`). Warnings never
-change whether a program checks or runs (`DIAGNOSTICS.md`).
+and parameters in one scope may use it. A program should bind `_` only for a
+value it does not use. Reading `_` as a value, that is, an identifier
+expression `_` that resolves to a binding, is valid in edition 2026 and refers
+to the most recent `_` binding in scope, exactly as shadowing does, but
+checking reports warning `K2003`; edition 2027 makes it an error. An
+identifier expression `_` with no `_` binding in scope is an undefined name
+(`K2001`). Warnings never change whether a program checks or runs
+(`DIAGNOSTICS.md`).
+
+In a pattern (sections 8.3 and 11), `_` is a wildcard: it matches any value
+and binds nothing, and one pattern may hold it any number of times
+(`[_, .._]`). Where a binder in its place would be visible (the arm of a
+`match` or let-else, or the rest of the block after a let-else pattern), `_`
+names no value at all: reading it there is an undefined name (`K2001`, with a
+note), even when an enclosing scope binds `_`, until a later declaration
+binds `_` again. A program written for 0.2, where a pattern's `_` was an
+ordinary binder, therefore fails to check rather than silently reading a
+different value.
 
 A lexical binding shadows a built-in name of the same spelling for the
 binding's whole scope, in checking and evaluation alike. `let`, function, and
@@ -587,7 +599,10 @@ A let-else is `let PATTERN (: TYPE)? = value else ARM;`, where the arm is a
 pattern, `=>`, and an expression, as in a `match`. Its two patterns are the
 two variants of one built-in family, in either order: `Ok(p)` and `Err(q)`, or
 `Some(p)` and `None`. A pattern's payload binder is an identifier or the
-discard name `_`; `None` binds nothing. A `Some`, `Ok`, or `Err` written after
+wildcard `_`, which binds nothing (section 7); `None` binds nothing either.
+Unlike a `match` pattern, a let-else pattern does not nest (`K3014`, below).
+A `Some`, `Ok`, or
+`Err` written after
 `let` without `(` is still a binding of that reserved name (`K2002`), and a
 variant pattern without an `else` arm is `K1002`.
 
@@ -623,6 +638,9 @@ the fix:
   an `if` branch, or a `match` arm, it would leave an expression rather than
   return from a function;
 - its two patterns are not the two variants of one family;
+- a pattern nests another variant or list pattern in its payload
+  (`let Ok(Some(x)) = ...`): bind the payload, then decide it with another
+  let-else or a `match` (section 11), whose patterns nest;
 - its value ends in `}`, such as an `if`, `match`, block, `record`, or
   anonymous function: in `let Ok(x) = if c { a } else { b } else Err(e) =>
   ...`, the first `else` would read as part of the let-else. Bind the value
@@ -719,7 +737,7 @@ List literal:
 [1, 2, 3]
 ```
 
-The only list decomposition construct in edition 2026 is exhaustive matching:
+The only list decomposition construct in edition 2026 is matching:
 
 ```krit
 match items {
@@ -728,36 +746,63 @@ match items {
 }
 ```
 
-The subject evaluates once and must be a list.
-
-- The `[]` arm is selected for an empty list.
-- The `[head, ..tail]` arm is selected for a non-empty list.
-- `head` receives the first element.
-- `tail` receives the remaining immutable list.
-- Pattern bindings exist only in the non-empty arm.
-
-The two pattern names must differ unless both are the discard name `_`
-(section 7). Both arms are mandatory and their order is fixed, making the
-match visibly exhaustive.
-
-`Option` and `Result` matches contain exactly the two variants of one family.
-Their arms may appear in either order:
+A `match` evaluates its subject once, then the value of the one arm whose
+pattern matches the subject's value:
 
 ```krit
-match possible_name {
-    Some(name) => name,
-    None => "anonymous",
-}
-
-match connector_result {
-    Err(message) => message,
-    Ok(response) => response.body,
+match state_get("agent-work", key) {
+    Ok(Some(saved)) => saved,
+    Ok(None) => "missing",
+    Err(error) => "failed: " + error,
 }
 ```
 
-`Some`, `Ok`, and `Err` bind their single payload. `None` binds nothing.
-Missing, duplicate, unknown, or mixed-family arms are `K1003` syntax errors.
-The subject evaluates once and must belong to the matched variant family.
+| Pattern | Matches | Binds |
+|---|---|---|
+| `name` | any value | `name`, to the value |
+| `_` | any value | nothing |
+| `Some(p)`, `Ok(p)`, `Err(p)` | that variant, when its payload matches `p` | what `p` binds |
+| `None` | `None` | nothing |
+| `[]` | the empty list | nothing |
+| `[head, ..tail]` | a non-empty list | `head` to the first element, `tail` to the remaining immutable list |
+
+A variant pattern's payload is a pattern, so patterns nest through the
+built-in families: `Ok(Some(value))`, `Some(Err(_))`, `Ok([head, ..rest])`.
+The head and tail of a list pattern are each a name or `_` (`K1003`
+otherwise); to look inside the head, match it in the arm. A name binds the
+value at its position for the arm's value only, and the head and tail cannot
+be the same name (`K2002`). `_` binds nothing (section 7). There are no
+literal patterns, guards, or record patterns: compare values with `if` and
+`==`. Other tokens where a pattern starts, an unknown variant such as
+`Foo(x)`, `None(x)`, a `Some`, `Ok`, or `Err` without its parenthesized
+payload, and list patterns of any other shape are `K1003` syntax errors.
+
+The arms of a match name every outcome exactly once. Checking enforces four
+rules:
+
+- **One family at each position.** The patterns that reach the same position
+  of the value are all `Some` and `None`, all `Ok` and `Err`, or all `[]` and
+  `[head, ..tail]` (`K1003`), and that family must be the static type at the
+  position, the subject's type or a payload type (`K3005`).
+- **No overlap.** No value matches two arms. An arm that only matches values
+  that earlier arms already match is a duplicate or unreachable arm, and an
+  arm that also matches what an earlier arm matches overlaps it: both are
+  `K1003`. `Ok(Some(v)) => a, Ok(other) => b` is rejected with a note to name
+  the remaining outcome instead: `Ok(None) => b`.
+- **No catch-all arm.** An arm whose whole pattern is a name or `_` would
+  stand for every outcome the other arms leave unnamed, so it is `K3005`, with
+  a note naming the arms to write instead. A name or `_` inside a payload
+  (`Err(_)`, `Some(value)`) names its variant and is allowed.
+- **Exhaustive.** Every value of the subject's type matches some arm.
+  Otherwise checking reports `K3005`, whose message lists every missing
+  pattern verbatim, with `_` for whatever no arm distinguishes, such as
+  ``non-exhaustive match; missing: `Ok(None)`, `Err(_)` ``.
+
+Because arms never overlap, their order never changes what a match means, and
+they may appear in any order, including `[head, ..tail]` before `[]`. Every
+arm's value has the match's type. A match adds the effects and capability
+requirements of its subject and of every arm's value, and nothing of its own.
+`TYPES-AND-EFFECTS.md` ("Matching") gives the order of these checks.
 
 ## 12. Built-in output
 
@@ -988,6 +1033,8 @@ Checking reports these, so a program containing one is never evaluated:
 - a let-else that is not a direct statement of a named function's body, whose
   patterns are not the two variants of one family, or whose value ends in `}`
   (section 8.3)
+- `match` arms that mix families at a position, overlap, include a top-level
+  catch-all, or leave an outcome unnamed (section 11)
 
 Evaluation reports these:
 
@@ -1049,8 +1096,9 @@ grammar-permitted trailing commas, not expression order or program semantics.
 - Output uses LF line endings and exactly one final line feed.
 - Binary operators, `=`, `=>`, `->`, and type/value colons use stable spacing.
   Calls, field access, postfix `?`, unary operators, generic type brackets,
-  and variant patterns remain compact (`load(id)?.body`, `-count? - 1`,
-  `let Ok(value) =`).
+  and patterns remain compact (`load(id)?.body`, `-count? - 1`,
+  `let Ok(value) =`, `Ok(Some(value)) =>`, `[_, ..rest] =>`). Match arms keep
+  their source order.
 - A let-else stays on one line when the rest of the statement, from `else`
   through `;`, fits on the line where `else` ends without wrapping:
   `let Ok(x) = load(id) else Err(e) => handle(e);`. Otherwise the line breaks

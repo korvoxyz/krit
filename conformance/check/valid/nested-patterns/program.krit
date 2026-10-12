@@ -1,0 +1,18 @@
+fn describe(stored: Result<Option<String>, String>) -> String {
+    match stored {
+        Err(_) => "failed",
+        Ok(None) => "missing",
+        Ok(Some(value)) => value,
+    }
+}
+
+fn first_or(items: Result<List<Int>, String>, fallback: Int) -> Int {
+    match items {
+        Ok([head, .._]) => head,
+        Ok([]) => fallback,
+        Err(_) => fallback,
+    }
+}
+
+let described = describe(Ok(Some("ready")));
+let first = first_or(Ok([3, 4]), 0);

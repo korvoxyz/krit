@@ -125,9 +125,11 @@ network service, or nondeterministic value.
 | `functions/recursion` | recursive declaration and calls |
 | `functions/deep-recursion` | 9,000 nested calls stay within the call-depth limit |
 | `lists/match` | list construction and exhaustive decomposition |
+| `lists/patterns` | list patterns with `_` head or tail in either arm order, and list patterns nested in `Ok` |
 | `records/fields` | ordered record rendering and field access |
 | `variants/option-match` | exhaustive Option matching |
 | `variants/result-match` | exhaustive Result matching |
+| `variants/nested-patterns` | nested `Ok(Some(v))`/`Ok(None)`/`Err(e)`, `Some(Err(_))`, and three-level Option patterns, in any arm order |
 | `propagate/result`, `propagate/option` | postfix `?` unwraps `Ok` and `Some` and returns `Err` and `None` from the enclosing function |
 | `propagate/order` | arguments evaluate left to right; effects before a `?` exit stay performed and nothing after it evaluates |
 | `propagate/positions` | `?` in `if` conditions, `match` subjects, list and record elements, and nested blocks |
@@ -146,22 +148,23 @@ network service, or nondeterministic value.
 | `check/syntax/missing-semicolon` | missing required syntax |
 | `check/syntax/habit-word-line-break` | a bound habit word ending a line before a missing `;` stays an ordinary name (`K1002`) |
 | `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
-| `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, and an unbound `_` is undefined |
+| `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, an unbound `_` is undefined, and a `_` pattern binds nothing, so reading `_` in its arm is undefined even beside an outer `_` (`K2001`, with one note) |
 | `check/name/did-you-mean`, `check/name/null` | undefined names (`K2001`) that carry a did-you-mean or `None` note |
 | `check/habit/*` | one case per construct from another language (`K1101`-`K1112`): `return`, loops, assignment, `struct`, `import`, `await`, `throw`, indexing, arrow functions, the conditional operator, `switch`, and `else { return ... }`; plus a conditional operator whose first branch does not parse and one after a postfix `?` |
 | `check/syntax/question-before-operand` | a `?` followed on its line by an operand, without a `:`, is an unexpected token (`K1001`) with one note |
 | `check/propagate/*` | postfix `?` where it cannot return (`K3012`: top level, anonymous function, webhook, missing or non-`Result`/`Option` return type), with another family or error type (`K3013`), and with an opaque `Secret` error type (`K3009`) |
 | `check/valid/propagate-queue` | a queue entrypoint returns its failures with `?` and builds |
-| `check/let-else/*` | let-else at the top level, in a nested block or branch, or in an anonymous function, with patterns that are not the two variants of one family, or with a value ending in `}` (`K3014`); a missing `else` arm (`K1002`) or a block arm (`K1003`), each with one note; an arm of another type (`K3001`), a value of another family (`K3005`), a binder declared twice (`K2002`), and a binder read in the arm (`K2001`) |
+| `check/let-else/*` | let-else at the top level, in a nested block or branch, or in an anonymous function, with patterns that are not the two variants of one family, with a nested pattern, or with a value ending in `}` (`K3014`); a missing `else` arm (`K1002`) or a block arm (`K1003`), each with one note; an arm of another type (`K3001`), a value of another family (`K3005`), a binder declared twice (`K2002`), and a binder read in the arm (`K2001`) |
 | `check/valid/let-else-queue` | a queue entrypoint binds an object read and returns early with let-else, including a `None` pattern, and builds |
 | `check/valid/habit-words-as-names` | habit words stay ordinary identifiers outside foreign constructs |
 | `check/type/*` | stable static operator, condition, field, call, arity, annotation, match, comparison, and JSON-encoding errors, including an infinite type between two solved bindings and a method call on a string (`K3011`) |
-| `check/match/*` | unique, exhaustive, single-family Option and Result arms (`K1003`) |
+| `check/match/*` | match arms with one family per position, no duplicate, unreachable, or overlapping arm (`K1003`, each with one note), a malformed list pattern (`K1003`), no top-level catch-all `_` or name (`K3005`, one note), patterns of the payload's type (`K3005`), and exhaustiveness with every missing pattern listed (`K3005`, one note) |
+| `check/valid/nested-patterns` | nested patterns with `_` payloads and list patterns, in any arm order, check |
 | `check/webhook/*` | top-level uniqueness and exact typed webhook signatures |
 | `check/capability/*` | literal-resource host capability contracts |
 | `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, types that grow after they are bound, and types that grow when two solved types unify |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
-| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook helper chaining config, secret, and HTTP calls with `?` builds; a webhook binding config, secret, HTTP, and AI results with let-else in its own body builds, and so does one committing or rolling back a database transaction |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook helper chaining config, secret, and HTTP calls with `?` builds; a webhook binding config, secret, HTTP, and AI results with let-else in its own body builds, and so does one committing or rolling back a database transaction; a webhook deciding `state_get`'s `Result<Option<String>, String>` with nested patterns builds |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |
@@ -176,6 +179,7 @@ network service, or nondeterministic value.
 | `format/webhook` | canonical typed webhook and ordered duplicate-header layout |
 | `format/propagate` | postfix `?` stays attached to its operand and chains like a call |
 | `format/let-else` | a let-else stays on one line when it fits, otherwise breaks after `else` with its arm indented one level; a block or comment in the arm always breaks |
+| `format/patterns` | nested and list patterns stay compact, keep their arm order, and nested list patterns are never list literals |
 
 ## Adding a case
 

@@ -7,8 +7,8 @@ use std::{
 
 use krit::{
     Analysis, Block, Builtin, Diagnostic as CompilerDiagnostic, Effect, EntrypointKind, Expression,
-    ExpressionKind, MatchKind, Program, RequirementSet, ResolvedName, Severity, Source, Span,
-    Statement, StatementKind, SymbolKind as CompilerSymbolKind, Type, TypeAnnotation,
+    ExpressionKind, Pattern, PatternKind, Program, RequirementSet, ResolvedName, Severity, Source,
+    Span, Statement, StatementKind, SymbolKind as CompilerSymbolKind, Type, TypeAnnotation,
 };
 use krit_package::Manifest;
 use lsp_server::ErrorCode;
@@ -1555,22 +1555,10 @@ fn field_candidates(program: &Program) -> BTreeSet<String> {
                         expression_fields(argument, fields);
                     }
                 }
-                ExpressionKind::Match { subject, kind } => {
+                ExpressionKind::Match { subject, arms } => {
                     expression_fields(subject, fields);
-                    match kind {
-                        MatchKind::List {
-                            empty_case,
-                            cons_case,
-                            ..
-                        } => {
-                            expression_fields(empty_case, fields);
-                            expression_fields(cons_case, fields);
-                        }
-                        MatchKind::Variants { arms, .. } => {
-                            for arm in arms {
-                                expression_fields(&arm.value, fields);
-                            }
-                        }
+                    for arm in arms {
+                        expression_fields(&arm.value, fields);
                     }
                 }
                 ExpressionKind::Unary { operand, .. }
@@ -2151,51 +2139,23 @@ impl<'a> DeclarationCollector<'a> {
                         self.expression(argument);
                     }
                 }
-                ExpressionKind::Match { subject, kind } => {
+                ExpressionKind::Match { subject, arms } => {
                     self.expression(subject);
-                    match kind {
-                        MatchKind::List {
-                            empty_case,
-                            head_name,
-                            head_span,
-                            tail_name,
-                            tail_span,
-                            cons_case,
-                        } => {
-                            self.expression(empty_case);
+                    for arm in arms {
+                        for binder in pattern_binders(&arm.pattern) {
+                            let PatternKind::Binder(name) = &binder.kind else {
+                                continue;
+                            };
                             self.add(
-                                head_name,
+                                name,
                                 CompilerSymbolKind::Match,
-                                *head_span,
-                                Some(*head_span),
-                                cons_case.span,
+                                binder.span,
+                                Some(binder.span),
+                                arm.value.span,
                                 None,
                             );
-                            self.add(
-                                tail_name,
-                                CompilerSymbolKind::Match,
-                                *tail_span,
-                                Some(*tail_span),
-                                cons_case.span,
-                                None,
-                            );
-                            self.expression(cons_case);
                         }
-                        MatchKind::Variants { arms, .. } => {
-                            for arm in arms {
-                                if let Some(binding) = &arm.binding {
-                                    self.add(
-                                        binding,
-                                        CompilerSymbolKind::Match,
-                                        arm.span,
-                                        find_identifier_span(self.text, arm.span, binding),
-                                        arm.value.span,
-                                        None,
-                                    );
-                                }
-                                self.expression(&arm.value);
-                            }
-                        }
+                        self.expression(&arm.value);
                     }
                 }
                 ExpressionKind::Unary { operand, .. }
@@ -2232,6 +2192,25 @@ impl<'a> DeclarationCollector<'a> {
             visibility,
             declared_type,
         });
+    }
+}
+
+/// The names and `_` that `pattern` binds, in source order. Patterns are
+/// paths, so the names are only ever at the end of one.
+fn pattern_binders(pattern: &Pattern) -> Vec<&Pattern> {
+    let mut current = pattern;
+    loop {
+        match &current.kind {
+            PatternKind::Binder(_) | PatternKind::Wildcard => return vec![current],
+            PatternKind::Cons { head, tail } => return vec![head.as_ref(), tail.as_ref()],
+            PatternKind::EmptyList | PatternKind::Variant { payload: None, .. } => {
+                return Vec::new();
+            }
+            PatternKind::Variant {
+                payload: Some(payload),
+                ..
+            } => current = payload,
+        }
     }
 }
 
@@ -2841,6 +2820,75 @@ mod tests {
                 .starts_with("`?` is not allowed at the top level\nhelp: ")
         );
         assert_eq!(diagnostic.range.start, Position::new(0, 19));
+    }
+
+    #[test]
+    fn walks_nested_patterns_without_losing_symbols() {
+        let directory = TestDirectory::new();
+        let uri = directory.uri("main.krit");
+        let mut state = ServerState::new(vec![directory.path.clone()]);
+        let source = "fn describe(stored: Result<Option<String>, Int>, items: List<Int>) -> Int {\n    \
+                      match stored {\n        Ok(Some(found)) => 1,\n        Ok(None) => 2,\n        \
+                      Err(code) => match items {\n            [_, ..rest] => code,\n            \
+                      [] => 0,\n        },\n    }\n}\n";
+        let diagnostics = state.open(uri.clone(), 1, source.to_owned());
+        assert!(diagnostics.diagnostics.is_empty(), "{diagnostics:?}");
+
+        let completions = |state: &ServerState, position| {
+            let CompletionResponse::List(list) = state
+                .completion(&uri, position)
+                .expect("completion should succeed")
+            else {
+                panic!("completion should return a bounded list")
+            };
+            list.items
+                .into_iter()
+                .map(|item| item.label)
+                .collect::<BTreeSet<_>>()
+        };
+        // Each arm sees its own binders only, and `_` binds nothing.
+        let in_found = completions(&state, Position::new(2, 28));
+        assert!(in_found.contains("found") && !in_found.contains("code"));
+        let in_rest = completions(&state, Position::new(5, 28));
+        assert!(in_rest.contains("rest") && in_rest.contains("code"));
+        assert!(!in_rest.contains("found") && !in_rest.contains("_"));
+
+        for (position, expected) in [
+            (Position::new(2, 17), "found: String"),
+            (Position::new(4, 13), "code: Int"),
+            (Position::new(5, 19), "rest: List<Int>"),
+        ] {
+            let hover = state
+                .hover(&uri, position)
+                .expect("hover should succeed")
+                .expect("the binder should have hover facts");
+            let HoverContents::Markup(markup) = hover.contents else {
+                panic!("hover should use markdown")
+            };
+            assert!(markup.value.contains(expected), "{}", markup.value);
+        }
+
+        let changed = state
+            .change(
+                &uri,
+                2,
+                "fn f(stored: Result<Option<String>, Int>) -> Int {\n    \
+                 match stored {\n        Ok(Some(found)) => 1,\n        Err(code) => 2,\n    }\n}\n"
+                    .to_owned(),
+            )
+            .expect("change should succeed");
+        let diagnostic = &changed.diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("K3005".to_owned()))
+        );
+        assert!(
+            diagnostic
+                .message
+                .starts_with("non-exhaustive match; missing: `Ok(None)`\nhelp: "),
+            "{}",
+            diagnostic.message
+        );
     }
 
     #[test]

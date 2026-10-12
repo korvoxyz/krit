@@ -3,9 +3,9 @@ use std::{fmt, io::Write, ops::Deref, rc::Rc};
 use crate::{
     Diagnostic, Span,
     ast::{
-        BinaryOperator, Block, Expression, ExpressionKind, MatchKind, Parameter, Program,
-        Statement, StatementKind, UnaryOperator, ValueLiteral, VariantArm, VariantFamily,
-        VariantName, VariantPattern,
+        BinaryOperator, Block, Expression, ExpressionKind, MatchArm, Parameter, Pattern,
+        PatternKind, Program, Statement, StatementKind, UnaryOperator, ValueLiteral, VariantArm,
+        VariantFamily, VariantName, VariantPattern,
     },
     limits::{MAX_CALL_DEPTH, MAX_EVALUATION_DEPTH, MAX_VALUE_DEPTH},
 };
@@ -557,8 +557,9 @@ impl Evaluator<'_> {
             )
             .into());
         };
+        // `_` binds nothing, as in every pattern.
         let bind = |binding: &Option<String>| match (binding, &payload) {
-            (Some(binding), Some(payload)) => {
+            (Some(binding), Some(payload)) if binding != "_" => {
                 environment.extend(binding.clone(), Value::clone(payload))
             }
             _ => environment.clone(),
@@ -669,8 +670,8 @@ impl Evaluator<'_> {
                 let value = self.expression(operand, environment)?;
                 propagate(value, *question)
             }
-            ExpressionKind::Match { subject, kind } => {
-                self.match_expression(subject, kind, environment)
+            ExpressionKind::Match { subject, arms } => {
+                self.match_expression(subject, arms, environment)
             }
             ExpressionKind::Unary { operator, operand } => {
                 self.unary(*operator, operand, environment, expression.span)
@@ -682,12 +683,12 @@ impl Evaluator<'_> {
     fn match_expression(
         &mut self,
         subject: &Expression,
-        kind: &MatchKind,
+        arms: &[MatchArm],
         environment: &Environment,
     ) -> Flow<Value> {
         let subject_value = self.expression(subject, environment)?;
         let (arm, arm_environment) =
-            select_match_arm(subject_value, subject.span, kind, environment)?;
+            select_match_arm(&subject_value, subject.span, arms, environment)?;
         self.expression(arm, &arm_environment)
     }
 
@@ -1229,74 +1230,127 @@ fn container_depth<'a>(
     Ok(depth)
 }
 
-/// Selects the match arm for an evaluated subject and returns it with the
-/// environment that binds its pattern names.
+/// Selects the arm whose pattern matches an evaluated subject and returns its
+/// value with the environment that binds its pattern names.
+///
+/// Analysis guarantees that exactly one arm matches; arms are tried in order,
+/// and a program evaluated without analysis whose arms match nothing fails
+/// with `K4001`.
 fn select_match_arm<'a>(
-    subject_value: Value,
+    subject_value: &Value,
     subject_span: Span,
-    kind: &'a MatchKind,
+    arms: &'a [MatchArm],
     environment: &Environment,
 ) -> Result<(&'a Expression, Environment), Diagnostic> {
-    match kind {
-        MatchKind::List {
-            empty_case,
-            head_name,
-            tail_name,
-            cons_case,
-            ..
-        } => {
-            let Value::List(values) = subject_value else {
-                return Err(Diagnostic::new(
-                    "K4001",
-                    format!("expected list, found {}", subject_value.kind()),
-                    subject_span,
-                ));
-            };
-            if values.is_empty() {
-                Ok((empty_case, environment.clone()))
-            } else {
-                let with_head = environment.extend(head_name.clone(), values[0].clone());
-                // The tail nests no deeper than the list it came from.
-                let tail = Value::list(values[1..].to_vec(), subject_span)?;
-                let with_tail = with_head.extend(tail_name.clone(), tail);
-                Ok((cons_case, with_tail))
-            }
+    for arm in arms {
+        if let Some(bound) = match_pattern(&arm.pattern, subject_value, subject_span, environment)?
+        {
+            return Ok((&arm.value, bound));
         }
-        MatchKind::Variants { family, arms } => {
-            let Value::Variant { name, payload } = subject_value else {
-                return Err(Diagnostic::new(
-                    "K4001",
-                    format!(
-                        "expected {} for variant match, found {}",
-                        variant_family_name(*family),
-                        subject_value.kind()
-                    ),
-                    subject_span,
-                ));
-            };
-            if variant_family(name) != *family {
-                return Err(Diagnostic::new(
-                    "K4001",
-                    format!(
-                        "expected {} for variant match, found {}",
-                        variant_family_name(*family),
-                        variant_family_name(variant_family(name))
-                    ),
-                    subject_span,
-                ));
+    }
+    let shape = match subject_value {
+        Value::Variant { name, .. } => format!("`{}`", name.as_str()),
+        Value::List(values) if values.is_empty() => "an empty list".to_owned(),
+        Value::List(_) => "a non-empty list".to_owned(),
+        value => value.kind().to_owned(),
+    };
+    Err(Diagnostic::new(
+        "K4001",
+        format!("no match arm matches {shape}"),
+        subject_span,
+    ))
+}
+
+/// Matches `value` against `pattern` and returns `environment` extended with
+/// the pattern's names, or `None` when the pattern does not match. A value
+/// of another kind than the pattern's family is `K4001` at the subject's
+/// `span`. Patterns are paths, so this walks one iteratively.
+fn match_pattern(
+    pattern: &Pattern,
+    value: &Value,
+    span: Span,
+    environment: &Environment,
+) -> Result<Option<Environment>, Diagnostic> {
+    let mut current = pattern;
+    let mut value = value.clone();
+    loop {
+        match &current.kind {
+            PatternKind::Binder(name) => {
+                return Ok(Some(environment.extend(name.clone(), value)));
             }
-            let arm = arms
-                .iter()
-                .find(|arm| arm.variant == name)
-                .expect("parser guarantees exhaustive variant arms");
-            let arm_environment = match (&arm.binding, payload) {
-                (Some(binding), Some(payload)) => {
-                    environment.extend(binding.clone(), Value::clone(&payload))
+            PatternKind::Wildcard => return Ok(Some(environment.clone())),
+            PatternKind::EmptyList | PatternKind::Cons { .. } => {
+                let Value::List(values) = value else {
+                    return Err(Diagnostic::new(
+                        "K4001",
+                        format!("expected list, found {}", value.kind()),
+                        span,
+                    ));
+                };
+                return match (&current.kind, values.first()) {
+                    (PatternKind::EmptyList, None) => Ok(Some(environment.clone())),
+                    (PatternKind::Cons { head, tail }, Some(first)) => {
+                        let mut bound = environment.clone();
+                        if let PatternKind::Binder(name) = &head.kind {
+                            bound = bound.extend(name.clone(), first.clone());
+                        }
+                        if let PatternKind::Binder(name) = &tail.kind {
+                            // The tail nests no deeper than the list it came
+                            // from.
+                            let rest = Value::list(values[1..].to_vec(), span)?;
+                            bound = bound.extend(name.clone(), rest);
+                        }
+                        Ok(Some(bound))
+                    }
+                    _ => Ok(None),
+                };
+            }
+            PatternKind::Variant { variant, payload } => {
+                let family = variant.family();
+                let Value::Variant {
+                    name,
+                    payload: carried,
+                } = value
+                else {
+                    return Err(Diagnostic::new(
+                        "K4001",
+                        format!(
+                            "expected {} for variant match, found {}",
+                            variant_family_name(family),
+                            value.kind()
+                        ),
+                        span,
+                    ));
+                };
+                if variant_family(name) != family {
+                    return Err(Diagnostic::new(
+                        "K4001",
+                        format!(
+                            "expected {} for variant match, found {}",
+                            variant_family_name(family),
+                            variant_family_name(variant_family(name))
+                        ),
+                        span,
+                    ));
                 }
-                (None, None) => environment.clone(),
-                _ => unreachable!("variant payload shape is fixed"),
-            };
-            Ok((&arm.value, arm_environment))
+                if name != *variant {
+                    return Ok(None);
+                }
+                match (payload, carried) {
+                    (Some(payload), Some(carried)) => {
+                        current = payload;
+                        value = Value::clone(&carried);
+                    }
+                    (None, None) => return Ok(Some(environment.clone())),
+                    _ => {
+                        return Err(Diagnostic::new(
+                            "K4001",
+                            format!("`{}` pattern has the wrong payload shape", name.as_str()),
+                            span,
+                        ));
+                    }
+                }
+            }
         }
     }
 }
@@ -1892,6 +1946,72 @@ mod tests {
     }
 
     #[test]
+    fn evaluates_nested_patterns_and_wildcards_in_any_arm_order() {
+        let source = r#"
+            fn describe(stored: Result<Option<String>, String>) -> String {
+                match stored {
+                    Err(_) => "failed",
+                    Ok(None) => "missing",
+                    Ok(Some(value)) => "found " + value,
+                }
+            }
+            fn second(items: List<Int>) -> Option<Int> {
+                match items {
+                    [_, ..rest] => match rest { [value, .._] => Some(value), [] => None },
+                    [] => None,
+                }
+            }
+            println(describe(Ok(Some("a"))));
+            println(describe(Ok(None)));
+            println(describe(Err("b")));
+            println(second([1, 2, 3]));
+            println(second([1]));
+            println(match Some(Ok([4])) {
+                Some(Ok([head, .._])) => head,
+                Some(Ok([])) => 0,
+                Some(Err(_)) => 0 - 1,
+                None => 0 - 2,
+            });
+            "#;
+        for run in [run as Run, run_unchecked] {
+            let (output, _) = run(source).expect("nested patterns should run");
+            assert_eq!(output, "found a\nmissing\nfailed\nSome(2)\nNone\n4\n");
+        }
+    }
+
+    #[test]
+    fn unchecked_matches_that_no_arm_matches_fail_closed() {
+        // Analysis rejects these programs; evaluating them without analysis
+        // reports an error instead of panicking.
+        for (text, message) in [
+            (
+                "match None { Some(x) => x };",
+                "no match arm matches `None`",
+            ),
+            (
+                "match Ok(None) { Ok(Some(x)) => x, Err(e) => e };",
+                "no match arm matches `Ok`",
+            ),
+            (
+                "match [] { [x, ..rest] => x };",
+                "no match arm matches an empty list",
+            ),
+            (
+                "match 1 { Some(x) => x, None => 0 };",
+                "expected option for variant match, found integer",
+            ),
+            (
+                "match Some(Ok(1)) { Some(None) => 0, None => 1 };",
+                "expected option for variant match, found result",
+            ),
+        ] {
+            let error = run_unchecked(text).expect_err(text);
+            assert_eq!(error.code(), "K4001", "{text}");
+            assert_eq!(error.message(), message, "{text}");
+        }
+    }
+
+    #[test]
     fn postfix_question_marks_return_failures_from_the_enclosing_function() {
         let (output, _) = run(r#"
             fn digit(text: String) -> Result<Int, String> {
@@ -2110,14 +2230,10 @@ mod tests {
             println(_);
             fn second(_, _) { _ }
             println(second(3, 4));
-            println(match [5, 6, 7] {
-                [] => [],
-                [_, .._] => _,
-            });
             "#;
         for run in [run as Run, run_unchecked] {
             let (output, _) = run(source).expect("repeated discards should run");
-            assert_eq!(output, "2\n4\n[6, 7]\n");
+            assert_eq!(output, "2\n4\n");
         }
     }
 

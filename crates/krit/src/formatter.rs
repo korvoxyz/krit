@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    Block, Diagnostic, Expression, ExpressionKind, MatchKind, Program, Source, Span, Statement,
-    StatementKind, TypeAnnotation, TypeKind,
+    Block, Diagnostic, Expression, ExpressionKind, Pattern, PatternKind, Program, Source, Span,
+    Statement, StatementKind, TypeAnnotation, TypeKind,
     lexer::{Comment, lex_with_comments},
     parser,
     token::{Token, TokenKind},
@@ -458,7 +458,8 @@ impl Writer {
 struct SyntaxMap {
     block_spans: HashSet<(usize, usize)>,
     call_group_spans: HashSet<(usize, usize)>,
-    /// The parentheses of let-else patterns, which are not followed by `=>`.
+    /// The parentheses and brackets of patterns, including those of
+    /// let-else patterns and nested patterns, which are not followed by `=>`.
     pattern_group_spans: HashSet<(usize, usize)>,
     type_tokens: Vec<bool>,
     generic_commas: Vec<bool>,
@@ -515,13 +516,19 @@ impl SyntaxMap {
             .pattern_spans
             .iter()
             .map(|span| {
-                // A binding pattern is a variant name, `(`, its binder, and
+                // A binding pattern is a variant name, `(`, its payload, and
                 // the `)` that ends it.
                 let open =
                     &tokens[tokens.partition_point(|token| token.span.start < span.start) + 1];
                 debug_assert!(matches!(open.kind, TokenKind::LeftParen));
                 (open.span.start, span.end)
             })
+            .chain(
+                collector
+                    .list_pattern_spans
+                    .iter()
+                    .map(|span| (span.start, span.end)),
+            )
             .collect();
         let let_else_arms = collector
             .let_else_spans
@@ -589,8 +596,11 @@ struct SyntaxCollector {
     type_spans: Vec<Span>,
     result_separator_spans: Vec<Span>,
     breaks_after: HashMap<usize, usize>,
-    /// The pattern after `let` of each let-else.
+    /// Each variant pattern with a payload: the pattern after `let` of a
+    /// let-else, and every such pattern of a `match` arm.
     pattern_spans: Vec<Span>,
+    /// Each `[]` or `[head, ..tail]` pattern of a `match` arm.
+    list_pattern_spans: Vec<Span>,
     /// The `else` keyword and the whole statement of each let-else.
     let_else_spans: Vec<(Span, Span)>,
 }
@@ -748,20 +758,11 @@ impl SyntaxCollector {
                 pending.push(SyntaxNode::Expression(callee));
                 pending.extend(arguments.iter().map(SyntaxNode::Expression));
             }
-            ExpressionKind::Match { subject, kind } => {
+            ExpressionKind::Match { subject, arms } => {
                 pending.push(SyntaxNode::Expression(subject));
-                match kind {
-                    MatchKind::List {
-                        empty_case,
-                        cons_case,
-                        ..
-                    } => {
-                        pending.push(SyntaxNode::Expression(empty_case));
-                        pending.push(SyntaxNode::Expression(cons_case));
-                    }
-                    MatchKind::Variants { arms, .. } => {
-                        pending.extend(arms.iter().map(|arm| SyntaxNode::Expression(&arm.value)));
-                    }
+                for arm in arms {
+                    self.match_pattern(&arm.pattern);
+                    pending.push(SyntaxNode::Expression(&arm.value));
                 }
             }
             ExpressionKind::Unary { operand, .. } | ExpressionKind::Propagate { operand, .. } => {
@@ -770,6 +771,28 @@ impl SyntaxCollector {
             ExpressionKind::Binary { left, right, .. } => {
                 pending.push(SyntaxNode::Expression(left));
                 pending.push(SyntaxNode::Expression(right));
+            }
+        }
+    }
+
+    /// Records the delimiters of `pattern` and of every pattern nested in it.
+    /// Patterns are paths, so this walks one iteratively.
+    fn match_pattern(&mut self, pattern: &Pattern) {
+        let mut current = pattern;
+        loop {
+            match &current.kind {
+                PatternKind::Binder(_) | PatternKind::Wildcard => return,
+                PatternKind::EmptyList | PatternKind::Cons { .. } => {
+                    self.list_pattern_spans.push(current.span);
+                    return;
+                }
+                PatternKind::Variant { payload, .. } => {
+                    let Some(payload) = payload else {
+                        return;
+                    };
+                    self.pattern_spans.push(current.span);
+                    current = payload;
+                }
             }
         }
     }
@@ -915,6 +938,7 @@ fn classify_group(
         TokenKind::LeftBracket => {
             if token_after(close, tokens)
                 .is_some_and(|token| matches!(token.kind, TokenKind::FatArrow))
+                || pattern_group_spans.contains(&(tokens[open].span.start, tokens[close].span.end))
             {
                 GroupKind::Pattern
             } else {
@@ -1304,6 +1328,22 @@ mod tests {
              if flag? {\n        Some(-b?? - c)\n    } else {\n        Some(a? - 1)\n    }\n}\n"
         );
         assert_eq!(format(&formatted), formatted);
+    }
+
+    #[test]
+    fn formats_nested_and_wildcard_patterns_compactly() {
+        let source = "fn f(r,items)->Int{match r{Ok( Some( v ) )=>v,Ok(None)=>match items{\n\
+                      [ _ , .. rest ]=>0,[ ]=>1},Err( _ )=>2}}";
+        let expected = "fn f(r, items) -> Int {\n    match r {\n        Ok(Some(v)) => v,\n        \
+                        Ok(None) => match items {\n            [_, ..rest] => 0,\n            \
+                        [] => 1,\n        },\n        Err(_) => 2,\n    }\n}\n";
+        assert_eq!(format(source), expected);
+        assert_eq!(format(expected), expected);
+        // A nested list pattern is a pattern, not a list literal: it neither
+        // gains a trailing comma nor a space before a nested payload.
+        let nested = "fn f(r) -> Int {\n    match r {\n        Ok([head, ..tail]) => head,\n        \
+                      Ok([]) => 0,\n        Err(Some(_)) => 1,\n        Err(None) => 2,\n    }\n}\n";
+        assert_eq!(format(nested), nested);
     }
 
     #[test]

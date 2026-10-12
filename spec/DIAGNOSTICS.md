@@ -130,7 +130,7 @@ Initial required codes:
 | `K0003` | Invalid string escape |
 | `K1001` | Unexpected token, including a `?` followed on its line by an operand that does not form a conditional operator (`K1110`) |
 | `K1002` | Expected token not found |
-| `K1003` | Invalid match pattern |
+| `K1003` | Invalid match pattern, or `match` arms that mix families at one position, repeat an arm, or overlap (including an unreachable arm) |
 | `K1004` | Webhook declaration is nested or otherwise misplaced |
 | `K1005` | Nesting depth limit exceeded: syntax nests more than 256 levels, nesting plus the `else if` continuations, operators, and call, field-access, or `?` links above a point exceeds 4,096, or an inferred type would nest more than 256 levels |
 | `K1101` | `return`: a block's value is its final expression |
@@ -145,14 +145,14 @@ Initial required codes:
 | `K1110` | Conditional operator `c ? a : b` |
 | `K1111` | `switch`, `case`, or `default` |
 | `K1112` | `return` opening an `else` block: an early exit |
-| `K2001` | Undefined name; a note suggests the closest visible name, `None` for a spelling of null, or the fix for a construct from another language |
+| `K2001` | Undefined name, including `_` where a `_` pattern binds nothing; a note suggests the closest visible name, `None` for a spelling of null, or the fix for a construct from another language |
 | `K2002` | Duplicate binding or parameter; the discard name `_` is exempt |
 | `K2003` | Warning: the discard name `_` is read as a value; this becomes an error in edition 2027 |
 | `K3001` | Static type mismatch or invalid typed operator |
 | `K3002` | Statically known non-function call target |
 | `K3003` | Static function argument count mismatch |
 | `K3004` | Invalid record field access |
-| `K3005` | Invalid match subject, family, or exhaustiveness |
+| `K3005` | Match subject or pattern of the wrong type, a catch-all `match` arm, or a non-exhaustive `match` (the message lists every missing pattern) |
 | `K3006` | Type is not comparable or JSON-encodable |
 | `K3007` | Webhook signature is not exactly `(HttpRequest) -> HttpResponse` |
 | `K3008` | Host capability resource is not a direct valid string literal |
@@ -161,7 +161,7 @@ Initial required codes:
 | `K3011` | Method call `value.name(...)` on a value that has no field `name`: Krit values have no methods |
 | `K3012` | Postfix `?` where it cannot return: at the top level, in an anonymous function or a webhook entrypoint, or in a named function whose declared return type is missing or is neither a `Result` nor an `Option` |
 | `K3013` | Postfix `?` whose operand's family or error type differs from the enclosing function's declared `Result<_, E>` or `Option<_>` |
-| `K3014` | let-else that is not a direct statement of a named function's body, whose two patterns are not the two variants of one family, or whose value ends in `}` |
+| `K3014` | let-else that is not a direct statement of a named function's body, whose two patterns are not the two variants of one family, whose pattern nests another pattern, or whose value ends in `}` |
 | `K4001` | Generic guest trap, wrong runtime value kind, or HTTP request/response the host refuses (including a request path that breaks the rule in `WEBHOOK-CONTRACTS.md`, "Request paths and queries") |
 | `K4002` | Calling a non-function |
 | `K4003` | Function argument count mismatch |
@@ -249,6 +249,11 @@ may improve, but which diagnostics carry one is part of each code's contract:
 - `K1002` for a `let` with a variant pattern and no `else` arm, and `K1003`
   for a block after a let-else's `else`, each carry one note showing the
   let-else arm to write.
+- `K1003` for a token that cannot start a match pattern carries one note
+  listing the pattern forms; `K1003` for `match` arms that mix families,
+  repeat, or overlap, and `K3005` for a catch-all arm or a non-exhaustive
+  `match`, each carry one note with the fix (see [Matches](#matches)).
+- `K2001` for reading `_` where a `_` pattern binds nothing carries one note.
 
 ### Constructs from other languages
 
@@ -278,6 +283,8 @@ help: a block's value is its final expression, written without `return` or `;`; 
 
 ### Undefined names
 
+`K2001` for `_` read where a `_` pattern binds nothing (see
+[Matches](#matches)) carries a note to give the value a name. Any other
 `K2001` carries the first of these notes that applies:
 
 1. For `null`, `NULL`, `Null`, `nil`, `Nil`, `NIL`, `undefined`, or
@@ -297,6 +304,41 @@ help: a block's value is its final expression, written without `return` or `;`; 
 main.krit:2:9: error[K2001]: undefined name `null`
 help: Krit has no `null`; write `None` for an absent `Option` value
 ```
+
+### Matches
+
+The arms of a `match` name every outcome exactly once (`LANGUAGE.md`
+section 11). Checking reports, in this order: within the arms that are not
+catch-alls and in arm order, a pattern of another family than an earlier
+arm's at the same position, at that pattern (`K1003`), and an arm that
+repeats or overlaps an earlier one, at its pattern (`K1003`); then a
+top-level catch-all arm, a name or `_`, at its pattern (`K3005`); then a
+pattern whose family is not the type at its position (`K3005`); and last a
+non-exhaustive match, at the match (`K3005`). A missing pattern is written
+exactly as it would be in source, with `_` for every part no arm
+distinguishes, in a fixed order: depth first, with `Some` before `None`,
+`Ok` before `Err`, and `[]` before `[head, ..tail]` at each position.
+
+| Diagnostic | Note |
+|---|---|
+| non-exhaustive match | the arm to add for each missing pattern |
+| catch-all arm | the arms to write in its place, or that the other arms already name every outcome |
+| overlapping arm (it also matches what an earlier, narrower arm matches) | the arms for the outcomes it would catch |
+| duplicate or unreachable arm | remove it |
+| mixed families | the families one position takes |
+
+```text
+main.krit:2:5: error[K3005]: non-exhaustive match; missing: `Ok(None)`
+help: add an arm for each missing pattern: `Ok(None) => ...`
+main.krit:4:9: error[K3005]: a match arm cannot match every value: `_` would stand for outcomes it does not name
+help: name every outcome: replace `_ => ...` with `Ok(None) => ...` and `Err(_) => ...`
+main.krit:4:9: error[K1003]: match arm `Ok(other)` overlaps the earlier arm `Ok(Some(value))`: arms may not overlap
+help: name each remaining outcome instead: replace `Ok(other) => ...` with `Ok(None) => ...`
+```
+
+`_` in a pattern binds nothing, so reading `_` in that arm (or after a
+let-else pattern `_`) is `K2001` even when an enclosing scope binds `_`; its
+note says to give the value a name.
 
 ### Method calls
 
@@ -350,9 +392,11 @@ help: bind each fallible step with let-else here, as in `let Ok(value) = step el
 pattern when it is not a direct statement of a named function's body, with a
 note to `match` the value there instead (or, in an anonymous function, to
 move the code into a named `fn`); at its arm when the two patterns are not
-the two variants of one family, with a note naming the arm to write; and at
-its value when the value ends in `}`, with a note to bind the value first or
-wrap it in parentheses.
+the two variants of one family, with a note naming the arm to write; at a
+pattern nested in either pattern's payload, such as the `Some` of
+`let Ok(Some(x)) = ...`, with a note to bind the payload and decide it with
+another let-else or a `match`; and at its value when the value ends in `}`,
+with a note to bind the value first or wrap it in parentheses.
 
 ```text
 main.krit:3:9: error[K3014]: let-else must be a statement of the function body itself, not of a nested block
