@@ -1,7 +1,14 @@
-//! The release gate for the shipped examples (PRD 0.3 §5, gate 2): every
-//! example is canonically formatted, checks without a diagnostic, and builds
-//! from its manifest; `scripts/metrics.py` keeps every example at depth 3 or
-//! less; and `examples/webhook-agent.krit` stays within 50 lines.
+//! The release gate for the shipped examples (PRD 0.3 §5, gate 2) and the
+//! conformance floor (PRD 0.3 §6, R5.3).
+//!
+//! Every example is canonically formatted and checks without a diagnostic.
+//! Every example except the documented exceptions in [`UNBUILDABLE_EXAMPLES`]
+//! passes the component target check and builds from the manifest whose
+//! entry it is: its own `examples/<name>.krit.pkg`, or the repository's root
+//! `krit.pkg` for `examples/factorial.krit`. `scripts/metrics.py` keeps every
+//! example at depth 3 or less, `examples/webhook-agent.krit` stays within 50
+//! lines, and the conformance suites keep at least 40 run, 60 check, and 8
+//! format cases.
 
 use std::{
     fs,
@@ -15,6 +22,25 @@ static DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
 const MAX_DEPTH: &str = "3";
 const WEBHOOK_AGENT_MAX_LINES: usize = 50;
+
+/// Examples that `krit build` cannot compile, each an exception to gate 2
+/// that the release owner accepts or resolves.
+///
+/// `examples/lists.krit` sums a `List<Int>` by list matching and prints the
+/// list. WebAssembly policy 1 has no guest layout for `List<Int>` and no list
+/// matching (both 0.4 scope), so the example runs with `krit run` only. The
+/// list is exact: a backend that starts building an exception, or a new
+/// example that cannot build, fails this gate until the list is updated.
+const UNBUILDABLE_EXAMPLES: &[&str] = &["examples/lists.krit"];
+
+/// The PRD 0.3 floor for each conformance suite: its directory under
+/// `conformance/`, the file that marks a case directory, and the minimum
+/// number of cases.
+const CONFORMANCE_FLOOR: [(&str, &str, usize); 3] = [
+    ("cases", "program.krit", 40),
+    ("check", "program.krit", 60),
+    ("format", "input.krit", 8),
+];
 
 struct ScratchDirectory {
     path: PathBuf,
@@ -103,15 +129,107 @@ fn every_example_is_canonical_and_checks_without_diagnostics() {
     }
 }
 
+fn is_unbuildable(example: &str) -> bool {
+    UNBUILDABLE_EXAMPLES.contains(&example)
+}
+
+/// The manifest that builds `example`: `examples/<name>.krit.pkg` or the
+/// root `krit.pkg`, whichever names the example as its entry.
+fn manifest_for(example: &str) -> Option<String> {
+    [format!("{example}.pkg"), "krit.pkg".to_owned()]
+        .into_iter()
+        .find(|manifest| {
+            let Ok(text) = fs::read_to_string(repository_root().join(manifest)) else {
+                return false;
+            };
+            let parsed = krit_package::Manifest::parse(&text)
+                .unwrap_or_else(|error| panic!("{manifest} should parse: {error}"));
+            let directory = Path::new(manifest).parent().unwrap_or(Path::new(""));
+            directory.join(&parsed.package.entry) == Path::new(example)
+        })
+}
+
+/// The component target check runs the whole WebAssembly pipeline that
+/// `krit build` runs, so an example fails it exactly when it cannot build.
+/// Only the documented exceptions may fail, and only on WebAssembly policy
+/// limits (`K7002`), never on a source error.
 #[test]
-fn every_example_package_builds_from_its_manifest() {
-    let directory = ScratchDirectory::new("build");
-    let mut built = 0;
+fn only_the_documented_exceptions_fail_the_component_target_check() {
+    let mut unbuildable = Vec::new();
     for example in examples() {
-        let manifest = format!("{example}.pkg");
-        if !repository_root().join(&manifest).is_file() {
+        let check = krit()
+            .args([
+                "check",
+                "--target",
+                "component",
+                "--diagnostic-format",
+                "json",
+                &example,
+            ])
+            .output()
+            .expect("check should start");
+        let diagnostics = String::from_utf8(check.stderr).expect("diagnostics should be UTF-8");
+        if check.status.success() {
+            assert!(
+                diagnostics.is_empty(),
+                "{example} should pass the component target check without diagnostics: \
+                 {diagnostics}"
+            );
             continue;
         }
+        let codes = diagnostics
+            .lines()
+            .map(|line| {
+                let diagnostic = serde_json::from_str::<serde_json::Value>(line)
+                    .expect("diagnostic should be JSON");
+                diagnostic["code"].as_str().unwrap_or_default().to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !codes.is_empty() && codes.iter().all(|code| code == "K7002"),
+            "{example} should fail the component target check only on WebAssembly policy \
+             limits (K7002): {diagnostics}"
+        );
+        unbuildable.push(example);
+    }
+    assert_eq!(
+        unbuildable, UNBUILDABLE_EXAMPLES,
+        "the examples that cannot build should be exactly the documented exceptions"
+    );
+}
+
+/// An example that cannot build is still a working `krit run` program.
+#[test]
+fn every_unbuildable_example_runs() {
+    for example in UNBUILDABLE_EXAMPLES {
+        let run = krit()
+            .args(["run", example])
+            .output()
+            .expect("run should start");
+        assert!(
+            run.status.success(),
+            "{example} should run: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            run.stderr.is_empty(),
+            "{example} should run without diagnostics: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
+fn every_buildable_example_builds_from_its_manifest() {
+    let directory = ScratchDirectory::new("build");
+    let examples = examples();
+    let mut built = 0;
+    for example in &examples {
+        if is_unbuildable(example) {
+            continue;
+        }
+        let manifest = manifest_for(example)
+            .unwrap_or_else(|| panic!("{example} should be the entry of a manifest"));
         let artifact = directory.path.join(format!("{built}.wasm"));
         let build = krit()
             .args(["build", "--manifest", &manifest, "--output"])
@@ -120,13 +238,41 @@ fn every_example_package_builds_from_its_manifest() {
             .expect("build should start");
         assert!(
             build.status.success(),
-            "{manifest} should build: {}",
+            "{manifest} should build {example}: {}",
             String::from_utf8_lossy(&build.stderr)
         );
         assert!(artifact.is_file(), "{manifest} should write its artifact");
         built += 1;
     }
-    assert_eq!(built, 7, "every example package should be built");
+    assert_eq!(
+        built + UNBUILDABLE_EXAMPLES.len(),
+        examples.len(),
+        "every example but the documented exceptions should be built"
+    );
+}
+
+/// The number of case directories under `directory`: those holding `marker`.
+fn count_cases(directory: &Path, marker: &str) -> usize {
+    if directory.join(marker).is_file() {
+        return 1;
+    }
+    fs::read_dir(directory)
+        .expect("conformance directory should be readable")
+        .map(|entry| entry.expect("directory entry should be readable").path())
+        .filter(|path| path.is_dir())
+        .map(|path| count_cases(&path, marker))
+        .sum()
+}
+
+#[test]
+fn conformance_suites_meet_the_release_floor() {
+    for (suite, marker, floor) in CONFORMANCE_FLOOR {
+        let count = count_cases(&repository_root().join("conformance").join(suite), marker);
+        assert!(
+            count >= floor,
+            "conformance/{suite} has {count} cases; PRD 0.3 requires at least {floor}"
+        );
+    }
 }
 
 #[test]
