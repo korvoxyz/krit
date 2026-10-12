@@ -60,7 +60,7 @@ documentation, examples, and the release gate.
 | D2 | Examples rewritten; `scripts/metrics.py`; depth ≤ 3 | R5.2 | done | metrics table |
 | D3 | Conformance ≥ 40 run / 60 check / 8 format | R5.3 | done | counts |
 | D4 | Prompt pack 0.3 with checked examples | R4.5 | done | examples check |
-| D5 | `docs/roadmap.md`, RFC-0007 resource handles (draft), CHANGELOG, README, version 0.3.0 | R5.4 | doing | checklist |
+| D5 | `docs/roadmap.md`, RFC-0007 resource handles (draft), CHANGELOG, README, version 0.3.0 | R5.4 | done | checklist |
 | D6 | Release gate (PRD §5) and grounded-sketch re-measure | §5 | doing | all gates |
 
 ## Log
@@ -110,3 +110,10 @@ documentation, examples, and the release gate.
   5/8 with reduced scope, 2/8 full behavior.
 - 2026-10-12 — Release stage started: version 0.3.0, CHANGELOG, independent
   release-gate audit.
+- 2026-10-12 — D5 done: workspace and language version 0.3.0 (the
+  `krit:runtime` WIT package stays 0.2.0, and the 0.2.0 golden artifacts
+  still load inside the window); factorial's pinned digest re-baselined, the
+  bytes differing from the 0.2.0 artifact only in the three recorded version
+  strings; README install references, root `krit.pkg`, and CONTRIBUTING's tag
+  example moved to 0.3.0; CHANGELOG 0.3.0 section with upgrade notes and
+  metrics. fmt and clippy clean, 1,017 tests pass, 1 ignored.

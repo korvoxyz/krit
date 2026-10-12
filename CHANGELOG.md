@@ -7,6 +7,313 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-12
+
+"Honest and flat." What checks is what ships, failures are diagnostics instead
+of crashes, secrets are bound to the origins they may reach, and the happy path
+reads top to bottom. This release folds the planned 0.2.1 and 0.2.2 releases
+into 0.3; scope and gates are in [docs/prd-0.3.md](docs/prd-0.3.md).
+
+### Highlights
+
+- **What checks is what ships.** For a file with a webhook, queue, or schedule
+  entrypoint, `krit check` runs the full WebAssembly build with the output
+  discarded and reports every `K7001`/`K7002` that `krit build` would, each at
+  its source span. `krit run` refuses every program that `krit check` refuses.
+- **Flat code.** Postfix `?`, let-else, nested patterns with `_`, named
+  construction, entry lists, `()`, `///` doc comments, string interpolation,
+  and `"""` text blocks, all additive in edition 2026. The reference webhook
+  agent goes from 79 lines nested 15 levels deep to 47 lines at depth 3.
+- **Secrets are bound to origins.** A manifest lists the origins each secret
+  may reach (`[secrets.github-token] origins = ["https://api.github.com"]`),
+  and the host refuses to send it anywhere else (`K5006`) before a byte
+  leaves.
+- **Strings deploy.** String `==`, `!=`, ordering, `+`, interpolation, text
+  blocks, and the new standard library build into components, so routing on
+  `request.method == "POST"` and composed responses run through `krit invoke`.
+- **No crashes on deep input.** Deep nesting reports `K1005` and runaway
+  recursion reports `K4010` in every stage, instead of aborting the process
+  with exit status 134.
+- **Hints for LLM habits.** `return`, loops, assignment, `class`, `import`,
+  `await`, `throw`, indexing, arrow functions, `?:`, `switch`, and
+  `else { return … }` each get their own code (`K1101`-`K1112`) and a one-line
+  fix. Undefined names get a did-you-mean, and a new warnings channel reports
+  problems without failing the command.
+- **Wasmtime 48 LTS.** The sandbox host moves to Wasmtime 48.0.5, supported
+  upstream until 2028-08-20, and 0.2.0 artifacts keep loading through a
+  published compatibility window.
+
+### Language
+
+- Postfix `?` returns `Err`/`None` early from a named function, including
+  queue and schedule entrypoints, whose declared return type is `Result<_, E>`
+  with the identical `E`, or `Option<_>`. Effects already performed stay
+  performed, and evaluation stays left to right. `K3012` reports a `?` that
+  cannot return (top level, closures, webhook entrypoints); `K3013` reports a
+  different error type or family
+- let-else: `let Ok(value) = step else Err(error) => fallback;` binds one
+  variant's payload, and otherwise returns the arm's value from the enclosing
+  function. It also works in webhook entrypoints, where `?` does not; misuse
+  is `K3014`
+- Nested built-in patterns such as `Ok(Some(x))`, `Ok(None)`, and `Err(e)`,
+  with exhaustiveness checked over the nested families. Missing combinations
+  are listed verbatim (`K3005`), unreachable and duplicate arms are rejected,
+  and so is a top-level catch-all `_ =>` arm, so every outcome is named
+- `_` binds nothing and may repeat in one scope. Reading `_` as a value is
+  warning `K2003`, an error from edition 2027
+- Named construction of the built-in contract records `HttpRequest`,
+  `HttpResponse`, `HttpHeader`, and `LogField`, with punning (`body` means
+  `body: body`) and fixed defaults (`HttpResponse { status: 200 }`). Unknown,
+  repeated, or missing required fields are `K3016`
+- Entry lists: `["accept": "text/plain"]` is a list of `record { name, value }`
+  for HTTP headers and log fields
+- The unit value `()` is an expression, so `Ok(())` works; the type is still
+  spelled `Unit`
+- `///` doc comments on functions and entrypoints, kept by `krit fmt` and
+  shown by `krit explain` and language-server hover
+- String interpolation such as `"\(request.method) \(request.path)"`. A hole
+  holds a name and field accesses of type `String`; anything else is `K3015`,
+  with a hint to use `int_to_string`
+- `"""` text blocks with indentation removal, escapes, and holes; layout errors
+  are `K0004`. Interpolated strings and text blocks are never capability
+  resource literals (`K3008`)
+- `<`, `<=`, `>`, and `>=` compare two strings byte by byte over UTF-8, with
+  the same result in `check`, `run`, and built components
+- Configuration keys may contain `_` (`config_string("agent.timeout_ms")`),
+  with the same placement rules as `-`
+- The habit words are not reserved: `let for = 1;` still works
+- `spec/LANGUAGE.md` is the Krit 0.3 specification, with one complete,
+  parser-verified grammar and each sugar defined by translation into the core
+  language (section 4.3)
+
+### Standard library
+
+- First standard library (v0), pure and deterministic, available in `check`,
+  `run`, the language server, and webhook, queue, and schedule components:
+  `int_to_string`, `url_path_segment`, `url_query`, `string_byte_len`,
+  `string_is_empty`, `string_contains`, `string_starts_with`, and
+  `string_ends_with`
+- `url_path_segment` returns `Result<String, String>`. It percent-encodes
+  everything except RFC 3986 unreserved characters and returns `Err` for text
+  the host path rule would refuse, so untrusted input fails as a value instead
+  of trapping the invocation
+- `url_query` builds `k=v&…` from an entry list, percent-encoded, with no
+  leading `?`
+
+### Diagnostics
+
+- Diagnostics carry a severity. Warnings print as `warning[K…]` in human
+  output and with `"severity": "warning"` in JSON Lines, never change the exit
+  status, and are published by the language server with Warning severity
+- Errors can carry one-line fix hints, printed on `help:` lines, returned in
+  the JSON `notes` array, and shown by the language server
+- New codes:
+  - `K0004` invalid text block layout
+  - `K1005` nesting depth limit (256 levels, 4,096 structural)
+  - `K1101`-`K1112` constructs from other languages, each with a fix hint
+  - `K2003` (warning) the discard name `_` read as a value
+  - `K3011` method call on a value (was `K3004`), naming the standard-library
+    function to use, such as `string_byte_len(s)`
+  - `K3012` and `K3013` postfix `?` where it cannot return, or with a
+    different error type or family
+  - `K3014` invalid let-else
+  - `K3015` invalid interpolation hole
+  - `K3016` unknown, repeated, or missing field in a named construction
+  - `K4010` direct-evaluation depth limit
+  - `K5006` secret sent to an origin outside its binding
+  - `K6003` manifest declares dependencies
+  - `K8003` (info) the language server left warnings out at its limit
+  - `K9013` (warning) an `HttpRequest` path or query piece that
+    `url_path_segment`, `url_query`, or `int_to_string` did not encode
+- `K9000`-`K9999` is reserved for lints, which are warnings by default
+- Undefined names (`K2001`) suggest the closest name in scope or built-in;
+  `null`, `nil`, and `undefined` suggest `None`
+- `K7002` messages name the right policy: "WebAssembly policy 1" for module
+  programs and "the bounded webhook ABI (WebAssembly policy 2)" for entrypoint
+  programs
+- Manifest diagnostics report their specific code instead of always `K6001`
+- `spec/DIAGNOSTICS.md` lists every emitted code exactly once with its severity
+
+### Compiler and Wasm backend
+
+- The backend support check returns every finding, sorted by source position,
+  instead of only the first. Composite equality and string operators are
+  reported at their span instead of `1:1`
+- Unused helpers are eliminated before layout checks, so an unused generic
+  helper no longer fails a build with `K7001`
+- A guest string runtime lowers String `==`, `!=`, ordering, `+`,
+  interpolation, text blocks, and the standard library into webhook, queue,
+  and schedule components
+- `?` and let-else lower to a verified Core function-exit operation and to Wasm
+  `return`, so a run of let-else statements does not nest deeper
+- Component `json_decode` into `String` decodes every JSON escape, including
+  `\uXXXX` surrogate pairs, and accepts surrounding whitespace, so model output
+  such as `"line one\nline two"` no longer traps. Invalid JSON is `K4009`, as
+  in `krit run`, and the input is never echoed
+- Guest code that runs out of memory, for example through runaway string
+  concatenation, reports `K5103` (resource limit) instead of a generic `K4001`
+  trap
+- Depth guards in the parser, analyzer, Core lowering, formatter, and both Wasm
+  compilers. Inferred types nested more than 256 levels fail fast with `K1005`,
+  and a 1,000-branch `else if` chain still checks, runs, formats, and builds
+- Typing a `match` costs one unification per pattern position, so wide nested
+  matches check in roughly linear time
+- Fixed: unifying two bindings whose types contain each other reports `K3001`
+  instead of overflowing the stack, and comparing a contract-typed value with
+  an equivalent record no longer crashes the compiler with `KICE0001`
+
+### Runtime and security
+
+- Secret→origin binding: `[secrets.<name>] origins = ["https://…"]` in the
+  manifest, with `inject = "bearer"` optional and the only accepted value. The
+  host refuses injection to any other origin with `K5006` before anything is
+  resolved or sent. AI adapter and search connector credentials in host
+  configuration may narrow a binding but never widen it
+- Request path hardening for inbound webhooks, `http_request`, durable
+  `replay_http`, AI adapter paths, and search connector paths. The host refuses
+  with `K4001`: `.` and `..` segments, including ones hidden behind `;`
+  parameters, an escaped `?` or `#`, or escaped spaces; percent-encoded `.`,
+  `/`, and `\`; double encodings; escaped ASCII control bytes; overlong UTF-8
+  escapes; malformed escapes; and raw spaces. Outbound requests are sent
+  exactly as validated (`CURLOPT_PATH_AS_IS`)
+- Outbound host requests send `User-Agent: krit/<version>` unless the program
+  sets one; an empty value turns the header off
+- The CLI runs on a 256 MiB stack thread and `krit run` evaluates on a 1 GiB
+  stack thread, both virtual reservations, so the depth limits are always
+  reached before a native stack overflow
+- On Windows and other non-Unix hosts, `invoke`, `worker`, `schedule`, and
+  `serve` refuse host configurations that grant secrets, durable state, jobs,
+  or application databases (`K5001`, exit status 4), because owner-only file
+  checks exist only on Unix
+- Wasmtime 48.0.5 LTS. Fuel, deadline, memory, stack, and host-call limits
+  behave as before, and bulk memory and table operators are still rejected by
+  validation
+- `SECURITY.md` documents supported versions and private disclosure through
+  GitHub private vulnerability reporting
+
+### Tooling
+
+- `krit check --target component|module|none` runs or skips the full build
+  pipeline with its output discarded. Entrypoint files are checked against the
+  component target by default
+- `krit build --diagnostic-format human|json`
+- Warnings and fix hints in `krit check`, `run`, `build`, `explain`, and the
+  language server. The language server publishes at most 100 warnings per
+  document followed by a `K8003` notice, and truncates oversized messages
+  instead of exiting
+- `krit permissions`, in human and `--json` form, with or without `--artifact`,
+  shows each secret's binding
+- `krit fmt` has one canonical spelling for every new form. It breaks long
+  operator chains before each operator, `+` string building included, keeps
+  integer digit separators (`1_000_000`), and keeps lines within 100 columns
+  wherever a break point exists. A comment inside a chain keeps its place
+- `krit assist` accepts candidates whose only diagnostics are warnings, and
+  advertises the prompt-pack version read from `ai/prompt-pack.json`
+- Prompt pack 0.3.0: `krit prompt` prints `KRIT-0.3-SYSTEM.md`, which teaches
+  idiomatic 0.3, the standard library, the bounded component subset, and a
+  "Krit is not Rust, TypeScript, or Python" table, in about 6,600 tokens
+- Every Krit example in `README.md`, `spec/`, the AI material, and `rfcs/` is
+  checked in CI with the real compiler
+- `scripts/metrics.py` reports lines, depth, nested matches, duplicated `Err`
+  arms, `record` uses, longest line, and authority literals (`--json`,
+  `--check-depth`, `--check-lines`). CI fails if an example is nested deeper
+  than 3 levels or `webhook-agent` grows past 50 lines
+- `scripts/clean.sh` reclaims build output; it is a dry run unless given
+  `--yes`
+- CI runs the test suite on Linux, macOS, and Windows (Windows is advisory
+  until its first green run), with Rust 1.95.0
+- Examples are rewritten in idiomatic 0.3, all at depth 3 or less, with
+  unchanged capabilities and permissions. Eight of nine build to a component;
+  `examples/lists.krit` runs only with `krit run` until list layouts land
+- Conformance gains package and build-compatibility suites; every runtime case
+  must pass checking, cases can declare `expect.warnings`, and a test enforces
+  a floor of 40 run, 60 check, and 8 format cases
+- Added `docs/roadmap.md` (the plan to 1.0), an RFC template, and draft
+  RFC-0007 on resource handles
+
+### Compatibility and upgrade notes
+
+- The minimum supported Rust version is 1.95, which Wasmtime 48 requires
+- Artifact compatibility window: a runtime loads an artifact when its metadata
+  schema, validation policy, `krit:runtime` WIT version, and edition are in
+  the runtime's supported sets and its recorded toolchain is the runtime's own
+  minor version or one of the two before it, never newer. 0.2.0 artifacts load
+  and run on 0.3 (golden artifacts in `conformance/build/compat/0.2.0`).
+  Newer, other-major, and unparsable versions are refused with `K7004`
+  (adjacent metadata) or `K7003` (component metadata). The `krit:runtime` WIT
+  package stays at 0.2.0; 0.3 artifacts record compiler and language version
+  0.3.0
+- Secret bindings: the legacy flat `[capabilities] secrets = [...]` list is
+  still accepted, but `krit permissions` reports those secrets as
+  `UNBOUND (any granted origin)`, and the host may send them to any granted
+  origin. Declare `[secrets.<name>] origins` to get host enforcement
+- A non-empty `[dependencies]` table is now rejected with `K6003` by
+  `package check`, `build`, `sandbox`, `permissions`, `invoke`, `worker`,
+  `schedule`, and `serve`. 0.2 ignored it silently; an empty table is still
+  accepted
+- `krit run` now refuses programs that fail checking, with check's diagnostic
+  and exit status and no partial output; 0.2 evaluated some of them
+- Reading `_` as a value still works in edition 2026 but warns (`K2003`)
+- Method calls such as `s.len()` now report `K3011` instead of `K3004`
+- Request paths that 0.2 accepted, such as dot segments, encoded separators,
+  and raw spaces, are now refused with `K4001`
+- Durable state: replay and inbound idempotency identity still includes the
+  artifact digest, and a 0.3 build records a new compiler version, so
+  rebuilding a 0.2 program with 0.3 orphans its replay and idempotency
+  records. Durable protocol 1.1, planned for 0.4, keys that identity by
+  package and declared namespace instead
+- Windows host mode refuses host configurations that grant secrets or durable
+  state (see Runtime and security)
+- Fuel for instantiation, unchanged from 0.2 but now documented and pinned by
+  tests: instantiation draws on the invocation budget. On hosts without
+  copy-on-write memory images (macOS, Windows), copying a module's data image
+  costs one unit per page-padded byte (16,384 units for one page on Apple
+  silicon); on Linux it costs nothing. Fuel used by artifacts with linear
+  memory is therefore host-dependent, so size narrowed fuel budgets for the
+  most expensive host
+- `krit assist` requests carry language version 0.3.0 and prompt-pack version
+  0.3.0
+
+### Known limitations
+
+- Krit is pre-1.0 and not production-ready
+- User-defined types (`type`, `enum`), generics, modules, and `json_parse` are
+  not part of 0.3; they arrive in 0.4 and later. See
+  [docs/roadmap.md](docs/roadmap.md)
+- Components have no layouts for user records or general lists: list matching
+  (including header lookup), `Some` outside the `http_request` bearer argument,
+  and helpers returning `Result<HttpRequest, String>` or `Result<Bool, String>`
+  are `K7002`. Typed JSON decoding and HMAC are not available yet
+- The front end stops at its first error (backend findings are already
+  reported together); multi-error reporting is planned for 0.4
+- `K9013` inspects interpolation holes and `+` operands within one function. It
+  does not flag an untrusted value used as a whole path or query
+
+### Metrics
+
+| Metric | 0.2.0 | 0.3.0 |
+| --- | --- | --- |
+| Workspace tests (`cargo test --workspace --all-targets`) | 629 | 1,017 |
+| Conformance run / check / format cases | 25 / 29 / 3 | 50 / 174 / 18 |
+| Conformance package / build-compatibility cases | 0 / 0 | 6 / 2 |
+| `webhook-agent.krit` lines / maximum depth | 79 / 15 | 47 / 3 |
+| Maximum depth across examples | 15 | 3 |
+| Nested matches / `record` keywords across examples | 18 / 31 | 0 / 0 |
+| Grounded sketches that check and build, full behavior | 1/8 | 2/8 |
+| Grounded sketches that check and build, reduced scope counted | 2/8 | 5/8 |
+| Habit codes with fix hints | 0 | 12 |
+| Process aborts on adversarial depth | yes | none |
+
+The grounded sketches are eight realistic agent programs (issue triage, chat
+summaries, a payment webhook, a ticket router, a retrying worker, RAG answers,
+and more) used to measure fit, as described in the release gate of
+[docs/prd-0.3.md](docs/prd-0.3.md). In 0.2.0 a reduced-scope payment sketch
+also built but was not counted, so the like-for-like comparison is 1/8 to 2/8
+with full behavior and 2/8 to 5/8 when reduced-scope rewrites count. Three of
+the five that build in 0.3 (chat summaries, the payment webhook, and the ticket
+router) do so only with reduced scope; full behavior waits on typed decoding,
+record and list layouts, header lookup, and HMAC.
+
 ## [0.2.0] - 2026-09-05
 
 First tagged Rust release, including the bootstrap begun on 2026-09-01 and the
