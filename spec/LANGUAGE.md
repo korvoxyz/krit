@@ -1428,9 +1428,63 @@ grammar-permitted trailing commas, not expression order or program semantics.
   arm that holds a block, a `match`, or a comment always breaks. A value that
   wraps on its own keeps a fitting arm after its closing delimiter
   (`) else Err(e) => handle(e);`).
+- A binary operator chain is a run of operands joined by the operators of
+  one precedence level (section 9), such as `a + b - c`, `x && y && z`, or
+  `left == right`; an operand may itself be a chain of a higher level or a
+  parenthesized one. A chain stays on one line when it fits there. Otherwise
+  the line breaks before each of its operators, so every operand after the
+  first starts a continuation line that begins with its operator, indented
+  one level deeper than the line the chain starts on:
+
+  ```krit
+  fn issue_path(owner: String, repository: String, number: Int) -> Result<String, String> {
+      let path = "/repos/"
+          + url_path_segment(owner)?
+          + "/"
+          + url_path_segment(repository)?
+          + "/issues/"
+          + int_to_string(number);
+      Ok(path)
+  }
+  ```
+
+  A chain that is a call argument, a list element, an entry value, a
+  construction or record field value, or a match arm value breaks the same
+  way from the line it starts on. A chain whose first operand is itself a
+  broken chain indents that operand's continuation lines one level deeper
+  still, so the lower-precedence operators stand out. When a broken chain is
+  the condition of an `if` or the subject of a `match`, the `{` that opens the
+  body moves to its own line:
+
+  ```krit
+  fn dispatch(path: String, method: String, authorized: Bool) -> Int {
+      if string_starts_with(path, "/repos/")
+          && string_ends_with(path, "/issues")
+          && method == "POST"
+          && authorized
+      {
+          1
+      } else {
+          0
+      }
+  }
+  ```
+
+  Whether a chain fits is measured with the chain unbroken, up to the first
+  delimited group that breaks on its own: one that is always multiline, or
+  too wide for the line where it opens; the measurement goes on after that
+  group's closing delimiter. A chain of three or more operands that holds a
+  group too wide for its line breaks instead, so its operands stay one per
+  line; a chain of two keeps such a group joined to its other operand
+  (`fields == [`, one element per line, `]`). A chain inside a group that
+  stays on one line never breaks, and a comment between two operands, outside
+  their delimited groups, always breaks the chain it stands in.
 - Non-empty blocks and every match are multiline. Short lists, records,
   parameter lists, argument lists, and record types remain on one line when
-  readable.
+  readable. A delimited group also breaks when the line through it and what
+  follows it on that line, up to the line's next break point, would pass the
+  100-column target: `?.body;` after a call, `) else` after a let-else value,
+  or the return type after a parameter list.
 - Multiline lists, records, parameter lists, argument lists, record types,
   and matches have one item per line and a trailing comma. Single-line forms
   omit a trailing comma.
@@ -1457,7 +1511,9 @@ grammar-permitted trailing commas, not expression order or program semantics.
   never changes the doc comment.
 - Top-level declarations are separated from executable expression statements
   by one blank line.
-- Integer separators are removed. Strings use direct printable Unicode plus
+- An integer keeps its spelling, digit separators included: `1_000_000`
+  stays `1_000_000` and `1000000` stays `1000000`. Strings use direct
+  printable Unicode plus
   `\"`, `\\`, `\n`, `\r`, `\t`, `\0`, or lowercase `\u{...}` escapes for
   required control characters. The text of an interpolated string is written
   the same way, and each hole exactly as written (`\(request.path)`).
@@ -1484,7 +1540,16 @@ grammar-permitted trailing commas, not expression order or program semantics.
   Formatting therefore never attaches a doc comment to an item or detaches
   one from it.
 
-The formatter uses a soft 100-column target. It wraps delimiter-based
-collections and signatures deterministically; an indivisible string, comment,
-or operator chain may exceed the target. Correctness, comment preservation,
-and idempotence take priority over filling every line optimally.
+The formatter uses a soft 100-column target, counted in Unicode scalar
+values. It breaks a line wherever the grammar gives it a break point and the
+line would otherwise pass the target: in delimited groups (argument and
+parameter lists, lists, entry lists, records, record types, named
+constructions, and matches), before the operators of a chain, and after the
+`else` of a let-else. Postfix `?`, calls, and field access stay compact, so a
+`?` chain such as `load(id)?.body` breaks only inside its argument lists. A
+line with no break point stays as written and may pass the target: a single
+long string literal, an interpolated string (never broken inside the
+literal), a text-block line, a comment, or a long name. Correctness, comment
+preservation, and idempotence take priority over filling every line
+optimally: formatting canonical source changes nothing, and no comment is
+ever dropped.

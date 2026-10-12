@@ -1,0 +1,23 @@
+fn issue_path(owner:String,repository:String,number:Int)->Result<String,String>{
+let path="/repos/"+url_path_segment(owner)?+"/"+url_path_segment(repository)?+"/issues/"+int_to_string(number);
+Ok(path)
+}
+
+fn greeting(name:String)->String{"Hello, "+name+"!"}
+
+fn summary(owner:String,repository:String,title:String,count:Int)->String{
+"Repository "+owner+"/"+repository+" has "+int_to_string(count)+" open issues; the newest is titled "+title
+}
+
+fn report(owner:String,repository:String,title:String)->HttpResponse{
+println("Reporting on "+owner+"/"+repository+" because a new issue arrived with the title "+title);
+log_info("report.sent",["subject":"New issue in "+owner+"/"+repository+": "+title+" (opened just now)"]);
+HttpResponse{status:200,body:"The issue titled "+title+" was filed against "+owner+"/"+repository+" and is now tracked"}
+}
+
+fn label(stored:Result<String,String>,owner:String)->String{
+match stored{
+Ok(text)=>"Stored label for "+owner+" is "+text+", which is what the triage step decided last time",
+Err(reason)=>"No label for "+owner+": "+reason,
+}
+}

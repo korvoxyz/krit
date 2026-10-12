@@ -1,0 +1,45 @@
+fn route(path: String, method: String, authorized: Bool) -> Int {
+    if string_starts_with(path, "/repos/")
+        && string_ends_with(path, "/issues")
+        && method == "POST"
+        && authorized
+    {
+        1
+    } else if string_starts_with(path, "/orgs/")
+            && string_ends_with(path, "/members")
+            && method == "GET"
+        || authorized
+    {
+        2
+    } else {
+        3
+    }
+}
+
+fn weighted(count: Int, weight: Int, bonus: Int, penalty: Int) -> Int {
+    count * weight * weight * weight * weight * weight * weight
+        + bonus * weight * weight * weight * weight * weight
+        - penalty * weight
+}
+
+fn within(size: Int, limit: Int) -> Bool {
+    size >= 0 && size <= limit
+}
+
+fn describe(owner: String, title: String) -> String {
+    let heading = "Issue opened by "
+        + owner // who
+        + " with the title "
+        + title;
+    let detail = "The triage step read the issue"
+        // and then decided
+        + " and chose a label for "
+        + owner;
+    heading + detail
+}
+
+fn checked(path: String, owner: String) -> Bool {
+    string_contains(path, owner)
+        && string_starts_with(path, "/repos/")
+        && string_ends_with(path, "/issues") == false
+}

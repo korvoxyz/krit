@@ -1,0 +1,16 @@
+// A comment longer than the width limit stays exactly as written, because a comment is never rewrapped by the formatter.
+let notice="This sentence is a single string literal that is longer than one hundred columns on its own line.";
+let user=record{name:"Ada",role:"reviewer"};
+let greeting="Hello \(user.name), you were assigned as the \(user.role) for this repository and its open issues.";
+let joined="Reviewer \(user.name) holds the role \(user.role) for every open issue,"+" and "+greeting+"!";
+
+fn explain(stored:Result<String,String>)->String{
+match stored{
+Ok(text)=>"The stored explanation is not available here, so this fixed fallback text is returned instead.",
+Err(reason)=>reason,
+}
+}
+
+println(notice);// the inline comment after a long line also stays where it is, even past the width limit
+println("This argument is one long string literal, so its call breaks but the literal stays on one line.");
+println(joined+explain(Err("none")));
