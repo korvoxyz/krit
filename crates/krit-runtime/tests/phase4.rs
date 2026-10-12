@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeMap,
+    fs,
     io::{Read, Write},
     net::TcpListener,
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -19,8 +21,8 @@ use krit_runtime::{
     IdempotencyPolicy, LogLevel, NetworkPolicy, RateLimitPolicy, RetryPolicy, Runtime, SecretStore,
 };
 use krit_wasm::{
-    AI_INTERFACE, BuildOptions, BuiltComponent, HTTP_INTERFACE, LOGGING_INTERFACE,
-    SECRETS_INTERFACE, build_component,
+    AI_INTERFACE, BuildOptions, BuiltComponent, CONFIG_INTERFACE, HTTP_INTERFACE,
+    LOGGING_INTERFACE, SECRETS_INTERFACE, build_component,
 };
 
 fn compile(source_text: &str, capabilities: &[&str]) -> BuiltComponent {
@@ -104,6 +106,38 @@ fn listener_origin(listener: &TcpListener) -> String {
     )
 }
 
+/// The shipped `examples/webhook-agent.krit`, so the success path of the
+/// example the README documents is what this gate runs. Its placeholder
+/// origins point at the loopback mocks, and the first event gains an
+/// `authorization` field so that log redaction is observed.
+fn webhook_agent_source(github_origin: &str, messaging_origin: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/webhook-agent.krit");
+    let mut source =
+        fs::read_to_string(path).expect("the shipped webhook agent should be readable");
+    for (shipped, local) in [
+        (
+            "\"https://github.example.invalid\"".to_owned(),
+            format!("\"{github_origin}\""),
+        ),
+        (
+            "\"https://message.example.invalid\"".to_owned(),
+            format!("\"{messaging_origin}\""),
+        ),
+        (
+            r#"["delivery": request.path]"#.to_owned(),
+            r#"["authorization": "must-redact", "delivery": request.path]"#.to_owned(),
+        ),
+    ] {
+        assert_eq!(
+            source.matches(&shipped).count(),
+            1,
+            "the shipped webhook agent should contain {shipped} once"
+        );
+        source = source.replace(&shipped, &local);
+    }
+    source
+}
+
 #[test]
 fn reference_webhook_runs_github_ai_and_messaging_with_exact_audit_facts() {
     let github = TcpListener::bind("127.0.0.1:0").expect("GitHub mock should bind");
@@ -168,88 +202,22 @@ fn reference_webhook_runs_github_ai_and_messaging_with_exact_audit_facts() {
         request
     });
 
-    let source = format!(
-        r#"
-fn failure(message: String) -> HttpResponse {{
-    log_error("reference.failed", [record {{ name: "reason", value: message }}]);
-    record {{ status: 502, headers: [], body: "reference flow failed" }}
-}}
-
-webhook fn handle(request: HttpRequest) -> HttpResponse {{
-    log_info(
-        "reference.received",
-        [
-            record {{ name: "authorization", value: "must-redact" }},
-            record {{ name: "delivery", value: request.path }},
-        ],
-    );
-    match secret("github-token") {{
-        Ok(github_token) => {{
-            let github_request: HttpRequest = record {{
-                method: "GET",
-                path: "/repos/example/issues/1",
-                query: "",
-                headers: [],
-                body: "",
-            }};
-            match http_request("{github_origin}", github_request, Some(github_token)) {{
-                Ok(github_response) => match ai_invoke("reviewer", github_response.body) {{
-                    Ok(model_output) => {{
-                        let summary: String = json_decode(model_output);
-                        match secret("message-token") {{
-                            Ok(message_token) => {{
-                                let message_request: HttpRequest = record {{
-                                    method: "POST",
-                                    path: "/messages",
-                                    query: "",
-                                    headers: [
-                                        record {{
-                                            name: "idempotency-key",
-                                            value: "reference-delivery",
-                                        }},
-                                    ],
-                                    body: summary,
-                                }};
-                                match http_request(
-                                    "{messaging_origin}",
-                                    message_request,
-                                    Some(message_token),
-                                ) {{
-                                    Ok(message_response) => {{
-                                        log_info(
-                                            "reference.completed",
-                                            [record {{ name: "adapter", value: "reviewer" }}],
-                                        );
-                                        record {{
-                                            status: 200,
-                                            headers: message_response.headers,
-                                            body: summary,
-                                        }}
-                                    }},
-                                    Err(error) => failure(error),
-                                }}
-                            }},
-                            Err(error) => failure(error),
-                        }}
-                    }},
-                    Err(error) => failure(error),
-                }},
-                Err(error) => failure(error),
-            }}
-        }},
-        Err(error) => failure(error),
-    }}
-}}
-"#
-    );
+    let source = webhook_agent_source(&github_origin, &messaging_origin);
     let artifact = compile(
         &source,
-        &["ai.invoke", "http.request", "observe.log", "secret.read"],
+        &[
+            "ai.invoke",
+            "config.read",
+            "http.request",
+            "observe.log",
+            "secret.read",
+        ],
     );
     assert_eq!(
         artifact.metadata.imports,
         [
             AI_INTERFACE,
+            CONFIG_INTERFACE,
             HTTP_INTERFACE,
             LOGGING_INTERFACE,
             SECRETS_INTERFACE
@@ -274,7 +242,8 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
     // Every credential is bound to the one origin that should receive it, as
     // in the shipped webhook-agent example.
     let manifest = manifest(&format!(
-        "http = [\"{github_origin}\", \"{ai_origin}\", \"{messaging_origin}\"]\n\
+        "config = [\"reference.repository\"]\n\
+         http = [\"{github_origin}\", \"{ai_origin}\", \"{messaging_origin}\"]\n\
          ai = [\"reviewer\"]\n\
          logs = true\n\
          \n\
@@ -288,7 +257,10 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
          origins = [\"{messaging_origin}\"]"
     ));
     let inputs = HostInputs::new(
-        BTreeMap::new(),
+        BTreeMap::from([(
+            "reference.repository".to_owned(),
+            "example/repository".to_owned(),
+        )]),
         SecretStore::new(BTreeMap::from([
             ("ai-token".to_owned(), b"ai-private".to_vec()),
             ("github-token".to_owned(), b"github-private".to_vec()),
@@ -374,11 +346,9 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {{
     for request in github_requests {
         let request = String::from_utf8(request).expect("GitHub request should be UTF-8");
         assert!(request.starts_with("GET /repos/example/issues/1 HTTP/1.1\r\n"));
-        assert!(
-            request
-                .to_ascii_lowercase()
-                .contains("authorization: bearer github-private\r\n")
-        );
+        let lower = request.to_ascii_lowercase();
+        assert!(lower.contains("authorization: bearer github-private\r\n"));
+        assert!(lower.contains("x-reference-repository: example/repository\r\n"));
         assert!(!request.contains("ai-private"));
         assert!(!request.contains("message-private"));
     }
