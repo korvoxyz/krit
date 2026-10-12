@@ -1094,7 +1094,7 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        if let Type::List(element) = value_type.as_ref() {
+        if matches!(value_type.as_ref(), Type::List(_)) {
             let mut empty = None;
             let mut cons = None;
             for constructor in order {
@@ -1104,8 +1104,8 @@ impl<'a> Lowerer<'a> {
                         empty = Some(self.lower_expression_block(&arm.value, Vec::new())?);
                     }
                     (patterns::Constructor::Cons, PatternKind::Cons { head, tail }) => {
-                        let head_parameter = self.pattern_parameter(head, element)?;
-                        let tail_parameter = self.pattern_parameter(tail, value_type)?;
+                        let head_parameter = self.pattern_parameter(head)?;
+                        let tail_parameter = self.pattern_parameter(tail)?;
                         let (head, tail) =
                             (head_parameter.match_binding, tail_parameter.match_binding);
                         let block = self.lower_expression_block(
@@ -1199,8 +1199,8 @@ impl<'a> Lowerer<'a> {
                 (None, [(arm, None)]) => {
                     (None, self.lower_expression_block(&arm.value, Vec::new())?)
                 }
-                (Some(payload_type), [(arm, Some(payload))]) if payload.is_catch_all() => {
-                    let parameter = self.pattern_parameter(payload, &payload_type)?;
+                (Some(_), [(arm, Some(payload))]) if payload.is_catch_all() => {
+                    let parameter = self.pattern_parameter(payload)?;
                     let binding = parameter.match_binding;
                     (
                         Some(binding),
@@ -1296,20 +1296,13 @@ impl<'a> Lowerer<'a> {
         ))
     }
 
-    /// The block parameter for a name or `_` that matches a value of type
-    /// `ty`: the source binder's match binding, or a Core-only one for `_`.
-    fn pattern_parameter(
-        &mut self,
-        pattern: &Pattern,
-        ty: &Arc<Type>,
-    ) -> Result<BlockParameter, IrError> {
-        let binding = match &pattern.kind {
-            PatternKind::Binder(name) => {
-                self.declaration_binding(pattern.span, name, SymbolKind::Match)?
-            }
-            PatternKind::Wildcard => {
-                self.synthetic_match_binding("$discard", Arc::clone(ty), pattern.span)
-            }
+    /// The block parameter for a name or `_` at the end of a pattern's path:
+    /// the match binding of the symbol analysis declared at the pattern. A
+    /// `_` is the discard name, bound like any other binder.
+    fn pattern_parameter(&mut self, pattern: &Pattern) -> Result<BlockParameter, IrError> {
+        let name = match &pattern.kind {
+            PatternKind::Binder(name) => name.as_str(),
+            PatternKind::Wildcard => "_",
             _ => {
                 return Err(IrError::new(format!(
                     "pattern at {:?} is not a name or `_`",
@@ -1317,6 +1310,7 @@ impl<'a> Lowerer<'a> {
                 )));
             }
         };
+        let binding = self.declaration_binding(pattern.span, name, SymbolKind::Match)?;
         self.block_parameter(binding)
     }
 
@@ -1538,19 +1532,13 @@ impl<'a> Lowerer<'a> {
         };
         let ty = Arc::clone(&success_block.ty);
 
-        let (failure_binding, failure_parameters) = match (&arm.binding, payload_of(arm.variant)) {
-            // `_` binds nothing, so its payload has a Core-only binding.
-            (Some(name), Some(payload)) if name == "_" => {
-                let binding = self.synthetic_match_binding("$discard", payload, arm.span);
-                let parameter = self.block_parameter(binding)?;
-                (Some(parameter.match_binding), vec![parameter])
-            }
-            (Some(name), _) => {
+        let (failure_binding, failure_parameters) = match &arm.binding {
+            Some(name) => {
                 let binding = self.declaration_binding(arm.span, name, SymbolKind::Match)?;
                 let parameter = self.block_parameter(binding)?;
                 (Some(parameter.match_binding), vec![parameter])
             }
-            (None, _) => (None, Vec::new()),
+            None => (None, Vec::new()),
         };
         let arm_fact = self.expression_fact(&arm.value)?;
         let effects = arm_fact.effects().clone();
@@ -1606,7 +1594,7 @@ impl<'a> Lowerer<'a> {
             },
         );
         match &pattern.binding {
-            Some(name) if name != "_" => {
+            Some(name) => {
                 let binding = self.declaration_binding(span, name, SymbolKind::Let)?;
                 self.emit(
                     operations,
@@ -1620,7 +1608,7 @@ impl<'a> Lowerer<'a> {
                 );
                 self.current_context_mut().define(binding, matched);
             }
-            _ => {
+            None => {
                 self.emit(
                     operations,
                     Arc::new(Type::Unit),
@@ -4712,8 +4700,10 @@ mod tests {
             rendered.contains("match $payload: Option<String>"),
             "{rendered}"
         );
-        assert!(rendered.contains("match $discard: String"), "{rendered}");
-        assert!(rendered.contains("match $discard: Int"), "{rendered}");
+        // A `_` binds the discard name like any binder (reading it is
+        // warning K2003).
+        assert!(rendered.contains("match _: String"), "{rendered}");
+        assert!(rendered.contains("match _: Int"), "{rendered}");
 
         // The arms keep the order in which the source first uses each
         // variant, and the `Ok` arm decides its payload with a nested match.

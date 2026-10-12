@@ -994,10 +994,7 @@ fn nested_patterns_run_explain_format_and_report_missing_outcomes() {
         explanation.contains("match $payload: Option<String>"),
         "{explanation}"
     );
-    assert!(
-        explanation.contains("match $discard: String"),
-        "{explanation}"
-    );
+    assert!(explanation.contains("match _: String"), "{explanation}");
 
     for (file, expected) in [
         (

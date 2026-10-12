@@ -145,9 +145,9 @@ Initial required codes:
 | `K1110` | Conditional operator `c ? a : b` |
 | `K1111` | `switch`, `case`, or `default` |
 | `K1112` | `return` opening an `else` block: an early exit |
-| `K2001` | Undefined name, including `_` where a `_` pattern binds nothing; a note suggests the closest visible name, `None` for a spelling of null, or the fix for a construct from another language |
+| `K2001` | Undefined name; a note suggests the closest visible name, `None` for a spelling of null, or the fix for a construct from another language |
 | `K2002` | Duplicate binding or parameter; the discard name `_` is exempt |
-| `K2003` | Warning: the discard name `_` is read as a value; this becomes an error in edition 2027 |
+| `K2003` | Warning: the discard name `_` is read as a value, including a pattern's `_`; this becomes an error in edition 2027 |
 | `K3001` | Static type mismatch or invalid typed operator |
 | `K3002` | Statically known non-function call target |
 | `K3003` | Static function argument count mismatch |
@@ -253,7 +253,6 @@ may improve, but which diagnostics carry one is part of each code's contract:
   listing the pattern forms; `K1003` for `match` arms that mix families,
   repeat, or overlap, and `K3005` for a catch-all arm or a non-exhaustive
   `match`, each carry one note with the fix (see [Matches](#matches)).
-- `K2001` for reading `_` where a `_` pattern binds nothing carries one note.
 
 ### Constructs from other languages
 
@@ -283,8 +282,6 @@ help: a block's value is its final expression, written without `return` or `;`; 
 
 ### Undefined names
 
-`K2001` for `_` read where a `_` pattern binds nothing (see
-[Matches](#matches)) carries a note to give the value a name. Any other
 `K2001` carries the first of these notes that applies:
 
 1. For `null`, `NULL`, `Null`, `nil`, `Nil`, `NIL`, `undefined`, or
@@ -336,9 +333,11 @@ main.krit:4:9: error[K1003]: match arm `Ok(other)` overlaps the earlier arm `Ok(
 help: name each remaining outcome instead: replace `Ok(other) => ...` with `Ok(None) => ...`
 ```
 
-`_` in a pattern binds nothing, so reading `_` in that arm (or after a
-let-else pattern `_`) is `K2001` even when an enclosing scope binds `_`; its
-note says to give the value a name.
+These rules treat `_` in a pattern as a wildcard that names no outcome:
+`Err(_)` names `Err`, and `_ =>` is a catch-all. In edition 2026 a pattern's
+`_` still binds the value at its position as a discard binding, so reading
+`_` in its arm (or after a let-else pattern `_`) is warning `K2003` and reads
+that value, exactly as reading a `let` or parameter `_` does.
 
 ### Method calls
 

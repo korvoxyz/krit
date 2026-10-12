@@ -155,8 +155,8 @@ fn repeated_discards_lower_to_distinct_bindings() {
         let _ = 2;
         fn second(_, _) { _ }
         let rest = match [1, 2, 3] {
-            [] => 0,
-            [_, .._] => 1,
+            [] => [],
+            [_, .._] => _,
         };
         println(_);
         "#,
@@ -168,41 +168,25 @@ fn repeated_discards_lower_to_distinct_bindings() {
     }
     let module = lower(&program, &analysis).expect("repeated discards should lower and verify");
 
-    // Two lets and two parameters each get their own binding at their own
-    // declaration site. The `_` patterns of the list head and tail bind
-    // nothing in source, so Core gives each a binding of its own that no
-    // name refers to.
-    let site = |name: &str| {
-        let mut sources = module
-            .bindings()
-            .iter()
-            .filter(|binding| binding.debug_name.as_deref() == Some(name))
-            .map(|binding| {
-                binding
-                    .source
-                    .expect("discard binding should have a source span")
-            })
-            .collect::<Vec<_>>();
-        let count = sources.len();
-        sources.sort();
-        sources.dedup();
-        assert_eq!(
-            sources.len(),
-            count,
-            "each `{name}` binding has a distinct site"
-        );
-        count
-    };
-    assert_eq!(site("_"), 4);
-    assert_eq!(site("$discard"), 2);
-    assert!(
-        analysis
-            .symbols()
-            .iter()
-            .filter(|symbol| symbol.name() == "_")
-            .count()
-            == 4
-    );
+    // Two lets, two parameters, and the list head and tail each get their own
+    // binding at their own declaration site.
+    let discards = module
+        .bindings()
+        .iter()
+        .filter(|binding| binding.debug_name.as_deref() == Some("_"))
+        .collect::<Vec<_>>();
+    assert_eq!(discards.len(), 6);
+    let mut sources = discards
+        .iter()
+        .map(|binding| {
+            binding
+                .source
+                .expect("discard binding should have a source span")
+        })
+        .collect::<Vec<_>>();
+    sources.sort();
+    sources.dedup();
+    assert_eq!(sources.len(), 6, "each discard binding has a distinct site");
 }
 
 #[test]

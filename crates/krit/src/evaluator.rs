@@ -557,9 +557,9 @@ impl Evaluator<'_> {
             )
             .into());
         };
-        // `_` binds nothing, as in every pattern.
+        // A binder `_` binds the discard name like any other binder.
         let bind = |binding: &Option<String>| match (binding, &payload) {
-            (Some(binding), Some(payload)) if binding != "_" => {
+            (Some(binding), Some(payload)) => {
                 environment.extend(binding.clone(), Value::clone(payload))
             }
             _ => environment.clone(),
@@ -1265,6 +1265,10 @@ fn select_match_arm<'a>(
 /// the pattern's names, or `None` when the pattern does not match. A value
 /// of another kind than the pattern's family is `K4001` at the subject's
 /// `span`. Patterns are paths, so this walks one iteratively.
+///
+/// A `_` binds the discard name like a name does, so that reading `_`
+/// (warning `K2003`) sees the most recent `_` binding, as checking resolves
+/// it: in `[_, .._]`, the tail.
 fn match_pattern(
     pattern: &Pattern,
     value: &Value,
@@ -1275,10 +1279,9 @@ fn match_pattern(
     let mut value = value.clone();
     loop {
         match &current.kind {
-            PatternKind::Binder(name) => {
-                return Ok(Some(environment.extend(name.clone(), value)));
+            PatternKind::Binder(_) | PatternKind::Wildcard => {
+                return Ok(Some(environment.extend(binder_name(current), value)));
             }
-            PatternKind::Wildcard => return Ok(Some(environment.clone())),
             PatternKind::EmptyList | PatternKind::Cons { .. } => {
                 let Value::List(values) = value else {
                     return Err(Diagnostic::new(
@@ -1290,17 +1293,13 @@ fn match_pattern(
                 return match (&current.kind, values.first()) {
                     (PatternKind::EmptyList, None) => Ok(Some(environment.clone())),
                     (PatternKind::Cons { head, tail }, Some(first)) => {
-                        let mut bound = environment.clone();
-                        if let PatternKind::Binder(name) = &head.kind {
-                            bound = bound.extend(name.clone(), first.clone());
-                        }
-                        if let PatternKind::Binder(name) = &tail.kind {
-                            // The tail nests no deeper than the list it came
-                            // from.
-                            let rest = Value::list(values[1..].to_vec(), span)?;
-                            bound = bound.extend(name.clone(), rest);
-                        }
-                        Ok(Some(bound))
+                        // The tail nests no deeper than the list it came from.
+                        let rest = Value::list(values[1..].to_vec(), span)?;
+                        Ok(Some(
+                            environment
+                                .extend(binder_name(head), first.clone())
+                                .extend(binder_name(tail), rest),
+                        ))
                     }
                     _ => Ok(None),
                 };
@@ -1352,6 +1351,16 @@ fn match_pattern(
                 }
             }
         }
+    }
+}
+
+/// The name a name or `_` pattern binds: the name itself, or the discard
+/// name `_`. Checking makes the head and tail of a list pattern, the only
+/// other places this is asked, names or `_`.
+fn binder_name(pattern: &Pattern) -> String {
+    match &pattern.kind {
+        PatternKind::Binder(name) => name.clone(),
+        _ => "_".to_owned(),
     }
 }
 
@@ -1977,6 +1986,35 @@ mod tests {
             let (output, _) = run(source).expect("nested patterns should run");
             assert_eq!(output, "found a\nmissing\nfailed\nSome(2)\nNone\n4\n");
         }
+    }
+
+    #[test]
+    fn reading_a_pattern_discard_reads_the_value_at_its_position() {
+        // Reading `_` is warning K2003 in edition 2026, and it reads the most
+        // recent `_` binding: a pattern's `_` over an outer one, and the tail
+        // of `[_, .._]`.
+        let source = r#"
+            let _ = "outer";
+            fn found(stored: Result<Option<String>, String>) -> String {
+                match stored {
+                    Ok(Some(_)) => "found " + _,
+                    Ok(None) => "missing",
+                    Err(_) => "failed " + _,
+                }
+            }
+            fn doubled(stored: Result<Int, Int>) -> Int {
+                let Ok(_) = stored else Err(_) => _;
+                _ * 2
+            }
+            println(found(Ok(Some("a"))));
+            println(found(Err("b")));
+            println(match [1, 2, 3] { [] => [], [_, .._] => _ });
+            println(doubled(Ok(21)));
+            println(doubled(Err(5)));
+            println(_);
+            "#;
+        let (output, _) = run(source).expect("pattern discards should run");
+        assert_eq!(output, "found a\nfailed b\n[2, 3]\n42\n5\nouter\n");
     }
 
     #[test]

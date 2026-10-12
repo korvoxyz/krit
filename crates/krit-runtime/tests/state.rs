@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use krit::{Source, analyze, lower, parse_source};
+use krit::{Source, analyze, analyze_with_warnings, lower, parse_source};
 use krit_package::Manifest;
 use krit_runtime::{
     AgentHost, AgentHostPolicy, AiAdapterConfig, ApprovalOperation, ApprovalPolicy,
@@ -433,6 +433,72 @@ webhook fn handle(request: HttpRequest) -> HttpResponse {
     assert_eq!(send("PUT", "/a", "one"), (201, "stored".to_owned()));
     assert_eq!(send("GET", "/a", ""), (200, "found one".to_owned()));
     assert_eq!(send("DELETE", "/a", ""), (500, "refused /a".to_owned()));
+}
+
+#[test]
+fn reading_a_pattern_discard_in_a_webhook_reads_the_value_at_its_position() {
+    // Edition 2026 keeps 0.2's meaning: a pattern's `_` binds the value at
+    // its position, so reading it (warning K2003) sees the payload, here in
+    // the guest, rather than the outer `_`.
+    let directory = TestDirectory::new("pattern-discard-read");
+    let database = directory.database();
+    let source = r#"
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let _ = "outer";
+    if request.method == "PUT" {
+        match state_put("agent-work", request.path, request.body) {
+            Ok(_) => record { status: 201, headers: [], body: "stored" },
+            Err(_) => record { status: 500, headers: [], body: _ },
+        }
+    } else {
+        match state_get("agent-work", request.path) {
+            Ok(Some(_)) => record { status: 200, headers: [], body: "found " + _ },
+            Ok(None) => record { status: 404, headers: [], body: _ },
+            Err(_) => record { status: 500, headers: [], body: _ },
+        }
+    }
+}
+"#;
+    let report = analyze_with_warnings(
+        &parse_source(&Source::new("src/main.krit", source)).expect("source should parse"),
+    );
+    report.result.expect("reading `_` should check");
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .map(|warning| warning.code())
+            .collect::<Vec<_>>(),
+        ["K2003"; 4]
+    );
+    let artifact = compile(source, &["state.transaction"]);
+    let grants = GrantSet::from_manifest(&manifest("state = [\"agent-work\"]"));
+    let inputs = HostInputs::new(BTreeMap::new(), SecretStore::default()).unwrap();
+    let state_host = host(inputs, durable(database, false));
+    let send = |method: &str, path: &str, body: &str| {
+        let response = Runtime::default()
+            .invoke_webhook_with_host(
+                &artifact.bytes,
+                &artifact.metadata,
+                &grants,
+                &state_host,
+                HttpRequest {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    query: String::new(),
+                    headers: Vec::new(),
+                    body: body.to_owned(),
+                },
+            )
+            .expect("the webhook should run")
+            .response;
+        (response.status, response.body)
+    };
+
+    // `Ok(None)` binds no `_`, so its arm reads the outer one.
+    assert_eq!(send("GET", "/a", ""), (404, "outer".to_owned()));
+    assert_eq!(send("PUT", "/a", "one"), (201, "stored".to_owned()));
+    assert_eq!(send("GET", "/a", ""), (200, "found one".to_owned()));
 }
 
 #[test]

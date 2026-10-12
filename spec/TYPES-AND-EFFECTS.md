@@ -136,19 +136,24 @@ otherwise).
 
 The checks run in source order:
 
-1. `P`'s binder must be free in the body's scope (`K2002`), as for `let`.
+1. `P`'s binder must be free in the body's scope (`K2002`), as for `let`;
+   the discard name `_` is exempt, as it is for `let`.
 2. `e` is analyzed; an annotation `A` is the type of `e` and is unified with
    it (`K3001`).
 3. The type of `e` must be `Option<T>` for `Some`/`None` or `Result<T, E>` for
    `Ok`/`Err`, for fresh `T` and `E` when it is unresolved (`K3005` for any
    other type).
 4. `Q`'s binder (the `T` of `Some`, or the `T` or `E` of `Ok` or `Err`) is
-   declared in a scope of the arm alone, and `r` is analyzed there.
+   declared in a scope of the arm alone, as a match symbol at the arm, and `r`
+   is analyzed there. A binder `_` is declared the same way, as the discard
+   name: reading `_` in `r` refers to it, with warning `K2003`.
 5. The type of `r` is unified with the function's return type: the declared
    one, or the type variable that stands for an undeclared one (`K3001`).
 6. `P`'s binder is declared in the body's scope with its payload type, as a
    `let` binding at the let-else statement, visible to the following
-   statements and the body's final expression.
+   statements and the body's final expression. A binder `_` is declared the
+   same way, as the discard name, exactly like `let _ = ...`: reading `_`
+   afterwards refers to it, with warning `K2003`.
 
 The statement's effects and requirements are those of `e` and `r`; let-else
 adds none of its own. Nothing is rebuilt, so no structural constraint applies
@@ -160,9 +165,11 @@ followed by `bind` of the match's result to `P`'s binder (or `discard` of the
 unit result of a `None` pattern). The arm of `P` binds the payload through a
 Core-only match binding (debug name `$value`) and yields it; the arm of `Q`
 binds `Q`'s source binder, evaluates `r`, and ends with an `exit` of its
-value, verified like every `exit` to have the function's result type. The
-match has `P`'s payload type, so successive let-else statements stay flat in
-the body block.
+value, verified like every `exit` to have the function's result type. A
+binder `_` in either pattern is a source binder like any other: `P`'s `_`
+gets the `bind` (debug name `_`), and `Q`'s arm binds the payload to `Q`'s
+`_`. The match has `P`'s payload type, so successive let-else statements
+stay flat in the body block.
 
 ## Matching
 
@@ -197,9 +204,11 @@ the first error:
    pattern with `_` below it.
 6. Each arm's value is analyzed in a scope of the arm that declares its
    pattern's names, as match symbols at the names' own spans, with the types
-   of step 4. A `_` declares nothing; it marks `_` as naming no value in that
-   scope, so reading `_` there is `K2001`. The arms' types are unified into
-   the match's type (`K3001`).
+   of step 4. A `_` is declared the same way, as the discard name, at its own
+   span (steps 2, 3, and 5 treat it exactly like a name), so reading `_` in
+   the arm refers to the most recent `_` (in `[_, .._]`, the tail), with
+   warning `K2003`. The arms' types are unified into the match's type
+   (`K3001`).
 
 Because the paths are pairwise disjoint and exhaustive, every value matches
 exactly one arm, and arm order has no meaning. The match's effects and
@@ -208,14 +217,14 @@ requirements are those of its subject and all of its arms.
 Core IR decides a match with nested variant and list matches over the
 decision tree the paths form. At each position, the Core match has one arm
 per constructor, in the order the source first uses it. That arm binds the
-payload to the arm's name when one arm matches the payload with a name; to a
-Core-only match binding (debug name `$discard`) when it matches it with `_`;
-and otherwise to a Core-only binding (debug name `$payload`) that a nested
-match on that binding decides. A list arm binds its head and tail the same
-way. Every arm's value is lowered exactly once, one Core block deeper for
-each pattern nested in a payload, which is why the parser counts those
-patterns as nesting levels of the arm's value (`LANGUAGE.md` section 4.1).
-Core verification applies its ordinary two-arm rules to each nested match.
+payload to the arm's name or `_` when one arm matches the payload with a name
+or `_`, and otherwise to a Core-only binding (debug name `$payload`) that a
+nested match on that binding decides. A list arm binds its head and tail to
+their names or `_`. Every arm's value is lowered exactly once, one Core block
+deeper for each pattern nested in a payload, which is why the parser counts
+those patterns as nesting levels of the arm's value (`LANGUAGE.md` section
+4.1). Core verification applies its ordinary two-arm rules to each nested
+match.
 
 ## Effects
 

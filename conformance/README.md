@@ -122,6 +122,7 @@ network service, or nondeterministic value.
 | `scope/closures` | immutable lexical capture and shadowing |
 | `scope/builtin-shadowing` | match binders shadow unreserved built-in names, as in checking |
 | `scope/discard` | repeated `_` bindings in one scope; reading `_` evaluates the most recent one and warns (`K2003`) |
+| `scope/discard-pattern` | reading a pattern's `_` (a nested variant payload, a let-else pattern) evaluates the value at its position rather than an outer `_`, and warns (`K2003`) |
 | `functions/recursion` | recursive declaration and calls |
 | `functions/deep-recursion` | 9,000 nested calls stay within the call-depth limit |
 | `lists/match` | list construction and exhaustive decomposition |
@@ -148,7 +149,7 @@ network service, or nondeterministic value.
 | `check/syntax/missing-semicolon` | missing required syntax |
 | `check/syntax/habit-word-line-break` | a bound habit word ending a line before a missing `;` stays an ordinary name (`K1002`) |
 | `check/name/*` | lexical undefined and duplicate name diagnostics, including duplicate record fields |
-| `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, an unbound `_` is undefined, and a `_` pattern binds nothing, so reading `_` in its arm is undefined even beside an outer `_` (`K2001`, with one note) |
+| `check/name/discard-*` | the discard name `_`: repeated bindings, reads warn with `K2003` without failing, warnings reported beside an error, an unbound `_` is undefined, and reading a pattern's `_` refers to the value at its position, beside an outer `_`, with `K2003` |
 | `check/name/did-you-mean`, `check/name/null` | undefined names (`K2001`) that carry a did-you-mean or `None` note |
 | `check/habit/*` | one case per construct from another language (`K1101`-`K1112`): `return`, loops, assignment, `struct`, `import`, `await`, `throw`, indexing, arrow functions, the conditional operator, `switch`, and `else { return ... }`; plus a conditional operator whose first branch does not parse and one after a postfix `?` |
 | `check/syntax/question-before-operand` | a `?` followed on its line by an operand, without a `:`, is an unexpected token (`K1001`) with one note |
@@ -164,7 +165,7 @@ network service, or nondeterministic value.
 | `check/capability/*` | literal-resource host capability contracts |
 | `check/nesting/*` | syntactic, structural, and inferred-type nesting limits (`K1005`), including deep list literals, chains hidden by parentheses, types that grow after they are bound, and types that grow when two solved types unify |
 | `check/jobs/*` | typed queue/schedule entrypoint uniqueness, signatures, and literal queue/schedule/bucket resources |
-| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook helper chaining config, secret, and HTTP calls with `?` builds; a webhook binding config, secret, HTTP, and AI results with let-else in its own body builds, and so does one committing or rolling back a database transaction; a webhook deciding `state_get`'s `Result<Option<String>, String>` with nested patterns builds |
+| `check/target/*` | entrypoint files report every build-target diagnostic at check time, after any front-end warnings; unused helpers are eliminated first; String routing and composition build; JSON string decoding builds; a webhook helper chaining config, secret, and HTTP calls with `?` builds; a webhook binding config, secret, HTTP, and AI results with let-else in its own body builds, and so does one committing or rolling back a database transaction; a webhook deciding `state_get`'s `Result<Option<String>, String>` with nested patterns builds, and so does one reading a pattern's `_` (with `K2003`) |
 | `check/secret/*` | opaque secret non-disclosure restrictions |
 | `check/valid/webhook-contract` | transitive typed webhook/config/secret facts |
 | `check/valid/queue-consumer` | typed `QueueJob` delivery and bounded object write |

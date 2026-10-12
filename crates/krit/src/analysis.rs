@@ -857,7 +857,7 @@ enum ConstraintKind {
 }
 
 struct Analyzer {
-    scopes: Vec<BTreeMap<String, ScopeEntry>>,
+    scopes: Vec<BTreeMap<String, ScopeBinding>>,
     type_parents: Vec<TypeVariable>,
     substitutions: HashMap<TypeVariable, InferType>,
     next_type_variable: TypeVariable,
@@ -951,25 +951,12 @@ struct ScopeBinding {
     ty: InferType,
 }
 
-/// What a name refers to in one lexical scope.
-#[derive(Clone)]
-enum ScopeEntry {
-    Bound(ScopeBinding),
-    /// `_` in a pattern, which binds nothing: where it would be visible, `_`
-    /// names no value at all, even when an enclosing scope binds it.
-    Discarded,
-}
-
-/// What one position of a pattern binds.
-enum PatternBinding {
-    /// A name, with its span and the type of the value it binds.
-    Name {
-        name: String,
-        span: Span,
-        ty: InferType,
-    },
-    /// `_`, which binds nothing.
-    Discard,
+/// A name or `_` at the end of a pattern's path, with its span and the type
+/// of the value at its position.
+struct PatternBinding {
+    name: String,
+    span: Span,
+    ty: InferType,
 }
 
 impl Analyzer {
@@ -1349,7 +1336,8 @@ impl Analyzer {
     /// binder is in scope only in the arm, whose value is the function's
     /// return value and so has its result type. The pattern's binder is then
     /// declared like a `let` binding for the rest of the block. A binder `_`
-    /// binds nothing, as in every pattern. The effects are those of the value
+    /// is the discard name, declared like any other binder, so reading it is
+    /// warning `K2003`, as for every `_`. The effects are those of the value
     /// and the arm.
     fn let_else(
         &mut self,
@@ -1446,26 +1434,20 @@ impl Analyzer {
         };
 
         self.push_scope();
-        match arm.binding.as_deref() {
-            Some(DISCARD) => self.discard_pattern(),
-            Some(binding) => {
-                self.define_symbol(
-                    binding,
-                    payload_of(arm.variant),
-                    arm.span,
-                    SymbolKind::Match,
-                    false,
-                );
-            }
-            None => {}
+        if let Some(binding) = &arm.binding {
+            self.define_symbol(
+                binding,
+                payload_of(arm.variant),
+                arm.span,
+                SymbolKind::Match,
+                false,
+            );
         }
         let arm_info = self.expression(&arm.value)?;
         self.pop_scope();
         self.unify(result, arm_info.ty, arm.value.span, "let-else arm")?;
 
-        if pattern.binding.as_deref() == Some(DISCARD) {
-            self.discard_pattern();
-        } else if let Some(name) = &pattern.binding {
+        if let Some(name) = &pattern.binding {
             let binding_type = self.fresh_type();
             self.unify(
                 binding_type.clone(),
@@ -2352,13 +2334,8 @@ impl Analyzer {
         let mut effects = subject.effects;
         for (arm, bindings) in arms.iter().zip(arm_bindings) {
             self.push_scope();
-            for binding in bindings {
-                match binding {
-                    PatternBinding::Name { name, span, ty } => {
-                        self.define_symbol(&name, ty, span, SymbolKind::Match, false);
-                    }
-                    PatternBinding::Discard => self.discard_pattern(),
-                }
+            for PatternBinding { name, span, ty } in bindings {
+                self.define_symbol(&name, ty, span, SymbolKind::Match, false);
             }
             let arm_info = self.expression(&arm.value);
             self.pop_scope();
@@ -2377,8 +2354,9 @@ impl Analyzer {
     }
 
     /// Types `pattern`, an arm of the match at `span`, against the type
-    /// `subject` of the value it matches and returns what it binds, in
-    /// source order.
+    /// `subject` of the value it matches and returns the names and `_` it
+    /// binds, in source order, each with the type of the value at its
+    /// position.
     ///
     /// A variant or list pattern requires its family (`K3005`): at the top
     /// level the subject's, reported at the match, and below it the payload
@@ -2397,13 +2375,19 @@ impl Analyzer {
         loop {
             match &current.kind {
                 PatternKind::Binder(name) => {
-                    return Ok(vec![PatternBinding::Name {
+                    return Ok(vec![PatternBinding {
                         name: name.clone(),
                         span: current.span,
                         ty,
                     }]);
                 }
-                PatternKind::Wildcard => return Ok(vec![PatternBinding::Discard]),
+                PatternKind::Wildcard => {
+                    return Ok(vec![PatternBinding {
+                        name: DISCARD.to_owned(),
+                        span: current.span,
+                        ty,
+                    }]);
+                }
                 PatternKind::EmptyList | PatternKind::Cons { .. } => {
                     let element = self.fresh_type();
                     let list = InferType::List(Box::new(element.clone()));
@@ -2427,15 +2411,17 @@ impl Analyzer {
                             current.span,
                         ));
                     }
+                    // `patterns::check_arms` made the head and tail names or
+                    // `_`.
                     return Ok([(head, element), (tail, list)]
                         .into_iter()
-                        .map(|(part, ty)| match &part.kind {
-                            PatternKind::Binder(name) => PatternBinding::Name {
-                                name: name.clone(),
-                                span: part.span,
-                                ty,
+                        .map(|(part, ty)| PatternBinding {
+                            name: match &part.kind {
+                                PatternKind::Binder(name) => name.clone(),
+                                _ => DISCARD.to_owned(),
                             },
-                            _ => PatternBinding::Discard,
+                            span: part.span,
+                            ty,
                         })
                         .collect());
                 }
@@ -3562,22 +3548,8 @@ impl Analyzer {
 
     fn lookup(&mut self, name: &str, span: Span) -> Result<(InferType, ResolvedName), Diagnostic> {
         for scope in self.scopes.iter().rev() {
-            match scope.get(name) {
-                Some(ScopeEntry::Bound(binding)) => {
-                    return Ok((binding.ty.clone(), ResolvedName::Symbol(binding.id)));
-                }
-                Some(ScopeEntry::Discarded) => {
-                    return Err(Diagnostic::new(
-                        "K2001",
-                        format!("undefined name `{name}`"),
-                        span,
-                    )
-                    .with_note(
-                        "`_` in a pattern binds nothing, so `_` names no value here; give the \
-                         value a name to use it",
-                    ));
-                }
-                None => {}
+            if let Some(binding) = scope.get(name) {
+                return Ok((binding.ty.clone(), ResolvedName::Symbol(binding.id)));
             }
         }
         if let Some(builtin) = self.builtin(name, span) {
@@ -3589,12 +3561,7 @@ impl Analyzer {
         let candidates = self
             .scopes
             .iter()
-            .flat_map(|scope| {
-                scope
-                    .iter()
-                    .filter(|(_, entry)| matches!(entry, ScopeEntry::Bound(_)))
-                    .map(|(name, _)| name.as_str())
-            })
+            .flat_map(|scope| scope.keys().map(String::as_str))
             .chain(Builtin::ALL.iter().map(|builtin| builtin.as_str()))
             .chain(["true", "false"]);
         Err(match undefined_name_note(name, candidates) {
@@ -4116,18 +4083,8 @@ impl Analyzer {
         self.scopes
             .last_mut()
             .expect("analyzer always has a scope")
-            .insert(name.to_owned(), ScopeEntry::Bound(ScopeBinding { id, ty }));
+            .insert(name.to_owned(), ScopeBinding { id, ty });
         id
-    }
-
-    /// Records a `_` pattern in the current scope: it binds nothing, and `_`
-    /// names no value for the rest of the scope, until a later declaration
-    /// binds `_` again.
-    fn discard_pattern(&mut self) {
-        self.scopes
-            .last_mut()
-            .expect("analyzer always has a scope")
-            .insert(DISCARD.to_owned(), ScopeEntry::Discarded);
     }
 
     fn push_scope(&mut self) {
@@ -4827,6 +4784,10 @@ mod tests {
             let text: String = _;
             fn pick(_, _: Bool) { _ }
             let flag: Bool = pick(1, true);
+            let rest: List<Int> = match [1, 2] {
+                [] => [],
+                [_, .._] => _,
+            };
             let ignore = fn(_, _) { 0 };
             fn _() { 3 }
             fn _() { 4 }
@@ -4834,7 +4795,7 @@ mod tests {
         );
 
         report.result.expect("repeated discards should check");
-        assert_eq!(warning_codes(&report.warnings), ["K2003", "K2003"]);
+        assert_eq!(warning_codes(&report.warnings), ["K2003", "K2003", "K2003"]);
         assert!(
             report
                 .warnings
@@ -5973,7 +5934,7 @@ mod tests {
             "fn(Option<Int>) -> Int effects {io.stdout}"
         );
 
-        // Either variant may come first, `_` binds nothing, and every named
+        // Either variant may come first, `_` may repeat, and every named
         // function body accepts let-else, including entrypoints and nested
         // named functions.
         for text in [
@@ -6118,8 +6079,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("`{name}` should be a match symbol at its own span"));
             assert_eq!(symbol.ty().to_string(), ty, "{name}");
         }
-        // `_` binds nothing.
-        assert!(analysis.symbols().iter().all(|symbol| symbol.name() != "_"));
+        // `_` is a wildcard for the arm rules, and it binds the discard name
+        // at its own span like any binder.
+        let start = text.find("_,").expect("the head `_` should occur");
+        let discard = analysis
+            .symbol(Span::new(start, start + 1), "_", SymbolKind::Match)
+            .expect("`_` should be a match symbol at its own span");
+        assert_eq!(discard.ty().to_string(), "Int");
     }
 
     #[test]
@@ -6297,30 +6263,62 @@ mod tests {
     }
 
     #[test]
-    fn a_wildcard_pattern_binds_nothing_and_hides_outer_discards() {
-        for text in [
-            "fn f(v: Option<Int>) -> Int { match v { Some(_) => _, None => 0 } }",
-            "fn f(_, v: Option<Int>) -> Int { match v { Some(_) => _, None => 0 } }",
-            "let _ = 1;\nlet x = match [1] { [] => 0, [_, .._] => _ };",
-            "fn f(r: Result<Int, Int>) -> Int {\n    let Ok(_) = r else Err(_) => _;\n    0\n}",
-            "fn f(_, r: Result<Int, Int>) -> Int {\n    let Ok(_) = r else Err(e) => e;\n    _\n}",
+    fn reading_a_pattern_discard_warns_and_reads_the_value_at_its_position() {
+        // Edition 2026 keeps 0.2's meaning: a pattern `_` binds the value at
+        // its position like `let _`, so reading it sees the most recent `_`
+        // (the tail of `[_, .._]`, and the pattern's `_` over an outer one),
+        // with K2003. Each annotation holds only for that binding.
+        for (text, warnings) in [
+            (
+                "fn f(v: Option<Int>) -> Int { match v { Some(_) => _ + 1, None => 0 } }",
+                1,
+            ),
+            (
+                "fn f(_: String, v: Option<Int>) -> Int { match v { Some(_) => _, None => 0 } }",
+                1,
+            ),
+            (
+                "let _ = 1;\nlet x: List<String> = match [\"a\"] { [] => [], [_, .._] => _ };",
+                1,
+            ),
+            (
+                "fn f(r: Result<Bool, Int>) -> Int {\n    let Ok(_) = r else Err(_) => _;\n    \
+                 if _ { 1 } else { 0 }\n}",
+                2,
+            ),
+            (
+                "fn f(_: String, r: Result<Int, Int>) -> Int {\n    \
+                 let Ok(_) = r else Err(e) => e;\n    _\n}",
+                1,
+            ),
+            (
+                "fn f(_: String, v: Option<Int>) -> String { match v { Some(x) => _, None => \"\" } }",
+                1,
+            ),
         ] {
-            let (code, message, notes) = error_notes(text);
-            assert_eq!(code, "K2001", "{text}");
-            assert_eq!(message, "undefined name `_`", "{text}");
-            assert_eq!(notes.len(), 1, "{text}");
-            assert!(
-                notes[0].starts_with("`_` in a pattern binds nothing"),
-                "{notes:?}"
+            let report = check_with_warnings(text);
+            report
+                .result
+                .unwrap_or_else(|error| panic!("{text} should check: {error:?}"));
+            assert_eq!(
+                warning_codes(&report.warnings),
+                vec!["K2003"; warnings],
+                "{text}"
             );
         }
-        // A later declaration binds `_` again, and an unrelated arm still
-        // sees an outer `_`, with K2003.
-        let report = check_with_warnings(
-            "fn f(r: Result<Int, Int>) -> Int {\n    let Ok(_) = r else Err(e) => e;\n    \
-             let _ = 2;\n    _\n}\nfn g(_: Int, v: Option<Int>) -> Int { match v { Some(x) => _, None => 0 } }",
+
+        // The read has the type of the value at the `_`'s position.
+        let text = "fn f(v: Result<Option<String>, Int>) -> String {\n    match v {\n        \
+                    Ok(Some(_)) => _,\n        Ok(None) => \"\",\n        Err(_) => \"\",\n    }\n}";
+        let analysis = check(text).expect("reading a nested `_` should check");
+        let read = text.find("=> _").expect("the read should occur") + 3;
+        assert_eq!(
+            analysis
+                .expression(Span::new(read, read + 1))
+                .expect("the read should have facts")
+                .ty()
+                .to_string(),
+            "String"
         );
-        report.result.expect("rebinding `_` should check");
-        assert_eq!(warning_codes(&report.warnings), ["K2003", "K2003"]);
     }
 }

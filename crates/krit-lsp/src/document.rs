@@ -2143,6 +2143,8 @@ impl<'a> DeclarationCollector<'a> {
                     self.expression(subject);
                     for arm in arms {
                         for binder in pattern_binders(&arm.pattern) {
+                            // A `_` is a wildcard here: analysis declares it
+                            // as the discard name, but it is not offered.
                             let PatternKind::Binder(name) = &binder.kind else {
                                 continue;
                             };
@@ -2846,7 +2848,8 @@ mod tests {
                 .map(|item| item.label)
                 .collect::<BTreeSet<_>>()
         };
-        // Each arm sees its own binders only, and `_` binds nothing.
+        // Each arm sees its own binders only, and a pattern's `_` is not
+        // offered, since reading it is warning K2003.
         let in_found = completions(&state, Position::new(2, 28));
         assert!(in_found.contains("found") && !in_found.contains("code"));
         let in_rest = completions(&state, Position::new(5, 28));

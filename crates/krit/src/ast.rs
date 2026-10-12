@@ -164,7 +164,9 @@ pub struct Pattern {
 pub enum PatternKind {
     /// A name, which matches any value and binds it.
     Binder(String),
-    /// `_`, which matches any value and binds nothing.
+    /// `_`, which matches any value without naming an outcome. In edition
+    /// 2026 it binds the value as the discard name `_`, whose reads are
+    /// warning `K2003`.
     Wildcard,
     /// `Some(p)`, `Ok(p)`, or `Err(p)`, whose payload matches `p`, or
     /// `None`, which has no payload.
@@ -254,8 +256,8 @@ pub enum VariantFamily {
 #[derive(Clone, Debug)]
 pub struct VariantArm {
     pub variant: VariantName,
-    /// The payload binder of `Some`, `Ok`, or `Err`; `None` binds nothing,
-    /// and neither does the binder `_`.
+    /// The payload binder of `Some`, `Ok`, or `Err`, possibly the discard
+    /// name `_`; `None` binds nothing.
     pub binding: Option<String>,
     pub value: Expression,
     pub span: Span,
@@ -266,8 +268,8 @@ pub struct VariantArm {
 #[derive(Clone, Debug)]
 pub struct VariantPattern {
     pub variant: VariantName,
-    /// The binder of `Some`, `Ok`, or `Err`; `None` binds nothing, and
-    /// neither does the binder `_`.
+    /// The binder of `Some`, `Ok`, or `Err`, possibly the discard name `_`;
+    /// `None` binds nothing.
     pub binding: Option<String>,
     pub span: Span,
 }

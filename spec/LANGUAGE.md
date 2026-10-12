@@ -409,24 +409,23 @@ by checking first (section 14).
 
 The identifier `_` alone is the discard name. It is exempt from the
 one-declaration rule: any number of `let` bindings, function declarations,
-and parameters in one scope may use it. A program should bind `_` only for a
-value it does not use. Reading `_` as a value, that is, an identifier
-expression `_` that resolves to a binding, is valid in edition 2026 and refers
-to the most recent `_` binding in scope, exactly as shadowing does, but
-checking reports warning `K2003`; edition 2027 makes it an error. An
-identifier expression `_` with no `_` binding in scope is an undefined name
-(`K2001`). Warnings never change whether a program checks or runs
-(`DIAGNOSTICS.md`).
+parameters, and pattern binders in one scope may use it, including both names
+of one `[_, .._]` list pattern. A program should bind `_` only for a value it
+does not use. Reading `_` as a value, that is, an identifier expression `_`
+that resolves to a binding, is valid in edition 2026 and refers to the most
+recent `_` binding in scope, exactly as shadowing does, but checking reports
+warning `K2003`; edition 2027 makes it an error. An identifier expression `_`
+with no `_` binding in scope is an undefined name (`K2001`). Warnings never
+change whether a program checks or runs (`DIAGNOSTICS.md`).
 
-In a pattern (sections 8.3 and 11), `_` is a wildcard: it matches any value
-and binds nothing, and one pattern may hold it any number of times
-(`[_, .._]`). Where a binder in its place would be visible (the arm of a
-`match` or let-else, or the rest of the block after a let-else pattern), `_`
-names no value at all: reading it there is an undefined name (`K2001`, with a
-note), even when an enclosing scope binds `_`, until a later declaration
-binds `_` again. A program written for 0.2, where a pattern's `_` was an
-ordinary binder, therefore fails to check rather than silently reading a
-different value.
+In a pattern (sections 8.3 and 11), `_` is also a wildcard: the rules that
+keep a `match`'s arms disjoint and exhaustive treat it as matching any value
+without naming an outcome, so `Err(_)` names `Err` and `_ =>` is a catch-all.
+In edition 2026 a pattern's `_` still binds the value at its position as a
+discard binding, as in 0.2, so reading `_` in the arm of a `match` or
+let-else, or after a let-else pattern, refers to the pattern's own `_` (in
+`[_, .._]`, the later one, the tail) with warning `K2003`. Edition 2027 makes
+every read of `_` an error, which leaves a pattern's `_` a pure wildcard.
 
 A lexical binding shadows a built-in name of the same spelling for the
 binding's whole scope, in checking and evaluation alike. `let`, function, and
@@ -599,12 +598,11 @@ A let-else is `let PATTERN (: TYPE)? = value else ARM;`, where the arm is a
 pattern, `=>`, and an expression, as in a `match`. Its two patterns are the
 two variants of one built-in family, in either order: `Ok(p)` and `Err(q)`, or
 `Some(p)` and `None`. A pattern's payload binder is an identifier or the
-wildcard `_`, which binds nothing (section 7); `None` binds nothing either.
-Unlike a `match` pattern, a let-else pattern does not nest (`K3014`, below).
-A `Some`, `Ok`, or
-`Err` written after
-`let` without `(` is still a binding of that reserved name (`K2002`), and a
-variant pattern without an `else` arm is `K1002`.
+wildcard `_`, a discard binding that the program should not read (section 7:
+reading it is warning `K2003`); `None` binds nothing. Unlike a `match`
+pattern, a let-else pattern does not nest (`K3014`, below). A `Some`, `Ok`, or
+`Err` written after `let` without `(` is still a binding of that reserved name
+(`K2002`), and a variant pattern without an `else` arm is `K1002`.
 
 It is exactly
 
@@ -760,7 +758,7 @@ match state_get("agent-work", key) {
 | Pattern | Matches | Binds |
 |---|---|---|
 | `name` | any value | `name`, to the value |
-| `_` | any value | nothing |
+| `_` | any value | nothing to read: a discard binding (section 7) |
 | `Some(p)`, `Ok(p)`, `Err(p)` | that variant, when its payload matches `p` | what `p` binds |
 | `None` | `None` | nothing |
 | `[]` | the empty list | nothing |
@@ -771,7 +769,8 @@ built-in families: `Ok(Some(value))`, `Some(Err(_))`, `Ok([head, ..rest])`.
 The head and tail of a list pattern are each a name or `_` (`K1003`
 otherwise); to look inside the head, match it in the arm. A name binds the
 value at its position for the arm's value only, and the head and tail cannot
-be the same name (`K2002`). `_` binds nothing (section 7). There are no
+be the same name (`K2002`). `_` is a discard binding, which the program
+should not read: reading it is warning `K2003` (section 7). There are no
 literal patterns, guards, or record patterns: compare values with `if` and
 `==`. Other tokens where a pattern starts, an unknown variant such as
 `Foo(x)`, `None(x)`, a `Some`, `Ok`, or `Err` without its parenthesized
