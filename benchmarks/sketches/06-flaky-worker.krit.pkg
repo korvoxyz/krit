@@ -1,0 +1,15 @@
+schema = 1
+
+[package]
+name = "usecases/flaky-worker"
+version = "0.2.0"
+edition = "2026"
+entry = "06-flaky-worker.krit"
+license = "Apache-2.0"
+
+[capabilities]
+http = ["https://partner.example.invalid"]
+secrets = ["partner-token"]
+consumes = ["deliveries"]
+buckets = ["rejected-deliveries"]
+logs = true

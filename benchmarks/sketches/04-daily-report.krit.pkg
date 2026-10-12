@@ -1,0 +1,15 @@
+schema = 1
+
+[package]
+name = "usecases/daily-report"
+version = "0.2.0"
+edition = "2026"
+entry = "04-daily-report.krit"
+license = "Apache-2.0"
+
+[capabilities]
+config = ["report.channel"]
+http = ["https://slack.com"]
+secrets = ["slack-token"]
+readOnlyDatabases = ["sales"]
+schedules = ["daily-report"]

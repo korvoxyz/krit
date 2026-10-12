@@ -1,0 +1,27 @@
+// Use case 6, rewritten for 0.3. FULL behavior (and the rejection log now
+// carries the status code through int_to_string).
+/// Delivers the order once per job id; transport, 429, and 5xx failures
+/// return `Err` so the host retries, and other rejections are parked.
+queue "deliveries" fn handle(job: QueueJob) -> Result<String, String> {
+    let token = secret("partner-token")?;
+    let response = http_request(
+        "https://partner.example.invalid",
+        HttpRequest {
+            method: "POST",
+            path: "/v1/orders",
+            headers: ["content-type": "application/json", "idempotency-key": job.id],
+            body: job.body,
+        },
+        Some(token),
+    )?;
+    if response.status >= 200 && response.status < 300 {
+        Ok(job.id)
+    } else if response.status == 429 || response.status >= 500 {
+        Err(response.body)
+    } else {
+        let status = int_to_string(response.status);
+        log_error("delivery.rejected", ["job": job.id, "status": status]);
+        object_put("rejected-deliveries", job.id, response.body)?;
+        Ok(job.id)
+    }
+}

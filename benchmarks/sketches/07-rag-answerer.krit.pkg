@@ -1,0 +1,16 @@
+schema = 1
+
+[package]
+name = "usecases/rag-answerer"
+version = "0.2.0"
+edition = "2026"
+entry = "07-rag-answerer.krit"
+license = "Apache-2.0"
+
+[capabilities]
+http = ["https://ai.example.invalid"]
+secrets = ["ai-token"]
+ai = ["answerer", "embedder"]
+cacheNamespaces = ["answers"]
+searchIndexes = ["handbook-text"]
+vectorIndexes = ["handbook"]

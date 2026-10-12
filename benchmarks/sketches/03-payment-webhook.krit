@@ -1,0 +1,41 @@
+// Use case 3, rewritten for 0.3. REDUCED scope: the shared token moves from
+// the `x-webhook-token` header to the `token=` query (no header lookup without
+// list matching); the event is decoded by the host-catalogued SQL statement
+// with json_extract (no typed json_decode); duplicate and ignored events share
+// one answer. Still no HMAC.
+/// Reports a failed step once its transaction is rolled back.
+fn rolled_back(rollback: Result<Unit, String>, error: String) -> HttpResponse {
+    match rollback {
+        Ok(_) => HttpResponse { status: 500, body: error },
+        Err(fatal) => HttpResponse { status: 500, body: fatal },
+    }
+}
+
+/// Records the event once; the statement ignores other event types and
+/// repeated deliveries (ON CONFLICT(event_id) DO NOTHING).
+fn record_payment(body: String) -> HttpResponse {
+    let Ok(transaction) = db_begin_write("payments") else
+        Err(error) => HttpResponse { status: 503, body: error };
+    let Ok(changed) = db_execute(transaction, "insert-payment-event", [body]) else
+        Err(error) => rolled_back(db_rollback(transaction), error);
+    let Ok(_) = db_commit(transaction) else
+        Err(error) => HttpResponse { status: 500, body: error };
+    if changed == 0 {
+        HttpResponse { status: 200, body: "duplicate or ignored" }
+    } else {
+        HttpResponse { status: 200, body: "recorded" }
+    }
+}
+
+/// Accepts signed-by-token POST deliveries only.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let Ok(expected) = config_string("payments.webhook-token") else
+        Err(error) => HttpResponse { status: 500, body: error };
+    if request.method != "POST" {
+        HttpResponse { status: 405, body: "POST only" }
+    } else if request.query != "token=" + expected {
+        HttpResponse { status: 401, body: "unauthorized" }
+    } else {
+        record_payment(request.body)
+    }
+}

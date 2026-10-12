@@ -1,0 +1,63 @@
+// Use case 1, rewritten for 0.3 with full behavior kept.
+/// The value of the first header named `name`.
+fn header(headers: List<HttpHeader>, name: String) -> Option<String> {
+    match headers {
+        [] => None,
+        [first, ..rest] => if first.name == name {
+            Some(first.value)
+        } else {
+            header(rest, name)
+        },
+    }
+}
+
+/// Only an exact allowlisted word becomes a label.
+fn allowed_label(output: String) -> String {
+    if output == "bug" || output == "feature" || output == "question" || output == "docs" {
+        output
+    } else {
+        "needs-triage"
+    }
+}
+
+/// Applies `label` to the issue through the GitHub REST API.
+fn apply_label(repository: String, number: Int, label: String) -> Result<String, String> {
+    let token = secret("github-token")?;
+    let issue = int_to_string(number);
+    let owner_repo = url_path_segment(repository)?;
+    let response = http_request(
+        "https://api.github.com",
+        HttpRequest {
+            method: "POST",
+            path: "/repos/\(owner_repo)/issues/\(issue)/labels",
+            headers: ["accept": "application/vnd.github+json"],
+            body: "{\"labels\":[\"\(label)\"]}",
+        },
+        Some(token),
+    )?;
+    if response.status >= 200 && response.status < 300 {
+        Ok(label)
+    } else {
+        Err("github rejected the label")
+    }
+}
+
+/// Labels newly opened issues.
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    let Some(event) = header(request.headers, "x-github-event") else
+        None => HttpResponse { status: 400, body: "missing x-github-event" };
+    let payload: Record {
+        action: String,
+        issue: Record { number: Int, title: String, body: String },
+        repository: Record { full_name: String },
+    } = json_decode(request.body);
+    let prompt = "Classify: \(payload.issue.title)";
+    let label = match ai_invoke("triage", prompt) {
+        Ok(output) => allowed_label(output),
+        Err(_) => "needs-triage",
+    };
+    match apply_label(payload.repository.full_name, payload.issue.number, label) {
+        Ok(applied) => HttpResponse { status: 200, body: applied },
+        Err(reason) => HttpResponse { status: 502, body: reason },
+    }
+}

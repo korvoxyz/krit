@@ -1,0 +1,165 @@
+// Use case 4: scheduled daily sales report posted to chat.
+//
+// The host schedule fires once per UTC day. The guest has no clock or date
+// library, so the report window and the YYYY-MM-DD label are derived from the
+// host-supplied epoch milliseconds with integer civil-date arithmetic.
+//
+// Host-catalogued query (rows are heterogeneous, which `List<T>` cannot type,
+// so SQLite packs each row into one JSON text column):
+//   SELECT json_object('region', region, 'amount_cents', amount_cents,
+//                      'refunded', refunded) AS row
+//   FROM orders WHERE created_ms >= ?1 AND created_ms < ?2
+//
+// There is no map type and no way to build a list of computed length, so
+// grouping by region only works for a fixed, known set of regions.
+// BEGIN PURE
+fn pad2(value: Int) -> String {
+    if value < 10 {
+        "0" + json_encode(value)
+    } else {
+        json_encode(value)
+    }
+}
+
+// Howard Hinnant's days-to-civil algorithm, specialised to dates after 1970.
+fn date_label(epoch_millis: Int) -> String {
+    let days = epoch_millis / 86400000 + 719468;
+    let era = days / 146097;
+    let day_of_era = days - era * 146097;
+    let year_of_era = (
+        day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096
+    ) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + if month <= 2 {
+        1
+    } else {
+        0
+    };
+    json_encode(year) + "-" + pad2(month) + "-" + pad2(day)
+}
+
+fn money(cents: Int) -> String {
+    "$" + json_encode(cents / 100) + "." + pad2(cents % 100)
+}
+
+fn decode_order(row: List<String>) -> Record {
+    region: String,
+    amount_cents: Int,
+    refunded: Int,
+} {
+    match row {
+        [] => record { region: "invalid", amount_cents: 0, refunded: 1 },
+        [cell, ..rest] => json_decode(cell),
+    }
+}
+
+// Sums paid revenue for one region ("*" means every region).
+fn revenue(rows: List<List<String>>, region: String) -> Int {
+    match rows {
+        [] => 0,
+        [row, ..rest] => {
+            let order = decode_order(row);
+            let counted = order.refunded == 0 && (region == "*" || order.region == region);
+            if counted {
+                order.amount_cents + revenue(rest, region)
+            } else {
+                revenue(rest, region)
+            }
+        },
+    }
+}
+
+fn count_orders(rows: List<List<String>>) -> Int {
+    match rows {
+        [] => 0,
+        [row, ..rest] => 1 + count_orders(rest),
+    }
+}
+
+fn report_text(label: String, rows: List<List<String>>) -> String {
+    "Daily sales "
+        + label
+        + "\n"
+        + "Orders: "
+        + json_encode(count_orders(rows))
+        + "\n"
+        + "Revenue: "
+        + money(revenue(rows, "*"))
+        + "\n"
+        + "  EU: "
+        + money(revenue(rows, "eu"))
+        + "\n"
+        + "  US: "
+        + money(revenue(rows, "us"))
+        + "\n"
+        + "  APAC: "
+        + money(revenue(rows, "apac"))
+}
+
+// END PURE
+fn post_report(channel: String, text: String) -> Result<String, String> {
+    match secret("slack-token") {
+        Ok(token) => {
+            let message: HttpRequest = record {
+                method: "POST",
+                path: "/api/chat.postMessage",
+                query: "",
+                headers: [record { name: "content-type", value: "application/json" }],
+                body: json_encode(record { channel: channel, text: text }),
+            };
+            match http_request("https://slack.com", message, Some(token)) {
+                Ok(response) => {
+                    // Slack reports failures as HTTP 200 with {"ok": false}.
+                    let reply: Record { ok: Bool } = json_decode(response.body);
+                    if response.status == 200 && reply.ok {
+                        Ok(text)
+                    } else {
+                        Err("chat rejected the report")
+                    }
+                },
+                Err(error) => Err(error),
+            }
+        },
+        Err(error) => Err(error),
+    }
+}
+
+schedule "daily-report" fn handle(event: ScheduleEvent) -> Result<String, String> {
+    let day_end = event.scheduledAtMillis - event.scheduledAtMillis % 86400000;
+    let day_start = day_end - 86400000;
+    let window = [json_encode(day_start), json_encode(day_end)];
+    // HTTP is refused while a transaction is open, so read, then close, then post.
+    let fetched = match db_begin_read("sales") {
+        Ok(transaction) => match db_query(transaction, "orders-in-window", window) {
+            Ok(rows) => match db_commit(transaction) {
+                Ok(done) => Ok(rows),
+                Err(error) => Err(error),
+            },
+            Err(error) => match db_rollback(transaction) {
+                Ok(undone) => Err(error),
+                Err(fatal) => Err(fatal),
+            },
+        },
+        Err(error) => Err(error),
+    };
+    match fetched {
+        Err(error) => Err(error),
+        Ok(json) => match config_string("report.channel") {
+            Err(error) => Err(error),
+            Ok(channel) => {
+                let result: Record {
+                    columns: List<String>,
+                    rows: List<List<String>>,
+                } = json_decode(json);
+                post_report(channel, report_text(date_label(day_start), result.rows))
+            },
+        },
+    }
+}

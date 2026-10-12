@@ -1,0 +1,11 @@
+schema = 1
+
+[package]
+name = "usecases/orders-transform"
+version = "0.2.0"
+edition = "2026"
+entry = "08-orders-transform.krit"
+license = "Apache-2.0"
+
+[capabilities]
+stdout = true

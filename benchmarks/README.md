@@ -32,3 +32,9 @@ isolated execution-thread creation, execution, deadline-worker join, and
 shutdown. It is not an in-process throughput result. The interactive machine's
 background load and power mode were not controlled, so the raw samples and
 median/MAD matter more than small differences.
+
+## Grounded use-case sketches
+
+[`sketches/`](sketches/README.md) holds the realistic agent programs behind
+release gate 8 of PRD 0.3: whether each one passes `krit check` and builds.
+`cargo test -p krit-cli --test sketches` measures them again.

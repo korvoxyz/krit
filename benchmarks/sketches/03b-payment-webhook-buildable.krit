@@ -1,0 +1,31 @@
+// Use case 3, buildable variant: Krit only moves the raw body; the
+// host-catalogued SQLite statement parses JSON with json_extract and enforces
+// idempotency with ON CONFLICT(event_id) DO NOTHING. No authentication at all:
+// header lookup, string equality, and json_decode are outside the webhook ABI.
+fn respond(status: Int, body: String) -> HttpResponse {
+    record { status: status, headers: [], body: body }
+}
+
+webhook fn handle(request: HttpRequest) -> HttpResponse {
+    match db_begin_write("payments") {
+        Ok(transaction) => match db_execute(
+            transaction,
+            "insert-payment-event",
+            [request.body],
+        ) {
+            Ok(changed) => match db_commit(transaction) {
+                Ok(committed) => if changed == 0 {
+                    respond(200, "duplicate or ignored")
+                } else {
+                    respond(200, "recorded")
+                },
+                Err(error) => respond(500, error),
+            },
+            Err(error) => match db_rollback(transaction) {
+                Ok(undone) => respond(500, error),
+                Err(fatal) => respond(500, fatal),
+            },
+        },
+        Err(error) => respond(503, error),
+    }
+}

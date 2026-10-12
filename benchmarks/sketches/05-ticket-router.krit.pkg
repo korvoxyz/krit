@@ -1,0 +1,16 @@
+schema = 1
+
+[package]
+name = "usecases/ticket-router"
+version = "0.2.0"
+edition = "2026"
+entry = "05-ticket-router.krit"
+license = "Apache-2.0"
+
+[capabilities]
+http = ["https://ai.example.invalid"]
+secrets = ["ai-token"]
+ai = ["support-router"]
+consumes = ["tickets"]
+queues = ["billing-desk", "human-triage", "support-desk"]
+buckets = ["ticket-routes"]

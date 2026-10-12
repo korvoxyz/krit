@@ -1,0 +1,37 @@
+// Use case 5, rewritten for 0.3. REDUCED scope: the job body is the raw ticket
+// text and the model answers with one JSON string naming the category;
+// priority, the tier clamp, and the draft reply are dropped (no typed decode
+// into records, no record layouts in components).
+/// Asks for exactly one category word, as a JSON string.
+fn router_prompt(ticket: String) -> String {
+    """
+    Route this support ticket. Answer with only a JSON string, one of
+    "billing", "technical", "account", or "other".
+    Ticket: \(ticket)
+    """
+}
+
+/// Publishes the ticket to the desk for `category`; queue names are literals,
+/// so each destination is its own branch and grant.
+fn deliver(id: String, category: String, ticket: String) -> Result<String, String> {
+    let job = if category == "billing" {
+        queue_publish("billing-desk", ticket)?
+    } else if category == "technical" || category == "account" {
+        queue_publish("support-desk", ticket)?
+    } else {
+        queue_publish("human-triage", ticket)?
+    };
+    object_put("ticket-routes", id, "\(category) \(job)")?;
+    Ok(job)
+}
+
+/// Routes with the model, and on the final attempt routes to humans without it.
+queue "tickets" fn handle(job: QueueJob) -> Result<String, String> {
+    if job.attempt >= job.maxAttempts {
+        deliver(job.id, "other", job.body)
+    } else {
+        let output = ai_invoke("support-router", router_prompt(job.body))?;
+        let category: String = json_decode(output);
+        deliver(job.id, category, job.body)
+    }
+}

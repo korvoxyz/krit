@@ -3,4 +3,6 @@
 /examples/target/
 /examples/state/
 /examples/data/
+/benchmarks/sketches/target/
+/benchmarks/sketches/data/
 __pycache__/

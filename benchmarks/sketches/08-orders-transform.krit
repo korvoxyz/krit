@@ -1,0 +1,159 @@
+// Use case 8: orders -> keep paid orders >= a minimum -> totals -> JSON summary.
+//
+// The natural input is CSV text:
+//   id,customer,amount_cents,status\n1001,alice,1250,paid\n...
+// Krit 0.2 cannot parse it: strings have no length, index, slice, split, find,
+// or character access. Input must already be JSON, so this sketch takes the
+// rows an upstream CSV-to-JSON step would emit (every cell still a string).
+//
+// Further gaps met here:
+// - No list construction of computed length (no cons, append, map, filter), so
+//   the filtered list is assembled as JSON text and re-decoded.
+// - No maps, so per-customer totals use an O(n^2) "last occurrence" scan.
+// - No let-polymorphism: one generic `count` cannot serve two element types.
+// - String-to-Int parsing is json_decode on the cell, which traps on "" or "12.5".
+// - No floats or decimals: money stays in integer cents.
+// BEGIN PURE
+fn cell(row: List<String>, index: Int) -> String {
+    match row {
+        [] => "",
+        [first, ..rest] => if index == 0 {
+            first
+        } else {
+            cell(rest, index - 1)
+        },
+    }
+}
+
+fn amount(row: List<String>) -> Int {
+    json_decode(cell(row, 2))
+}
+
+fn kept(row: List<String>, minimum: Int) -> Bool {
+    cell(row, 3) == "paid" && amount(row) >= minimum
+}
+
+fn order_json(row: List<String>) -> String {
+    json_encode(
+        record {
+            id: cell(row, 0),
+            customer: cell(row, 1),
+            amount_cents: amount(row),
+        },
+    )
+}
+
+// Comma-joins the JSON of kept rows; "" when none are kept.
+fn kept_json(rows: List<List<String>>, minimum: Int) -> String {
+    match rows {
+        [] => "",
+        [row, ..rest] => {
+            let tail = kept_json(rest, minimum);
+            if !kept(row, minimum) {
+                tail
+            } else {
+                if tail == "" {
+                    order_json(row)
+                } else {
+                    order_json(row) + "," + tail
+                }
+            }
+        },
+    }
+}
+
+fn kept_count(rows: List<List<String>>, minimum: Int) -> Int {
+    match rows {
+        [] => 0,
+        [row, ..rest] => if kept(row, minimum) {
+            1 + kept_count(rest, minimum)
+        } else {
+            kept_count(rest, minimum)
+        },
+    }
+}
+
+fn revenue(rows: List<List<String>>, minimum: Int, customer: String) -> Int {
+    match rows {
+        [] => 0,
+        [row, ..rest] => {
+            let matches = kept(row, minimum)
+                && (customer == "*" || cell(row, 1) == customer);
+            if matches {
+                amount(row) + revenue(rest, minimum, customer)
+            } else {
+                revenue(rest, minimum, customer)
+            }
+        },
+    }
+}
+
+fn has_customer(rows: List<List<String>>, minimum: Int, customer: String) -> Bool {
+    match rows {
+        [] => false,
+        [row, ..rest] => kept(row, minimum) && cell(row, 1) == customer
+            || has_customer(rest, minimum, customer),
+    }
+}
+
+// Emits one entry per customer, at that customer's last kept row.
+fn customers_json(
+    all: List<List<String>>,
+    rows: List<List<String>>,
+    minimum: Int,
+) -> String {
+    match rows {
+        [] => "",
+        [row, ..rest] => {
+            let tail = customers_json(all, rest, minimum);
+            let customer = cell(row, 1);
+            if !kept(row, minimum) || has_customer(rest, minimum, customer) {
+                tail
+            } else {
+                let entry = json_encode(
+                    record {
+                        customer: customer,
+                        revenue_cents: revenue(all, minimum, customer),
+                    },
+                );
+                if tail == "" {
+                    entry
+                } else {
+                    entry + "," + tail
+                }
+            }
+        },
+    }
+}
+
+fn summary(rows: List<List<String>>, minimum: Int) -> String {
+    let count = kept_count(rows, minimum);
+    let total = revenue(rows, minimum, "*");
+    let orders: List<Record { id: String, customer: String, amount_cents: Int }> = json_decode(
+        "[" + kept_json(rows, minimum) + "]",
+    );
+    let customers: List<Record { customer: String, revenue_cents: Int }> = json_decode(
+        "[" + customers_json(rows, rows, minimum) + "]",
+    );
+    json_encode(
+        record {
+            paid_orders: count,
+            revenue_cents: total,
+            average_cents: if count == 0 {
+                0
+            } else {
+                total / count
+            },
+            orders: orders,
+            customers: customers,
+        },
+    )
+}
+
+// END PURE
+let rows: List<List<String>> = json_decode(
+    "[[\"1001\",\"alice\",\"1250\",\"paid\"],[\"1002\",\"bob\",\"300\",\"refunded\"],[\"1003\",\"alice\",\"4000\",\"paid\"],[\"1004\",\"chen\",\"99\",\"paid\"],[\"1005\",\"dana\",\"2500\",\"paid\"]]",
+);
+
+println(summary(rows, 100));
+println(summary(rows, 100000));

@@ -1,0 +1,12 @@
+schema = 1
+
+[package]
+name = "usecases/payment-webhook"
+version = "0.2.0"
+edition = "2026"
+entry = "03-payment-webhook.krit"
+license = "Apache-2.0"
+
+[capabilities]
+config = ["payments.webhook-token"]
+databases = ["payments"]
