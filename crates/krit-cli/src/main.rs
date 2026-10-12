@@ -27,7 +27,7 @@ use krit_wasm::{
 use serde::Serialize;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const GENERATION_PROMPT: &str = include_str!("../assets/KRIT-0.2-SYSTEM.md");
+const GENERATION_PROMPT: &str = include_str!("../assets/KRIT-0.3-SYSTEM.md");
 
 #[derive(Clone, Copy, Debug)]
 enum DiagnosticFormat {
@@ -2981,6 +2981,9 @@ mod tests {
             count += 1;
             remaining = &code[end + "\n```".len()..];
         }
-        assert_eq!(count, 12, "prompt should contain twelve canonical examples");
+        assert_eq!(
+            count, 13,
+            "prompt should contain thirteen canonical examples"
+        );
     }
 }
