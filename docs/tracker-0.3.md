@@ -50,18 +50,18 @@ documentation, examples, and the release gate.
 | L5 | Entry lists, `()`, `///` (formatter + LSP hover) | R3.5 | done | fmt idempotent | |
 | L6 | Interpolation `\(…)`, `"""` text blocks, K3015 | R3.6 | done | prompt webhook builds | W2 |
 | L7 | Stdlib v0 (8 functions; `url_path_segment` returns Result) + K9013 lint | R4.1, R4.2 | done | evaluator/Wasm agreement | W2, F3 |
-| L8 | Formatter polish: `+` chains, digit separators, 100 cols | R3.7 | doing | idempotence suite | L1–L7 |
+| L8 | Formatter polish: `+` chains, digit separators, 100 cols | R3.7 | done | idempotence suite | L1–L7 |
 
 ## Wave 3 — docs, examples, release
 
 | ID | Item | Req | Status | Acceptance check |
 |---|---|---|---|---|
-| D1 | Spec updates (LANGUAGE, DIAGNOSTICS, TYPES-AND-EFFECTS, WASM-SANDBOX, CAPABILITIES, PACKAGES) | R5.1 | doing | spec matches code |
-| D2 | Examples rewritten; `scripts/metrics.py`; depth ≤ 3 | R5.2 | doing | metrics table |
-| D3 | Conformance ≥ 40 run / 60 check / 8 format | R5.3 | doing | counts |
-| D4 | Prompt pack 0.3 with checked examples | R4.5 | doing | examples check |
-| D5 | `docs/roadmap.md`, RFC-0007 resource handles (draft), CHANGELOG, README, version 0.3.0 | R5.4 | todo | checklist |
-| D6 | Release gate (PRD §5) and grounded-sketch re-measure | §5 | todo | all gates |
+| D1 | Spec updates (LANGUAGE, DIAGNOSTICS, TYPES-AND-EFFECTS, WASM-SANDBOX, CAPABILITIES, PACKAGES) | R5.1 | done | spec matches code |
+| D2 | Examples rewritten; `scripts/metrics.py`; depth ≤ 3 | R5.2 | done | metrics table |
+| D3 | Conformance ≥ 40 run / 60 check / 8 format | R5.3 | done | counts |
+| D4 | Prompt pack 0.3 with checked examples | R4.5 | done | examples check |
+| D5 | `docs/roadmap.md`, RFC-0007 resource handles (draft), CHANGELOG, README, version 0.3.0 | R5.4 | doing | checklist |
+| D6 | Release gate (PRD §5) and grounded-sketch re-measure | §5 | doing | all gates |
 
 ## Log
 
@@ -98,3 +98,15 @@ documentation, examples, and the release gate.
 - 2026-10-12 — Wave 3 started in four worktrees: formatter polish (L8),
   examples + metrics + conformance + sketch re-measure (D2, D3), prompt pack
   0.3 + RFC-0007 resource handles (D4), spec and README consolidation (D1).
+- 2026-10-12 — Wave 3 complete and merged: L8 formatter polish (operator-
+  leading chain breaks, digit separators kept, 100 columns; fuzzed), D2
+  examples rewritten (webhook-agent 79 → 47 lines, max depth 15 → 3, `record`
+  9 → 0, identical permissions), `scripts/metrics.py` depth gate in CI,
+  conformance 50 run / 174 check / 13 format, D4 prompt pack 0.3.0 with
+  compiler-checked examples and draft RFC-0007 resource handles, D1 spec and
+  README consolidation with compiler-checked snippets. One cross-track test
+  fix after merging (stdlib heading level). Gate results recorded in the PRD:
+  `lists.krit` is the one unbuildable example (0.4 list layouts); sketches
+  5/8 with reduced scope, 2/8 full behavior.
+- 2026-10-12 — Release stage started: version 0.3.0, CHANGELOG, independent
+  release-gate audit.
