@@ -7,6 +7,39 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-14
+
+0.3.2 is the first published 0.3 release. 0.3.1 was tagged but never
+published: its Release workflow stopped before packaging because the new
+supply-chain gate found two rustls advisories published the same day, and the
+Windows test job failed on a path-separator bug in a test. 0.3.2 contains
+everything listed under 0.3.1 and 0.3.0, plus the changes in this section. It
+changes no compiler or CLI behavior beyond the version number it reports: the
+`factorial` artifact is byte-identical to 0.3.0's apart from the two embedded
+version strings.
+
+### Security
+
+- RUSTSEC-2026-0346 (GHSA-c8m5-c952-6cm4) and RUSTSEC-2026-0347
+  (GHSA-vp88-798v-h67f) in rustls, both published 2026-10-14 and fixed in
+  rustls 0.23.46, which rustls-ffi 0.15.5 pins (via curl). The first makes
+  the `Debug` output of client session values include the TLS master secret
+  or resumption PSK; Krit never formats session values, so it was not
+  exposed. The second sends buffered application data to the outer server
+  after an Encrypted Client Hello rejection; Krit's HTTP client does not
+  enable ECH. The supply-chain gate refused the release as designed.
+
+### Fixed
+
+- The repository-wide formatter round-trip test matched fixture paths with
+  `/` and so failed on Windows, where paths use `\`; names are now
+  normalized before matching
+
+### Changed
+
+- CI and `scripts/gate.sh` run the test suites with `--no-fail-fast`, so one
+  run reports every failing test binary instead of stopping at the first
+
 ## [0.3.1] - 2026-10-12
 
 0.3.1 is the first published 0.3 release. 0.3.0 was tagged but never

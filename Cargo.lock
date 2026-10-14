@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "krit"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "krit-capability",
  "serde_json",
@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "krit-assist"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "blake3",
  "curl",
@@ -996,18 +996,18 @@ dependencies = [
 
 [[package]]
 name = "krit-cache"
-version = "0.3.1"
+version = "0.3.2"
 
 [[package]]
 name = "krit-capability"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "url",
 ]
 
 [[package]]
 name = "krit-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "krit",
  "krit-assist",
@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "krit-database"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "krit-lsp"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "crossbeam-channel",
  "krit",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "krit-package"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "krit-capability",
  "semver",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "krit-runtime"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "blake3",
  "curl",
@@ -1082,14 +1082,14 @@ dependencies = [
 
 [[package]]
 name = "krit-state"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "rusqlite",
 ]
 
 [[package]]
 name = "krit-wasm"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "blake3",
  "krit",
@@ -1436,9 +1436,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -1450,9 +1450,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-ffi"
-version = "0.15.4"
+version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c73c7253436c6c8e1acdbc98f4a526f51987fd39fafdda4d228cf4b30f34bf88"
+checksum = "4146b98d9eb08a4700105c4d03c70a0969e637715e77be4a4dd43bf5fba7e0f0"
 dependencies = [
  "libc",
  "log",
