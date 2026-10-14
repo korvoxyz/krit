@@ -145,7 +145,8 @@ fn round_trip_every_repository_source() {
             .strip_prefix(&root)
             .expect("source should be in repository")
             .to_string_lossy()
-            .into_owned();
+            // Match the '/'-separated rules below on every OS.
+            .replace('\\', "/");
         let source = Source::new(name.clone(), text);
         let before_parse = parse_source(&source);
         let formatted = format_source(&source);

@@ -171,7 +171,7 @@ supply_tool() {
 step "Check formatting" run cargo +"$toolchain" fmt --all --check
 step "Check example metrics" example_metrics
 step "Run Clippy" run cargo +"$toolchain" clippy --workspace --all-targets --locked -- -D warnings
-step "Run tests and conformance" run cargo +"$toolchain" test --workspace --all-targets --locked
+step "Run tests and conformance" run cargo +"$toolchain" test --workspace --all-targets --locked --no-fail-fast
 step "Run documentation tests" run cargo +"$toolchain" test --workspace --doc --locked
 if $supply; then
     step "Check dependencies with cargo deny" supply_tool deny "$CARGO_DENY_VERSION" --locked check

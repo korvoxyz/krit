@@ -53,7 +53,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run tests and conformance
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --locked --no-fail-fast
 
       - name: Run documentation tests
         run: cargo test --workspace --doc --locked
@@ -119,7 +119,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run tests
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --locked --no-fail-fast
 
   packages:
     name: Package ${{ matrix.target }}
