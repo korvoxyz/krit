@@ -223,6 +223,12 @@ primitive, including Windows. On Windows, host mode (`invoke`, `worker`,
 durable state, because owner-only file checks exist only on Unix; see
 [Platform support](spec/WASM-SANDBOX.md#platform-support).
 
+**Windows is a preview platform in 0.3.2.** The Windows archive is built and
+attested like the others, but the Windows test suite is not yet green: most
+failing tests do not yet account for the Windows limits above, and the
+language server (`krit lsp`) is under investigation on Windows. Linux and
+macOS are fully tested.
+
 ### GitHub Packages
 
 Krit is also published to

@@ -40,6 +40,16 @@ version strings.
 - CI and `scripts/gate.sh` run the test suites with `--no-fail-fast`, so one
   run reports every failing test binary instead of stopping at the first
 
+### Known limitations
+
+- Windows is a preview platform. Its archive is built, packaged and attested,
+  but the advisory Windows test job still has 11 failing tests: 9 do not yet
+  account for documented Windows limits (assist acceptance fails closed with
+  K8107, host mode refuses secrets and durable state with K5001, output paths
+  use `\`, and a different resource limit trips first), and 2 show the
+  language server failing on Windows, which is under investigation. Linux and
+  macOS are fully tested. The fixes are scheduled for the next release.
+
 ## [0.3.1] - 2026-10-12
 
 0.3.1 is the first published 0.3 release. 0.3.0 was tagged but never
