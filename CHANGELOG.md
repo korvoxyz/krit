@@ -7,6 +7,30 @@ Krit is pre-1.0 and does not yet promise stable syntax between minor releases.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-15
+
+0.3.3 is the first published 0.3 release. 0.3.2 was tagged but never
+published: the morning it was tagged, Wasmtime published eleven security
+advisories, and the supply-chain gate refused the release as designed. 0.3.3
+contains everything listed under 0.3.2, 0.3.1 and 0.3.0, plus the changes in
+this section, and changes no compiler or CLI behavior beyond the version it
+reports.
+
+### Security
+
+- Wasmtime 48.0.5 → 48.0.6 (with the matching Cranelift and Pulley patch
+  releases; no other dependency changes), fixing RUSTSEC-2026-0353 through
+  RUSTSEC-2026-0359 and RUSTSEC-2026-0361 through RUSTSEC-2026-0364. Three
+  bear on Krit's sandbox: component-model handle tables were capped only per
+  instance and charged to no limit, a guest `realloc` that calls back into the
+  host could panic the host, and dropping a long chain of recursive types
+  could overflow the host stack. The rest concern component-model async,
+  streams, futures and exception tags, which Krit's artifact policy rejects.
+
+### Known limitations
+
+- Windows remains a preview platform, as described under 0.3.2.
+
 ## [0.3.2] - 2026-10-14
 
 0.3.2 is the first published 0.3 release. 0.3.1 was tagged but never

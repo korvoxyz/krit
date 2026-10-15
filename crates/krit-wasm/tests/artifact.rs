@@ -159,7 +159,7 @@ fn factorial_builds_as_a_valid_deterministic_component() {
     assert_eq!(first.bytes.len(), 1393);
     assert_eq!(
         first.metadata.digest,
-        "blake3:509f6a8348d6c8acb52ec1b9b40f99a99fbb38e075854ca5474a07d29d456f86"
+        "blake3:cb5bebbe6155babb2e32e9a1c29ae090cffd2b0dd9df5a7379b726980fcc8754"
     );
 
     let inspection =

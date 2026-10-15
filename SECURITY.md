@@ -17,15 +17,15 @@ archived Racket prototype (tag `racket-v0.1.0`) is not supported.
 
 ## Verifying a release
 
-From 0.3.2 on, the repository's Release workflow attests every release
+From 0.3.3 on, the repository's Release workflow attests every release
 archive, `SHA256SUMS`, and the multi-architecture container image with signed
 SLSA build provenance. Verify a download or image with the
 [GitHub CLI](https://cli.github.com/manual/gh_attestation_verify) before
 trusting it:
 
 ```sh
-gh attestation verify krit-0.3.2-x86_64-unknown-linux-gnu.tar.gz --repo korvoxyz/krit
-gh attestation verify oci://ghcr.io/korvoxyz/krit:0.3.2 --repo korvoxyz/krit
+gh attestation verify krit-0.3.3-x86_64-unknown-linux-gnu.tar.gz --repo korvoxyz/krit
+gh attestation verify oci://ghcr.io/korvoxyz/krit:0.3.3 --repo korvoxyz/krit
 ```
 
 Add `--signer-workflow korvoxyz/krit/.github/workflows/release.yml` to also

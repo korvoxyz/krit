@@ -190,22 +190,22 @@ The archives are self-contained: **no Rust, Python, or Node.js installation is
 required**. Each includes the CLI, runnable examples, `BUILD.json` with the source
 commit and binary digest, and dependency license notices.
 
-| Platform | Archive for release 0.3.2 |
+| Platform | Archive for release 0.3.3 |
 | --- | --- |
-| Linux x86-64, glibc 2.35+ | `krit-0.3.2-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux ARM64, glibc 2.35+ | `krit-0.3.2-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS 12+, Intel | `krit-0.3.2-x86_64-apple-darwin.tar.gz` |
-| macOS 12+, Apple Silicon | `krit-0.3.2-aarch64-apple-darwin.tar.gz` |
-| Windows x86-64 | `krit-0.3.2-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64, glibc 2.35+ | `krit-0.3.3-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64, glibc 2.35+ | `krit-0.3.3-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS 12+, Intel | `krit-0.3.3-x86_64-apple-darwin.tar.gz` |
+| macOS 12+, Apple Silicon | `krit-0.3.3-aarch64-apple-darwin.tar.gz` |
+| Windows x86-64 | `krit-0.3.3-x86_64-pc-windows-msvc.zip` |
 
 Download `SHA256SUMS` alongside your archive. On Linux, verify the downloaded
 archive with `sha256sum --check --ignore-missing SHA256SUMS`. On macOS, select
 its checksum entry, for example:
 
 ```sh
-grep '  krit-0.3.2-aarch64-apple-darwin.tar.gz$' SHA256SUMS | shasum -a 256 -c -
-tar -xzf krit-0.3.2-aarch64-apple-darwin.tar.gz
-cd krit-0.3.2-aarch64-apple-darwin
+grep '  krit-0.3.3-aarch64-apple-darwin.tar.gz$' SHA256SUMS | shasum -a 256 -c -
+tar -xzf krit-0.3.3-aarch64-apple-darwin.tar.gz
+cd krit-0.3.3-aarch64-apple-darwin
 ./krit --version
 ./krit run examples/factorial.krit
 ```
@@ -223,7 +223,7 @@ primitive, including Windows. On Windows, host mode (`invoke`, `worker`,
 durable state, because owner-only file checks exist only on Unix; see
 [Platform support](spec/WASM-SANDBOX.md#platform-support).
 
-**Windows is a preview platform in 0.3.2.** The Windows archive is built and
+**Windows is a preview platform in 0.3.3.** The Windows archive is built and
 attested like the others, but the Windows test suite is not yet green: most
 failing tests do not yet account for the Windows limits above, and the
 language server (`krit lsp`) is under investigation on Windows. Linux and
@@ -236,8 +236,8 @@ Krit is also published to
 with native Linux AMD64 and ARM64 images:
 
 ```sh
-docker run --rm ghcr.io/korvoxyz/krit:0.3.2 --version
-docker run --rm ghcr.io/korvoxyz/krit:0.3.2 run examples/factorial.krit
+docker run --rm ghcr.io/korvoxyz/krit:0.3.3 --version
+docker run --rm ghcr.io/korvoxyz/krit:0.3.3 run examples/factorial.krit
 ```
 
 The image runs as a non-root user. To use a local project on Linux or macOS,
@@ -246,7 +246,7 @@ yours:
 
 ```sh
 docker run --rm --user "$(id -u):$(id -g)" \
-  --volume "$PWD:/work" ghcr.io/korvoxyz/krit:0.3.2 check main.krit
+  --volume "$PWD:/work" ghcr.io/korvoxyz/krit:0.3.3 check main.krit
 ```
 
 The `0.3` tag tracks the 0.3 series; `latest` tracks the latest stable release.
@@ -260,14 +260,14 @@ versions retain that setting.
 
 ### Verifying a release
 
-From 0.3.2 on, the Release workflow attests every archive, `SHA256SUMS`, and
+From 0.3.3 on, the Release workflow attests every archive, `SHA256SUMS`, and
 the multi-architecture container image with signed SLSA build provenance.
 Check that a download or image was built from this repository by that
 workflow with the [GitHub CLI](https://cli.github.com/manual/gh_attestation_verify):
 
 ```sh
-gh attestation verify krit-0.3.2-aarch64-apple-darwin.tar.gz --repo korvoxyz/krit
-gh attestation verify oci://ghcr.io/korvoxyz/krit:0.3.2 --repo korvoxyz/krit
+gh attestation verify krit-0.3.3-aarch64-apple-darwin.tar.gz --repo korvoxyz/krit
+gh attestation verify oci://ghcr.io/korvoxyz/krit:0.3.3 --repo korvoxyz/krit
 ```
 
 Add `--signer-workflow korvoxyz/krit/.github/workflows/release.yml` to also
@@ -1064,7 +1064,7 @@ schema = 1
 
 [package]
 name = "akshay/krit"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2026"
 entry = "examples/factorial.krit"
 license = "Apache-2.0"
